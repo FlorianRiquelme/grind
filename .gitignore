@@ -1,0 +1,8 @@
+.DS_Store
+
+# Session handoff batons — per-session, per-worktree, never shared history
+.handoff.md
+.handoff.consumed.md
+
+# Local tool caches
+.impeccable/
