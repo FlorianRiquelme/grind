@@ -147,6 +147,11 @@ def parse_job(issue_ref):
         "anchor": clean(field("anchor artifact")),
         "budget": clean(field("budget ceiling", required=False)),
         "plugin_spec": field("pinned plugin version"),
+        # A Job pins its plugin so Runs stay comparable; the model deserves the same pin.
+        # The whole pipeline shares one context window, so the model's window size decides
+        # whether a Run compacts mid-flight — which is not something to leave to whatever
+        # the dispatching shell happened to default to.
+        "model": clean(field("model", required=False)) or os.environ.get("GRIND_MODEL"),
     }
 
     m = re.search(r"(\d+\.\d+\.\d+)", job["plugin_spec"])
@@ -167,6 +172,26 @@ def resolve_plugin_dir(job):
     if not d.is_dir():
         die(f"pinned plugin not installed: {d}")
     return str(d)
+
+
+def resolve_claude_bin():
+    """The real binary, not a wrapper shim.
+
+    `claude` on PATH may resolve to cmux's shim, which injects that host's session hooks
+    into the Run. Harmless in practice, but it makes a Run depend on the terminal it was
+    dispatched from, so it would not reproduce outside cmux.
+    """
+    override = os.environ.get("GRIND_CLAUDE_BIN")
+    if override:
+        return override
+    native = Path.home() / ".local" / "bin" / "claude"
+    if native.is_file() and os.access(native, os.X_OK):
+        return str(native)
+    found = sh(["which", "-a", "claude"], check=False).splitlines()
+    for p in found:
+        if "shim" not in p:
+            return p
+    return "claude"
 
 
 def resolve_repo_path(target_repo):
@@ -340,7 +365,12 @@ def invoke(state, attempt_n, resuming):
     d.mkdir(parents=True, exist_ok=True)
     job = state["job"]
 
-    cmd = ["claude", "-p", "--output-format", "json", "--permission-mode", "bypassPermissions"]
+    # Both fall back to what a Run dispatched before these were recorded already used, so
+    # re-entering an in-flight Run never changes its conditions mid-pipeline.
+    cmd = [state.get("claude_bin") or "claude", "-p", "--output-format", "json",
+           "--permission-mode", "bypassPermissions"]
+    if state.get("model"):
+        cmd += ["--model", state["model"]]
     if resuming:
         cmd += ["--resume", state["session_id"]]
     else:
@@ -441,6 +471,7 @@ def report(state):
     print(f"Job     {state['job']['url']}")
     print(f"Branch  {state['job']['branch']}  (worktree {state['worktree']})")
     print(f"Session {state['session_id']}")
+    print(f"Model   {state.get('model') or '(session default — unpinned)'}")
     print(f"Attempts {len(state['attempts'])}   cost ${total:.2f}   tool denials {denials}")
     print()
     print(f"  furthest stage    {obs.get('furthest_stage', '?')}")
@@ -487,11 +518,15 @@ def cmd_run(args):
         "plugin_dir": plugin_dir,
         "worktree": str(wt),
         "session_id": str(uuid.uuid4()),
+        "claude_bin": resolve_claude_bin(),
+        "model": job.get("model"),
         "denied_tools": DENIED_TOOLS,
         "attempts": [],
     }
     save(state)
     print(f"  plugin pinned to {plugin_dir}")
+    print(f"  model {job.get('model') or '(session default — unpinned)'}")
+    print(f"  claude {state['claude_bin']}")
     print(f"  run {run_id}")
     supervise(state)
     report(state)
@@ -526,6 +561,9 @@ def cmd_list(args):
 
 
 def main():
+    # A Run is long and usually backgrounded; block-buffered stdout makes it look dead.
+    sys.stdout.reconfigure(line_buffering=True)
+
     ap = argparse.ArgumentParser(prog="grind", description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
