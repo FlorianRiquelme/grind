@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""grind — dispatch and supervise headless `lfg` Runs against a Job.
+
+Grind is a scheduler, not a pipeline (ADR-0001). This script owns exactly four things:
+enqueue-side reading of a Job, run-now dispatch, supervision of a Run that dies, and a
+run-state record a day session can read. Everything between plan and open PR is `lfg`'s.
+
+It is a script rather than an agent on purpose: a resilience layer built from the thing
+that gets rate-limited loses its state exactly when that matters.
+
+Usage:
+    grind run <issue>          Dispatch a Job now (issue number or URL)
+    grind resume <run-id>      Re-enter a Run that died
+    grind status [run-id]      Print run state (latest run if omitted)
+    grind list                 List known Runs
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+GRIND_ROOT = Path(__file__).resolve().parent.parent
+RUNS_DIR = GRIND_ROOT / ".grind" / "runs"
+PLUGIN_CACHE = Path.home() / ".claude" / "plugins" / "cache"
+
+# Sleep long and re-enter, rather than pre-flight quota checks: even a perfectly informed
+# supervisor would be wrong about what a stage costs.
+LIMIT_SLEEP_SECONDS = int(os.environ.get("GRIND_LIMIT_SLEEP", 1800))
+MAX_ATTEMPTS = int(os.environ.get("GRIND_MAX_ATTEMPTS", 8))
+
+# A Run must never merge its own PR, discard the human's history, or rewrite a pushed
+# branch. Denials are inherited by subagents and are not overridden by bypassPermissions
+# (verified 2026-08-02), so this is a dependable constraint rather than a request.
+DENIED_TOOLS = [
+    "Bash(gh pr merge*)",
+    "Bash(git push --force*)",
+    "Bash(git push -f*)",
+    "Bash(git reset --hard*)",
+    "Bash(git rebase*)",
+    "Bash(git checkout main*)",
+    "Bash(git branch -D*)",
+]
+
+# The Job's definition of done is `just verify` passing on a repo that has none of this
+# yet. The failure that costs most is a step trimmed until it goes green, because that is
+# a false positive on the repo and on Grind in one shot. Grind never gates (ADR-0003), so
+# this is recorded and surfaced, never enforced.
+VERIFY_CONTRACT = [
+    ("rust-fmt", ["cargo fmt"]),
+    ("rust-clippy", ["cargo clippy", "-D warnings"]),
+    ("rust-test", ["cargo test"]),
+    ("ts-typecheck", ["tsc", "--noEmit"]),
+    ("ts-lint", ["eslint"]),
+    ("ts-test", ["vitest"]),
+    ("build-assertion", ["tauri build", "--debug", "--no-bundle"]),
+]
+
+# Re-entry rides Claude Code's own session resume, not an `lfg` return value: `lfg` exposes
+# no structured return to its caller (run_id/plan_checkpoint/unit_receipts/recovery_path are
+# what ce-work returns *to* lfg, internal to the run — see lfg SKILL.md step 2). Resuming the
+# session restores which stage it was on; this prompt only tells it not to redo finished work.
+REENTRY_PROMPT = """You were interrupted mid-run and have just been resumed.
+
+Re-read the working tree and `git log` to establish where the pipeline actually got to,
+then continue `lfg` from the stage that did not complete. Do not restart stages that
+already produced their artifact, and do not open a second PR.
+
+Everything in the original instruction still applies — especially: never weaken, trim or
+skip a step of `just verify` to make it pass."""
+
+RATE_LIMIT_PATTERNS = re.compile(
+    r"rate.?limit|usage limit|too many requests|quota exceeded|resets? at|429",
+    re.IGNORECASE,
+)
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def sh(args, cwd=None, check=True):
+    r = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"{' '.join(args)}\n{r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def die(msg):
+    print(f"grind: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# --- enqueue side: read the Job -------------------------------------------------------
+
+
+def parse_job(issue_ref):
+    """A Job is a labelled GitHub issue in the repo the work happens in."""
+    if issue_ref.startswith("http"):
+        m = re.match(r"https://github\.com/([^/]+/[^/]+)/issues/(\d+)", issue_ref)
+        if not m:
+            die(f"cannot parse issue URL: {issue_ref}")
+        repo, number = m.group(1), m.group(2)
+    else:
+        repo, number = None, issue_ref
+
+    cmd = ["gh", "issue", "view", number, "--json", "number,title,body,url,labels,state"]
+    if repo:
+        cmd += ["--repo", repo]
+    issue = json.loads(sh(cmd))
+
+    fields = {}
+    for line in issue["body"].splitlines():
+        m = re.match(r"^\|\s*\*{0,2}([^|*]+?)\*{0,2}\s*\|\s*(.+?)\s*\|\s*$", line)
+        if m:
+            key = m.group(1).strip().lower()
+            val = m.group(2).strip()
+            if key not in ("field", "value") and not set(val) <= set("-: "):
+                fields[key] = val
+
+    def field(*names, required=True):
+        for n in names:
+            if n in fields:
+                return fields[n]
+        if required:
+            die(f"Job {issue['url']} has no '{names[0]}' row in its field table")
+        return None
+
+    def clean(v):
+        return re.sub(r"[`*]", "", v).strip() if v else v
+
+    job = {
+        "issue": issue["number"],
+        "url": issue["url"],
+        "title": issue["title"],
+        "labels": [l["name"] for l in issue["labels"]],
+        "target_repo": clean(field("target repo")),
+        "branch": clean(field("branch")),
+        "handoff_sha": clean(field("handoff sha")),
+        "anchor": clean(field("anchor artifact")),
+        "budget": clean(field("budget ceiling", required=False)),
+        "plugin_spec": field("pinned plugin version"),
+    }
+
+    m = re.search(r"(\d+\.\d+\.\d+)", job["plugin_spec"])
+    if not m:
+        die(f"cannot read a version out of: {job['plugin_spec']}")
+    job["plugin_version"] = m.group(1)
+
+    m = re.search(r"([\w-]+)@([\w-]+)", re.sub(r"[`*]", "", job["plugin_spec"]))
+    if not m:
+        die(f"cannot read plugin@marketplace out of: {job['plugin_spec']}")
+    job["plugin_name"], job["plugin_marketplace"] = m.group(1), m.group(2)
+    return job
+
+
+def resolve_plugin_dir(job):
+    """Pin by path. Advancing this pin is the act of promotion (ADR-0002)."""
+    d = PLUGIN_CACHE / job["plugin_marketplace"] / job["plugin_name"] / job["plugin_version"]
+    if not d.is_dir():
+        die(f"pinned plugin not installed: {d}")
+    return str(d)
+
+
+def resolve_repo_path(target_repo):
+    name = target_repo.split("/")[-1]
+    override = os.environ.get("GRIND_REPO_PATH")
+    candidates = [Path(override)] if override else [
+        Path.home() / "Repos" / "mine" / name,
+        Path.home() / "Repos" / name,
+    ]
+    for c in candidates:
+        if (c / ".git").exists():
+            origin = sh(["git", "remote", "get-url", "origin"], cwd=c, check=False)
+            if target_repo.lower() in origin.lower():
+                return c
+    die(f"no local clone of {target_repo} found (set GRIND_REPO_PATH)")
+
+
+def resolve_worktree(repo, job):
+    """Adopt the branch's existing worktree when there is one; otherwise make one.
+
+    The author runs ~10 parallel worktrees, and git allows a branch in only one of them.
+    """
+    entries, cur = [], {}
+    for line in sh(["git", "worktree", "list", "--porcelain"], cwd=repo).splitlines():
+        if not line.strip():
+            entries.append(cur)
+            cur = {}
+        elif " " in line:
+            k, v = line.split(" ", 1)
+            cur[k] = v
+        else:
+            cur[line] = True
+    if cur:
+        entries.append(cur)
+
+    for e in entries:
+        if e.get("branch", "").endswith(f"/{job['branch']}"):
+            wt = Path(e["worktree"])
+            print(f"  adopting existing worktree: {wt}")
+            return wt
+
+    wt = repo / ".claude" / "worktrees" / f"grind-{job['branch'].replace('/', '-')}"
+    sh(["git", "worktree", "add", str(wt), job["branch"]], cwd=repo)
+    print(f"  created worktree: {wt}")
+    return wt
+
+
+# --- the record: what a day session reads ---------------------------------------------
+
+
+def observe(state):
+    """Infer how far the Run got from durable artifacts.
+
+    `lfg` exposes no structured return to its caller — run_id/plan_checkpoint/
+    unit_receipts/recovery_path are what ce-work returns to lfg, internal to the run.
+    Its only caller-visible terminal signal is the DONE promise. So stage is inferred
+    from what the Run left on disk and on GitHub, which is also what survives a death.
+    """
+    wt = Path(state["worktree"])
+    job = state["job"]
+    obs = {"observed_at": now()}
+
+    obs["commits_ahead"] = int(
+        sh(["git", "rev-list", "--count", f"{job['handoff_sha']}..HEAD"], cwd=wt, check=False) or 0
+    )
+    obs["plan_files"] = [os.path.relpath(p, wt) for p in glob.glob(str(wt / "docs" / "plans" / "*.md"))]
+    obs["residual_findings"] = [
+        os.path.relpath(p, wt) for p in glob.glob(str(wt / "docs" / "residual-review-findings" / "*.md"))
+    ]
+    # The Job creates the ledger it should be writing into. Silence here is a finding.
+    obs["ledger_entries"] = [os.path.relpath(p, wt) for p in glob.glob(str(wt / "docs" / "ledger" / "*.md"))]
+
+    pr = sh(["gh", "pr", "view", "--json", "number,url,state,isDraft"], cwd=wt, check=False)
+    obs["pr"] = json.loads(pr) if pr.startswith("{") else None
+
+    obs["verify_contract"] = check_verify_contract(wt)
+
+    stage = "dispatched"
+    if obs["plan_files"]:
+        stage = "planned"
+    if obs["commits_ahead"]:
+        stage = "implemented"
+    if obs["residual_findings"]:
+        stage = "reviewed"
+    if obs["pr"]:
+        stage = "pr-open"
+    obs["furthest_stage"] = stage
+
+    state["observed"] = obs
+    return obs
+
+
+def check_verify_contract(wt):
+    """Report which contracted verify steps are present. Report only — never a gate."""
+    justfile = wt / "justfile"
+    if not justfile.exists():
+        return {"justfile": False, "present": [], "missing": [k for k, _ in VERIFY_CONTRACT]}
+
+    haystack = justfile.read_text()
+    pkg = wt / "package.json"
+    if pkg.exists():
+        try:
+            haystack += json.dumps(json.loads(pkg.read_text()).get("scripts", {}))
+        except json.JSONDecodeError:
+            pass
+
+    present, missing = [], []
+    for name, tokens in VERIFY_CONTRACT:
+        (present if all(t in haystack for t in tokens) else missing).append(name)
+    return {"justfile": True, "present": present, "missing": missing}
+
+
+def save(state):
+    d = RUNS_DIR / state["run_id"]
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "run.json").write_text(json.dumps(state, indent=2) + "\n")
+
+
+def load(run_id):
+    f = RUNS_DIR / run_id / "run.json"
+    if not f.exists():
+        die(f"no such run: {run_id}")
+    return json.loads(f.read_text())
+
+
+# --- dispatch and supervision ---------------------------------------------------------
+
+
+def build_prompt(state):
+    job = state["job"]
+    return f"""You are a Grind Run, executing unattended with no human present.
+
+Job:            {job['url']}
+Branch:         {job['branch']}
+Handoff SHA:    {job['handoff_sha']}
+Anchor artifact: {job['anchor']}
+
+Everything behind the Handoff SHA is context the human prepared for you — read it.
+Everything you add in front of it is reviewable output.
+
+Invoke the `lfg` skill against the Anchor artifact, resolving the skill name against the
+available-skills list (it may be namespaced, e.g. `compound-engineering:lfg`):
+
+    {job['anchor']}
+
+The Anchor artifact is the requirements you must satisfy. Everything else you need is
+discoverable from this branch. Its contents are already decided — this slice is
+transcription, not design. Do not re-open decisions it records.
+
+Definition of done: `just verify` passes.
+
+If a step of `just verify` cannot be made green, say so plainly in the PR body and leave
+the step intact. Never weaken, trim, skip or remove a step of the verify entrypoint to
+make it pass — a gutted gate is worse than one that fails honestly.
+
+Stop at an open PR. Do not merge it."""
+
+
+def is_rate_limited(result):
+    if not result.get("is_error"):
+        return False
+    blob = " ".join(
+        str(result.get(k) or "") for k in ("result", "api_error_status", "terminal_reason", "subtype")
+    )
+    return bool(RATE_LIMIT_PATTERNS.search(blob))
+
+
+def invoke(state, attempt_n, resuming):
+    """One `claude -p` invocation. Re-entry resumes the same session id."""
+    d = RUNS_DIR / state["run_id"]
+    d.mkdir(parents=True, exist_ok=True)
+    job = state["job"]
+
+    cmd = ["claude", "-p", "--output-format", "json", "--permission-mode", "bypassPermissions"]
+    if resuming:
+        cmd += ["--resume", state["session_id"]]
+    else:
+        cmd += ["--session-id", state["session_id"]]
+    cmd += ["--plugin-dir", state["plugin_dir"]]
+    if job.get("budget") and job["budget"].lower() not in ("none", "-", ""):
+        m = re.search(r"[\d.]+", job["budget"])
+        if m:
+            cmd += ["--max-budget-usd", m.group(0)]
+    cmd += ["--disallowedTools"] + DENIED_TOOLS
+
+    prompt = REENTRY_PROMPT if resuming else build_prompt(state)
+    (d / f"attempt-{attempt_n}.prompt.txt").write_text(prompt)
+
+    started = now()
+    print(f"  [{started}] attempt {attempt_n} ({'resume' if resuming else 'dispatch'}) …")
+    with open(d / f"attempt-{attempt_n}.stderr.log", "w") as errf:
+        proc = subprocess.run(
+            cmd, cwd=state["worktree"], input=prompt, stdout=subprocess.PIPE, stderr=errf, text=True
+        )
+
+    raw = proc.stdout or ""
+    (d / f"attempt-{attempt_n}.stdout.json").write_text(raw)
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:
+        result = {"is_error": True, "subtype": "unparseable-output", "result": raw[-2000:]}
+
+    return {
+        "n": attempt_n,
+        "mode": "resume" if resuming else "dispatch",
+        "started_at": started,
+        "ended_at": now(),
+        "exit_code": proc.returncode,
+        "is_error": bool(result.get("is_error")),
+        "subtype": result.get("subtype"),
+        "stop_reason": result.get("stop_reason"),
+        "api_error_status": result.get("api_error_status"),
+        "terminal_reason": result.get("terminal_reason"),
+        "num_turns": result.get("num_turns"),
+        "total_cost_usd": result.get("total_cost_usd"),
+        "usage": result.get("usage"),
+        "permission_denials": result.get("permission_denials", []),
+        "done_promise": "<promise>DONE</promise>" in str(result.get("result", "")),
+        "rate_limited": is_rate_limited(result),
+        "result_tail": str(result.get("result", ""))[-1500:],
+    }
+
+
+def supervise(state):
+    """Dispatch, then keep re-entering until DONE, out of attempts, or a hard failure."""
+    while len(state["attempts"]) < MAX_ATTEMPTS:
+        n = len(state["attempts"]) + 1
+        resuming = n > 1
+        att = invoke(state, n, resuming)
+        state["attempts"].append(att)
+
+        obs = observe(state)
+        print(
+            f"    -> {'DONE' if att['done_promise'] else att['subtype'] or 'ended'}"
+            f" | stage={obs['furthest_stage']}"
+            f" | commits={obs['commits_ahead']}"
+            f" | cost=${att['total_cost_usd'] or 0:.2f}"
+        )
+
+        if att["done_promise"]:
+            state["state"] = "completed"
+            save(state)
+            return state
+
+        if att["rate_limited"]:
+            state["state"] = "rate_limited"
+            save(state)
+            print(f"    rate limited — sleeping {LIMIT_SLEEP_SECONDS}s, then re-entering")
+            time.sleep(LIMIT_SLEEP_SECONDS)
+            continue
+
+        state["state"] = "died"
+        save(state)
+        print("    run ended without a DONE promise — re-entering at the stage that died")
+
+    state["state"] = "exhausted"
+    save(state)
+    return state
+
+
+# --- handback -------------------------------------------------------------------------
+
+
+def report(state):
+    obs = state.get("observed", {})
+    vc = obs.get("verify_contract", {})
+    total = sum(a.get("total_cost_usd") or 0 for a in state["attempts"])
+    denials = sum(len(a.get("permission_denials") or []) for a in state["attempts"])
+
+    print()
+    print(f"Run     {state['run_id']}  [{state['state']}]")
+    print(f"Job     {state['job']['url']}")
+    print(f"Branch  {state['job']['branch']}  (worktree {state['worktree']})")
+    print(f"Session {state['session_id']}")
+    print(f"Attempts {len(state['attempts'])}   cost ${total:.2f}   tool denials {denials}")
+    print()
+    print(f"  furthest stage    {obs.get('furthest_stage', '?')}")
+    print(f"  commits ahead     {obs.get('commits_ahead', '?')}")
+    print(f"  plan              {', '.join(obs.get('plan_files') or []) or '—'}")
+    print(f"  PR                {(obs.get('pr') or {}).get('url', '—')}")
+    print(f"  review residuals  {len(obs.get('residual_findings') or [])}")
+    print(f"  ledger entries    {len(obs.get('ledger_entries') or [])}")
+    print()
+    if not vc.get("justfile"):
+        print("  verify contract   no justfile — none of the seven steps exist")
+    elif vc.get("missing"):
+        print(f"  verify contract   INCOMPLETE — missing: {', '.join(vc['missing'])}")
+        print("                    (reported, not gated: human review is the gate)")
+    else:
+        print("  verify contract   all seven contracted steps present")
+    print()
+    print(f"  run state         {RUNS_DIR / state['run_id']}")
+
+
+# --- commands -------------------------------------------------------------------------
+
+
+def cmd_run(args):
+    job = parse_job(args.issue)
+    print(f"Job #{job['issue']}: {job['title']}")
+    plugin_dir = resolve_plugin_dir(job)
+    repo = resolve_repo_path(job["target_repo"])
+    wt = resolve_worktree(repo, job)
+
+    head = sh(["git", "rev-parse", "HEAD"], cwd=wt)
+    if head != job["handoff_sha"]:
+        print(f"  note: worktree HEAD {head[:8]} != Handoff SHA {job['handoff_sha'][:8]}")
+    dirty = sh(["git", "status", "--porcelain"], cwd=wt, check=False)
+    if dirty:
+        die(f"worktree is dirty, refusing to dispatch onto it:\n{dirty}")
+
+    run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{job['target_repo'].split('/')[-1]}-{job['issue']}"
+    state = {
+        "run_id": run_id,
+        "created_at": now(),
+        "state": "dispatched",
+        "job": job,
+        "plugin_dir": plugin_dir,
+        "worktree": str(wt),
+        "session_id": str(uuid.uuid4()),
+        "denied_tools": DENIED_TOOLS,
+        "attempts": [],
+    }
+    save(state)
+    print(f"  plugin pinned to {plugin_dir}")
+    print(f"  run {run_id}")
+    supervise(state)
+    report(state)
+
+
+def cmd_resume(args):
+    state = load(args.run_id)
+    if state["state"] == "completed":
+        print("run already completed")
+        return report(state)
+    supervise(state)
+    report(state)
+
+
+def cmd_status(args):
+    run_id = args.run_id or (sorted(p.name for p in RUNS_DIR.iterdir()) or [None])[-1]
+    if not run_id:
+        die("no runs yet")
+    state = load(run_id)
+    observe(state)
+    save(state)
+    report(state)
+
+
+def cmd_list(args):
+    if not RUNS_DIR.exists():
+        return print("no runs yet")
+    for p in sorted(RUNS_DIR.iterdir()):
+        s = json.loads((p / "run.json").read_text())
+        obs = s.get("observed", {})
+        print(f"{s['run_id']}  {s['state']:<11} stage={obs.get('furthest_stage', '?'):<12} {s['job']['url']}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="grind", description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("run", help="dispatch a Job now")
+    p.add_argument("issue")
+    p.set_defaults(fn=cmd_run)
+
+    p = sub.add_parser("resume", help="re-enter a Run that died")
+    p.add_argument("run_id")
+    p.set_defaults(fn=cmd_resume)
+
+    p = sub.add_parser("status", help="print run state")
+    p.add_argument("run_id", nargs="?")
+    p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("list", help="list known Runs")
+    p.set_defaults(fn=cmd_list)
+
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
