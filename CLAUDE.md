@@ -44,6 +44,10 @@ tests belong there when a change carries a safety property, not for coverage's s
 
 - **`.grind/` is Run state and is never committed.** Gitignored deliberately — it is the
   supervisor's own working record, not history.
+- **The supervisor is the only writer of `run.json`.** A read path that saves what it loaded
+  can erase `attempts[]`, which nothing can rebuild — and it erases it while the human is
+  watching the dashboard to be reassured. Status and the roster observe fresh and persist
+  nothing (issues #12, #27).
 - **Grind never gates** (ADR-0003). Verdict language describes what happened, never quality.
   A completed Run means the pipeline finished, not that the code is good. Never add
   something that blocks a PR from existing on the strength of a finding.
