@@ -45,7 +45,9 @@ is discovered from the branch.
 _Avoid_: spec, plan, requirements doc
 
 **Run state**:
-The supervisor's own working record of a Run, held on local disk and never committed.
+The supervisor's own working record of a Run, held on local disk and never committed. The
+supervisor is its only writer — reading it never writes it — and it names the host holding
+it, because it does not travel.
 _Avoid_: artifacts, journal, log
 
 **Handback**:
