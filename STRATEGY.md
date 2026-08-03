@@ -1,6 +1,6 @@
 ---
 name: Grind
-last_updated: 2026-07-30
+last_updated: 2026-08-03
 ---
 
 # Grind Strategy
@@ -17,8 +17,8 @@ questions, so picking it up in the morning can cost more than the unattended run
 Consume `lfg` wholesale and build only the four things it has no opinion about: enqueue,
 unattended dispatch, supervision of a run that dies, and the handback. Every capability lags
 supervised local use until it stops needing correction, and a Run stops at an open PR
-without ever asserting the work is ready — so the human's review stays the gate it already
-was.
+without ever asserting the work is ready — so the gate stays downstream of Grind, where it
+already was: an agent-run review, and the human's merge decision over the PR's record.
 
 ## Who it's for
 
@@ -84,7 +84,8 @@ that earns trust. A Run that produces good code and an unreadable pile has still
 - Multi-user or team deployment — colleagues fork their own version.
 - A cross-run digest or cockpit — channel presence already does the "needs you" job, and a
   projection over run state is an hour's work if a week of runs shows it is wanted.
-- Gating a PR on review findings — human review is the gate. See ADR-0003.
+- Gating a PR on review findings — the gate is downstream of Grind and Grind does not own
+  it. See ADR-0003.
 - Proving new capabilities headlessly — new lenses, an adversarial pass, `depth:full` and
   guidelines checking all earn their way in from supervised use. See ADR-0002.
 - Giving the runner its own credentials — dispatch stays human-managed against the weekly
