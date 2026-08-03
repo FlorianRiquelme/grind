@@ -561,7 +561,8 @@ def cmd_list(args):
 
 
 def main():
-    # A Run is long and usually backgrounded; block-buffered stdout makes it look dead.
+    # A Run is long and the caller detaches it (`tmux new -d`, not `&` — a backgrounded job
+    # still takes SIGHUP with its session leader); block-buffered stdout makes it look dead.
     sys.stdout.reconfigure(line_buffering=True)
 
     ap = argparse.ArgumentParser(prog="grind", description=__doc__.splitlines()[0])
