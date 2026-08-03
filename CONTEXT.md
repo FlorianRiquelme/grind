@@ -28,7 +28,9 @@ _Avoid_: launch, trigger, kick off
 
 **Run**:
 One supervised execution of `lfg` against a Job. Restartable, and re-enterable at the
-stage it died on.
+stage it died on. Runs are independent and any number may be in flight at once; the only
+thing two of them share is the usage pool. The world moves underneath one — colleagues
+and other Runs land commits while it works.
 _Avoid_: build, execution, night
 
 **Handoff SHA**:

@@ -37,8 +37,10 @@ is affordable precisely because the shell over `lfg` is thin.
   it. Measured from the handback itself.
 - **Unattended completion rate** — share of dispatched Runs reaching an open PR with no
   mid-run intervention. Measured from run state.
-- **Weekly-limit cost per run** — session and weekly-limit consumption a Run spends, against
-  the scarce resource that is not wall-clock. Measured from run state plus `claudefuel`.
+- **Weekly-limit cost per run** — session and weekly-limit consumption a Run spends. Kept as
+  the instrument that would show the limit becoming binding, not because it already is: the
+  scarce input is refined plans, and they arrive slower than the limit refills. Measured from
+  run state plus `claudefuel`.
 - **Self-diagnosable failures** — of Runs that died, the share the human could explain from
   run state, PR and channel alone, without re-dispatching or reading raw transcripts. This
   is what makes the record debuggable by a day session rather than an archive.
@@ -81,14 +83,18 @@ that earns trust. A Run that produces good code and an unreadable pile has still
 
 ## Not working on
 
-- Multi-user or team deployment — colleagues fork their own version.
+- Multi-user or team deployment — colleagues fork their own version and run it on their own
+  infrastructure against their own Claude plan. Not only a scoping preference: one plan
+  serving several people is against Anthropic's terms.
 - A cross-run digest or cockpit — channel presence already does the "needs you" job, and a
   projection over run state is an hour's work if a week of runs shows it is wanted.
 - Gating a PR on review findings — the gate is downstream of Grind and Grind does not own
   it. See ADR-0003.
 - Proving new capabilities headlessly — new lenses, an adversarial pass, `depth:full` and
   guidelines checking all earn their way in from supervised use. See ADR-0002.
-- Giving the runner its own credentials — dispatch stays human-managed against the weekly
-  limit for now; this is the right long-term answer and is deliberately deferred.
+- Giving the runner its own Claude plan — still deferred, but no longer for the reason first
+  written. Dispatch is human-managed because Grind never selects a Job, not because the human
+  is rationing the weekly limit. The credentials half is already settled: a remote host needs
+  its own `setup-token` regardless (issue #7).
 - A central cross-repo queue — `gh search issues --label <x> --assignee @me` is the queue
   view, and a central one would orphan each issue from its code.
