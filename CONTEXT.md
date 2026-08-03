@@ -15,9 +15,15 @@ The single conversational step, with the human present, that turns a prepared br
 a Job.
 _Avoid_: file, submit, schedule
 
+**Queue**:
+The Jobs waiting, seen as a label query over GitHub issues rather than held anywhere.
+Grind never selects from it; a human does, by naming a Job. Dispatch dequeues by removing
+the label.
+_Avoid_: backlog, pipeline, list
+
 **Dispatch**:
-Starting a Run for a Job. Human-triggered on demand; a schedule is one possible trigger,
-not a property of the system.
+Starting a Run for a Job, always by a human naming that Job. Grind never selects. A
+schedule can only delay a Dispatch a human already chose, never choose one.
 _Avoid_: launch, trigger, kick off
 
 **Run**:
