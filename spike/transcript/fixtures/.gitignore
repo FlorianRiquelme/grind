@@ -1,0 +1,7 @@
+# Real transcripts are copied from ~/.claude/projects/ by ./regenerate.sh and are NOT committed:
+# they are verbatim conversation content from unrelated projects, and this spike is throwaway.
+# The small damaged fixtures below ARE committed — they are what the degradation table cites.
+real-*.jsonl
+real-fanout-session/
+truncated.jsonl
+not-json.jsonl

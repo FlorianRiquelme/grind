@@ -1,0 +1,9 @@
+# Prototype: whether std's File::try_lock (flock) alone can serialize two
+# concurrent grind dispatches onto the same repo+branch. Zero dependencies
+# on purpose -- see ../FINDINGS.md.
+[package]
+name = "runlock"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
