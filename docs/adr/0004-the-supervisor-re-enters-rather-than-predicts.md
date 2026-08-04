@@ -14,6 +14,12 @@ Recorded resolving [#32](https://github.com/FlorianRiquelme/grind/issues/32), wh
 holds the full inventory: what survives as a test, what is an accident free to drop, and
 which of the script's claims are already superseded.
 
+> **Amended 2026-08-05 by [#34](https://github.com/FlorianRiquelme/grind/issues/34).** Three
+> behaviours remain rules of this ADR. The fourth — raw written before anything parses it — is
+> now carried by a **type** (`RawAttempt`) under ADR-0006, because a type was not an option
+> #32 had when it sent all four here. Its section below keeps the evidence and no longer
+> states the rule: one carrier per finding, or the finding drifts.
+
 ## Sleep long and re-enter; never a pre-flight quota check
 
 The supervisor does not ask whether there is enough budget before starting a stage. It
@@ -39,7 +45,11 @@ The policy is a thing that changes on its own:
 [#23](https://github.com/FlorianRiquelme/grind/issues/23) will decide whether a no-progress
 re-entry costs an attempt at all.
 
-## Raw child output is written before anything parses it
+## Raw child output is written before anything parses it — carried by a type since #34
+
+**The rule now lives in the type, not here.** `RawAttempt` has private fields and is returned
+only by `write_raw`, so parsing before writing is uncallable and the escape is `E0603`
+(ADR-0006). What this section keeps is why the invariant was worth a carrier at all.
 
 The prompt, stdout and stderr of every attempt are written to disk *first*; parsing happens
 afterwards, over bytes that are already durable. This is why `docs/findings/0001` could report
@@ -53,7 +63,9 @@ exit code rather than domain values. Neither is possible if the only copy of a r
 already been through a parser.
 
 Parsing itself degrades and never aborts: unreadable output becomes a record that says so and
-keeps the tail, rather than an exception.
+keeps the tail, rather than an exception. #33 narrowed where that leniency is owed: a killed
+child leaves stdout **empty, not truncated**, so the tolerant parse is the transcript's problem
+rather than the child's.
 
 ## Standard output is line-buffered
 

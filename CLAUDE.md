@@ -8,7 +8,7 @@ is not present for, and stops at an open PR.
 - **`CONTEXT.md`** — the glossary. Job, Enqueue, Dispatch, Run, Handoff SHA, Anchor
   artifact, Handback and the rest are defined terms with explicit `_Avoid_` lists. Use them;
   don't drift to the synonyms they rule out.
-- **`docs/adr/`** — five accepted decisions that constrain almost every change here.
+- **`docs/adr/`** — six accepted decisions that constrain almost every change here.
 - **`STRATEGY.md`** — the target problem and the four metrics a change should serve.
 - **`docs/findings/`** — what actual Runs measured. `0001-first-run.md` is the only real
   data the metrics have; it also corrects two things `BRAINSTORM.md` got wrong.
@@ -55,7 +55,9 @@ tests belong there when a change carries a safety property, not for coverage's s
   nothing (issues #12, #27).
 - **Grind never gates** (ADR-0003). Verdict language describes what happened, never quality.
   A completed Run means the pipeline finished, not that the code is good. Never add
-  something that blocks a PR from existing on the strength of a finding.
+  something that blocks a PR from existing on the strength of a finding. Two shapes carry
+  this in the base and are prohibited (ADR-0006): a verdict variant meaning *rejected*, and
+  a summary boolean on the verify contract — `if !vc.ok { return }` is a gate one line away.
 - **Grind is a scheduler, not a pipeline** (ADR-0001). Everything between plan and open PR
   belongs to `lfg`. Don't reimplement stages it already runs.
 - **The plugin version is pinned per Job** (ADR-0001, ADR-0002). Advancing that pin is the
@@ -71,6 +73,11 @@ tests belong there when a change carries a safety property, not for coverage's s
   entire barrier, not the outer one. Established resolving
   [#37](https://github.com/FlorianRiquelme/grind/issues/37).
 - **`VERIFY_CONTRACT` is recorded and surfaced, never enforced** — same reason as ADR-0003.
+- **Types catch omission and convention, never intent** (ADR-0006). Before reaching for a type
+  to protect a property, ask how it realistically fails: a forgotten arm or an unthinking idiom
+  is typeable, an agent that means to do it is not. And a variant set is a policy — a careless
+  type makes a forbidden thing newly *expressible*, which means reachable, because nobody reads
+  the diff. ADR-0006 lists the shapes the base must not have.
 
 ## Agent skills
 
