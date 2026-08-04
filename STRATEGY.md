@@ -61,9 +61,10 @@ Run-now before any schedule, re-entry at the stage that died, limit handling by 
 re-entering rather than pre-flight quota checks, and run state on gitignored local disk that
 is structured enough for a day session to read.
 
-_Why it serves the approach:_ It is the resilience layer, so it is a script rather than an
-agent — a supervisor built from the thing that gets rate-limited loses its state exactly
-when that matters.
+_Why it serves the approach:_ It is the resilience layer, so it is **not an agent** — a
+supervisor built from the thing that gets rate-limited loses its state exactly when that
+matters. That argues against an agent and nothing more: the base is a compiled Rust binary
+(ADR-0005), which serves the same reasoning better than a script does.
 
 ### The record
 
