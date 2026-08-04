@@ -485,7 +485,7 @@ def report(state):
         print("  verify contract   no justfile — none of the seven steps exist")
     elif vc.get("missing"):
         print(f"  verify contract   INCOMPLETE — missing: {', '.join(vc['missing'])}")
-        print("                    (reported, not gated: human review is the gate)")
+        print("                    (reported, never gated — ADR-0003)")
     else:
         print("  verify contract   all seven contracted steps present")
     print()

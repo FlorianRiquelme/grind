@@ -8,7 +8,7 @@ is not present for, and stops at an open PR.
 - **`CONTEXT.md`** — the glossary. Job, Enqueue, Dispatch, Run, Handoff SHA, Anchor
   artifact, Handback and the rest are defined terms with explicit `_Avoid_` lists. Use them;
   don't drift to the synonyms they rule out.
-- **`docs/adr/`** — three accepted decisions that constrain almost every change here.
+- **`docs/adr/`** — four accepted decisions that constrain almost every change here.
 - **`STRATEGY.md`** — the target problem and the four metrics a change should serve.
 - **`docs/findings/`** — what actual Runs measured. `0001-first-run.md` is the only real
   data the metrics have; it also corrects two things `BRAINSTORM.md` got wrong.
