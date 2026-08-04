@@ -59,7 +59,12 @@ tests belong there when a change carries a safety property, not for coverage's s
   sessions first. Grind is not where we experiment.
 - **`DENIED_TOOLS` in `bin/grind` is a safety property.** A Run must never merge its own PR,
   force-push, hard-reset, rebase, or delete a branch. Denials are inherited by subagents and
-  survive `bypassPermissions`. Don't loosen the list to make a Run go through.
+  survive `bypassPermissions`. Don't loosen the list to make a Run go through — and note that
+  **nothing sits behind it**: no credential can withhold merge from something allowed to open a PR
+  (`Pull requests: write` covers both, `Contents: write` covers push and branch deletion, and
+  force-push is indistinguishable from push at every credential layer), so these globs are the
+  entire barrier, not the outer one. Established resolving
+  [#37](https://github.com/FlorianRiquelme/grind/issues/37).
 - **`VERIFY_CONTRACT` is recorded and surfaced, never enforced** — same reason as ADR-0003.
 
 ## Agent skills
