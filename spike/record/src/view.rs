@@ -42,4 +42,11 @@ impl RunView {
         let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         serde_json::from_str(&raw).map_err(|e| format!("{path:?}: {e}"))
     }
+
+    /// How long ago `observed` was taken, e.g. "observed 45s ago". `None`
+    /// when there is no observation to date yet (a Run that hasn't been
+    /// observed at all).
+    pub fn observation_freshness(&self) -> Option<String> {
+        self.observed.as_ref().map(|o| crate::freshness(o.observed_at_epoch))
+    }
 }

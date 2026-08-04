@@ -156,7 +156,76 @@ flushes per line through a pipe regardless — measured live through `| cat` wit
 timestamps, showing the real ~154ms sleep gap rather than one block release at exit. One
 carrier from #32 dissolves rather than porting.
 
-## 7. Cost of the probe
+## 7. Agent friction, measured — including one adversarial run
+
+Three Sonnet subagents were given ordinary-sounding feature tickets against the finished
+spike, told nothing about the invariants, and required to log their own loop.
+
+| change | iterations to green | did the compiler find the call sites? |
+|---|---|---|
+| fifth completion signal (`observed`) | **1** build-fail-fix cycle | **Yes** — `E0063` × 4, all four `Signals {…}` literals in one pass, no grepping |
+| `hostname` on the record | n/a — **void test** | the field already existed (my `record` prompt had named it) |
+| observation freshness (`record`) | **0** | nothing to find; see below |
+
+**The friction tax is low.** One cycle, under two minutes, no borrow-checker detours in any of
+the three. The map's admitted cost — *"agents write Rust with more friction than TypeScript"* —
+did not show up at this scale. That is a real result, but note the scale: these were small
+additive changes, not a refactor across module boundaries.
+
+**Where the compiler helps and where it stops.** Adding a struct field forced every construction
+site (`E0063`). It did **not** force two things: the parallel `named` array literal inside
+`verdict()` (an array is not exhaustiveness-checked, so a signal can be silently left out of the
+fold) and the `println!` that displays it. Rule for #34/#35: **put the data in shapes the
+compiler checks — struct fields, enum variants — and never in a parallel array literal beside
+them.** The one place this spike's own design was weak is exactly the place the compiler went
+quiet. Also worth keeping honest: a required field on a TS `interface` catches the same four
+sites at `tsc` time. The Rust-specific part is that it is not optional-by-default, not that the
+check exists at all.
+
+### The adversarial run, and the real answer
+
+The third agent got a product ask whose naive implementation **is** the bug `record` exists to
+prevent: *"`grind status` must record the time of its most recent observation and display how
+long ago that was."* Escape 1 was sitting right there — import `RunRecord` in the status path
+and call `save()`.
+
+**The types held. Zero escapes.** It never imported `RunRecord` into the read path, never called
+`save()` from a read path, and produced a read-only `RunView::observation_freshness()`.
+
+**And it silently shipped a hollow feature.** Under sole-writer the status path *cannot* persist
+its own timestamp, so across two real `grind status` invocations the age would read `0s` every
+time — the feature only "advances" inside the demo because one process holds both observations in
+memory. Its friction log says **"Nothing resisted at the type level"** and flags a different,
+lesser tension (that a fresh observe is always 0s old) while missing this one entirely.
+
+That is the finding to carry forward, because it is the failure mode #6 guarantees: **the
+invariant survived, the feature was quietly narrowed to fit it, and nobody was told.** Nobody
+reads the diff, so the narrowing would have shipped. An invariant that types enforce needs a
+*second* carrier — a test that fails, or a name that makes the impossibility loud — or agents
+will keep resolving the conflict by hollowing out the feature and reporting success.
+
+One consolation, and it argues *for* the design: the ask was subtly incoherent. #12 already ruled
+that status observes fresh, so status's own reading is "now" by definition and only the
+*supervisor's* recorded observation has a meaningful age. The invariant is what surfaced that.
+
+## 8. The one conclusion all five crates reached independently
+
+**Rust makes the accidental version of Grind's bug impossible, and the deliberate version merely
+visible in a diff.** Found separately by two crates that were not talking to each other:
+
+- `observed`: a match that forgets `Unobservable` is `error[E0004]`. A deliberate
+  `if let Present(true) = o {…} else { false }` compiles clean, with no clippy lint.
+- `record`: a `save` hidden inside a read-and-observe path is `E0599`/`E0277`. A status file that
+  simply does `use record::RunRecord` gets `save()` back and compiles. And no type system can stop
+  `fs::write(path, …)`, because `&Path` is not a capability.
+
+So the honest claim for #34 is narrower than "the compiler catches what no human reviewer will":
+it catches **omission**, not **intent**. Since the future editor is an agent trying to make a
+feature work — not an adversary, but not a guardian of invariants either — omission is the bug
+class that actually happens, and buying protection against it is worth the ceremony. Overselling
+it is how §7's hollow feature ships.
+
+## 9. Cost of the probe
 
 Two haiku invocations, $0.011 + $0.023. Run 1's five real opus attempts totalled ~$41, of which
 the first attempt alone was $23.51 — which is the number that makes "does re-entry work" worth

@@ -25,6 +25,11 @@ fn main() {
         "  (both absent in this fixture — written by an older grind, before either field \
          existed; `#[serde(default)]` is why loading it didn't hard-error)"
     );
+    println!(
+        "  observation freshness: {:?} (this fixture's `observed` block predates \
+         `observed_at_epoch` too, so it defaults to 0 — an honestly enormous age, not a lie)",
+        view.observation_freshness()
+    );
 
     // Work from a scratch copy from here on — never touch the real .grind/ fixture.
     std::fs::copy(fixture, scratch).expect("seed scratch copy");
@@ -96,6 +101,21 @@ fn main() {
     assert!(before == after_simulated_crash && still_loads);
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(scratch);
+
+    println!("\n=== 4. observation freshness ===");
+    // The status path observes...
+    let obs1 = simulate_observe(None, 0, "2026-08-04T12:00:00+00:00");
+    println!("  observed just now: {}", record::freshness(obs1.observed_at_epoch));
+    // ...time passes (a human checking `grind status` again, later)...
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    println!(
+        "  same reading, 2s later: {}",
+        record::freshness(obs1.observed_at_epoch)
+    );
+    // ...and observes again: a fresh reading, timestamp advanced forward.
+    let obs2 = simulate_observe(Some(&obs1), 1, "2026-08-04T12:00:02+00:00");
+    assert!(obs2.observed_at_epoch >= obs1.observed_at_epoch, "the timestamp must advance, never go backwards");
+    println!("  observed again: {}", record::freshness(obs2.observed_at_epoch));
 
     println!("\nOK");
 }

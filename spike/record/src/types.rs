@@ -84,6 +84,15 @@ pub struct VerifyContract {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Observation {
     pub observed_at: String,
+    /// Unix-epoch seconds at the moment this observation was taken. Distinct
+    /// from `observed_at` (a human-authored ISO string, kept for the existing
+    /// fixtures/demo): this field is what freshness display is computed
+    /// against, and it is always the real wall clock — `simulate_observe`
+    /// sets it from `SystemTime::now()`, never from the `at` argument.
+    /// `#[serde(default)]` so records written before this field existed
+    /// still parse (age then just reads as "a long time ago").
+    #[serde(default)]
+    pub observed_at_epoch: u64,
     pub commits_ahead: i64,
     pub plan_files: Vec<String>,
     pub residual_findings: Vec<String>,
