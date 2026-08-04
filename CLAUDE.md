@@ -8,7 +8,7 @@ is not present for, and stops at an open PR.
 - **`CONTEXT.md`** — the glossary. Job, Enqueue, Dispatch, Run, Handoff SHA, Anchor
   artifact, Handback and the rest are defined terms with explicit `_Avoid_` lists. Use them;
   don't drift to the synonyms they rule out.
-- **`docs/adr/`** — four accepted decisions that constrain almost every change here.
+- **`docs/adr/`** — five accepted decisions that constrain almost every change here.
 - **`STRATEGY.md`** — the target problem and the four metrics a change should serve.
 - **`docs/findings/`** — what actual Runs measured. `0001-first-run.md` is the only real
   data the metrics have; it also corrects two things `BRAINSTORM.md` got wrong.
@@ -17,9 +17,14 @@ is not present for, and stops at an open PR.
 
 ## Shape
 
-`bin/grind` is a single Python 3 script, stdlib only — no dependencies, no package manager,
-no build step. It is a script rather than an agent on purpose: a resilience layer built from
-the thing that gets rate-limited loses its state exactly when that matters. Keep it that way.
+`bin/grind` is a single Python 3 script, stdlib only. **It is being replaced by a compiled
+Rust binary** (ADR-0005): stdlib-only, no-package-manager and no-build-step are withdrawn, and
+`serde` is the only dependency the base takes. The script stays reference and evidence — never a
+translation source.
+
+**Grind is not an agent, and that is permanent.** It is the half of the original rationale that
+survives: a resilience layer built from the thing that gets rate-limited loses its state exactly
+when that matters. A compiled binary satisfies that better than a script; an agent cannot.
 
 ```
 grind run <issue>       dispatch a Job now (issue number or URL)
