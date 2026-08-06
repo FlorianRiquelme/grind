@@ -260,6 +260,281 @@ pub fn presence(present: bool) -> Observed<bool> {
     Observed::Present(present)
 }
 
+// --- the host item list's classifiers ---------------------------------------------------
+//
+// **Every one of these renders a fixed, item-specific diagnostic and never the raw stdout or
+// stderr of the check.** Doctor's whole purpose is to run on hosts that failed provisioning,
+// and a misprovisioned host is exactly where an HTTPS `origin` embeds a token.
+
+/// What a host item's check found. Distinct from [`Observed`]: `Unchecked` is a deliberate
+/// absence of a boolean, while `Observed::Unobservable` is a check that tried and could not.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome {
+    Satisfied(String),
+    Unsatisfied(String),
+    /// No honest boolean is available, and this says which part.
+    Unchecked(String),
+}
+
+/// Items marked *step*, and the halves of a credential step that no check can reach.
+pub fn unchecked(why: &str) -> Observed<Outcome> {
+    Observed::Present(Outcome::Unchecked(why.to_string()))
+}
+
+fn satisfied(what: &str) -> Observed<Outcome> {
+    Observed::Present(Outcome::Satisfied(what.to_string()))
+}
+
+fn unsatisfied(what: &str) -> Observed<Outcome> {
+    Observed::Present(Outcome::Unsatisfied(what.to_string()))
+}
+
+/// `~/.grind/repos/<owner>/<name>` exists, and — at doctor's depth — its `origin` names the
+/// target repo. `origin` is `None` at dispatch depth, which is what makes the dispatch subset a
+/// shallower run of the same item rather than a second item.
+pub fn declared_clone(
+    exists: bool,
+    origin: Option<&Completed>,
+    declared: &str,
+) -> Observed<Outcome> {
+    if !exists {
+        return unsatisfied("no declared clone at ~/.grind/repos/<owner>/<name>");
+    }
+    let Some(completed) = origin else {
+        return satisfied("declared clone present");
+    };
+    if completed.code != Some(0) {
+        return Observed::Unobservable(Reason::saying("git remote get-url origin: could not read"));
+    }
+    match repo_of_remote(&completed.stdout) {
+        // The two parsed owner/name pairs, never the remote URL.
+        Some(found) if found.eq_ignore_ascii_case(declared) => {
+            satisfied("origin names the target repo")
+        }
+        Some(found) => unsatisfied(&format!("origin names {found}, the Job names {declared}")),
+        None => Observed::Unobservable(Reason::saying(
+            "git remote get-url origin: no owner/name in the remote",
+        )),
+    }
+}
+
+/// `owner/name` out of an SSH or HTTPS remote. The URL itself never leaves this function.
+pub fn repo_of_remote(remote: &str) -> Option<String> {
+    let remote = remote.trim().trim_end_matches(".git");
+    // The host comes first, so anything a credential helper embedded in front of it — a token
+    // in an HTTPS remote on a half-provisioned box — is dropped before the pairs are read.
+    let tail = if let Some((_, tail)) = remote.split_once("github.com/") {
+        tail
+    } else if let Some((_, tail)) = remote.split_once("github.com:") {
+        tail
+    } else if let Some((_, tail)) = remote.rsplit_once(':') {
+        tail
+    } else {
+        remote
+    };
+    let mut parts = tail.trim_matches('/').split('/');
+    let (owner, name) = (parts.next()?, parts.next()?);
+    (!owner.is_empty() && !name.is_empty() && parts.next().is_none())
+        .then(|| format!("{owner}/{name}"))
+}
+
+/// One declared clone per target repo — not a search path. This is what makes the lock key
+/// sound: *two clones of one supervised repo* stops being a state the host can be in.
+pub fn one_clone_per_repo(clone_paths: &[String], declared: &str) -> Observed<Outcome> {
+    let (_, name) = declared.split_once('/').unwrap_or(("", declared));
+    let same_name: Vec<&String> = clone_paths
+        .iter()
+        .filter(|p| p.rsplit('/').next() == Some(name))
+        .collect();
+    match same_name.len() {
+        0 => unsatisfied("no clone declared for this repo"),
+        1 => satisfied("one declared clone"),
+        n => unsatisfied(&format!("{n} clones named `{name}` under ~/.grind/repos")),
+    }
+}
+
+/// `bin/claude` is executable and is **not a shim**. Asserted loudly rather than filtered for:
+/// on this laptop `which -a claude` returns a terminal's shim first, twice, so a symlink made
+/// from `which` points at the wrong file and the Run silently inherits that terminal's session
+/// hooks — reproducible nowhere, with nothing printed.
+pub fn claude_binary(executable: bool, resolved: Option<&str>) -> Observed<Outcome> {
+    if !executable {
+        return unsatisfied("~/.grind/bin/claude is missing or not executable");
+    }
+    let Some(target) = resolved else {
+        return satisfied("~/.grind/bin/claude is executable");
+    };
+    if target.contains("shim") {
+        return unsatisfied("~/.grind/bin/claude resolves to a wrapper shim");
+    }
+    satisfied("executable, and not a shim")
+}
+
+/// An executable resolves on `PATH`. No version floor is invented — an invented floor is a
+/// precondition that fails for no reason.
+pub fn on_path(tool: &str, completed: &Completed) -> Observed<Outcome> {
+    if completed.code == Some(0) && !completed.stdout.trim().is_empty() {
+        satisfied(&format!("`{tool}` resolves on PATH"))
+    } else {
+        unsatisfied(&format!("`{tool}` does not resolve on PATH"))
+    }
+}
+
+/// `git --version` at or above the floor SSH commit signing needs.
+pub fn git_version_floor(completed: &Completed, floor: (u64, u64)) -> Observed<Outcome> {
+    if completed.code != Some(0) {
+        return unsatisfied("`git` does not resolve on PATH");
+    }
+    let Some((major, minor)) = parse_git_version(&completed.stdout) else {
+        return Observed::Unobservable(Reason::saying("git --version: unreadable"));
+    };
+    if (major, minor) >= floor {
+        satisfied(&format!(
+            "git {major}.{minor}, at or above {}.{}",
+            floor.0, floor.1
+        ))
+    } else {
+        unsatisfied(&format!(
+            "git {major}.{minor} is below the {}.{} floor",
+            floor.0, floor.1
+        ))
+    }
+}
+
+fn parse_git_version(output: &str) -> Option<(u64, u64)> {
+    let digits = output
+        .split_whitespace()
+        .find(|t| t.starts_with(|c: char| c.is_ascii_digit()))?;
+    let mut parts = digits.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+/// The pinned plugin directory is installed on this host.
+pub fn plugin_installed(exists: bool) -> Observed<Outcome> {
+    if exists {
+        satisfied("the pinned plugin version is installed")
+    } else {
+        unsatisfied("the pinned plugin version is not installed on this host")
+    }
+}
+
+/// `gh auth status`. A headless box stores the token in plaintext `hosts.yml`; a laptop uses a
+/// keyring. Both are satisfied — what is checked is that a token store exists at all.
+pub fn gh_auth_store(completed: &Completed) -> Observed<Outcome> {
+    if completed.code != Some(0) {
+        return unsatisfied("`gh auth status` reports no authenticated host");
+    }
+    let said = completed.stdout.to_lowercase() + &completed.stderr.to_lowercase();
+    if said.contains("keyring") {
+        satisfied("authenticated, token in the keyring")
+    } else if said.contains("oauth_token") {
+        satisfied("authenticated, token in plaintext hosts.yml")
+    } else if said.contains("logged in") {
+        satisfied("authenticated")
+    } else {
+        Observed::Unobservable(Reason::saying("gh auth status: unreadable"))
+    }
+}
+
+/// The signing key exists and loads with no passphrase — `ssh-keygen -y -P ""`, a read, never a
+/// write. What cannot be checked is named beside it: an agent-backed signer makes committing
+/// depend on a GUI approval, and `ssh-add -l` keeps listing the key throughout, because listing
+/// needs no approval and *using* one does. Run 2 lost its declared branch to exactly that.
+pub fn ssh_key_passphraseless(
+    configured_key: Option<&str>,
+    probe: Option<&Completed>,
+) -> Observed<Outcome> {
+    let Some(key) = configured_key.filter(|k| !k.trim().is_empty()) else {
+        return unsatisfied("`user.signingkey` names no key, so there is none to check");
+    };
+    match probe {
+        Some(completed) if completed.code == Some(0) => unchecked(&format!(
+            "key at `{key}` loads with no passphrase; whether the signer will actually sign \
+             cannot be checked — an agent-backed signer lists fine and refuses to sign"
+        )),
+        Some(_) => unsatisfied("the configured signing key does not load without a passphrase"),
+        None => unchecked("not probed"),
+    }
+}
+
+/// `gh ssh-key list` shows the same key uploaded for **both** `authentication` and `signing`.
+/// `gh auth login --git-protocol ssh` uploads it as authentication only, which is why this is a
+/// checklist rather than a command.
+pub fn ssh_keys_both_types(completed: &Completed) -> Observed<Outcome> {
+    if completed.code != Some(0) {
+        return Observed::Unobservable(Reason::saying("gh ssh-key list: could not read"));
+    }
+    let said = completed.stdout.to_lowercase();
+    match (said.contains("authentication"), said.contains("signing")) {
+        (true, true) => satisfied("a key is uploaded for authentication and for signing"),
+        (true, false) => unsatisfied("a key is uploaded for authentication but not for signing"),
+        (false, true) => unsatisfied("a key is uploaded for signing but not for authentication"),
+        (false, false) => unsatisfied("no key is uploaded for either type"),
+    }
+}
+
+/// `gpg.format ssh`, `user.signingkey` at the private key path, `commit.gpgsign true`.
+pub fn signing_config(
+    format: &Completed,
+    key: &Completed,
+    gpgsign: &Completed,
+) -> Observed<Outcome> {
+    let format_value = format.stdout.trim().to_lowercase();
+    let key_value = key.stdout.trim().to_string();
+    let sign_value = gpgsign.stdout.trim().to_lowercase();
+    let mut missing = Vec::new();
+    if format_value != "ssh" {
+        missing.push("gpg.format is not `ssh`");
+    }
+    if key_value.is_empty() {
+        missing.push("user.signingkey is unset");
+    } else if key_value.ends_with(".pub") {
+        missing.push("user.signingkey names the public key, not the private one");
+    }
+    if sign_value != "true" {
+        missing.push("commit.gpgsign is not `true`");
+    }
+    if missing.is_empty() {
+        satisfied("gpg.format ssh, a private signing key, commit.gpgsign true")
+    } else {
+        unsatisfied(&missing.join("; "))
+    }
+}
+
+/// `user.name` / `user.email` set to the machine identity. Whether the email is **added and
+/// verified on the GitHub account** is named rather than guessed: the granted scopes are
+/// `repo` / `read:org` / `gist`, and reading a user's verified addresses needs `user:email`.
+pub fn committer_identity(name: &Completed, email: &Completed) -> Observed<Outcome> {
+    let has_name = !name.stdout.trim().is_empty();
+    let has_email = !email.stdout.trim().is_empty();
+    match (has_name, has_email) {
+        (true, true) => unchecked(
+            "user.name and user.email are set; whether that address is verified on the account \
+             cannot be checked without a scope Grind does not hold",
+        ),
+        (false, true) => unsatisfied("user.name is unset"),
+        (true, false) => unsatisfied("user.email is unset"),
+        (false, false) => unsatisfied("user.name and user.email are unset"),
+    }
+}
+
+/// `origin` on SSH. Whether a **real push** succeeds is the only step that proves the other
+/// five, and doctor never performs a write to prove a step — so that half is named, not faked.
+pub fn origin_over_ssh(completed: &Completed) -> Observed<Outcome> {
+    if completed.code != Some(0) {
+        return Observed::Unobservable(Reason::saying("git remote get-url origin: could not read"));
+    }
+    let remote = completed.stdout.trim();
+    if remote.starts_with("git@") || remote.starts_with("ssh://") {
+        unchecked(
+            "origin is on SSH; that a real push succeeds is the only step proving the other \
+             five, and doctor never writes to prove one",
+        )
+    } else {
+        unsatisfied("origin is not on SSH")
+    }
+}
+
 fn first_line(text: &str) -> String {
     let line = text
         .lines()
@@ -420,6 +695,186 @@ mod tests {
             listing(true, "plan", vec!["docs/plans/a.md".into()]),
             Observed::Present(vec!["docs/plans/a.md".into()])
         );
+    }
+
+    // --- the host item list's classifiers -------------------------------------------------
+
+    #[test]
+    fn a_clone_whose_origin_names_another_repo_fails_and_names_both() {
+        let origin = completed("git@github.com:someone-else/snapper.git\n", "", Some(0));
+        let found = declared_clone(true, Some(&origin), "FlorianRiquelme/snapper");
+        let Observed::Present(Outcome::Unsatisfied(said)) = found else {
+            panic!("a mismatched origin must be unsatisfied: {found:?}");
+        };
+        assert!(said.contains("someone-else/snapper"), "{said}");
+        assert!(said.contains("FlorianRiquelme/snapper"), "{said}");
+    }
+
+    #[test]
+    fn a_check_renders_the_parsed_pairs_and_never_the_remote_url() {
+        // Doctor runs on hosts that failed provisioning, which is exactly where an HTTPS
+        // origin embeds a token.
+        let leaky = "https://x-access-token:ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@github.com/o/snapper.git\n";
+        let origin = completed(leaky, "", Some(0));
+        let found = declared_clone(true, Some(&origin), "FlorianRiquelme/snapper");
+        let Observed::Present(Outcome::Unsatisfied(said)) = found else {
+            panic!("expected a mismatch: {found:?}");
+        };
+        assert!(
+            !said.contains("ghp_"),
+            "the diagnostic leaked the token: {said}"
+        );
+        assert!(
+            !said.contains("github.com"),
+            "the diagnostic leaked the URL: {said}"
+        );
+        assert!(said.contains("o/snapper"), "{said}");
+    }
+
+    #[test]
+    fn a_matching_origin_satisfies_and_a_missing_clone_does_not() {
+        let origin = completed("git@github.com:FlorianRiquelme/snapper.git\n", "", Some(0));
+        assert!(matches!(
+            declared_clone(true, Some(&origin), "FlorianRiquelme/snapper"),
+            Observed::Present(Outcome::Satisfied(_))
+        ));
+        assert!(matches!(
+            declared_clone(false, None, "FlorianRiquelme/snapper"),
+            Observed::Present(Outcome::Unsatisfied(_))
+        ));
+    }
+
+    #[test]
+    fn a_claude_resolving_to_a_shim_fails_loudly_rather_than_being_skipped() {
+        let shimmed = claude_binary(true, Some("/var/folders/T/cmux-shim/bin/claude"));
+        let Observed::Present(Outcome::Unsatisfied(said)) = shimmed else {
+            panic!("a shim must be an unsatisfied item, not a filtered-out one: {shimmed:?}");
+        };
+        assert!(said.contains("shim"), "{said}");
+        assert!(matches!(
+            claude_binary(true, Some("/Users/op/.local/bin/claude")),
+            Observed::Present(Outcome::Satisfied(_))
+        ));
+        assert!(matches!(
+            claude_binary(false, None),
+            Observed::Present(Outcome::Unsatisfied(_))
+        ));
+    }
+
+    #[test]
+    fn the_git_floor_is_the_one_ssh_signing_needs() {
+        let floor = (2, 34);
+        assert!(matches!(
+            git_version_floor(&completed("git version 2.51.2\n", "", Some(0)), floor),
+            Observed::Present(Outcome::Satisfied(_))
+        ));
+        assert!(matches!(
+            git_version_floor(&completed("git version 2.20.1\n", "", Some(0)), floor),
+            Observed::Present(Outcome::Unsatisfied(_))
+        ));
+    }
+
+    #[test]
+    fn a_key_uploaded_for_one_type_only_is_the_failure_gh_auth_login_actually_produces() {
+        let list = completed("2026-08-01\tsnapper\tauthentication\n", "", Some(0));
+        let Observed::Present(Outcome::Unsatisfied(said)) = ssh_keys_both_types(&list) else {
+            panic!("authentication-only must not pass");
+        };
+        assert!(said.contains("signing"), "{said}");
+        let both = completed(
+            "2026-08-01\tsnapper\tauthentication\n2026-08-01\tsnapper\tsigning\n",
+            "",
+            Some(0),
+        );
+        assert!(matches!(
+            ssh_keys_both_types(&both),
+            Observed::Present(Outcome::Satisfied(_))
+        ));
+    }
+
+    #[test]
+    fn the_signing_config_names_every_part_that_is_wrong() {
+        let public_key = completed("/home/op/.ssh/id_ed25519.pub\n", "", Some(0));
+        let found = signing_config(
+            &completed("openpgp\n", "", Some(0)),
+            &public_key,
+            &completed("false\n", "", Some(0)),
+        );
+        let Observed::Present(Outcome::Unsatisfied(said)) = found else {
+            panic!("expected an unsatisfied config: {found:?}");
+        };
+        assert!(said.contains("gpg.format"), "{said}");
+        assert!(said.contains("public key"), "{said}");
+        assert!(said.contains("commit.gpgsign"), "{said}");
+    }
+
+    #[test]
+    fn the_steps_no_check_can_reach_are_named_rather_than_guessed() {
+        // No check here is a guess dressed as a boolean, and none performs a write to prove a
+        // step. The parts that cannot be reached say so in the report.
+        let ssh_origin = completed("git@github.com:o/n.git\n", "", Some(0));
+        let Observed::Present(Outcome::Unchecked(said)) = origin_over_ssh(&ssh_origin) else {
+            panic!("a real push is not something doctor may perform");
+        };
+        assert!(said.contains("never writes"), "{said}");
+
+        let identity = committer_identity(
+            &completed("Snapper Host\n", "", Some(0)),
+            &completed("host@example.com\n", "", Some(0)),
+        );
+        let Observed::Present(Outcome::Unchecked(said)) = identity else {
+            panic!("verified-on-the-account is not reachable with the scopes Grind holds");
+        };
+        assert!(said.contains("verified"), "{said}");
+
+        assert!(matches!(
+            origin_over_ssh(&completed("https://github.com/o/n.git\n", "", Some(0))),
+            Observed::Present(Outcome::Unsatisfied(_))
+        ));
+    }
+
+    #[test]
+    fn two_clones_of_one_repo_is_a_state_the_host_must_not_be_in() {
+        assert!(matches!(
+            one_clone_per_repo(&["/g/repos/a/snapper".into()], "a/snapper"),
+            Observed::Present(Outcome::Satisfied(_))
+        ));
+        let two = [
+            "/g/repos/a/snapper".to_string(),
+            "/g/repos/b/snapper".to_string(),
+        ];
+        assert!(matches!(
+            one_clone_per_repo(&two, "a/snapper"),
+            Observed::Present(Outcome::Unsatisfied(_))
+        ));
+    }
+
+    #[test]
+    fn a_failed_check_carries_no_quality_language() {
+        let banned = [
+            "bad", "wrong", "invalid", "broken", "fail", "poor", "should",
+        ];
+        let origin = completed("git@github.com:someone/else.git\n", "", Some(0));
+        let said = [
+            declared_clone(false, None, "a/b"),
+            declared_clone(true, Some(&origin), "a/b"),
+            claude_binary(true, Some("/tmp/shim/claude")),
+            on_path("just", &completed("", "", Some(1))),
+            git_version_floor(&completed("git version 2.20.1\n", "", Some(0)), (2, 34)),
+            plugin_installed(false),
+            gh_auth_store(&completed("", "", Some(1))),
+        ];
+        for outcome in said {
+            let Observed::Present(Outcome::Unsatisfied(text)) = outcome else {
+                continue;
+            };
+            for word in banned {
+                assert!(
+                    !text.to_lowercase().contains(word),
+                    "a failed host check must read as incoherent input, not a judgement: {text}"
+                );
+            }
+        }
     }
 
     #[test]
