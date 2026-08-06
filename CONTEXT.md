@@ -50,6 +50,13 @@ supervisor is its only writer — reading it never writes it — and it names th
 it, because it does not travel.
 _Avoid_: artifacts, journal, log
 
+**Provisioned host**:
+A machine a Dispatch can succeed on. One definition, and the laptop must meet it too — an
+item it cannot satisfy is a wrong item, not a special machine. The host declares itself by
+the layout of `~/.grind/` rather than by configuration, and what it owes is listed in
+`docs/provisioned-host.md`.
+_Avoid_: box, machine, runner, worker
+
 **Handback**:
 What a finished Run leaves for the human to pick up — the open PR, the seeded feature
 channel, and the findings and residuals inside them. Its shape is what the morning costs.
@@ -67,5 +74,6 @@ _Avoid_: verify command, test command, gate
 
 **Promotion**:
 Moving a capability from supervised local sessions into Grind, once it has stopped
-needing correction. Enacted by advancing the pinned plugin version.
+needing correction. Enacted by changing Grind — no longer by advancing a pinned plugin
+version, which floats with the host (ADR-0002 as amended).
 _Avoid_: rollout, enablement, release

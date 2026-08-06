@@ -8,7 +8,10 @@ is not present for, and stops at an open PR.
 - **`CONTEXT.md`** — the glossary. Job, Enqueue, Dispatch, Run, Handoff SHA, Anchor
   artifact, Handback and the rest are defined terms with explicit `_Avoid_` lists. Use them;
   don't drift to the synonyms they rule out.
-- **`docs/adr/`** — six accepted decisions that constrain almost every change here.
+- **`docs/adr/`** — eight accepted decisions that constrain almost every change here.
+- **`docs/provisioned-host.md`** — what a host must guarantee before a Dispatch succeeds on
+  it: the `~/.grind/` layout, the executables, the six credential steps, and which items are
+  checked at dispatch, by `grind doctor`, or not at all. Read it before provisioning anything.
 - **`STRATEGY.md`** — the target problem and the four metrics a change should serve.
 - **`docs/findings/`** — what actual Runs measured. `0001-first-run.md` is the only real
   data the metrics have; it also corrects two things `BRAINSTORM.md` got wrong.
@@ -25,6 +28,12 @@ translation source.
 **Grind is not an agent, and that is permanent.** It is the half of the original rationale that
 survives: a resilience layer built from the thing that gets rate-limited loses its state exactly
 when that matters. A compiled binary satisfies that better than a script; an agent cannot.
+
+The base is **one crate, ten modules, exactly one of them impure** (ADR-0007): `world` is the
+sole namer of `std::process` and `std::fs`; `job`, `observe`, `decide`, `policy`, `attempt`,
+`view` and `render` are pure; `supervisor` holds the loop and the record; `cli` is the only
+thing that prints. Effects are returned as values — `policy` returns the sleep, `render` returns
+a `String` — so every decision is testable from literals with no network.
 
 ```
 grind run <issue>       dispatch a Job now (issue number or URL)
@@ -47,12 +56,19 @@ tests belong there when a change carries a safety property, not for coverage's s
 
 ## Constraints that are easy to violate
 
-- **`.grind/` is Run state and is never committed.** Gitignored deliberately — it is the
-  supervisor's own working record, not history.
+- **Run state is never committed.** It is the supervisor's own working record, not history. It
+  lives at `~/.grind/runs/` (ADR-0008), outside any checkout, so this holds structurally rather
+  than by a `.gitignore` line. The script's `<checkout>/.grind/` is the old location and cannot
+  survive a shipped binary — `GRIND_ROOT` derives from `__file__`.
 - **The supervisor is the only writer of `run.json`.** A read path that saves what it loaded
   can erase `attempts[]`, which nothing can rebuild — and it erases it while the human is
   watching the dashboard to be reassured. Status and the roster observe fresh and persist
   nothing (issues #12, #27).
+- **Privacy only bites between siblings** (ADR-0007). `supervisor` and `view` are siblings at
+  the crate root and the writable record type is private to `supervisor`. Never nest them under
+  a shared parent, and never add a module named for a noun two others share (`record/`,
+  `types`) — a child module reaches its ancestor's private items and **compiles clean**, so the
+  tidy-up that looks like housekeeping is what withdraws the guarantee.
 - **Grind never gates** (ADR-0003). Verdict language describes what happened, never quality.
   A completed Run means the pipeline finished, not that the code is good. Never add
   something that blocks a PR from existing on the strength of a finding. Two shapes carry
@@ -60,8 +76,12 @@ tests belong there when a change carries a safety property, not for coverage's s
   a summary boolean on the verify contract — `if !vc.ok { return }` is a gate one line away.
 - **Grind is a scheduler, not a pipeline** (ADR-0001). Everything between plan and open PR
   belongs to `lfg`. Don't reimplement stages it already runs.
-- **The plugin version is pinned per Job** (ADR-0001, ADR-0002). Advancing that pin is the
-  act of promotion; it is reviewable and revertible. Never resolve "latest" at dispatch.
+- **The plugin version is frozen per Run, not pinned per Job** (ADR-0002 as amended by #42).
+  The Job names the plugin; the host names the version. `resolve_plugin_dir()` runs **once**, at
+  dispatch, and the resolved path goes into the record — every attempt and every `--resume` reads
+  the record. Never re-resolve per attempt: an 8-attempt Run spans hours of rate-limit sleeps, and
+  a version changing mid-Run is silent. Promotion is now enacted by changing Grind, not by
+  advancing a pin.
 - **Headless deliberately lags local** (ADR-0002). New capabilities get proven in supervised
   sessions first. Grind is not where we experiment.
 - **`DENIED_TOOLS` in `bin/grind` is a safety property.** A Run must never merge its own PR,
