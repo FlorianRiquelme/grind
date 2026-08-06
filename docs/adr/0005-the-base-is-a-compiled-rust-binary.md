@@ -41,6 +41,16 @@ awkward bit, against the real `claude` binary and Run 1's real record.
 - **`serde` is the only dependency**, and only because JSON is. Regex is not needed: normalising
   the haystack (strip non-alphanumerics, then match) detects rate limits *more* broadly than the
   current `rate.?limit` regex, which cannot match `rate  limit`.
+- **Amended 2026-08-06 by Run 2 — the haystack must include `api_error_status`, and phrase
+  matching alone is not sufficient.** The spike reported `api_error_status` as `null` on all five
+  of Run 1's attempts and named `terminal_reason` the honest discriminator. Run 2 overturns both:
+  its six rate-limited attempts carry `api_error_status: 429`, `terminal_reason: "api_error"`, and
+  `result: "You've hit your session limit · resets 5pm (Europe/Berlin)"` — where *session limit* is
+  not *usage limit* and *resets 5pm* is not *resets at*, so the **only** thing that classified them
+  was the status code. Missing it means `died` and immediate re-entry with no sleep: eight attempts
+  burned in under a minute against a three-hour wall, which is *mistaking a rate limit for a crash*.
+  A rate-limited attempt's raw triple becomes a fixture with the base, so ADR-0009's
+  `d-rate-limited` scenario is recorded rather than derived. `docs/findings/0002-second-run.md`.
 - **Strict `serde` for formats Grind owns; tolerant `Value` lookups for formats it does not.**
   `run.json` may be strict, with post-day-one fields `Option` + `#[serde(default)]`. Claude Code's
   transcripts may not: a derive struct must stay in sync with an undocumented format forever, and
