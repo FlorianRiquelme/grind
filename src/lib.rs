@@ -11,6 +11,7 @@
 //! carrier. `tests/topology.rs` is what notices.
 
 pub mod cli;
+pub mod decide;
 pub mod job;
 pub mod observe;
 pub mod world;
