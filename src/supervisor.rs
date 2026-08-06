@@ -336,7 +336,8 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
         record.save(&path)?;
 
         let stop = loop {
-            let observation = observe_once(&worktree);
+            let observation =
+                crate::view::observe_fresh(&worktree, &record.job.handoff_sha, world::now_iso());
             let signals = decide::signals_of(&observation);
             let promised = record.attempts().last().is_some_and(|a| a.done_promise);
             let verdict = decide::verdict(&signals, promised);
@@ -463,23 +464,6 @@ fn announce(record: &RunRecord, observation: &Observation, verdict: &Verdict) {
         decide::furthest_stage(observation),
         observation.commits_ahead,
     ));
-}
-
-fn observe_once(worktree: &Path) -> Observation {
-    observe_a_run(worktree, "", world::now_iso())
-}
-
-/// Shared by the loop and, through the same `observe` function, by the read path.
-fn observe_a_run(worktree: &Path, handoff_sha: &str, at: String) -> Observation {
-    let readable = world::is_dir(worktree);
-    let mut run = |argv: &[String]| world::run(argv, Some(worktree));
-    let mut list = |relative: &str| {
-        world::list_with_extension(&worktree.join(relative), "md")
-            .into_iter()
-            .map(|p| p.strip_prefix(worktree).unwrap_or(&p).display().to_string())
-            .collect::<Vec<String>>()
-    };
-    crate::observe::observe_run(at, handoff_sha, readable, &mut run, &mut list)
 }
 
 // --- dispatch's own steps ------------------------------------------------------------------

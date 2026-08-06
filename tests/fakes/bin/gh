@@ -1,0 +1,33 @@
+#!/bin/sh
+# The fake `gh`, reached from a replaced `PATH` so no real `gh` is reachable at all.
+#
+# Dispatch removes a label and comments on the Job issue, so a fall-through here would mutate a
+# real GitHub issue from a routine `just verify`. **Anything unimplemented fails loudly.**
+F="${HOME:?}/.fake/gh"
+COUNT=$(cat "${HOME}/.fake/counter" 2>/dev/null || echo 0)
+
+case "$1 $2" in
+  "issue view")    cat "$F/issue.json"; exit 0 ;;
+  "issue edit")    printf 'label removed\n'; exit 0 ;;
+  "issue comment") printf 'comment posted\n'; exit 0 ;;
+  "auth status")   printf 'github.com: Logged in to github.com account tester (oauth_token)\n'; exit 0 ;;
+  "ssh-key list")  printf '2026-08-01\ttester\tauthentication\n2026-08-01\ttester\tsigning\n'; exit 0 ;;
+  "pr view")
+      KIND=pr
+      for a in "$@"; do
+        case "$a" in *statusCheckRollup*) KIND=rollup ;; esac
+      done
+      # The world moves underneath a Run: the PR appears at the attempt the scenario names.
+      APPEARS=$(cat "$F/pr_from" 2>/dev/null || echo 1)
+      if [ "$KIND" = pr ] && [ "$COUNT" -lt "$APPEARS" ]; then
+        printf 'no pull requests found for branch\n' >&2
+        exit 1
+      fi
+      [ -f "$F/$KIND.stderr" ] && cat "$F/$KIND.stderr" >&2
+      [ -f "$F/$KIND.stdout" ] && cat "$F/$KIND.stdout"
+      exit "$(cat "$F/$KIND.code" 2>/dev/null || echo 0)"
+      ;;
+esac
+
+printf 'fake gh: unimplemented subcommand: %s\n' "$*" >&2
+exit 64
