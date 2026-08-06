@@ -7,6 +7,9 @@
 # Local tool caches
 .impeccable/
 
+# Cargo build output
+/target
+
 # Run state — the supervisor's own working record, never committed
 .grind/
 

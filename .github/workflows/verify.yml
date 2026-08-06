@@ -1,0 +1,58 @@
+name: verify
+
+# Grind's working pattern is agents pushing branches no human reads, so a mark per push is
+# the point. Cancellation stops three pushes in a minute burning three runs.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+# Pinned redundantly with the repo's `default_workflow_permissions: read`, because that
+# default is a repo *setting*: it appears in no file, no diff and no `git log`, and it is one
+# toggle from `write`. `DENIED_TOOLS` never sees a GitHub Actions job — a write-scoped
+# `GITHUB_TOKEN` reaches all five forbidden operations without touching the barrier at all.
+# One line moves the control into a file (ADR-0009).
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `ubuntu-latest` ships none of `just`, the musl targets, zig or cargo-zigbuild, so
+      # without this setup the cross-build step is red on the first push. Setup steps are not
+      # verification steps — the job runs exactly one `just verify` and nothing else.
+      #
+      # `just` comes from apt and zig from a pinned tarball, never a marketplace action: a
+      # third-party action is silent trust in the one repo whose thesis is that silent trust
+      # is expensive (ADR-0009). apt's `just` version floats and no floor is pinned, because
+      # the recipe uses no recent syntax.
+      - name: Install just
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y just
+
+      - name: Add the two shipping targets
+        run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+      - name: Install zig
+        env:
+          ZIG_VERSION: 0.16.0
+          ZIG_SHA256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+        run: |
+          set -euo pipefail
+          tarball="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -fsSL -o "$tarball" "https://ziglang.org/download/${ZIG_VERSION}/${tarball}"
+          echo "${ZIG_SHA256}  ${tarball}" | sha256sum --check --strict
+          sudo tar -xJf "$tarball" -C /opt
+          echo "/opt/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: just verify
+        run: just verify
