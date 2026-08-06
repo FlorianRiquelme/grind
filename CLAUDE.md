@@ -8,7 +8,7 @@ is not present for, and stops at an open PR.
 - **`CONTEXT.md`** — the glossary. Job, Enqueue, Dispatch, Run, Handoff SHA, Anchor
   artifact, Handback and the rest are defined terms with explicit `_Avoid_` lists. Use them;
   don't drift to the synonyms they rule out.
-- **`docs/adr/`** — eight accepted decisions that constrain almost every change here.
+- **`docs/adr/`** — nine accepted decisions that constrain almost every change here.
 - **`docs/provisioned-host.md`** — what a host must guarantee before a Dispatch succeeds on
   it: the `~/.grind/` layout, the executables, the six credential steps, and which items are
   checked at dispatch, by `grind doctor`, or not at all. Read it before provisioning anything.
@@ -53,6 +53,13 @@ Exits non-zero on failure and prints per-check lines. Pure functions only — no
 would be expensive: mistaking a rate limit for a crash, missing a rate limit, and failing to
 notice that a step of the target repo's `just verify` was trimmed until it went green. New
 tests belong there when a change carries a safety property, not for coverage's sake.
+
+**That is the script's entrypoint. The base's is `just verify`** (ADR-0009) — `cargo fmt --check`,
+`cargo clippy -D warnings`, `cargo test`, and a musl cross-build of the two shipping triples, with
+CI running that recipe and nothing else so there is one definition of checked rather than two.
+`cargo test` alone still runs every test carrying a safety property, including the compile-fail and
+source-level carriers ADR-0007 spent, so reaching for the idiom is an incomplete green and never a
+false one.
 
 ## Constraints that are easy to violate
 

@@ -68,14 +68,20 @@ like housekeeping here is what withdraws the guarantee.
 
 ## Executables
 
-`claude` is spawned only by Grind, so Grind names the file. `git` and `gh` are spawned by Grind
-**and by the Run** — #31 counted `gh pr create` ×41 and `git worktree add` ×56 across the `lfg`
-chain — so they must be on `PATH` regardless of what Grind resolves.
+`claude` is spawned only by Grind, so Grind names the file. `git`, `gh` and `just` are spawned by
+the Run and — for the first two — by Grind as well: #31 counted `gh pr create` ×41 and
+`git worktree add` ×56 across the `lfg` chain. They must be on `PATH` regardless of what Grind
+resolves.
 
 - **`git` on `PATH`, ≥ 2.34.** — *dispatch, doctor* — The floor is inherited from the SSH commit
   signing in step 4 below, not invented. Nothing else in Grind needs a recent git.
 - **`gh` on `PATH`.** — *dispatch, doctor* — No version floor. Grind uses `issue view`, `pr view`
   and `auth status`; an invented floor is a precondition that fails for no reason.
+- **`just` on `PATH`.** — *doctor* — No version floor, for the same reason as `gh`. Grind never
+  spawns it, which is why it was missed when this list was written (ADR-0009 found the gap) — but
+  the dispatch prompt makes `just verify` the Run's definition of done, so a host without it fails
+  every Run at the last step, in the target repo, with nothing in Grind's own output naming the
+  cause. *doctor* rather than *dispatch* because the failure is the Run's, not the Dispatch's.
 - **The `lfg` plugin is installed.** — *dispatch* — The Job names the plugin, the host names the
   version (ADR-0002 as amended). Resolution picks the installed version, records the resolved path,
   and every attempt and every `--resume` reads the record — so a Run's plugin version is fixed for
