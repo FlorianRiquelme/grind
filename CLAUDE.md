@@ -75,7 +75,11 @@ false one.
   the crate root and the writable record type is private to `supervisor`. Never nest them under
   a shared parent, and never add a module named for a noun two others share (`record/`,
   `types`) — a child module reaches its ancestor's private items and **compiles clean**, so the
-  tidy-up that looks like housekeeping is what withdraws the guarantee.
+  tidy-up that looks like housekeeping is what withdraws the guarantee. `tests/topology.rs`
+  carries this as *no directories under `src/`*, and it is also what asserts that process,
+  filesystem and environment access are named in `world` and nowhere else. It is string
+  matching and can be fooled by aliasing an import — **do not harden it**; it guards
+  convention, and aliasing to dodge it is intent.
 - **Grind never gates** (ADR-0003). Verdict language describes what happened, never quality.
   A completed Run means the pipeline finished, not that the code is good. Never add
   something that blocks a PR from existing on the strength of a finding. Two shapes carry
