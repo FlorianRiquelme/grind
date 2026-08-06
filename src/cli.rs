@@ -1,7 +1,431 @@
-//! The surface: the argument shapes, and the only thing that writes to stdout.
+//! The argument shapes, the doctor driver, and the only thing that writes to stdout.
+//!
+//! **The exit code reports observability, never health.** Status exiting non-zero on an
+//! unhealthy Run is the idiom every CLI has ever followed, and it is precisely how Grind grows
+//! a gate through the back door: something downstream acts on the code, and a finding starts
+//! blocking. There is deliberately no conversion from a verdict in existence anywhere in this
+//! module (ADR-0006's convention mode, aimed at the surface most exposed to it).
+//!
+//! Nothing here invokes an agent. A view built out of the thing that gets rate-limited is
+//! unavailable during exactly the stall it exists to explain.
 
-/// `grind --version` answers which copy of the binary is running — the only honest check on
-/// the *step*-marked item that says where the binary lives (`docs/provisioned-host.md`).
-pub fn run() {
-    println!("grind {}", env!("CARGO_PKG_VERSION"));
+use crate::decide::{self, VerifyContract};
+use crate::job::{self, Check, Depth, Refusal};
+use crate::observe::{self, Observed, Outcome};
+use crate::render::{self, DoctorLine, SingleRun};
+use crate::supervisor;
+use crate::view::{self, Lookup};
+use crate::world;
+use std::path::{Path, PathBuf};
+
+/// Whether the command could answer the question it was asked. **Not how the Run is doing.**
+enum Observability {
+    Answered,
+    CouldNotAnswer,
+}
+
+impl Observability {
+    fn code(self) -> i32 {
+        match self {
+            Observability::Answered => 0,
+            Observability::CouldNotAnswer => 3,
+        }
+    }
+}
+
+/// A refused Dispatch, a refused resume and a failed host check all leave in the same register:
+/// **incoherent input**, never a health verdict and never a gate.
+const INCOHERENT_INPUT: i32 = 2;
+
+pub fn run() -> i32 {
+    let args = world::args();
+    let rest: Vec<&str> = args.iter().map(String::as_str).collect();
+    match rest.as_slice() {
+        ["--version"] | ["-V"] => {
+            print(&format!("grind {}\n", env!("CARGO_PKG_VERSION")));
+            0
+        }
+        ["--help"] | ["-h"] | [] => {
+            print(USAGE);
+            0
+        }
+        ["run", issue] => finish(supervisor::dispatch(issue)),
+        ["resume", run_id] => finish(supervisor::resume(run_id)),
+        ["status"] => status_roster(),
+        ["status", run_id] => status_one(run_id),
+        ["doctor"] => doctor(),
+        // No `list`. A bare status that resolves to one Run is Grind selecting, and the repair
+        // *"pick the one in flight"* would pick a zombie.
+        other => {
+            print_err(&render::refusal(&format!(
+                "unknown command: {}",
+                other.join(" ")
+            )));
+            print(USAGE);
+            INCOHERENT_INPUT
+        }
+    }
+}
+
+const USAGE: &str = "grind — dispatch and supervise headless `lfg` Runs against a Job.
+
+    grind run <issue>       dispatch a Job now (issue number or URL)
+    grind resume <run-id>   re-enter a Run that died
+    grind status [run-id]   roster when bare; one Run's live view when named
+    grind doctor            check the provisioned-host list
+    grind --version         which copy of the binary is this
+";
+
+// --- run and resume ---------------------------------------------------------------------------
+
+fn finish(outcome: Result<supervisor::Outcome, Refusal>) -> i32 {
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(refusal) => {
+            print_err(&render::refusal(&refusal.to_string()));
+            return INCOHERENT_INPUT;
+        }
+    };
+    if outcome.already_completed {
+        print("run already completed\n");
+    }
+    // The Handback is composed from a **fresh** read, not from anything the loop was holding.
+    let Some(home) = world::home() else {
+        return INCOHERENT_INPUT;
+    };
+    match view::load(&home, &outcome.run_id) {
+        Lookup::Here(found) => {
+            let observation = observe_for(&found);
+            print(&render::handback(
+                &found,
+                &observation,
+                &contract_of(&found.worktree),
+                decide::furthest_stage(&observation),
+                &view::record_path(&home, &outcome.run_id),
+            ));
+            0
+        }
+        _ => 0,
+    }
+}
+
+// --- status ------------------------------------------------------------------------------------
+
+/// Bare `grind status` prints the roster and **never resolves to a single Run**.
+fn status_roster() -> i32 {
+    let Some(home) = world::home() else {
+        print_err(&render::refusal("$HOME is unset"));
+        return INCOHERENT_INPUT;
+    };
+    let rows = view::roster(&home);
+    let blind = rows
+        .iter()
+        .any(|row| matches!(row.supervisor_here, Observed::Unobservable(_)));
+    print(&render::roster(&hostname(), &rows));
+    if blind {
+        Observability::CouldNotAnswer
+    } else {
+        Observability::Answered
+    }
+    .code()
+}
+
+fn status_one(run_id: &str) -> i32 {
+    let Some(home) = world::home() else {
+        print_err(&render::refusal("$HOME is unset"));
+        return INCOHERENT_INPUT;
+    };
+    match view::load(&home, run_id) {
+        // A Run on another box sends the operator to its Job issue rather than looking like a
+        // typo, and answering that *is* answering.
+        Lookup::NotHere => {
+            print(&render::not_here(run_id, &hostname()));
+            Observability::Answered.code()
+        }
+        Lookup::Unreadable(reason) => {
+            print_err(&render::refusal(&reason.to_string()));
+            Observability::CouldNotAnswer.code()
+        }
+        Lookup::Here(found) => {
+            let observation = observe_for(&found);
+            let signals = decide::signals_of(&observation);
+            let promised = found.attempts.last().is_some_and(|a| a.done_promise);
+            let verdict = decide::verdict(&signals, promised);
+            let live = view::live(
+                &view::transcript_path(&home, &found.worktree, &found.session_id),
+                world::now_epoch(),
+            );
+            let here = view::supervisor_here(
+                found.supervisor_identity.as_deref(),
+                world::process_start_stamp(found.supervisor_pid).as_deref(),
+            );
+            print(&render::run_view(&SingleRun {
+                found: &found,
+                observation: &observation,
+                live: &live,
+                verdict: &verdict,
+                contract: &contract_of(&found.worktree),
+                furthest: decide::furthest_stage(&observation),
+                supervisor_here: &here,
+                run_state: &view::record_path(&home, run_id),
+            }));
+            // Derived from what could be observed. There is no path from the verdict to here.
+            if matches!(verdict, decide::Verdict::Unobserved(_)) {
+                Observability::CouldNotAnswer.code()
+            } else {
+                Observability::Answered.code()
+            }
+        }
+    }
+}
+
+fn observe_for(found: &view::RunView) -> observe::Observation {
+    view::observe_fresh(
+        Path::new(&found.worktree),
+        &found.job.handoff_sha,
+        world::now_iso(),
+    )
+}
+
+fn contract_of(worktree: &str) -> VerifyContract {
+    let worktree = Path::new(worktree);
+    let justfile = world::read_to_string(&worktree.join("justfile")).ok();
+    let package = world::read_to_string(&worktree.join("package.json")).ok();
+    decide::verify_contract(justfile.as_deref(), package.as_deref())
+}
+
+// --- doctor -------------------------------------------------------------------------------------
+
+/// The driver: walk `job`'s item list, call `world` per item, hand the raw triples to `observe`,
+/// and pass each item's name and depth mark **alongside** its classified result to `render`.
+/// That is what keeps `render` composition-only, with no edge to the list.
+fn doctor() -> i32 {
+    let Some(home) = world::home() else {
+        print_err(&render::refusal("$HOME is unset"));
+        return INCOHERENT_INPUT;
+    };
+    let clones = declared_clones(&home);
+    let results: Vec<(&'static str, &'static str, Observed<Outcome>)> = job::host_items()
+        .iter()
+        .map(|item| {
+            (
+                item.name,
+                mark_of(item.depth),
+                check(&home, &clones, item.check),
+            )
+        })
+        .collect();
+    let lines: Vec<DoctorLine> = results
+        .iter()
+        .map(|(name, mark, outcome)| DoctorLine {
+            name,
+            mark,
+            outcome: outcome.clone(),
+        })
+        .collect();
+    print(&render::doctor(&hostname(), &lines));
+
+    let unmet = results.iter().any(|(_, _, outcome)| {
+        matches!(
+            outcome,
+            Observed::Present(Outcome::Unsatisfied(_))
+                | Observed::Unobservable(_)
+                | Observed::Absent
+        )
+    });
+    // A failed host check is incoherent input, not a judgement. It is also not a gate: nothing
+    // downstream consults this code.
+    if unmet { INCOHERENT_INPUT } else { 0 }
+}
+
+fn mark_of(depth: Depth) -> &'static str {
+    match depth {
+        Depth::Dispatch => "dispatch",
+        Depth::Doctor => "doctor",
+        Depth::Step => "step",
+    }
+}
+
+/// Every `~/.grind/repos/<owner>/<name>` the host declares. The path *is* the declaration, so
+/// each clone's own path is what its `origin` is checked against — doctor takes no Job.
+fn declared_clones(home: &Path) -> Vec<(String, PathBuf)> {
+    let mut found = Vec::new();
+    for owner in world::list_dir(&job::grind_dir(home).join("repos")) {
+        let Some(owner_name) = owner.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        for clone in world::list_dir(&owner) {
+            if let Some(name) = clone.file_name().and_then(|n| n.to_str())
+                && world::is_dir(&clone)
+            {
+                found.push((format!("{owner_name}/{name}"), clone.clone()));
+            }
+        }
+    }
+    found
+}
+
+fn check(home: &Path, clones: &[(String, PathBuf)], check: Check) -> Observed<Outcome> {
+    match check {
+        Check::DeclaredClone => {
+            let Some((declared, path)) = clones.first() else {
+                return observe::declared_clone(false, None, "any repo");
+            };
+            let origin = world::run(&words(&["git", "remote", "get-url", "origin"]), Some(path));
+            observe::declared_clone(true, Some(&origin), declared)
+        }
+        Check::OneClonePerRepo => {
+            let paths: Vec<String> = clones
+                .iter()
+                .map(|(_, p)| p.display().to_string())
+                .collect();
+            match clones.first() {
+                Some((declared, _)) => observe::one_clone_per_repo(&paths, declared),
+                None => observe::one_clone_per_repo(&[], "any repo"),
+            }
+        }
+        Check::ClaudeBinary => {
+            let binary = job::claude_bin(home);
+            let resolved = world::resolve_link(&binary);
+            observe::claude_binary(
+                world::is_executable(&binary),
+                resolved
+                    .as_deref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .as_deref(),
+            )
+        }
+        Check::OnPath(tool) => observe::on_path(tool, &resolves(tool)),
+        Check::GitVersionFloor => observe::git_version_floor(
+            &world::run(&words(&["git", "--version"]), None),
+            job::GIT_VERSION_FLOOR,
+        ),
+        // With no Job there is no pin to resolve, so what is checked at this depth is that the
+        // host has a plugin cache with something in it. The pinned directory itself is a
+        // dispatch-depth check, where a Job names it.
+        Check::PluginInstalled => observe::plugin_installed(
+            !world::list_dir(&home.join(".claude").join("plugins").join("cache")).is_empty(),
+        ),
+        Check::GhAuthStore => {
+            observe::gh_auth_store(&world::run(&words(&["gh", "auth", "status"]), None))
+        }
+        Check::SshKeyPassphraseless => {
+            let key = config("user.signingkey");
+            let named = key.stdout.trim().to_string();
+            if named.is_empty() {
+                return observe::ssh_key_passphraseless(None, None);
+            }
+            // A read, never a write: doctor performs no write to prove a step.
+            let probe = world::run(&words(&["ssh-keygen", "-y", "-P", "", "-f", &named]), None);
+            observe::ssh_key_passphraseless(Some(&named), Some(&probe))
+        }
+        Check::SshKeyBothTypes => {
+            observe::ssh_keys_both_types(&world::run(&words(&["gh", "ssh-key", "list"]), None))
+        }
+        Check::SigningConfig => observe::signing_config(
+            &config("gpg.format"),
+            &config("user.signingkey"),
+            &config("commit.gpgsign"),
+        ),
+        Check::CommitterIdentity => {
+            observe::committer_identity(&config("user.name"), &config("user.email"))
+        }
+        Check::OriginOverSsh => match clones.first() {
+            Some((_, path)) => observe::origin_over_ssh(&world::run(
+                &words(&["git", "remote", "get-url", "origin"]),
+                Some(path),
+            )),
+            None => observe::unchecked("no declared clone to read an origin from"),
+        },
+        Check::NoBoolean => observe::unchecked(
+            "performed during provisioning; every available check would be a guess",
+        ),
+    }
+}
+
+fn config(key: &str) -> world::Completed {
+    world::run(&words(&["git", "config", "--global", "--get", key]), None)
+}
+
+/// `command -v` is a shell builtin, so it needs a shell. `which` is not guaranteed anywhere the
+/// rest of this list is.
+fn resolves(tool: &str) -> world::Completed {
+    world::run(&words(&["sh", "-c", &format!("command -v {tool}")]), None)
+}
+
+fn words(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|p| p.to_string()).collect()
+}
+
+fn hostname() -> String {
+    world::hostname().unwrap_or_else(|| "this host".to_string())
+}
+
+fn print(text: &str) {
+    world::print_line(text.trim_end_matches('\n'));
+}
+
+fn print_err(text: &str) {
+    world::print_error(text.trim_end_matches('\n'));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_exit_code_reports_whether_status_could_answer_and_never_how_the_run_is_doing() {
+        assert_eq!(Observability::Answered.code(), 0);
+        assert_ne!(Observability::CouldNotAnswer.code(), 0);
+        // Neither of these takes a verdict, and there is no conversion from one in existence.
+        // An unhealthy Run whose every signal was observed answers, and answering is a zero.
+    }
+
+    #[test]
+    fn a_refusal_leaves_in_the_incoherent_input_register_and_not_the_observability_one() {
+        assert_ne!(INCOHERENT_INPUT, Observability::Answered.code());
+        assert_ne!(INCOHERENT_INPUT, Observability::CouldNotAnswer.code());
+    }
+
+    #[test]
+    fn the_surface_is_five_shapes_and_none_of_them_is_list() {
+        // A bare status that resolves to one Run is Grind selecting, and the repair
+        // "pick the one in flight" would pick a zombie.
+        assert!(!USAGE.contains("grind list"));
+        assert!(!USAGE.contains("latest if omitted"));
+        for shape in [
+            "grind run <issue>",
+            "grind resume <run-id>",
+            "grind status [run-id]",
+            "grind doctor",
+            "grind --version",
+        ] {
+            assert!(USAGE.contains(shape), "the surface must name {shape}");
+        }
+        assert!(USAGE.contains("roster when bare"));
+    }
+
+    #[test]
+    fn every_depth_mark_has_a_word_and_it_is_the_documents() {
+        assert_eq!(mark_of(Depth::Dispatch), "dispatch");
+        assert_eq!(mark_of(Depth::Doctor), "doctor");
+        assert_eq!(mark_of(Depth::Step), "step");
+    }
+
+    #[test]
+    fn the_driver_answers_for_every_item_on_the_list() {
+        // Without this wiring the host requirements have no home: `job` ships the list and its
+        // classifiers, and nothing else walks it.
+        let home = Path::new("/nowhere/that/exists");
+        for item in job::host_items() {
+            let outcome = check(home, &[], item.check);
+            if item.depth == Depth::Step {
+                assert!(
+                    matches!(outcome, Observed::Present(Outcome::Unchecked(_))),
+                    "`{}` is marked *step* and must carry no boolean",
+                    item.name
+                );
+            }
+        }
+    }
 }

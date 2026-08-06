@@ -521,9 +521,10 @@ pub fn check_presence(home: &Path, job: &Job, check: job::Check) -> Observed<Ite
             &world::run(&words(&["git", "--version"]), None),
             job::GIT_VERSION_FLOOR,
         ),
-        job::Check::OnPath(tool) => {
-            obs::on_path(tool, &world::run(&words(&["command", "-v", tool]), None))
-        }
+        job::Check::OnPath(tool) => obs::on_path(
+            tool,
+            &world::run(&words(&["sh", "-c", &format!("command -v {tool}")]), None),
+        ),
         job::Check::PluginInstalled => {
             obs::plugin_installed(world::is_dir(&job::plugin_dir(home, &job.plugin)))
         }

@@ -1,3 +1,3 @@
 fn main() {
-    grind::cli::run();
+    grind::world::exit(grind::cli::run());
 }

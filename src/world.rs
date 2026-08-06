@@ -298,6 +298,13 @@ pub fn print_line(line: &str) {
     let _ = out.flush();
 }
 
+/// Refusals go to stderr, so a Run's own output stays parseable when it is piped.
+pub fn print_error(line: &str) {
+    let mut err = std::io::stderr();
+    let _ = writeln!(err, "{line}");
+    let _ = err.flush();
+}
+
 // --- the wall clock -------------------------------------------------------------------
 //
 // Civil-time arithmetic lives here, beside the clock read, rather than in a producer. The
