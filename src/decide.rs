@@ -356,9 +356,9 @@ mod tests {
 
     #[test]
     fn a_trimmed_verify_step_on_the_target_repo_is_caught() {
-        // Inherited from `tests/test_grind.py`: the failure that costs most is a step trimmed
-        // until it goes green, because that is a false positive on the target repo and on
-        // Grind in one shot.
+        // Inherited from the Python entrypoint this replaced: the failure that costs most is
+        // a step trimmed until it goes green, because that is a false positive on the target
+        // repo and on Grind in one shot.
         assert_eq!(
             verify_contract(Some(INTACT), None).missing,
             Vec::<String>::new()

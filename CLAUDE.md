@@ -20,10 +20,7 @@ is not present for, and stops at an open PR.
 
 ## Shape
 
-`bin/grind` is a single Python 3 script, stdlib only. **It is being replaced by a compiled
-Rust binary** (ADR-0005): stdlib-only, no-package-manager and no-build-step are withdrawn, and
-`serde` is the only dependency the base takes. The script stays reference and evidence — never a
-translation source.
+Grind is a compiled Rust binary (ADR-0005), and `serde` is the only dependency it takes.
 
 **Grind is not an agent, and that is permanent.** It is the half of the original rationale that
 survives: a resilience layer built from the thing that gets rate-limited loses its state exactly
@@ -38,35 +35,35 @@ a `String` — so every decision is testable from literals with no network.
 ```
 grind run <issue>       dispatch a Job now (issue number or URL)
 grind resume <run-id>   re-enter a Run that died
-grind status [run-id]   print run state (latest if omitted)
-grind list              list known Runs
+grind status [run-id]   roster when bare; one Run's live view when named
+grind doctor            check the provisioned-host list
+grind --version         which copy of the binary is this
 ```
+
+The shipped artifact is a **prebuilt musl static file**; Grind never builds on a host.
 
 ## Verify entrypoint
 
 ```
-python3 tests/test_grind.py
+just verify
 ```
 
-Exits non-zero on failure and prints per-check lines. Pure functions only — no network, no
-`claude` invocations, no pytest. `tests/test_grind.py` guards the logic whose silent failure
-would be expensive: mistaking a rate limit for a crash, missing a rate limit, and failing to
-notice that a step of the target repo's `just verify` was trimmed until it went green. New
-tests belong there when a change carries a safety property, not for coverage's sake.
+`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and a musl cross-build of the
+two shipping triples (ADR-0009), with CI running that recipe and nothing else so there is one
+definition of checked rather than two.
 
-**That is the script's entrypoint. The base's is `just verify`** (ADR-0009) — `cargo fmt --check`,
-`cargo clippy -D warnings`, `cargo test`, and a musl cross-build of the two shipping triples, with
-CI running that recipe and nothing else so there is one definition of checked rather than two.
-`cargo test` alone still runs every test carrying a safety property, including the compile-fail and
-source-level carriers ADR-0007 spent, so reaching for the idiom is an incomplete green and never a
-false one.
+`cargo test` alone still runs every test carrying a safety property, including the compile-fail
+and source-level carriers ADR-0007 spent, so reaching for the idiom is an incomplete green and
+never a false one. What those tests guard is the logic whose silent failure would be expensive:
+mistaking a rate limit for a crash, missing a rate limit, and failing to notice that a step of
+the target repo's `just verify` was trimmed until it went green. New tests belong there when a
+change carries a safety property, not for coverage's sake.
 
 ## Constraints that are easy to violate
 
 - **Run state is never committed.** It is the supervisor's own working record, not history. It
   lives at `~/.grind/runs/` (ADR-0008), outside any checkout, so this holds structurally rather
-  than by a `.gitignore` line. The script's `<checkout>/.grind/` is the old location and cannot
-  survive a shipped binary — `GRIND_ROOT` derives from `__file__`.
+  than by a `.gitignore` line.
 - **The supervisor is the only writer of `run.json`.** A read path that saves what it loaded
   can erase `attempts[]`, which nothing can rebuild — and it erases it while the human is
   watching the dashboard to be reassured. Status and the roster observe fresh and persist
@@ -95,15 +92,30 @@ false one.
   advancing a pin.
 - **Headless deliberately lags local** (ADR-0002). New capabilities get proven in supervised
   sessions first. Grind is not where we experiment.
-- **`DENIED_TOOLS` in `bin/grind` is a safety property.** A Run must never merge its own PR,
-  force-push, hard-reset, rebase, or delete a branch. Denials are inherited by subagents and
-  survive `bypassPermissions`. Don't loosen the list to make a Run go through — and note that
-  **nothing sits behind it**: no credential can withhold merge from something allowed to open a PR
-  (`Pull requests: write` covers both, `Contents: write` covers push and branch deletion, and
-  force-push is indistinguishable from push at every credential layer), so these globs are the
-  entire barrier, not the outer one. Established resolving
-  [#37](https://github.com/FlorianRiquelme/grind/issues/37).
-- **`VERIFY_CONTRACT` is recorded and surfaced, never enforced** — same reason as ADR-0003.
+- **`DENIED_TOOLS` in `src/attempt.rs` is a safety property, and the list lives here.** A Run
+  must never merge its own PR, force-push, hard-reset, rebase, or delete a branch:
+
+  ```
+  Bash(gh pr merge*)
+  Bash(git push --force*)
+  Bash(git push -f*)
+  Bash(git reset --hard*)
+  Bash(git rebase*)
+  Bash(git checkout main*)
+  Bash(git branch -D*)
+  ```
+
+  Denials are inherited by subagents and survive `bypassPermissions`. Don't loosen the list to
+  make a Run go through — and note that **nothing sits behind it**: no credential can withhold
+  merge from something allowed to open a PR (`Pull requests: write` covers both,
+  `Contents: write` covers push and branch deletion, and force-push is indistinguishable from
+  push at every credential layer), so these globs are the entire barrier, not the outer one.
+  Established resolving [#37](https://github.com/FlorianRiquelme/grind/issues/37). What is
+  typeable is only the narrower property — *every invocation carries them* — via a command
+  builder whose output cannot be constructed without them; weakening the contents is intent,
+  and no carrier defends against intent, which is why they are prose and why they are here.
+- **`VERIFY_CONTRACT` in `src/decide.rs` is recorded and surfaced, never enforced** — same
+  reason as ADR-0003.
 - **Types catch omission and convention, never intent** (ADR-0006). Before reaching for a type
   to protect a property, ask how it realistically fails: a forgotten arm or an unthinking idiom
   is typeable, an agent that means to do it is not. And a variant set is a policy — a careless

@@ -9,9 +9,3 @@
 
 # Cargo build output
 /target
-
-# Run state — the supervisor's own working record, never committed
-.grind/
-
-# Python bytecode from loading bin/grind as a module in tests
-__pycache__/
