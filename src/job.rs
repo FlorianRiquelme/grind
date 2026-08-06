@@ -329,6 +329,180 @@ pub fn plugin_dir(home: &Path, pin: &PluginPin) -> PathBuf {
         .join(pin.version())
 }
 
+// --- the host item list -------------------------------------------------------------------
+//
+// One list, checked at two depths: presence before every Dispatch, the full list by
+// `grind doctor`. The list lives here because `job` already absorbs host resolution — repo
+// path, worktree adoption, plugin directory, `claude` binary — and the dispatch-time subset is
+// part of turning a Job reference into a dispatch.
+//
+// The tension is named rather than hidden: `grind doctor` takes no Job argument, so the list
+// stretches this module's stated scope. The alternatives are worse — an eleventh module breaks
+// the cut, and `world` holds no branching. Revisit if a second Job-independent concern lands
+// here.
+
+/// How an item is caught. `docs/provisioned-host.md` is the operative list and these three
+/// marks are its depth model; the test below asserts each item carries the mark that document
+/// gives it, because membership alone cannot catch a mis-marked item and that is the only
+/// failure this list has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Depth {
+    /// Verified before every Dispatch — presence only, local, free, no network. Also verified,
+    /// at full depth, by `grind doctor`.
+    Dispatch,
+    /// Verified by `grind doctor` alone, including the live checks.
+    Doctor,
+    /// Performed during provisioning, with no honest boolean behind it. Not checked, because
+    /// every available check is a guess.
+    Step,
+}
+
+/// What the driver has to do to answer for one item. `cli` walks the list, `world` runs what
+/// each variant needs, and `observe` classifies the raw triples — so this stays data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Check {
+    DeclaredClone,
+    OneClonePerRepo,
+    ClaudeBinary,
+    OnPath(&'static str),
+    GitVersionFloor,
+    PluginInstalled,
+    GhAuthStore,
+    SshKeyPassphraseless,
+    SshKeyBothTypes,
+    SigningConfig,
+    CommitterIdentity,
+    OriginOverSsh,
+    /// No honest boolean exists. Rendered as unchecked, with no boolean beside it.
+    NoBoolean,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HostItem {
+    /// What the report calls it.
+    pub name: &'static str,
+    pub depth: Depth,
+    pub check: Check,
+    /// A distinctive fragment of this item's entry in `docs/provisioned-host.md`. It exists so
+    /// the list and the document cannot drift apart silently.
+    pub doc_anchor: &'static str,
+}
+
+/// The whole list, in the document's order.
+pub fn host_items() -> &'static [HostItem] {
+    &[
+        HostItem {
+            name: "declared clone",
+            depth: Depth::Dispatch,
+            check: Check::DeclaredClone,
+            doc_anchor: "`repos/<owner>/<name>` exists and its `origin` matches the target repo.",
+        },
+        HostItem {
+            name: "one clone per target repo",
+            depth: Depth::Doctor,
+            check: Check::OneClonePerRepo,
+            doc_anchor: "One declared clone per target repo.",
+        },
+        HostItem {
+            name: "claude binary",
+            depth: Depth::Dispatch,
+            check: Check::ClaudeBinary,
+            doc_anchor: "`bin/claude` is executable and is not a shim.",
+        },
+        HostItem {
+            name: "git on PATH",
+            depth: Depth::Dispatch,
+            check: Check::GitVersionFloor,
+            doc_anchor: "`git` on `PATH`, ≥ 2.34.",
+        },
+        HostItem {
+            name: "gh on PATH",
+            depth: Depth::Dispatch,
+            check: Check::OnPath("gh"),
+            doc_anchor: "`gh` on `PATH`.",
+        },
+        HostItem {
+            name: "just on PATH",
+            depth: Depth::Doctor,
+            check: Check::OnPath("just"),
+            doc_anchor: "`just` on `PATH`.",
+        },
+        HostItem {
+            name: "lfg plugin installed",
+            depth: Depth::Dispatch,
+            check: Check::PluginInstalled,
+            doc_anchor: "The `lfg` plugin is installed.",
+        },
+        HostItem {
+            name: "credential: gh auth store",
+            depth: Depth::Doctor,
+            check: Check::GhAuthStore,
+            doc_anchor: "`gh auth login` — device-code flow",
+        },
+        HostItem {
+            name: "credential: passphrase-less ssh key",
+            depth: Depth::Doctor,
+            check: Check::SshKeyPassphraseless,
+            doc_anchor: "`ssh-keygen`, passphrase-less.",
+        },
+        HostItem {
+            name: "credential: key uploaded for both types",
+            depth: Depth::Doctor,
+            check: Check::SshKeyBothTypes,
+            doc_anchor: "`gh ssh-key add --type authentication`",
+        },
+        HostItem {
+            name: "credential: ssh commit signing",
+            depth: Depth::Doctor,
+            check: Check::SigningConfig,
+            doc_anchor: "`git config --global gpg.format ssh`",
+        },
+        HostItem {
+            name: "credential: committer identity",
+            depth: Depth::Doctor,
+            check: Check::CommitterIdentity,
+            doc_anchor: "`user.name` / `user.email` set to the machine identity",
+        },
+        HostItem {
+            name: "credential: origin over ssh",
+            depth: Depth::Doctor,
+            check: Check::OriginOverSsh,
+            doc_anchor: "`origin` on SSH, and the push",
+        },
+        HostItem {
+            name: "the grind binary on PATH",
+            depth: Depth::Step,
+            check: Check::NoBoolean,
+            doc_anchor: "The `grind` binary is on `PATH`.",
+        },
+        HostItem {
+            name: "auto-update for claude and the plugin",
+            depth: Depth::Step,
+            check: Check::NoBoolean,
+            doc_anchor: "Auto-update for `claude` and for the plugin.",
+        },
+        HostItem {
+            name: "the dispatching user's $HOME",
+            depth: Depth::Step,
+            check: Check::NoBoolean,
+            doc_anchor: "The dispatching user's `$HOME`.",
+        },
+    ]
+}
+
+/// What runs before every Dispatch: presence only, local, free, no network. A strict subset of
+/// what doctor runs, from the same list — one definition of provisioned rather than two.
+pub fn dispatch_subset() -> Vec<&'static HostItem> {
+    host_items()
+        .iter()
+        .filter(|item| item.depth == Depth::Dispatch)
+        .collect()
+}
+
+/// The floor `git` inherits from SSH commit signing. Not invented here — nothing else in Grind
+/// needs a recent git.
+pub const GIT_VERSION_FLOOR: (u64, u64) = (2, 34);
+
 // --- pure parses over porcelain ----------------------------------------------------------
 
 /// `git status --porcelain`: any output at all means dirty.
@@ -609,6 +783,145 @@ mod tests {
         let note = head_note("9d1f4c7a2b6e", "1111111111").expect("a note");
         assert!(note.contains("9d1f4c7a"));
         assert!(note.contains("11111111"));
+    }
+
+    // --- the host item list ---------------------------------------------------------------
+
+    // The operative list arrives through `include_str!` rather than the filesystem: reading it
+    // at run time would name `std::fs` inside `src/`, which `tests/topology.rs` forbids.
+    const PROVISIONED_HOST: &str = include_str!("../docs/provisioned-host.md");
+
+    /// Every entry in the document that carries a depth mark, reassembled from its wrapped
+    /// lines, paired with the mark it carries.
+    fn document_entries() -> Vec<(String, Depth)> {
+        let mut entries = Vec::new();
+        let mut current: Option<String> = None;
+        let mut in_credentials = false;
+        for line in PROVISIONED_HOST.lines() {
+            if line.starts_with("## ") {
+                in_credentials = line.contains("Credentials");
+            }
+            let starts_entry = line.starts_with("- **")
+                || (in_credentials
+                    && line.starts_with(|c: char| c.is_ascii_digit())
+                    && line.contains(". "));
+            if starts_entry {
+                if let Some(entry) = current.take() {
+                    push_entry(&mut entries, entry, in_credentials);
+                }
+                current = Some(line.to_string());
+            } else if line.starts_with("  ") {
+                if let Some(entry) = current.as_mut() {
+                    entry.push(' ');
+                    entry.push_str(line.trim());
+                }
+            } else if let Some(entry) = current.take() {
+                push_entry(&mut entries, entry, in_credentials);
+            }
+        }
+        if let Some(entry) = current.take() {
+            push_entry(&mut entries, entry, in_credentials);
+        }
+        entries
+    }
+
+    fn push_entry(entries: &mut Vec<(String, Depth)>, entry: String, in_credentials: bool) {
+        // The credential section marks all six of its steps at once, in prose above them:
+        // "All *doctor*, never *dispatch*".
+        if in_credentials && entry.starts_with(|c: char| c.is_ascii_digit()) {
+            entries.push((entry, Depth::Doctor));
+        } else if entry.contains("— *dispatch") {
+            entries.push((entry, Depth::Dispatch));
+        } else if entry.contains("— *doctor*") {
+            entries.push((entry, Depth::Doctor));
+        } else if entry.contains("— *step*") {
+            entries.push((entry, Depth::Step));
+        }
+    }
+
+    #[test]
+    fn every_item_carries_the_mark_the_document_gives_it() {
+        // Membership alone cannot catch a mis-marked item, and a mis-marked item is the only
+        // failure this list has: an item quietly demoted from *dispatch* to *doctor* stops
+        // running before a Dispatch and nothing says so.
+        let entries = document_entries();
+        assert_eq!(
+            entries.len(),
+            host_items().len(),
+            "docs/provisioned-host.md carries {} marked entries and the list holds {}",
+            entries.len(),
+            host_items().len()
+        );
+        for item in host_items() {
+            let matching: Vec<&(String, Depth)> = entries
+                .iter()
+                .filter(|(text, _)| text.contains(item.doc_anchor))
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "`{}` must match exactly one entry in docs/provisioned-host.md; its anchor \
+                 `{}` matched {}",
+                item.name,
+                item.doc_anchor,
+                matching.len()
+            );
+            assert_eq!(
+                matching[0].1, item.depth,
+                "`{}` is marked {:?} here and {:?} in docs/provisioned-host.md",
+                item.name, item.depth, matching[0].1
+            );
+        }
+    }
+
+    #[test]
+    fn the_dispatch_subset_is_a_strict_subset_of_one_list() {
+        let subset = dispatch_subset();
+        assert!(!subset.is_empty());
+        assert!(
+            subset.len() < host_items().len(),
+            "a subset that is the whole list is not one"
+        );
+        for item in &subset {
+            assert!(
+                host_items().iter().any(|whole| whole.name == item.name),
+                "the dispatch subset must be drawn from the one list"
+            );
+            assert_eq!(item.depth, Depth::Dispatch);
+        }
+    }
+
+    #[test]
+    fn a_host_missing_just_fails_doctor_and_passes_the_dispatch_subset() {
+        let just = host_items()
+            .iter()
+            .find(|i| i.name == "just on PATH")
+            .expect("just is listed");
+        assert_eq!(just.depth, Depth::Doctor);
+        assert!(
+            !dispatch_subset().iter().any(|i| i.name == "just on PATH"),
+            "`just` is doctor's, not dispatch's — the failure is the Run's, not the Dispatch's"
+        );
+    }
+
+    #[test]
+    fn items_with_no_honest_boolean_carry_no_check() {
+        for item in host_items().iter().filter(|i| i.depth == Depth::Step) {
+            assert_eq!(
+                item.check,
+                Check::NoBoolean,
+                "`{}` is marked *step*, so every available check is a guess",
+                item.name
+            );
+        }
+        for item in host_items().iter().filter(|i| i.depth != Depth::Step) {
+            assert_ne!(
+                item.check,
+                Check::NoBoolean,
+                "`{}` claims a check it has not got",
+                item.name
+            );
+        }
     }
 
     #[test]

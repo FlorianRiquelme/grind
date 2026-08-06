@@ -260,6 +260,59 @@ pub fn presence(present: bool) -> Observed<bool> {
     Observed::Present(present)
 }
 
+// --- observing a Run, once ---------------------------------------------------------------
+
+/// Where the durable artifacts live, relative to the worktree.
+pub const PLAN_DIR: &str = "docs/plans";
+pub const RESIDUAL_DIR: &str = "docs/residual-review-findings";
+pub const LEDGER_DIR: &str = "docs/ledger";
+
+/// Take one whole observation of a Run.
+///
+/// The argv and the classifier that reads it sit in the same module on purpose: a parser can
+/// be perfect while the command was built with a wrong flag, and that pairing is the only thing
+/// a reader can check at a glance. `run` and `list` are the caller's doors to `world`, so both
+/// the supervisor's loop and the read path get **one** definition of the sequence without
+/// either of them naming the other.
+pub fn observe_run(
+    observed_at: String,
+    handoff_sha: &str,
+    worktree_readable: bool,
+    run: &mut dyn FnMut(&[String]) -> Completed,
+    list: &mut dyn FnMut(&str) -> Vec<String>,
+) -> Observation {
+    let argv = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<String>>();
+
+    let counted = run(&argv(&[
+        "git",
+        "rev-list",
+        "--count",
+        &format!("{handoff_sha}..HEAD"),
+    ]));
+    let status = run(&argv(&["git", "status", "--porcelain"]));
+    let pr_view = run(&argv(&[
+        "gh",
+        "pr",
+        "view",
+        "--json",
+        "number,url,state,isDraft",
+    ]));
+    let rollup = run(&argv(&["gh", "pr", "view", "--json", "statusCheckRollup"]));
+    let (checks_pending, checks_red) = checks(&rollup);
+
+    Observation {
+        observed_at,
+        commits_ahead: commits_ahead(&counted),
+        tree_clean: tree_clean(&status),
+        pr: pr(&pr_view),
+        checks_pending,
+        checks_red,
+        plan_files: listing(worktree_readable, "plan", list(PLAN_DIR)),
+        residual_findings: listing(worktree_readable, "residual findings", list(RESIDUAL_DIR)),
+        ledger_entries: listing(worktree_readable, "ledger", list(LEDGER_DIR)),
+    }
+}
+
 // --- the host item list's classifiers ---------------------------------------------------
 //
 // **Every one of these renders a fixed, item-specific diagnostic and never the raw stdout or

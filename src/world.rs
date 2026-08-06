@@ -37,6 +37,21 @@ pub struct Completed {
     pub code: Option<i32>,
 }
 
+/// An acquired lock, opaque on purpose. It carries no operations — holding it *is* the
+/// operation, and dropping it releases. Wrapping the handle is also what keeps `std::fs` from
+/// having to be named by the module that takes the lock.
+#[derive(Debug)]
+pub struct LockHandle(File);
+
+impl Drop for LockHandle {
+    /// The tidy path, for a supervisor that exits normally. The guarantee that matters does not
+    /// depend on it: the kernel releases the lock when the holding process dies, killed or not,
+    /// which is the whole reason this is a lock rather than a state check.
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// What the kernel said about a lock, unclassified. `WouldBlock` and `Failed` are never
 /// folded together: collapsing them reproduces the exact bug `Observed<T>` exists to remove,
 /// relocated to the lock.
@@ -45,7 +60,7 @@ pub enum TryLock {
     /// drop, so a handle owned by a dispatch function evaporates seconds into a Run that lasts
     /// hours, and the kernel-releases-it-when-the-holder-dies guarantee needs a holder that is
     /// still holding.
-    Acquired(File),
+    Acquired(LockHandle),
     /// Somebody else holds it.
     WouldBlock,
     /// The attempt could not be made at all — permissions, a missing directory, anything.
@@ -135,6 +150,15 @@ pub fn write(path: &Path, contents: &str) -> Result<(), String> {
     fs::write(path, contents).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Write via a temporary file in the same directory, then rename over the target. A crash
+/// between the two leaves the **old** `run.json` intact, because the temp file is the only
+/// thing that can be half-written. A plain write truncates the real file instead.
+pub fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
+    let scratch = path.with_extension("tmp");
+    fs::write(&scratch, contents).map_err(|e| format!("{}: {e}", scratch.display()))?;
+    fs::rename(&scratch, path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 pub fn create_dir_all(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -202,7 +226,7 @@ pub fn try_lock(path: &Path) -> TryLock {
         Err(e) => return TryLock::Failed(format!("{}: {e}", path.display())),
     };
     match file.try_lock() {
-        Ok(()) => TryLock::Acquired(file),
+        Ok(()) => TryLock::Acquired(LockHandle(file)),
         Err(fs::TryLockError::WouldBlock) => TryLock::WouldBlock,
         Err(fs::TryLockError::Error(e)) => TryLock::Failed(format!("{}: {e}", path.display())),
     }
