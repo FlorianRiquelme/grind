@@ -36,6 +36,11 @@ jobs:
       - name: Install just
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y just
 
+      # The runner's preinstalled toolchain floats. `File::try_lock` needs 1.89, so a stale one
+      # would fail as a syntax error rather than as a version.
+      - name: Use current stable Rust
+        run: rustup update stable && rustup default stable
+
       - name: Add the two shipping targets
         run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 

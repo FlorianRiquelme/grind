@@ -2,6 +2,9 @@
 name = "grind"
 version = "0.1.0"
 edition = "2024"
+# `File::try_lock` (the dispatch lock) stabilised here, and let-chains are used throughout.
+# Stated so a runner on an older toolchain fails with the reason rather than with a syntax error.
+rust-version = "1.89"
 description = "A queue, a supervisor and a record around headless `lfg` runs."
 publish = false
 
