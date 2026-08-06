@@ -563,6 +563,126 @@ fn scenario_f_a_run_that_stays_unobservable_stops_and_says_so() {
     assert!(out.contains("could not observe"), "it says so:\n{out}");
 }
 
+// --- the exit code reports observability, never health ----------------------------------------
+
+/// Dispatch a Run that stops short of completion, and hand back its run id.
+fn a_run_that_did_not_finish(box_: &Sandbox) -> String {
+    box_.scenario(&["subtle_error"]).pr_appears_at(99);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    box_.record()["run_id"]
+        .as_str()
+        .expect("a run id")
+        .to_string()
+}
+
+#[test]
+fn an_unhealthy_but_fully_observed_run_exits_zero() {
+    // The idiom every CLI has ever followed is *non-zero means bad*, and following it here is
+    // how Grind grows a gate through the back door. This Run is exhausted with no PR — as
+    // unhealthy as it gets — and status answered, so status exits zero.
+    let box_ = sandbox("status-unhealthy");
+    let run_id = a_run_that_did_not_finish(&box_);
+
+    let (out, err, code) = box_.run(&["status", &run_id]);
+    assert_eq!(
+        code,
+        Some(0),
+        "an answered question is a zero:\n{out}\n{err}"
+    );
+    assert!(
+        out.contains("exhausted"),
+        "and it is plainly unhealthy:\n{out}"
+    );
+    assert!(out.contains("incomplete"), "{out}");
+}
+
+#[test]
+fn a_run_whose_signals_could_not_be_observed_exits_non_zero() {
+    let box_ = sandbox("status-blind");
+    let run_id = a_run_that_did_not_finish(&box_);
+    box_.gh_cannot_be_reached();
+
+    let (out, err, code) = box_.run(&["status", &run_id]);
+    assert_ne!(
+        code,
+        Some(0),
+        "a question it could not answer:\n{out}\n{err}"
+    );
+    assert_ne!(
+        code,
+        Some(2),
+        "and not the incoherent-input register either"
+    );
+    // The blind signals render as could-not-observe rather than as facts.
+    assert!(out.contains("unobserved"), "{out}");
+}
+
+#[test]
+fn bare_status_prints_the_roster_and_never_a_single_runs_view() {
+    let box_ = sandbox("status-roster");
+    let run_id = a_run_that_did_not_finish(&box_);
+
+    let (out, err, code) = box_.run(&["status"]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert!(out.contains("this host only"), "{out}");
+    assert!(out.contains(&run_id), "the roster lists it:\n{out}");
+    // Nothing from the single-Run view: a bare status that resolves to one Run is Grind
+    // selecting, and the repair "pick the one in flight" would pick a zombie.
+    assert!(!out.contains("last words"), "{out}");
+    assert!(!out.contains("furthest stage"), "{out}");
+}
+
+#[test]
+fn status_reads_and_never_writes() {
+    // Watching a Run to be reassured must not destroy the one field nothing can rebuild.
+    let box_ = sandbox("status-read-only");
+    let run_id = a_run_that_did_not_finish(&box_);
+    let record = box_.run_dir().join("run.json");
+    let before = fs::read_to_string(&record).expect("the record");
+
+    for _ in 0..3 {
+        let (_, _, code) = box_.run(&["status", &run_id]);
+        assert_eq!(code, Some(0));
+    }
+    let after = fs::read_to_string(&record).expect("the record");
+    assert_eq!(before, after, "status must leave the record byte-identical");
+    let parsed: serde_json::Value = serde_json::from_str(&after).unwrap();
+    assert_eq!(parsed["attempts"].as_array().expect("attempts").len(), 8);
+}
+
+#[test]
+fn resume_on_a_completed_run_prints_the_handback_and_starts_nothing() {
+    let box_ = sandbox("resume-completed");
+    box_.scenario(&["success_done"]).pr_appears_at(1);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    let run_id = box_.record()["run_id"]
+        .as_str()
+        .expect("a run id")
+        .to_string();
+    let attempts_before = box_.record()["attempts"]
+        .as_array()
+        .expect("attempts")
+        .len();
+
+    let (out, err, code) = box_.run(&["resume", &run_id]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert!(out.contains("run already completed"), "{out}");
+    assert!(
+        out.contains("run state"),
+        "the Handback, not a re-entry:\n{out}"
+    );
+    assert_eq!(
+        box_.record()["attempts"]
+            .as_array()
+            .expect("attempts")
+            .len(),
+        attempts_before,
+        "a mistyped command must not restart finished work"
+    );
+}
+
 // --- the sandbox's own guarantees ------------------------------------------------------------
 
 #[test]
