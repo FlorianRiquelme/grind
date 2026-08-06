@@ -14,6 +14,15 @@ holds the full table. [#32](https://github.com/FlorianRiquelme/grind/issues/32) 
 ordering this refines, and [#33](https://github.com/FlorianRiquelme/grind/issues/33) supplied
 the measurements it rests on.
 
+> **Amended 2026-08-06 by [#35](https://github.com/FlorianRiquelme/grind/issues/35).**
+> **Visibility carries two of the three properties below, not three.** *Only dispatch reads
+> the environment* cannot be carried by privacy at all — privacy gates `crate::` paths, and
+> nothing stops a read path calling `std::env::var`. Its carrier is a source-level test under
+> ADR-0007. That ADR also sharpens the mechanism this one rests on: **privacy only bites
+> between siblings.** A child module reaches its ancestor's private items and compiles clean,
+> so nesting the reader under a parent that owns the writable type withdraws the carrier
+> silently — by housekeeping, which is this ADR's own *convention* mode.
+
 ## The two rulings that looked contradictory
 
 #32 ruled **one carrier per finding**, because a duplicated finding drifts — explicitly,
@@ -89,7 +98,7 @@ Three properties have that shape — *who may call*, not *what may exist*:
 |---|---|
 | only the supervisor writes `run.json` | `cmd_status` → `save()` — shipped and live in `bin/grind` |
 | status never reaches an agent | none yet; a view built from the thing that gets rate-limited is unavailable during the stall it exists to explain |
-| only dispatch reads the environment | `MAX_ATTEMPTS` is read at print time, so re-entering with a different `GRIND_MAX_ATTEMPTS` makes the record misreport its own budget |
+| ~~only dispatch reads the environment~~ — **not visibility; see the amendment above** | `MAX_ATTEMPTS` is read at print time, so re-entering with a different `GRIND_MAX_ATTEMPTS` makes the record misreport its own budget |
 
 All three are omission-shaped in the way that counts: the agent does not decide to corrupt the
 record, it reaches for the obvious symbol and the language hands it over. `use RunRecord` is not
@@ -147,7 +156,8 @@ believes the fold is airtight is the one who ships the collapse.
   invariant to the type rather than duplicating it.
 - **Ten properties become types, five shapes are prohibited, three become visibility, eight
   become tests, five stay prose.** The table is in
-  [#34](https://github.com/FlorianRiquelme/grind/issues/34).
+  [#34](https://github.com/FlorianRiquelme/grind/issues/34). *Amended: two become visibility
+  and one moves to a source-level test — see above.*
 - **The claim to make downstream is narrow.** These carriers stop an agent forgetting and stop
   an agent reaching for the idiom. They stop nothing an agent means to do. ADR-0005 already says
   this about omission; the addition here is that convention is the mode most of Grind's rules
@@ -166,4 +176,5 @@ The contents stay prose, in `CLAUDE.md`, where they already are.
 
 **Which module anything lives in.** Visibility is only a carrier once the seams exist, and the
 seams are [#35](https://github.com/FlorianRiquelme/grind/issues/35)'s. This ADR hands that
-ticket one constraint and decides nothing else about layout.
+ticket one constraint and decides nothing else about layout. *Settled in ADR-0007, which found
+the constraint needs a second clause — sibling modules, never a shared parent.*

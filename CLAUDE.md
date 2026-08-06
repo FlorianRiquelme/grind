@@ -26,6 +26,12 @@ translation source.
 survives: a resilience layer built from the thing that gets rate-limited loses its state exactly
 when that matters. A compiled binary satisfies that better than a script; an agent cannot.
 
+The base is **one crate, ten modules, exactly one of them impure** (ADR-0007): `world` is the
+sole namer of `std::process` and `std::fs`; `job`, `observe`, `decide`, `policy`, `attempt`,
+`view` and `render` are pure; `supervisor` holds the loop and the record; `cli` is the only
+thing that prints. Effects are returned as values — `policy` returns the sleep, `render` returns
+a `String` — so every decision is testable from literals with no network.
+
 ```
 grind run <issue>       dispatch a Job now (issue number or URL)
 grind resume <run-id>   re-enter a Run that died
@@ -53,6 +59,11 @@ tests belong there when a change carries a safety property, not for coverage's s
   can erase `attempts[]`, which nothing can rebuild — and it erases it while the human is
   watching the dashboard to be reassured. Status and the roster observe fresh and persist
   nothing (issues #12, #27).
+- **Privacy only bites between siblings** (ADR-0007). `supervisor` and `view` are siblings at
+  the crate root and the writable record type is private to `supervisor`. Never nest them under
+  a shared parent, and never add a module named for a noun two others share (`record/`,
+  `types`) — a child module reaches its ancestor's private items and **compiles clean**, so the
+  tidy-up that looks like housekeeping is what withdraws the guarantee.
 - **Grind never gates** (ADR-0003). Verdict language describes what happened, never quality.
   A completed Run means the pipeline finished, not that the code is good. Never add
   something that blocks a PR from existing on the strength of a finding. Two shapes carry
