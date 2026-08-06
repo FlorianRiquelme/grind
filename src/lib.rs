@@ -10,6 +10,7 @@
 //! a `record/` directory, a `types` module — is the tidy-up that silently withdraws the
 //! carrier. `tests/topology.rs` is what notices.
 
+pub mod attempt;
 pub mod cli;
 pub mod decide;
 pub mod job;
