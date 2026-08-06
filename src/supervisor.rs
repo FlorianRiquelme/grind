@@ -752,6 +752,43 @@ mod tests {
     }
 
     #[test]
+    fn what_the_writer_serialises_is_what_the_reader_deserialises() {
+        // The two types deserialise the same JSON in modules that cannot see each other, so
+        // field names are duplicated by design and can drift. The carrier is this test rather
+        // than the compiler, which is blind to it precisely because the wall is working.
+        //
+        // It has to live here: `view` cannot name `RunRecord`, which is the whole point. Under
+        // `deny_unknown_fields` on the reader, a field the writer gains and the reader forgets
+        // is a failure — a fixture-only check cannot see that, because a field the reader never
+        // declares is not a shared field and serde drops it silently.
+        const DAY_ONE: &str = include_str!("../tests/fixtures/record/day-one.json");
+        let written: RunRecord = serde_json::from_str(DAY_ONE).expect("the writer's shape");
+        let bytes = serde_json::to_string(&written).expect("serialise");
+        let read: crate::view::RunView = serde_json::from_str(&bytes)
+            .expect("the reader must accept every field the writer emits");
+
+        assert_eq!(read.run_id, written.run_id);
+        assert_eq!(read.attempts.len(), written.attempts().len());
+        assert_eq!(read.attempt_budget, written.attempt_budget);
+        assert_eq!(read.limit_sleep_seconds, written.limit_sleep_seconds);
+        assert_eq!(read.supervisor_pid, written.supervisor_pid);
+        assert_eq!(read.state, written.state.as_str());
+        assert_eq!(read.denied_tools, written.denied_tools);
+    }
+
+    #[test]
+    fn a_field_the_writer_gains_and_the_reader_forgets_is_caught() {
+        // The failure the test above exists for, reproduced directly.
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/record/day-one.json")).unwrap();
+        value["fanout_health"] = serde_json::json!("healthy");
+        assert!(
+            serde_json::from_value::<crate::view::RunView>(value).is_err(),
+            "an undeclared field must fail rather than being dropped silently"
+        );
+    }
+
+    #[test]
     fn the_attempt_list_can_only_grow() {
         // `attempts` is private with an appending mutator, so *load a stale copy, then
         // overwrite the whole list* is not expressible even from inside the writable type.
