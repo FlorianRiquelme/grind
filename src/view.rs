@@ -12,7 +12,6 @@
 //! because the wall is working.
 
 use crate::attempt::Attempt;
-use crate::decide::Stage;
 use crate::job::{self, Job};
 use crate::observe::{self, Observation, Observed, Reason};
 use crate::world;
@@ -358,10 +357,6 @@ pub fn observe_fresh(worktree: &Path, handoff_sha: &str, at: String) -> Observat
             .collect::<Vec<String>>()
     };
     observe::observe_run(at, handoff_sha, readable, &mut run, &mut list)
-}
-
-pub fn furthest_stage_of(observation: &Observation) -> Stage {
-    crate::decide::furthest_stage(observation)
 }
 
 #[cfg(test)]

@@ -253,13 +253,6 @@ pub fn listing(readable: bool, what: &str, entries: Vec<String>) -> Observed<Vec
     Observed::Present(entries)
 }
 
-/// A host item that is either there or not, with no third state available from the check
-/// itself. `checked` is what the check could see; `false` is a real absence, and a check that
-/// could not run at all is the caller's job to spell as could-not-observe.
-pub fn presence(present: bool) -> Observed<bool> {
-    Observed::Present(present)
-}
-
 // --- observing a Run, once ---------------------------------------------------------------
 
 /// Where the durable artifacts live, relative to the worktree.
@@ -941,6 +934,5 @@ mod tests {
             Observed::Unobservable(Reason::saying("constructed")),
         ];
         assert_eq!(arms.len(), 3);
-        assert!(presence(true) == Observed::Present(true));
     }
 }
