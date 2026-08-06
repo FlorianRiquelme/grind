@@ -15,4 +15,5 @@ pub mod cli;
 pub mod decide;
 pub mod job;
 pub mod observe;
+pub mod policy;
 pub mod world;
