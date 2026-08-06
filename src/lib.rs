@@ -16,6 +16,7 @@ pub mod decide;
 pub mod job;
 pub mod observe;
 pub mod policy;
+pub mod render;
 pub mod supervisor;
 pub mod view;
 pub mod world;
