@@ -1,0 +1,31 @@
+[package]
+name = "grind"
+version = "0.1.0"
+edition = "2024"
+# `File::try_lock` (the dispatch lock) stabilised here, and let-chains are used throughout.
+# Stated so a runner on an older toolchain fails with the reason rather than with a syntax error.
+rust-version = "1.89"
+description = "A queue, a supervisor and a record around headless `lfg` runs."
+publish = false
+
+# ADR-0005: serde is the only dependency the base takes, read as the family — JSON is the
+# reason the dependency exists at all. No dev-dependencies: the compile-fail carrier shells
+# out to `rustc` itself rather than taking `trybuild`.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# A library plus a thin binary. In a binary crate `dead_code` is rooted at `main` and `pub`
+# does not exempt an item, so every module landing before its consumer would fail
+# `cargo clippy -- -D warnings` as an unreferenced module — and the repair an agent reaches
+# for is `#[allow(dead_code)]`, which also silences the unconstructed-variant warning
+# ADR-0009 put clippy in the recipe to catch. `#[allow(dead_code)]` is never the repair for
+# an unwired module. The library target is also what gives the compile-fail carrier a crate
+# to copy.
+[lib]
+name = "grind"
+path = "src/lib.rs"
+
+[[bin]]
+name = "grind"
+path = "src/main.rs"

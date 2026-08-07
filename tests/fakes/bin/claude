@@ -1,0 +1,21 @@
+#!/bin/sh
+# The fake `claude` at the layout's declared `~/.grind/bin/claude`.
+#
+# The seam is the binary path, and it is the only seam here: only a real process replays real
+# SIGKILL, real empty-not-truncated stdout, a real separate stderr file and a real exit code
+# the parent did not choose. A shell script at this path needs no trait and no injection.
+#
+# It serves one shape per attempt, from a scenario file, and records the argv it was given so
+# the literal flags of every attempt can be asserted afterwards.
+cat >/dev/null                      # drain the prompt, exactly like the real child
+F="${HOME:?}/.fake"
+N=$(cat "$F/counter" 2>/dev/null || echo 0)
+N=$((N + 1))
+echo "$N" > "$F/counter"
+{
+  for a in "$@"; do printf '%s\n' "$a"; done
+  printf -- '--- attempt %s\n' "$N"
+} >> "$F/argv.log"
+SHAPE=$(sed -n "${N}p" "$F/scenario")
+[ -n "$SHAPE" ] || SHAPE=$(sed -n '$p' "$F/scenario")
+exec "$F/shapes/$SHAPE.sh"

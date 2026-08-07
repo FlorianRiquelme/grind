@@ -7,8 +7,5 @@
 # Local tool caches
 .impeccable/
 
-# Run state — the supervisor's own working record, never committed
-.grind/
-
-# Python bytecode from loading bin/grind as a module in tests
-__pycache__/
+# Cargo build output
+/target
