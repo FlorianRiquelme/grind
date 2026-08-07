@@ -31,6 +31,12 @@ pub const QUEUE_LABEL: &str = "ready-for-agent";
 pub const ATTEMPT_BUDGET: usize = 8;
 pub const LIMIT_SLEEP_SECONDS: u64 = 1800;
 pub const REOBSERVATIONS: usize = 3;
+/// How long a re-observation waits before looking again. The mechanism exists for a transient
+/// window — the one after a laptop wake is the case it names — and three retries fired within
+/// milliseconds of each other cannot span it; this is what spends the retry budget across real
+/// time instead. Not per-Job and not recorded: like `REOBSERVATIONS`, it is Grind's own policy
+/// knob rather than a fact the record needs to freeze.
+pub const REOBSERVE_PAUSE_SECONDS: u64 = 15;
 
 /// **Seven states, and none of them is `running`.** A SIGKILLed supervisor would sit in
 /// `running` forever, which is why the roster observes liveness for itself instead.
@@ -117,7 +123,10 @@ pub struct Outcome {
     pub run_id: String,
     pub state: &'static str,
     pub attempts_made: usize,
-    /// True when `resume` found a Run that had already completed and started nothing.
+    /// True when `resume` found a Run already at a terminal state and started nothing. The name
+    /// reads narrower than the flag now is — it covers `Exhausted` as well as `Completed`, see
+    /// the guard in `resume` — so nothing may render it as the word *completed*. `state` beside
+    /// it carries which terminal state was actually found, and `cli` prints that.
     pub already_completed: bool,
 }
 
@@ -292,10 +301,25 @@ pub fn resume(run_id: &str) -> Result<Outcome, Refusal> {
     }
     let mut record = RunRecord::load(&path)?;
 
-    if record.state == State::Completed {
+    // Option (a) from the review: widen the guard rather than add a second branch below it.
+    // `supervise` attempts before it ever consults `policy::next` (`run_one_attempt` runs, then
+    // the record is saved, then the loop asks what's next) — so `Completed` is not the only
+    // state a resume must not walk into. `Exhausted` means the record already holds a Run at
+    // its recorded attempt budget; resuming it would spend a ninth attempt with no `policy`
+    // check standing between `resume` and `run_one_attempt` to stop it, breaking *attempt N of
+    // M, with M from the record* the same way the Completed case would.
+    //
+    // `Unobserved` and `Uncorroborated` are deliberately left resumable. Neither stopped because
+    // the attempt budget ran out — `Uncorroborated` always stops regardless of budget, and
+    // `Unobserved` stops on a fault in Grind's own eyes, not the Job's — so resuming one does
+    // not overspend anything the record promises. For `Unobserved` in particular, the transient
+    // `policy`'s new reobserve pause exists for may simply have cleared since; refusing to
+    // resume it would remove the only recovery path for exactly the fault this fix's other half
+    // gives more time to clear.
+    if matches!(record.state, State::Completed | State::Exhausted) {
         return Ok(Outcome {
             run_id: record.run_id.clone(),
-            state: State::Completed.as_str(),
+            state: record.state.as_str(),
             attempts_made: record.attempts().len(),
             already_completed: true,
         });
@@ -321,6 +345,7 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
         attempts: record.attempt_budget,
         limit_sleep: Duration::from_secs(record.limit_sleep_seconds),
         reobservations: REOBSERVATIONS,
+        reobserve_pause: Duration::from_secs(REOBSERVE_PAUSE_SECONDS),
     };
     let worktree = PathBuf::from(&record.worktree);
     let mut reobservations = 0usize;
@@ -350,9 +375,13 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
                 reobservations,
                 &budget,
             ) {
-                Next::Reobserve => {
+                Next::Reobserve(pause) => {
                     reobservations += 1;
-                    world::print_line("    a signal could not be observed — looking again");
+                    world::print_line(&format!(
+                        "    a signal could not be observed — sleeping {}s before looking again",
+                        pause.as_secs()
+                    ));
+                    world::sleep(pause);
                     continue;
                 }
                 Next::SpendCiBudget => {

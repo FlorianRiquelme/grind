@@ -432,13 +432,16 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_check_holds_completion_open_and_a_pr_with_no_checks_does_not() {
+    fn a_pending_check_holds_completion_open_and_an_absent_one_does_not() {
         let mut seen = observation();
         seen.checks_pending = Observed::Present(true);
         assert!(matches!(
             verdict(&signals_of(&seen), false),
             Verdict::Incomplete(_)
         ));
+        // `observe::checks` could not return `Absent` before Fix 1 — it is what a Run with no
+        // PR yet now produces, and `signals_of` reads it as nothing left to hold open, not as
+        // blind.
         seen.checks_pending = Observed::Absent;
         assert_eq!(verdict(&signals_of(&seen), false), Verdict::Completed);
     }

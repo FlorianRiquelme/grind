@@ -5,12 +5,38 @@ date: 2026-07-29
 
 # Headless deliberately lags the local session
 
+> **Re-amended 2026-08-07 by [#50](https://github.com/FlorianRiquelme/grind/issues/50).**
+> **The Job names the version too.** #50 story 5 requires the plugin reference to be refused
+> unless it carries both `name@marketplace` and a literal `x.y.z`, and the base implements that:
+> `PluginPin::parse` refuses a Job without one, and `job::plugin_dir()` builds the resolved path
+> from that literal. Nothing scans the host. So *the host names the version, which is whatever is
+> installed* — the #42 sentence directly below — is **withdrawn**, and with it the quieter-queue
+> trade: a Dispatch **is** refused over an absent version, and *Promotion is mechanical* in the
+> Consequences below stands as originally written.
+>
+> Why the reversal, rather than teaching `plugin_dir()` to resolve the newest installed version:
+> the literal-`x.y.z` shape is the carrier that makes `Latest` **unspellable**. Host-side
+> resolution reintroduces it under another name — a Job that says only `name@marketplace` means
+> *whatever this box happens to have*, which is the same silent-drift risk #42's own mirror-risk
+> paragraph accepted and left merely observable. Refusing at parse time is cheaper than observing
+> after the fact.
+>
+> **#42's load-bearing half survives unchanged and is the part that matters:** resolution happens
+> **once**, at dispatch, and the resolved path lands in the record, so every attempt and every
+> `--resume` reads the record rather than re-resolving. A Run's plugin version is fixed and
+> knowable for the Run's whole life. That was always the real content of #42; what this amendment
+> withdraws is only where the version *comes from*, not when it is frozen.
+>
+> Established resolving [#51](https://github.com/FlorianRiquelme/grind/pull/51), where the base
+> was found to implement the pre-#42 reading while this ADR and `CLAUDE.md` described the amended
+> one — a contract no code held.
+
 > **Amended 2026-08-06 by [#42](https://github.com/FlorianRiquelme/grind/issues/42).**
 > **The plugin version is frozen per Run at dispatch, not pinned per Job.** The Job names the
 > plugin; the host names the version, which is whatever is installed. *Promotion is mechanical*
 > below therefore loses its reviewable half — advancing a version is now an auto-update, not an
 > edit to a Job — and *never resolve latest at dispatch* is withdrawn as written. What that rule
-> protected survives intact and by a different carrier: `resolve_plugin_dir()` runs **once**, at
+> protected survives intact and by a different carrier: `job::plugin_dir()` runs **once**, at
 > dispatch, and the resolved path lands in the record, so every attempt and every `--resume` reads
 > the record rather than re-resolving. A Run's plugin version is fixed and knowable for the Run's
 > whole life — [#32](https://github.com/FlorianRiquelme/grind/issues/32)'s *conditions read from

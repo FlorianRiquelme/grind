@@ -18,8 +18,11 @@ case "$1 $2" in
         case "$a" in *statusCheckRollup*) KIND=rollup ;; esac
       done
       # The world moves underneath a Run: the PR appears at the attempt the scenario names.
+      # The explicit unreachable override (`$KIND.code`) wins over the appears-gate, and while
+      # no PR exists yet the gate applies to *both* projections — a real `gh` cannot answer the
+      # rollup question about a PR that does not exist either.
       APPEARS=$(cat "$F/pr_from" 2>/dev/null || echo 1)
-      if [ "$KIND" = pr ] && [ "$COUNT" -lt "$APPEARS" ]; then
+      if [ ! -f "$F/$KIND.code" ] && [ "$COUNT" -lt "$APPEARS" ]; then
         printf 'no pull requests found for branch\n' >&2
         exit 1
       fi

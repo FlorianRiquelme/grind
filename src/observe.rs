@@ -189,6 +189,12 @@ fn parse_pr(body: &str) -> Option<Pr> {
 /// *did anything come back red*. They are separate signals: one holds completion open and the
 /// other lands on the verdict line without holding anything (ADR-0003).
 pub fn checks(completed: &Completed) -> (Observed<bool>, Observed<bool>) {
+    // No PR yet is the normal early state of every Run, not a blind one — `pr()` already draws
+    // this line, and doing it here too is what stops the old script's "no PR = completed" bug
+    // from resurfacing as "no PR = blind" instead.
+    if says_no_pr(&completed.stderr) {
+        return (Observed::Absent, Observed::Absent);
+    }
     if completed.code != Some(0) || !completed.stdout.trim().starts_with('{') {
         let reason = Reason::of("gh pr view --json statusCheckRollup", completed);
         return (
@@ -728,6 +734,17 @@ mod tests {
         ));
         assert!(matches!(pending, Observed::Unobservable(_)));
         assert!(matches!(red, Observed::Unobservable(_)));
+    }
+
+    #[test]
+    fn a_run_with_no_pr_yet_reads_checks_as_absent_rather_than_could_not_observe() {
+        // The normal early state of every Run is "no PR yet", not "blind" — this is the same
+        // line `pr()` already draws, drawn here too so the old script's "no PR = completed"
+        // bug does not resurface one module over as "no PR = blind".
+        let none = completed("", "no pull requests found for branch\n", Some(1));
+        let (pending, red) = checks(&none);
+        assert_eq!(pending, Observed::Absent);
+        assert_eq!(red, Observed::Absent);
     }
 
     #[test]

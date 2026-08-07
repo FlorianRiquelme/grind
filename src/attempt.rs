@@ -22,7 +22,7 @@ use std::path::Path;
 /// Weakening the list is **intent**, and no carrier defends against intent. What is typeable is
 /// the narrower, omission-shaped property below: every invocation carries them. The contents
 /// stay prose, in `CLAUDE.md`, where they already are.
-pub const DENIED_TOOLS: [&str; 7] = [
+pub const DENIED_TOOLS: [&str; 12] = [
     "Bash(gh pr merge*)",
     "Bash(git push --force*)",
     "Bash(git push -f*)",
@@ -30,6 +30,19 @@ pub const DENIED_TOOLS: [&str; 7] = [
     "Bash(git rebase*)",
     "Bash(git checkout main*)",
     "Bash(git branch -D*)",
+    // Deletes a branch through `push`, the sibling of `git branch -D` above.
+    "Bash(git push --delete*)",
+    // The `+refspec` force. Also refuses a push to a branch with a literal `+` in its name —
+    // an acceptable false refusal for a barrier of this kind.
+    "Bash(git push*+*)",
+    // Every `git -C` invocation, not just the dangerous ones. A Run works inside its own
+    // worktree via cwd, so `git -C` pointing anywhere is outside the shape it should have —
+    // enumerating `-C` × each forbidden verb is the whack-a-mole this glob avoids.
+    "Bash(git -C*)",
+    // The sibling of `git checkout main` above.
+    "Bash(git switch main*)",
+    // Merge through the API rather than `gh pr merge`.
+    "Bash(gh api*merge*)",
 ];
 
 /// Re-entry rides Claude Code's own session resume, not an `lfg` return value: `lfg` exposes no
@@ -261,6 +274,10 @@ pub struct Attempt {
     /// Whether the child's stdout parsed at all. An unparseable response is a record that says
     /// so, not an aborted supervisor.
     pub parse_ok: bool,
+    /// `Some("unparseable-output")` when `parse_ok` is false, `Some("result-field-missing")`
+    /// when the payload parsed but its `result` key did not arrive, the payload's own subtype
+    /// otherwise. Two distinct synthetic values rather than one, so a renamed field never reads
+    /// the same as garbage that never parsed.
     pub subtype: Option<String>,
     pub stop_reason: Option<String>,
     pub api_error_status: Option<String>,
@@ -291,6 +308,12 @@ pub fn classify(
     let parse_ok = parsed.is_some();
     let value = parsed.unwrap_or(serde_json::Value::Null);
 
+    // Absent is not the same fact as present-and-empty: `result.get` distinguishes a key that
+    // never arrived (a renamed or dropped field in an otherwise well-formed payload) from one
+    // that arrived null or empty. Folding the two together with `.unwrap_or_default()` is how
+    // a finished Run's DONE promise, sitting under a renamed key, read as `done_promise: false`
+    // indistinguishable from a session that truly said nothing.
+    let result_present = value.get("result").is_some();
     let result = text_at(&value, "result").unwrap_or_default();
     let is_error = value
         .get("is_error")
@@ -305,10 +328,20 @@ pub fn classify(
         exit_code: code,
         is_error,
         parse_ok,
-        subtype: if parse_ok {
-            text_at(&value, "subtype")
-        } else {
+        // `subtype` already carries a synthetic value for one kind of drift
+        // (`unparseable-output`, when the whole payload did not parse); a missing `result` key
+        // gets its own synthetic value here rather than folding into that one. A single
+        // `Attempt` has no room for a new field without breaking the record's shape everywhere
+        // it is built by hand (ADR-0006's point about widening a record's vocabulary), and
+        // collapsing both drifts into one string would make a payload that parsed cleanly but
+        // renamed a field indistinguishable, in the operator-facing announce line, from a
+        // payload that never parsed at all — its own loss of information.
+        subtype: if !parse_ok {
             Some("unparseable-output".to_string())
+        } else if !result_present {
+            Some("result-field-missing".to_string())
+        } else {
+            text_at(&value, "subtype")
         },
         stop_reason: text_at(&value, "stop_reason"),
         api_error_status: text_at(&value, "api_error_status"),
@@ -324,8 +357,17 @@ pub fn classify(
         done_promise: result.contains("<promise>DONE</promise>"),
         rate_limited: is_rate_limited(&value),
         // The tail is kept whether or not the response parsed, so an unreadable child still
-        // leaves something diagnosable.
-        result_tail: tail(if parse_ok { &result } else { stdout }, 1500),
+        // leaves something diagnosable. A missing `result` key takes the same fallback as an
+        // unparseable payload, for the same reason: there is nothing under that key to show
+        // either way, and the raw stdout is the only thing left to look at.
+        result_tail: tail(
+            if parse_ok && result_present {
+                &result
+            } else {
+                stdout
+            },
+            1500,
+        ),
     }
 }
 
@@ -404,6 +446,8 @@ mod tests {
     const TRUNCATED: &str = include_str!("../tests/fixtures/run1/degraded-truncated.stdout.json");
     const GARBAGE: &str = include_str!("../tests/fixtures/run1/degraded-garbage.stdout.json");
     const EMPTY: &str = include_str!("../tests/fixtures/run1/degraded-empty.stdout.json");
+    const DEGRADED_RENAMED: &str =
+        include_str!("../tests/fixtures/run1/degraded-renamed.stdout.json");
 
     fn job() -> Job {
         Job {
@@ -442,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn every_built_argv_carries_all_seven_globs_on_all_three_paths() {
+    fn every_built_argv_carries_all_twelve_globs_on_all_three_paths() {
         let conditions = conditions(None, None);
         for invocation in [
             dispatch(&conditions, &job()),
@@ -455,6 +499,93 @@ mod tests {
                 "{:?} must carry every denial",
                 invocation.mode()
             );
+        }
+    }
+
+    /// A minimal reimplementation of the two facts CLAUDE.md's `DENIED_TOOLS` section states
+    /// about Claude Code's own deny-glob matcher: `*` may appear anywhere in the pattern (start,
+    /// middle or end), and matching is per-subcommand after splitting the full command line on
+    /// `&&`, `||`, `;`, `|`, `|&`, `&` and newlines. **This tests our own understanding of that
+    /// matcher, not the matcher itself** — the real one lives in Claude Code and cannot be
+    /// imported here, so a bug in this reimplementation would pass silently. Keep it dumb:
+    /// full-string match, `*` the only wildcard, no other glob syntax.
+    fn glob_matches(pattern: &str, candidate: &str) -> bool {
+        fn rec(p: &[u8], c: &[u8]) -> bool {
+            match p.first() {
+                None => c.is_empty(),
+                Some(b'*') => rec(&p[1..], c) || (!c.is_empty() && rec(p, &c[1..])),
+                Some(head) => c.first() == Some(head) && rec(&p[1..], &c[1..]),
+            }
+        }
+        rec(pattern.as_bytes(), candidate.as_bytes())
+    }
+
+    fn subcommands_of(command: &str) -> Vec<String> {
+        let mut pieces = vec![command.to_string()];
+        for separator in ["|&", "&&", "||", ";", "|", "&", "\n"] {
+            pieces = pieces
+                .iter()
+                .flat_map(|p| p.split(separator).map(str::to_string).collect::<Vec<_>>())
+                .collect();
+        }
+        pieces.into_iter().map(|p| p.trim().to_string()).collect()
+    }
+
+    fn is_denied(command: &str) -> bool {
+        subcommands_of(command).iter().any(|sub| {
+            DENIED_TOOLS.iter().any(|glob| {
+                let pattern = glob
+                    .strip_prefix("Bash(")
+                    .and_then(|g| g.strip_suffix(')'))
+                    .expect("every DENIED_TOOLS glob is Bash(...)");
+                glob_matches(pattern, sub)
+            })
+        })
+    }
+
+    #[test]
+    fn each_forbidden_operation_has_a_glob_that_refuses_it_under_the_documented_matcher() {
+        // Table of forbidden operation -> a candidate command string that performs it. This is
+        // the coverage the membership test above cannot give: the globs were present all along
+        // for the seven original spellings, and still missed the five spellings below.
+        let table: [(&str, &str); 12] = [
+            ("merge via gh pr merge", "gh pr merge 123 --squash"),
+            ("force push with --force", "git push --force origin feat/x"),
+            ("force push with -f", "git push -f"),
+            ("hard reset", "git reset --hard HEAD~3"),
+            ("rebase", "git rebase main"),
+            ("checkout main", "git checkout main"),
+            ("branch delete with -D", "git branch -D feat/x"),
+            ("branch delete via push", "git push --delete origin feat/x"),
+            ("the +refspec force", "git push origin +main"),
+            (
+                "the -C prefix moving the verb off the front",
+                "git -C /tmp/other push --force",
+            ),
+            ("switch onto main", "git switch main"),
+            (
+                "merge through the api",
+                "gh api repos/o/r/pulls/12/merge -X PUT",
+            ),
+        ];
+        for (name, candidate) in table {
+            assert!(is_denied(candidate), "{name}: {candidate:?} must be denied");
+        }
+        // Denials are per-subcommand after splitting on shell operators, so a prefix like `cd`
+        // ahead of the forbidden verb must not let it through.
+        assert!(is_denied("cd /tmp && git push --force origin main"));
+    }
+
+    #[test]
+    fn ordinary_operations_the_barrier_must_not_catch_are_not_denied() {
+        for allowed in [
+            "git push origin feat/x",
+            "git status",
+            "git branch -d feat/x",
+            "gh pr view 12",
+            "git checkout feat/x",
+        ] {
+            assert!(!is_denied(allowed), "{allowed:?} must not be denied");
         }
     }
 
@@ -592,20 +723,40 @@ mod tests {
 
     #[test]
     fn unparseable_stdout_becomes_a_record_that_says_so_and_keeps_the_tail() {
+        // Expectations here are derived independently of `tail` rather than by calling it a
+        // second time: `tail` is the production path's own helper, so re-invoking it would let
+        // an off-by-one or wrong-end bug in `tail` reproduce identically on both sides of the
+        // assertion and pass unnoticed.
         for raw in [TRUNCATED, GARBAGE, EMPTY] {
             let found = classify(raw, Some(1), 1, Mode::Dispatch, "start", "end");
             assert!(!found.parse_ok, "this fixture does not parse");
             assert_eq!(found.subtype.as_deref(), Some("unparseable-output"));
             assert!(found.is_error);
-            assert_eq!(
-                found.result_tail,
-                tail(raw, 1500),
-                "the tail is what was actually there"
+            assert!(
+                found.result_tail.chars().count() <= 1500,
+                "a tail is never longer than what it was asked to keep"
+            );
+            assert!(
+                raw.ends_with(found.result_tail.as_str()),
+                "a tail must be a suffix of what it came from"
             );
         }
-        // The truncated one is the case that matters: bytes arrived and then stopped.
+        // The truncated fixture is 1998 characters, long enough to actually cross the
+        // 1500-character boundary — the case that matters, where bytes arrived and then stopped.
         let truncated = classify(TRUNCATED, Some(1), 1, Mode::Dispatch, "start", "end");
-        assert!(!truncated.result_tail.is_empty());
+        assert_eq!(truncated.result_tail.chars().count(), 1500);
+        assert_ne!(
+            truncated.result_tail, TRUNCATED,
+            "the boundary was crossed, so the tail must actually have been cut"
+        );
+        // Both of these fixtures are under the boundary, so nothing was cut.
+        for raw in [GARBAGE, EMPTY] {
+            let found = classify(raw, Some(1), 1, Mode::Dispatch, "start", "end");
+            assert_eq!(
+                found.result_tail, raw,
+                "under the 1500-character boundary, the tail is everything there was"
+            );
+        }
     }
 
     #[test]
@@ -636,6 +787,30 @@ mod tests {
         })
         .to_string();
         assert!(!classify(&unpromised, Some(0), 4, Mode::Resume, "s", "e").done_promise);
+    }
+
+    #[test]
+    fn a_result_key_renamed_to_output_is_recorded_as_missing_not_as_an_empty_promise() {
+        // The fixture this wires in models a real drift: `claude` sent a well-formed payload
+        // whose DONE text sits under `output` rather than `result`. Before this fix, that read
+        // as `parse_ok: true, done_promise: false` — indistinguishable from a session that
+        // genuinely said nothing.
+        let found = classify(DEGRADED_RENAMED, Some(0), 1, Mode::Dispatch, "start", "end");
+        assert!(found.parse_ok, "the payload itself is well-formed JSON");
+        assert_eq!(
+            found.subtype.as_deref(),
+            Some("result-field-missing"),
+            "distinct from `unparseable-output`: this payload parsed fine"
+        );
+        assert!(
+            !found.done_promise,
+            "nothing can be read from a key that never arrived"
+        );
+        assert!(
+            found.result_tail.contains("<promise>DONE</promise>"),
+            "the raw stdout still carries the promise text under its new name, so the fallback \
+             to it keeps the diagnostic alive"
+        );
     }
 
     #[test]

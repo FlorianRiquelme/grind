@@ -87,7 +87,7 @@ fn finish(outcome: Result<supervisor::Outcome, Refusal>) -> i32 {
         }
     };
     if outcome.already_completed {
-        print("run already completed\n");
+        print(&format!("run already {}\n", outcome.state));
     }
     // The Handback is composed from a **fresh** read, not from anything the loop was holding.
     let Some(home) = world::home() else {
@@ -103,9 +103,22 @@ fn finish(outcome: Result<supervisor::Outcome, Refusal>) -> i32 {
                 decide::furthest_stage(&observation),
                 &view::record_path(&home, &outcome.run_id),
             ));
-            0
+            // Mirrors `status_one`: the exit code answers for what the fresh observation
+            // actually showed, not for the state the loop recorded on its way out — the two
+            // are read moments apart, and the Handback above is already keyed to the fresh one.
+            let signals = decide::signals_of(&observation);
+            let promised = found.attempts.last().is_some_and(|a| a.done_promise);
+            let verdict = decide::verdict(&signals, promised);
+            if matches!(verdict, decide::Verdict::Unobserved(_)) {
+                Observability::CouldNotAnswer.code()
+            } else {
+                Observability::Answered.code()
+            }
         }
-        _ => 0,
+        // A record that cannot even be found or read here is itself a failure to observe —
+        // the Handback that this command exists to produce never got composed, so a bare `0`
+        // would tell a caller checking `$?` that everything answered when nothing did.
+        _ => Observability::CouldNotAnswer.code(),
     }
 }
 

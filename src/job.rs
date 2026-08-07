@@ -174,8 +174,11 @@ pub fn from_issue_json(raw: &str) -> Result<Job, Refusal> {
             .iter()
             .find(|(key, _)| key == row)
             .map(|(_, value)| value.clone())
+            .filter(|v| !is_blank_row(v))
             .ok_or_else(|| {
-                Refusal::saying(format!("Job {url} has no `{row}` row in its field table"))
+                Refusal::saying(format!(
+                    "Job {url} has no usable `{row}` row in its field table"
+                ))
             })
     };
     let optional = |row: &str| -> Option<String> {
@@ -192,6 +195,7 @@ pub fn from_issue_json(raw: &str) -> Result<Job, Refusal> {
     validate_branch(&branch)?;
     let handoff_sha = required("handoff sha")?;
     let anchor = required("anchor artifact")?;
+    validate_anchor(&anchor)?;
     let plugin = PluginPin::parse(&required("pinned plugin version")?)?;
     let budget = optional("budget ceiling");
     let model = optional("model");
@@ -280,6 +284,15 @@ fn validate_branch(branch: &str) -> Result<(), Refusal> {
     if branch.starts_with('/') || branch.ends_with('/') || !branch.split('/').all(is_segment) {
         return Err(Refusal::saying(format!(
             "the `branch` row must be slash-separated segments with no path traversal: {branch}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_anchor(anchor: &str) -> Result<(), Refusal> {
+    if anchor.starts_with('/') || anchor.ends_with('/') || !anchor.split('/').all(is_segment) {
+        return Err(Refusal::saying(format!(
+            "the `anchor artifact` row must be slash-separated segments with no path traversal: {anchor}"
         )));
     }
     Ok(())
@@ -678,6 +691,27 @@ mod tests {
             "the refusal must name the missing row: {refusal}"
         );
         assert!(!refusal.to_string().to_lowercase().contains("invalid"));
+    }
+
+    #[test]
+    fn a_present_but_blank_handoff_sha_row_refuses_and_names_that_row() {
+        for blank in ["", "none", "-", "n/a"] {
+            let rows = FULL_ROWS.replace("`9d1f4c7a2b6e0538d4a17c9b3e5f8021ac6d4e77`", blank);
+            let refusal = from_issue_json(&issue_json(&rows)).expect_err("must refuse");
+            assert!(
+                refusal.to_string().contains("handoff sha"),
+                "the refusal must name the blank row: {refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_anchor_carrying_a_traversal_refuses_and_names_the_row() {
+        for hostile in ["../escape", "/leading", "docs/../..", "trailing/"] {
+            let rows = FULL_ROWS.replace("docs/plans/2026-08-05-002-plan.md", hostile);
+            let refusal = from_issue_json(&issue_json(&rows)).expect_err("must refuse");
+            assert!(refusal.to_string().contains("anchor artifact"), "{refusal}");
+        }
     }
 
     #[test]

@@ -396,6 +396,11 @@ fn scenario_a_a_real_run_shape_with_the_literal_argv_of_every_attempt() {
                 "Bash(git rebase*)",
                 "Bash(git checkout main*)",
                 "Bash(git branch -D*)",
+                "Bash(git push --delete*)",
+                "Bash(git push*+*)",
+                "Bash(git -C*)",
+                "Bash(git switch main*)",
+                "Bash(gh api*merge*)",
             ]
         );
         // Fixed at dispatch and read from the record on every attempt.
@@ -541,26 +546,36 @@ fn scenario_e_attempts_exhausted_is_its_own_outcome_and_not_a_death() {
 }
 
 #[test]
-fn scenario_f_a_run_that_stays_unobservable_stops_and_says_so() {
-    // A fault in Grind's own eyes must never cost an attempt or mutate a branch, so this
-    // re-observes and then stops — it does not re-enter eight times.
+fn scenario_f_an_unobservable_run_pauses_before_looking_again_and_spends_no_attempt() {
+    // A fault in Grind's own eyes must never cost an attempt, and three retries fired within
+    // milliseconds of each other cannot span the transient this pause exists for (the window
+    // after a laptop wake), so this asserts on the *announced* pause and kills the child
+    // mid-sleep — exactly scenario d's technique for the 1800s rate-limit sleep. Nothing here
+    // waits out the three real fifteen-second pauses it would otherwise take to walk this Run
+    // all the way to `unobserved`; that terminal transition is `policy`'s own
+    // `re_observation_spent_stops_as_unobserved_rather_than_as_a_death`.
     let box_ = sandbox("f-unobservable");
     box_.scenario(&["silent"]).gh_cannot_be_reached();
 
-    let (out, err, code) = box_.run(&["run", ISSUE]);
-    assert_eq!(code, Some(0), "{out}\n{err}");
+    let mut child = box_.spawn(&["run", ISSUE]);
+    let seen = wait_for_line(
+        &mut child,
+        "sleeping 15s before looking again",
+        Duration::from_secs(30),
+    );
+    assert!(
+        seen.contains("could not be observed"),
+        "a fault in Grind's own eyes, not a death:\n{seen}"
+    );
+    child.kill().expect("stop the supervisor mid-pause");
+    let _ = child.wait();
 
     let record = box_.record();
-    assert_eq!(
-        record["state"], "unobserved",
-        "*I could not look* is not *the Run died*"
-    );
     assert_eq!(
         record["attempts"].as_array().expect("attempts").len(),
         1,
         "re-observing must not cost attempts"
     );
-    assert!(out.contains("could not observe"), "it says so:\n{out}");
 }
 
 // --- the exit code reports observability, never health ----------------------------------------
@@ -680,6 +695,36 @@ fn resume_on_a_completed_run_prints_the_handback_and_starts_nothing() {
             .len(),
         attempts_before,
         "a mistyped command must not restart finished work"
+    );
+}
+
+#[test]
+fn resume_on_an_exhausted_run_prints_the_handback_and_starts_nothing() {
+    // `supervise` attempts before it ever consults `policy::next`, so without this guard a
+    // resume of an exhausted Run would spend a ninth attempt against a recorded budget of
+    // eight. The Handback names the state it actually found, so an exhausted Run reads as
+    // exhausted rather than borrowing the word `completed` from its sibling short-circuit.
+    let box_ = sandbox("resume-exhausted");
+    let run_id = a_run_that_did_not_finish(&box_);
+    let record = box_.record();
+    assert_eq!(record["state"], "exhausted");
+    let attempts_before = record["attempts"].as_array().expect("attempts").len();
+    assert_eq!(attempts_before, 8);
+
+    let (out, err, code) = box_.run(&["resume", &run_id]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert!(out.contains("run already exhausted"), "{out}");
+    assert!(
+        out.contains("run state"),
+        "the Handback, not a re-entry:\n{out}"
+    );
+    assert_eq!(
+        box_.record()["attempts"]
+            .as_array()
+            .expect("attempts")
+            .len(),
+        attempts_before,
+        "resuming an exhausted Run must not spend a ninth attempt against a recorded budget of eight"
     );
 }
 

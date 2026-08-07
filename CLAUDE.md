@@ -84,12 +84,13 @@ change carries a safety property, not for coverage's sake.
   a summary boolean on the verify contract — `if !vc.ok { return }` is a gate one line away.
 - **Grind is a scheduler, not a pipeline** (ADR-0001). Everything between plan and open PR
   belongs to `lfg`. Don't reimplement stages it already runs.
-- **The plugin version is frozen per Run, not pinned per Job** (ADR-0002 as amended by #42).
-  The Job names the plugin; the host names the version. `resolve_plugin_dir()` runs **once**, at
-  dispatch, and the resolved path goes into the record — every attempt and every `--resume` reads
-  the record. Never re-resolve per attempt: an 8-attempt Run spans hours of rate-limit sleeps, and
-  a version changing mid-Run is silent. Promotion is now enacted by changing Grind, not by
-  advancing a pin.
+- **The plugin version is pinned per Job and frozen per Run** (ADR-0002 as amended by #42 and
+  re-amended by #50). The Job names both the plugin and the version, and a reference without a
+  literal `x.y.z` is refused at parse time — that shape is what makes `Latest` unspellable.
+  `job::plugin_dir()` then runs **once**, at dispatch, and the resolved path goes into the record —
+  every attempt and every `--resume` reads the record. Never re-resolve per attempt: an 8-attempt
+  Run spans hours of rate-limit sleeps, and a version changing mid-Run is silent. Advancing the
+  pin in a Job is the act of promotion, which keeps promotion reviewable.
 - **Headless deliberately lags local** (ADR-0002). New capabilities get proven in supervised
   sessions first. Grind is not where we experiment.
 - **`DENIED_TOOLS` in `src/attempt.rs` is a safety property, and the list lives here.** A Run
@@ -103,7 +104,21 @@ change carries a safety property, not for coverage's sake.
   Bash(git rebase*)
   Bash(git checkout main*)
   Bash(git branch -D*)
+  Bash(git push --delete*)
+  Bash(git push*+*)
+  Bash(git -C*)
+  Bash(git switch main*)
+  Bash(gh api*merge*)
   ```
+
+  The last five close spellings the first seven miss, and they rely on two documented matcher
+  facts: a `*` may appear anywhere in the pattern, not only at the end, and a rule is matched
+  against each subcommand after splitting on `&&`, `;` and `|`. Two are deliberately broad.
+  `Bash(git -C*)` refuses **every** `git -C`, because a Run works inside its own worktree via
+  cwd, so `-C` pointing anywhere is outside the shape it should have — and enumerating `-C` ×
+  each forbidden verb is whack-a-mole. `Bash(git push*+*)` catches the `+refspec` force and will
+  also refuse a push to a branch with a literal `+` in its name, which is an acceptable false
+  refusal for a barrier of this kind. Widening the list is safe and welcome; narrowing it is not.
 
   Denials are inherited by subagents and survive `bypassPermissions`. Don't loosen the list to
   make a Run go through — and note that **nothing sits behind it**: no credential can withhold

@@ -22,6 +22,10 @@ pub struct Budget {
     /// How many times a blind observation may be retried before the Run stops and says so. A
     /// fault in Grind's eyes must never cost an attempt.
     pub reobservations: usize,
+    /// How long to wait between re-observations, so a transient window — the one after a
+    /// laptop wake is the case this exists for — has a real chance to clear before the next
+    /// look. Sourced from a compiled constant beside `REOBSERVATIONS`, never per-Job.
+    pub reobserve_pause: Duration,
 }
 
 /// What the loop does next.
@@ -29,9 +33,11 @@ pub struct Budget {
 pub enum Next {
     Reenter,
     SleepThenReenter(Duration),
-    /// Look again. **Never a re-entry** — an unobservable signal is a fault in Grind's eyes, and
-    /// paying for it with an attempt would let Grind's blindness mutate a branch.
-    Reobserve,
+    /// Look again, after the given pause. **Never a re-entry** — an unobservable signal is a
+    /// fault in Grind's eyes, and paying for it with an attempt would let Grind's blindness
+    /// mutate a branch. The pause is a value like every other wait in this module: given here,
+    /// taken by the loop.
+    Reobserve(Duration),
     /// The one bounded PR-babysitting invocation a decided-and-failing CI buys.
     SpendCiBudget,
     Stop(Stop),
@@ -71,7 +77,8 @@ pub fn next(
         Verdict::Uncorroborated(unmet) => Next::Stop(Stop::Uncorroborated(unmet.clone())),
         Verdict::Unobserved(blind) => {
             if reobservations < budget.reobservations {
-                Next::Reobserve
+                // The recorded pause, not a constant fired back-to-back.
+                Next::Reobserve(budget.reobserve_pause)
             } else {
                 Next::Stop(Stop::Unobserved(blind.clone()))
             }
@@ -95,10 +102,19 @@ mod tests {
     use crate::observe::Reason;
 
     fn budget(attempts: usize, limit_sleep_secs: u64) -> Budget {
+        budget_with_pause(attempts, limit_sleep_secs, 15)
+    }
+
+    fn budget_with_pause(
+        attempts: usize,
+        limit_sleep_secs: u64,
+        reobserve_pause_secs: u64,
+    ) -> Budget {
         Budget {
             attempts,
             limit_sleep: Duration::from_secs(limit_sleep_secs),
             reobservations: 3,
+            reobserve_pause: Duration::from_secs(reobserve_pause_secs),
         }
     }
 
@@ -186,9 +202,44 @@ mod tests {
         let blind = Verdict::Unobserved(vec!["PR open: gh pr view: connection reset".to_string()]);
         for spent in 0..3 {
             let found = next(&attempts, &blind, &clear(), spent, &budget(8, 1800));
-            assert_eq!(found, Next::Reobserve, "{spent} re-observations spent");
+            assert_eq!(
+                found,
+                Next::Reobserve(Duration::from_secs(15)),
+                "{spent} re-observations spent"
+            );
             assert_ne!(found, Next::Reenter);
         }
+    }
+
+    #[test]
+    fn a_blind_signal_asks_for_the_recorded_pause_and_not_a_constant() {
+        // Exactly the shape of `a_rate_limited_attempt_asks_for_the_recorded_sleep_and_not_a_constant`:
+        // three retries fired back-to-back cannot span the transient this exists for, so the
+        // spacing has to be a value read from the budget rather than a literal baked into the
+        // loop.
+        let attempts = [attempt(1, Mode::Dispatch, false)];
+        let blind = Verdict::Unobserved(vec!["PR open: gh pr view: connection reset".to_string()]);
+        assert_eq!(
+            next(
+                &attempts,
+                &blind,
+                &clear(),
+                0,
+                &budget_with_pause(8, 1800, 15)
+            ),
+            Next::Reobserve(Duration::from_secs(15))
+        );
+        // The same policy against a budget carrying a different pause.
+        assert_eq!(
+            next(
+                &attempts,
+                &blind,
+                &clear(),
+                0,
+                &budget_with_pause(8, 1800, 5)
+            ),
+            Next::Reobserve(Duration::from_secs(5))
+        );
     }
 
     #[test]
