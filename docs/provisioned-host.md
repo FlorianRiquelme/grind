@@ -108,7 +108,13 @@ with your GitHub credentials?"*.
 4. `git config --global gpg.format ssh`, `user.signingkey` at the **private** key path (so
    `ssh-keygen -Y sign` needs no `ssh-agent` on a host with no login session), `commit.gpgsign
    true`. Worktrees inherit this; repo config is shared across worktrees unless
-   `extensions.worktreeConfig` is opted into, which nothing here does.
+   `extensions.worktreeConfig` is opted into, which nothing here does. **Run 2 is this step's
+   evidence, and it is the first item the laptop demonstrably fails:** 1Password's `op-ssh-sign`
+   stopped signing twice mid-Run, which cost the Run its declared branch and left two finished
+   items uncommitted. An agent-backed signer makes committing depend on a GUI approval no Grind
+   check can see — and `ssh-add -l` keeps listing the key throughout, because listing needs no
+   approval and *using* one does, so the obvious check is the one that lies.
+   `docs/findings/0002-second-run.md`.
 5. `user.name` / `user.email` set to the machine identity, and that email **added and verified**
    on the GitHub account — GitHub matches the committer *email*, not the name, so this is what
    makes `git log` name the Run and the verified badge survive.
@@ -124,6 +130,14 @@ between a Run and merging its own PR, permanently and by construction. See #37 a
 Performed during provisioning; deliberately unchecked, because every check available is a
 heuristic guess of the kind this list keeps removing.
 
+- **The `grind` binary is on `PATH`.** — *step* — Not a layout item. `bin/claude` is named by the
+  layout because *Grind* spawns it and had to dodge a shim; nothing spawns `grind` except a human or
+  a unit file, so the layout has no mechanical use for its path — and an item declaring where the
+  binary lives cannot be checked by that binary, since a `grind doctor` you cannot invoke reports
+  nothing. That is the loudest failure available and has no honest boolean. #30 ships a prebuilt
+  file and never builds on the host; where it lands is the human's `PATH`, and `grind --version`
+  answers *which one is this* if the wrong copy is ever found there. Decided resolving
+  [#48](https://github.com/FlorianRiquelme/grind/issues/48).
 - **Auto-update for `claude` and for the plugin.** — *step* — Since the plugin version floats
   (ADR-0002 as amended), a box whose cache is baked into an image and never refreshed drifts *old*
   silently — the mirror of the risk the amendment accepts. The record makes it observable, since
