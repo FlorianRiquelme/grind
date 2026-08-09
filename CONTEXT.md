@@ -33,6 +33,13 @@ thing two of them share is the usage pool. The world moves underneath one — co
 and other Runs land commits while it works.
 _Avoid_: build, execution, night
 
+**Supervisor**:
+The process that runs one Run — dispatching its Attempts, deciding re-entry, and the sole
+writer of its Run state. One per Run and never resident: nothing watches it while the host
+is up, and a host that restarts re-enters the Runs that were cut off rather than restarting
+the supervisor itself.
+_Avoid_: daemon, service, watcher
+
 **Attempt**:
 One invocation of the agent within a Run, and the unit the Run's budget counts. A Run is
 bounded by how many Attempts do work, never by how long it takes or what it costs.

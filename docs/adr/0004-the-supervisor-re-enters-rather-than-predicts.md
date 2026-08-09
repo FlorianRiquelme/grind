@@ -108,3 +108,10 @@ is perfectly re-enterable sitting at `died` until a human notices. The superviso
 model is being decided on
 [map #5](https://github.com/FlorianRiquelme/grind/issues/5); enshrining the workaround here
 would outlive the constraint that produced it.
+
+> **Answered 2026-08-09 by [#38](https://github.com/FlorianRiquelme/grind/issues/38) — see
+> ADR-0011.** Nothing is above the supervisor, and nothing becomes so: there is no daemon, and the
+> reboot gap is closed by a boot-time one-shot calling `grind resume --all`, which re-enters only
+> Runs that were *cut off* and never ones that *stopped*. Declining to enshrine `tmux new -d` was
+> right for a second reason this section could not see — the process staying alive on a live host
+> was never the open half, so the workaround was a fix to a solved problem.

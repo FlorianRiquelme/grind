@@ -87,6 +87,27 @@ resolves.
   and every attempt and every `--resume` reads the record — so a Run's plugin version is fixed for
   the Run's whole life even though it was never pinned.
 
+## Lifetime
+
+There is no Grind daemon (ADR-0011). The host owes exactly one thing: something that fires **once
+at boot** and calls `grind resume --all`, so a restart re-enters the Runs it cut off instead of
+leaving them at `died` until a human looks. Nothing watches a supervisor while the host is up, and
+nothing needs to.
+
+**Decided, not yet on the list above.** The item is *a boot-time one-shot calling
+`grind resume --all` is installed and loaded* — `RunAtLoad` on darwin, `Type=oneshot` on linux —
+and it is marked **doctor**: a Dispatch works perfectly well without it, so refusing one would gate
+a Job on something unrelated to it (ADR-0003). It is written here without a mark on purpose,
+because the marks above are bound to `job::host_items()` by
+`every_item_carries_the_mark_the_document_gives_it`, and this item has no `Check` behind it yet.
+**Both halves land together or neither does.**
+
+Two costs to carry into that build. It is the **first platform-branching check** — `launchctl
+print` against `systemctl is-enabled`, where every existing check is one command everywhere. And it
+must verify **loaded**, not merely present: a plist sitting on disk that was never bootstrapped is
+the likeliest way this fails, and it fails silently, one reboot later, with a Run stranded and
+nothing saying so.
+
 ## Credentials
 
 [#37](https://github.com/FlorianRiquelme/grind/issues/37)'s six steps, verbatim in substance. All
