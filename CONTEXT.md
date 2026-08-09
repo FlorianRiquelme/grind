@@ -33,6 +33,23 @@ thing two of them share is the usage pool. The world moves underneath one — co
 and other Runs land commits while it works.
 _Avoid_: build, execution, night
 
+**Attempt**:
+One invocation of the agent within a Run, and the unit the Run's budget counts. A Run is
+bounded by how many Attempts do work, never by how long it takes or what it costs.
+_Avoid_: try, retry, iteration
+
+**Wait**:
+An Attempt that did no work — it cost nothing and took at most one turn, because the world
+was not ready for it. A Wait is not a failure and never spends the budget; a Run that only
+waits is bounded separately, by how many it does in a row.
+_Avoid_: probe, retry, no-op, free attempt
+
+**Blocker**:
+An obstacle a Run cannot clear itself and a human can. A Run that meets one stops at once
+rather than spending Attempts against it, and resumes where it stopped once the human has
+cleared it — the world changed, not the budget.
+_Avoid_: failure, error, stuck
+
 **Handoff SHA**:
 The commit at which the human stopped and the Run begins. Context is everything behind
 it; reviewable output is everything in front of it.

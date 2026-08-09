@@ -45,6 +45,25 @@ The policy is a thing that changes on its own:
 [#23](https://github.com/FlorianRiquelme/grind/issues/23) will decide whether a no-progress
 re-entry costs an attempt at all.
 
+> **Amended 2026-08-09 by [#23](https://github.com/FlorianRiquelme/grind/issues/23).** It
+> decided, and the shape moved: **the budget bounds futility, so an Attempt that did no work
+> costs nothing.** A **Wait** — zero cost, at most one turn — is free, and a run of consecutive
+> Waits is bounded by its own counter the way `reobservations` is. Two Runs paid for this: Run 1
+> spent 5 of 8 on laptop sleep, Run 2 spent 6 of 8 on a wall that did not lift for three hours
+> and opened its PR on the last Attempt the budget allowed.
+>
+> Two things about *how* it is counted are part of the amendment, because the obvious versions
+> are both wrong. It keys on **work done, never on cause** — keying on `rate_limited` would key
+> the budget on the classifier that already nearly failed, since Run 2's *"session limit · resets
+> 5pm"* matched none of the phrases and only the literal `429` saved it. And the arithmetic reads
+> **`Attempt` and never `observe`** — a progress-based cap needs `commits_ahead`, which read `0`
+> for all eight of Run 2's Attempts while twelve commits existed, and would have killed that Run
+> faster than the flat count did.
+>
+> Exhaustion also splits: a Run stopped by a **Blocker** — something only a human can clear —
+> records `Blocked`, stops immediately, and is resumable, because it never spent the budget.
+> `Exhausted` keeps its meaning and stays terminal.
+
 ## Raw child output is written before anything parses it — carried by a type since #34
 
 **The rule now lives in the type, not here.** `RawAttempt` has private fields and is returned
