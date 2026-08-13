@@ -102,8 +102,12 @@ _Avoid_: box, machine, runner, worker
 **Handback**:
 What a finished Run leaves for the human to pick up: the Record, plus the things only the
 supervisor knows — how many Attempts did work, what it spent, what it was denied, and what could
-not be observed at all. Its shape is what the morning costs. The Record is its durable half; the
-rest is a projection and may compress.
+not be observed at all. It makes exactly five claims about the world — the verdict, and the four
+observations that decide it — and everything else it carries is cost or a pointer; it never
+re-counts what the Record already shows. Two surfaces carry it, one on the host and one on the
+Job issue, over a single set of facts, differing only in where they send the human to look. Its
+shape is what the morning costs. The Record is its durable half; the rest is a projection and may
+compress.
 _Avoid_: digest, report, results, morning
 
 **Verify entrypoint**:

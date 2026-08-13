@@ -32,9 +32,18 @@ is affordable precisely because the shell over `lfg` is thin.
 
 ## Key metrics
 
-- **Morning decisions per run** — count of findings and open questions in the handback that
-  require a decision from the human before work can continue. The primary metric; minimise
-  it. Measured from the handback itself.
+- **Handback fidelity** — of the Handback's five claims about the world (the verdict, plus the
+  four observations that decide it: PR open, tree clean, commits ahead, no check pending), how
+  many the human had to check for themselves before they could act. The primary metric;
+  minimise it. Hand-counted from the Handback beside the PR, and nothing instruments it. Run 1
+  scored 0 of 5, Run 2 scored 3 of 5 — and Run 2's morning cost was disbelief rather than
+  decisions, which is the cost the metric below could not see. Distinct from *self-diagnosable
+  failures*: that one is about explaining a death, this one about trusting a terminal fact.
+- **Morning decisions per run** — count of findings and open questions that require a decision
+  from the human before work can continue. Secondary, and minimised only alongside fidelity:
+  on its own it rewards a Run that says nothing, and every Run is now asked to narrate (issue
+  #55). **Measured from the Record — the PR and its narrative — never from the handback**, which
+  carries no findings and depends on the narrative for nothing.
 - **Unattended completion rate** — share of dispatched Runs reaching an open PR with no
   mid-run intervention. Measured from run state.
 - **Weekly-limit cost per run** — session and weekly-limit consumption a Run spends. Kept as
