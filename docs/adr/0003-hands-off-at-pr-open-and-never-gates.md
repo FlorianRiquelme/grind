@@ -11,8 +11,7 @@ It never asserts that work is ready, never blocks a PR from existing on the stre
 review finding, and never treats a green check as a completion signal. The gate is
 downstream of Grind and Grind does not own it: an agent-run review over the PR, and the
 human's merge decision over its record. From the open PR onward the human owns the feature:
-they check it, post findings in its channel, work with day agents, and either finish it or
-re-file it as a new Job. Re-filing is the only feedback path into Grind.
+they check it, work with day agents, and either finish it or re-file it as a new Job. Re-filing is the only feedback path into Grind.
 
 This is also the seam `lfg` already draws — its pipeline-mode CI watch stops at "CI
 decided", not merged, and it hands the interactive watch-to-merge back to a human.
