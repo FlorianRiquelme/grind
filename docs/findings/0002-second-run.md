@@ -147,8 +147,48 @@ finished without the promise, zero promises emitted by an attempt that actually 
 ruling that the promise is *neither necessary nor sufficient* is now carried by two independent
 observations rather than one.
 
+## The Anchor was promoted in place, and the Job's own watch item went unanswered
+
+snapper#28 named it: *"Does the Run promote the Anchor in place? snapper#27 requires
+`artifact_readiness: requirements-only → implementation-ready` **in the same file**. 1a's Run wrote
+a second plan document instead, which is the deviation #27 was answered to prevent."*
+
+It did.
+
+| | `artifact_readiness` | files under `docs/plans/` in the diff |
+|---|---|---|
+| snapper `main` | `requirements-only` | — |
+| the Run's branch, [PR #30](https://github.com/FlorianRiquelme/snapper/pull/30) | `implementation-ready`, plus a new `planned: 2026-08-06` | **one** — the Anchor itself |
+
+`ce-plan` resolved the Anchor through its *"Explicit path from the user"* branch, which enriches a
+`ce-unified-plan/v1` + `requirements-only` file **in place** rather than writing a new one. No
+second plan document exists in this Run's diff. `lfg`'s step-1 metadata gate then read the promoted
+file, which is why the classification that worried Run 1 could not bite: that gate applies to the
+plan `ce-plan` wrote, and here the plan `ce-plan` wrote *is* the Anchor.
+
+Two things follow, and neither was recorded until
+[#17](https://github.com/FlorianRiquelme/grind/issues/17) went looking:
+
+- **The Anchor already carries CE's contract, and Grind required nothing to get it.** #17's premise
+  — that the Anchor "is currently shapeless" — was true of Run 1 and false here.
+  `ce-unified-plan/v1` arrived because the human's day sessions produce it (snapper#27), not because
+  Enqueue asked for it. An Enqueue-side requirement would have been a no-op on this Run and can only
+  ever fire as a false refusal until a second target repo exists.
+- **The shape paid off in the PR body, not in the plan.** Run 1's legacy Anchor had `ce-plan`
+  *derive* 16 requirement ids into a new document, and
+  [#4](https://github.com/FlorianRiquelme/grind/issues/4) records that not one of the 16 reached the
+  PR body. Run 2's Anchor **authors** R1–R36 itself, and the PR body walks all 36. So a shaped
+  Anchor does measurably improve something, and the thing it improves is accountability at the
+  Handback rather than plan quality.
+
+**`readiness-promoted by the Run`** in `CONTEXT.md`'s Anchor artifact entry is therefore
+demonstrated rather than aspirational, on the harder of the two Jobs.
+
 ## What held
 
+- **The Anchor artifact was promoted in place, not duplicated** — `requirements-only →
+  implementation-ready` in the same file, one plan document in the diff, R1–R36 accounted for
+  individually in the PR body. The deviation snapper#27 was written to prevent did not recur.
 - **Raw written before anything parses it** (ADR-0004) — 8/8 stdout files present and parseable,
   8/8 stderr 0 bytes. Every diagnosis in this document was made from run state and raw stdout, with
   no transcript opened. #33's *empty, not truncated* survives a second Run.
@@ -177,5 +217,12 @@ observations rather than one.
   to the base's: refusing a Handoff SHA row that is not a bare SHA (incoherent input, the shape of
   the dirty-worktree refusal); observing the PR by the **Job's** branch and noticing when the Run
   pushed elsewhere; and whether a Handoff SHA that is a merge commit is adoptable at all.
+- **The Anchor artifact question closes with no carrier**
+  ([#17](https://github.com/FlorianRiquelme/grind/issues/17)): Enqueue requires no shape, because
+  two Runs got the shape without asking and the one measurable gain came from the target repo
+  adopting `ce-unified-plan/v1` on its own. What Dispatch *checks* and *says* about the Anchor is
+  [#63](https://github.com/FlorianRiquelme/grind/issues/63) — nothing verifies the file exists, and
+  the prompt asserts *"this slice is transcription, not design"* as a **constant**, which was
+  accidentally true for both Runs and fights the first design Job that arrives.
 - **`~/.grind/runs/` starts empty and this record is not migrated** (#48). This document and the
   fixture are what survive it.
