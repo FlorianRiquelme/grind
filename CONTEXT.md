@@ -57,6 +57,13 @@ rather than spending Attempts against it, and resumes where it stopped once the 
 cleared it — the world changed, not the budget.
 _Avoid_: failure, error, stuck
 
+**Fan-out**:
+The subagents one Attempt spawns to work in parallel. Claude Code substrate, never an `lfg`
+stage — which is what lets the supervisor count it without observing the pipeline. How many were
+spawned and how many returned is readable from outside; what any of them concluded is not, and
+the difference is a fact about processes rather than a judgement about the work.
+_Avoid_: stage, review pass, swarm
+
 **Handoff SHA**:
 The commit at which the human stopped and the Run begins. Context is everything behind
 it; reviewable output is everything in front of it.
