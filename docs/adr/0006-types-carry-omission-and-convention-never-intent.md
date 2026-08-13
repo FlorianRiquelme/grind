@@ -23,6 +23,13 @@ the measurements it rests on.
 > so nesting the reader under a parent that owns the writable type withdraws the carrier
 > silently — by housekeeping, which is this ADR's own *convention* mode.
 
+> **Amended 2026-08-13 by [#13](https://github.com/FlorianRiquelme/grind/issues/13).**
+> **A sixth shape is prohibited** — a boolean or verdict describing fan-out health. It is
+> `VerifyContract { ok }` in a new place, and it arrives by the same route: two counts read
+> honestly, then folded into the one field that reads well in a status line. See the table below.
+
+
+
 ## The two rulings that looked contradictory
 
 #32 ruled **one carrier per finding**, because a duplicated finding drifts — explicitly,
@@ -120,6 +127,7 @@ Grind's base must *not* have are as load-bearing as the ones it must:
 | `enum PluginPin { Pinned(_), Latest }` | once `Latest` is spelled, resolve-at-dispatch is one match arm away, and advancing that pin is the act of promotion (ADR-0001, ADR-0002). Refusal must be the absence of a spelling, not a rejected case. |
 | `VerifyContract { ok: bool }` | `present` and `missing` carry everything the handback needs. Add the boolean and `if !vc.ok { return }` is one line — a gate, in the exact place the constant says *recorded and surfaced, never enforced* (ADR-0003). |
 | `Verdict::{Rejected, Blocked, Failed}` | every variant describes what happened. ADR-0003's *verdict language describes what happened, never quality* is enforceable as a variant set and nowhere else. |
+| `fanout_healthy: bool`, `FanoutHealth::Degraded`, or any summary of a fan-out's outcome | `spawned` and `returned` carry everything the record needs, and the subtraction belongs to whoever reads them. The boolean is the verify contract's `ok` again, reached the same way: two honest counts folded into the field that reads well in a status line. What makes it worse here is what it summarises — a count of *processes* becomes an assertion about the *review a stage produced*, which is quality, which ADR-0003 refuses. Ruled resolving [#13](https://github.com/FlorianRiquelme/grind/issues/13). |
 | `Observed<T>` spelled `Result<Option<T>, E>` | #31 ruled `Result<T, E>` is two-valued in the same shape `sh(check=False)` is. The deeper reason is combinators: `.ok()`, `?` and `unwrap_or_default()` collapse three states into two *silently*, supplied free by the ecosystem. A dedicated enum has no such combinators, so every collapse must be written out where a reader could see it. |
 
 ## The fold, and the bypass rustc hands you
@@ -157,7 +165,7 @@ believes the fold is airtight is the one who ships the collapse.
 - **Ten properties become types, five shapes are prohibited, three become visibility, eight
   become tests, five stay prose.** The table is in
   [#34](https://github.com/FlorianRiquelme/grind/issues/34). *Amended: two become visibility
-  and one moves to a source-level test — see above.*
+  and one moves to a source-level test, and the prohibited shapes are now six — see above.*
 - **The claim to make downstream is narrow.** These carriers stop an agent forgetting and stop
   an agent reaching for the idiom. They stop nothing an agent means to do. ADR-0005 already says
   this about omission; the addition here is that convention is the mode most of Grind's rules
