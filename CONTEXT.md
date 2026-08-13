@@ -81,6 +81,15 @@ supervisor is its only writer — reading it never writes it — and it names th
 it, because it does not travel.
 _Avoid_: artifacts, journal, log
 
+**Record**:
+The durable account of a Run and the one a human actually reads: the open PR together with the
+branch behind it. It is written complete, carries the Run's own narrative on top — decisions
+taken, the non-obvious, what surprised it — and is identified by the commit the Run pushed
+rather than by the branch its Job named. Run state is the supervisor's working copy of the same
+Run and does not travel; every other surface that shows a Run is a projection of the Record and
+may compress.
+_Avoid_: log, report, write-up, PR description
+
 **Provisioned host**:
 A machine a Dispatch can succeed on. One definition, and the laptop must meet it too — an
 item it cannot satisfy is a wrong item, not a special machine. The host declares itself by
@@ -89,8 +98,10 @@ the layout of `~/.grind/` rather than by configuration, and what it owes is list
 _Avoid_: box, machine, runner, worker
 
 **Handback**:
-What a finished Run leaves for the human to pick up — the open PR, the seeded feature
-channel, and the findings and residuals inside them. Its shape is what the morning costs.
+What a finished Run leaves for the human to pick up: the Record, plus the things only the
+supervisor knows — how many Attempts did work, what it spent, what it was denied, and what could
+not be observed at all. Its shape is what the morning costs. The Record is its durable half; the
+rest is a projection and may compress.
 _Avoid_: digest, report, results, morning
 
 **Feature channel**:
