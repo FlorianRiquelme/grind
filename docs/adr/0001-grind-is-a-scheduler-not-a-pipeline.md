@@ -27,7 +27,7 @@ autonomous residual handoff that files durable records without prompting.
 - The plugin version is **pinned per job**, so a plugin update cannot change run behaviour
   mid-experiment and invalidate comparison across runs.
 - Grind owns no shared state: it reads issues, writes run state to gitignored local
-  disk, opens PRs and creates channels.
+  disk, comments on the Job issue at dispatch and at every terminal state, and opens PRs.
 - If `lfg` turns out to be too opinionated, composing later is a mechanical decomposition
   of a known-good sequence rather than a redesign — and by then we will know which of its
   opinions actually cost us something.

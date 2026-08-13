@@ -87,7 +87,9 @@ branch behind it. It is written complete, carries the Run's own narrative on top
 taken, the non-obvious, what surprised it — and is identified by the commit the Run pushed
 rather than by the branch its Job named. Run state is the supervisor's working copy of the same
 Run and does not travel; every other surface that shows a Run is a projection of the Record and
-may compress.
+may compress. In leg 1 there is exactly one such projection that leaves the host — the
+supervisor's terminal-state comment on the Job issue — and Grind seeds no room, channel or
+second home for a feature's history.
 _Avoid_: log, report, write-up, PR description
 
 **Provisioned host**:
@@ -103,11 +105,6 @@ supervisor knows — how many Attempts did work, what it spent, what it was deni
 not be observed at all. Its shape is what the morning costs. The Record is its durable half; the
 rest is a projection and may compress.
 _Avoid_: digest, report, results, morning
-
-**Feature channel**:
-The Buzz room that carries a feature's history — seeded by the Run, continued by the
-human and their day agents, archived by hand when the feature is done.
-_Avoid_: thread, room, digest
 
 **Verify entrypoint**:
 A repo's own generic answer to "how do I check this", adopted rather than invented, and

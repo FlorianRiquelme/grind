@@ -42,7 +42,7 @@ is affordable precisely because the shell over `lfg` is thin.
   scarce input is refined plans, and they arrive slower than the limit refills. Measured from
   run state plus `claudefuel`.
 - **Self-diagnosable failures** — of Runs that died, the share the human could explain from
-  run state, PR and channel alone, without re-dispatching or reading raw transcripts. This
+  run state and the Record alone, without re-dispatching or reading raw transcripts. This
   is what makes the record debuggable by a day session rather than an archive.
 
 ## Tracks
@@ -68,8 +68,9 @@ matters. That argues against an agent and nothing more: the base is a compiled R
 
 ### The record
 
-Draft PR provenance and the seeded Buzz feature channel: what happened, faithfully, in the
-two places the feature's history will continue to live.
+The open PR together with the branch behind it — the Record — carrying what happened,
+faithfully, in the one place a human actually reads. Everything else that shows a Run is a
+projection of it and may compress.
 
 _Why it serves the approach:_ Because Grind never gates, the record is the entire basis on
 which a human decides what the Run's output is worth.
@@ -87,8 +88,9 @@ that earns trust. A Run that produces good code and an unreadable pile has still
 - Multi-user or team deployment — colleagues fork their own version and run it on their own
   infrastructure against their own Claude plan. Not only a scoping preference: one plan
   serving several people is against Anthropic's terms.
-- A cross-run digest or cockpit — channel presence already does the "needs you" job, and a
-  projection over run state is an hour's work if a week of runs shows it is wanted.
+- A cross-run digest or cockpit — nothing does the "needs you" job in leg 1, and that is the
+  ruling rather than a gap: the human looks, and is never reached. A projection over run
+  state is an hour's work if a week of runs shows it is wanted.
 - Gating a PR on review findings — the gate is downstream of Grind and Grind does not own
   it. See ADR-0003.
 - Proving new capabilities headlessly — new lenses, an adversarial pass, `depth:full` and
