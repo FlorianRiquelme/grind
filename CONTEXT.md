@@ -65,9 +65,18 @@ the difference is a fact about processes rather than a judgement about the work.
 _Avoid_: stage, review pass, swarm
 
 **Handoff SHA**:
-The commit at which the human stopped and the Run begins. Context is everything behind
-it; reviewable output is everything in front of it.
+The commit at which the human stopped and the Run begins. It bounds **authorship**, not
+visibility: everything in front of it is the Run's, which is what makes `handoff_sha..HEAD`
+a reviewable diff. The Run may read past it — the default branch moves while it works — but
+only to avoid colliding with the world, never to change what it builds.
 _Avoid_: base, head, start commit
+
+**Base drift**:
+The target repo's default branch moving after the Handoff SHA. It is the standing condition
+rather than a mode, was present with zero Runs in flight, and is invisible where it matters
+most — two files claiming ADR-0001 have different names, so git merges clean and reports
+nothing. Observed and surfaced when non-zero, never enforced.
+_Avoid_: divergence, staleness, conflict
 
 **Anchor artifact**:
 The one file a Run is pointed at explicitly as the requirements it must satisfy —
@@ -103,8 +112,8 @@ _Avoid_: box, machine, runner, worker
 What a finished Run leaves for the human to pick up: the Record, plus the things only the
 supervisor knows — how many Attempts did work, what it spent, what it was denied, and what could
 not be observed at all. It makes exactly five claims about the world — the verdict, and the four
-observations that decide it — and everything else it carries is cost or a pointer; it never
-re-counts what the Record already shows. Two surfaces carry it, one on the host and one on the
+observations that decide it — and everything else it carries is cost, a pointer, or a fact that
+decides nothing and appears only when non-zero; it never re-counts what the Record already shows. Two surfaces carry it, one on the host and one on the
 Job issue, over a single set of facts, differing only in where they send the human to look. Its
 shape is what the morning costs. The Record is its durable half; the rest is a projection and may
 compress.
