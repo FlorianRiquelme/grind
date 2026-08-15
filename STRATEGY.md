@@ -58,8 +58,10 @@ is affordable precisely because the shell over `lfg` is thin.
 
 ### Enqueue
 
-Everything at the seam: the labelled issue in the target repo, the Handoff SHA, the anchor
-artifact, the decomposability admission check, the pinned plugin version.
+Everything at the seam: the Job issue in the target repo, the Handoff SHA, the anchor
+artifact, the decomposability admission check, the pinned plugin version. Enqueue is also
+where the Dispatch is offered — the trigger is a push closing this step, never a watcher
+observing anything (ADR-0012).
 
 _Why it serves the approach:_ Enqueue is the last moment a human is present, so it is the
 only place a badly shaped job can be caught before it fails unattended and expensively.
@@ -108,5 +110,8 @@ that earns trust. A Run that produces good code and an unreadable pile has still
   written. Dispatch is human-managed because Grind never selects a Job, not because the human
   is rationing the weekly limit. The credentials half is already settled: a remote host needs
   its own `setup-token` regardless (issue #7).
-- A central cross-repo queue — `gh search issues --label <x> --assignee @me` is the queue
-  view, and a central one would orphan each issue from its code.
+- A central cross-repo queue — a central one would orphan each issue from its code. The
+  justification used to be that `gh search issues --label <x> --assignee @me` already _is_ the
+  queue view; ADR-0012 took the label away, so the queue view is now whatever the human's own
+  tracker gives them and Grind cannot see it either way. The ruling is unchanged; only its
+  example was.

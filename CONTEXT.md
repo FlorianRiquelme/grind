@@ -6,24 +6,28 @@ human is not present for, and stops at an open PR.
 ## Language
 
 **Job**:
-One unit of queued work, filed as a labelled GitHub issue in the repo the work happens
-in. Names a target repo, a branch, a Handoff SHA and an Anchor artifact.
+One unit of queued work, filed as a GitHub issue in the repo the work happens in. Names a
+target repo, a branch, a Handoff SHA and an Anchor artifact. What makes it a Job is what its
+body names, never a label — Grind applies none (ADR-0012).
 _Avoid_: ticket, task, plan
 
 **Enqueue**:
 The single conversational step, with the human present, that turns a prepared branch into
-a Job.
+a Job. It may close by offering the Dispatch, which is what keeps filing and starting one
+act rather than two.
 _Avoid_: file, submit, schedule
 
 **Queue**:
-The Jobs waiting, seen as a label query over GitHub issues rather than held anywhere.
-Grind never selects from it; a human does, by naming a Job. Dispatch dequeues by removing
-the label.
+The Jobs filed and not yet started, found however the human's own tracker already finds
+things. Grind has no part in it — it applies no label, runs no query, and cannot tell a
+queued Job from any other issue (ADR-0012). Nothing waits here for a mechanism: a Job waits
+only because its human has not yet chosen to start it.
 _Avoid_: backlog, pipeline, list
 
 **Dispatch**:
-Starting a Run for a Job, always by a human naming that Job. Grind never selects. A
-schedule can only delay a Dispatch a human already chose, never choose one.
+Starting a Run for a Job, always by a human naming that Job. Grind never selects — not the
+Job, and not the host it runs on. Nothing watches the Queue and nothing fires on a schedule;
+the act that files a Job is the act that may start it.
 _Avoid_: launch, trigger, kick off
 
 **Run**:
