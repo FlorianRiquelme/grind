@@ -13,8 +13,11 @@ _Avoid_: ticket, task, plan
 
 **Enqueue**:
 The single conversational step, with the human present, that turns a prepared branch into
-a Job. It may close by offering the Dispatch, which is what keeps filing and starting one
-act rather than two.
+a Job. It drafts the whole Job from what that session already knows — deriving what the repo
+can tell it, asking only where deriving would guess — and files nothing the human has not read.
+It closes by offering the Dispatch, which is what keeps filing and starting one act rather than
+two; declining is what leaves the Job on the Queue. It writes no taxonomy of its own
+(ADR-0012), so a Job left waiting is marked however its human already marks things.
 _Avoid_: file, submit, schedule
 
 **Queue**:
@@ -133,6 +136,7 @@ _Avoid_: verify command, test command, gate
 
 **Promotion**:
 Moving a capability from supervised local sessions into Grind, once it has stopped
-needing correction. Enacted by changing Grind — no longer by advancing a pinned plugin
-version, which floats with the host (ADR-0002 as amended).
+needing correction. Enacted by changing Grind — never by advancing a pinned plugin version,
+which is resolved fresh at each Enqueue and so moves without anyone deciding it
+(ADR-0002 as amended a third time).
 _Avoid_: rollout, enablement, release
