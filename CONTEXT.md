@@ -71,8 +71,11 @@ _Avoid_: stage, review pass, swarm
 **Handoff SHA**:
 The commit at which the human stopped and the Run begins. It bounds **authorship**, not
 visibility: everything in front of it is the Run's, which is what makes `handoff_sha..HEAD`
-a reviewable diff. The Run may read past it — the default branch moves while it works — but
-only to avoid colliding with the world, never to change what it builds.
+a reviewable diff. That diff exists only where the commit is **reachable from the worktree the
+Run adopts**, so Dispatch refuses a Job whose branch does not already contain it: stopping on a
+merge commit is ordinary, and adopting a branch that has not caught up with one is incoherent.
+The Run may read past it — the default branch moves while it works — but only to avoid
+colliding with the world, never to change what it builds.
 _Avoid_: base, head, start commit
 
 **Base drift**:
