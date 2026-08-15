@@ -5,6 +5,29 @@ date: 2026-07-29
 
 # Headless deliberately lags the local session
 
+> **Amended a third time 2026-08-15 by [#69](https://github.com/FlorianRiquelme/grind/issues/69).**
+> **Promotion is not the pin, and never was after #42.** *Promotion is mechanical* in the
+> Consequences below — *"Grind pins a version per job. Advancing that pin is the act of
+> promotion, which means promotion is reviewable and revertible"* — is **withdrawn for good**.
+> Enqueue resolves the newest installed version at the moment it drafts the Job and writes that
+> literal, so nobody advances anything: a pin moves because the local cache updated. The freeze
+> survives untouched and is the whole of what the pin is for — one resolution, at Enqueue, landing
+> in the record, so a Run's version is fixed and knowable for its whole life.
+>
+> This is **not** the host-side resolution #50 refused, and #50's argument survives rather than
+> losing. #50 refused a Job spelling only `name@marketplace`, resolved by `plugin_dir()` on
+> whatever box received it — `Latest` under another name, resolved with nobody watching. Enqueue
+> resolves **once, with the human present, and writes the literal**, so the Job still cannot spell
+> `Latest`, `PluginPin::parse` still refuses a reference without an `x.y.z`, and the resolution is
+> visible in the Job body where a human reads it before filing.
+>
+> What it costs, stated: a Job's first unattended use of a version is no longer preceded by anyone
+> choosing that version, and the local cache held **six** at the time of writing — `3.20.0` through
+> `3.21.4`, with Run 1 on `3.21.0` and Run 2 on `3.21.3`. The lag this ADR is actually about is
+> untouched, because it was never versioned: **headless still lags local**, and the capabilities it
+> withholds are behavioural. `CONTEXT.md`'s **Promotion** entry already described this state and is
+> correct as written; this ADR was the document that was behind.
+
 > **Re-amended 2026-08-07 by [#50](https://github.com/FlorianRiquelme/grind/issues/50).**
 > **The Job names the version too.** #50 story 5 requires the plugin reference to be refused
 > unless it carries both `name@marketplace` and a literal `x.y.z`, and the base implements that:
