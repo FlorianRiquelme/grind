@@ -136,6 +136,13 @@ change carries a safety property, not for coverage's sake.
   is typeable, an agent that means to do it is not. And a variant set is a policy — a careless
   type makes a forbidden thing newly *expressible*, which means reachable, because nobody reads
   the diff. ADR-0006 lists the shapes the base must not have.
+- **`skills/enqueue/` ships a skill, not code, and its table is a contract with `src/job.rs`.**
+  Enqueue is invoked from a session in the **target** repo, so it is symlinked into
+  `~/.claude/skills/` to be loadable at all; it lives here because the Job table it writes is what
+  `job::from_issue_json` reads back, and **nothing tests that seam** — no test spans a skill and a
+  parser. One repo means one diff, which is the whole of the mitigation. Change either half and
+  check the other. It is not a `docs/provisioned-host.md` item: a host needs `grind run`, never
+  Enqueue.
 
 ## Agent skills
 
