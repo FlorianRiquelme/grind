@@ -7,9 +7,9 @@
 //! **Verdict language describes what happened, never quality** (ADR-0003). Check every string
 //! this module emits against that rule; there is a test at the bottom that does.
 
-use crate::decide::{Stage, Verdict, VerifyContract, VerifyCoverage};
+use crate::decide::{Stage, Verdict, VerifyContract};
 use crate::observe::{Observation, Observed, Outcome, UNOBSERVABLE_MARK};
-use crate::view::{Live, RosterRow, RunView};
+use crate::view::{Facts, Live, RosterRow, RunView};
 use std::path::Path;
 
 /// One item of doctor's report, as `cli` hands it over: the name and the depth mark alongside
@@ -175,25 +175,6 @@ pub fn not_here(run_id: &str, hostname: &str) -> String {
     )
 }
 
-/// Everything a Handback is composed from. **One fact set, and both renderers take it.**
-///
-/// Two independently-chosen lists would drift *invisibly*, because nobody ever sees both
-/// renderings of one Run. The verdict is the **fresh** one, computed from the observation
-/// beside it rather than read off the record: the two are produced moments apart, and Run 2's
-/// Handback said `[exhausted]` with `PR —` over an open, green, twelve-commit PR.
-pub struct Handback<'a> {
-    pub found: &'a RunView,
-    pub observation: &'a Observation,
-    pub verdict: &'a Verdict,
-    pub contract: &'a VerifyContract,
-    pub coverage: &'a Observed<VerifyCoverage>,
-    pub furthest: Stage,
-    /// What must be cleared, when the Run stopped for a human. A fact about the world, carried
-    /// beside the verdict rather than inside it.
-    pub blocker: Option<&'a str>,
-    pub run_state: &'a Path,
-}
-
 /// One line of the observation block, with the mark it came back with.
 struct Row {
     label: &'static str,
@@ -207,8 +188,8 @@ struct Row {
 /// something moves to the trailing block, everything that is a permanent negative does not
 /// print at all, and everything that could not be observed groups where the eye can see that it
 /// is a different kind of row rather than a mark down a column it reads as uniform.
-pub fn handback(view: &Handback) -> String {
-    let Handback {
+pub fn handback(view: &Facts) -> String {
+    let Facts {
         found,
         observation,
         verdict,
@@ -218,6 +199,8 @@ pub fn handback(view: &Handback) -> String {
         blocker,
         run_state,
     } = view;
+    let furthest = *furthest;
+    let blocker = blocker.as_deref();
     let mut out = String::new();
 
     // The fresh verdict, in the top position, and the recorded state nowhere. Where the two
@@ -227,7 +210,7 @@ pub fn handback(view: &Handback) -> String {
         &mut out,
         &format!(
             "Verdict  {}",
-            handback_verdict(verdict, observation, found, *blocker)
+            handback_verdict(verdict, observation, found, blocker)
         ),
     );
     line(&mut out, "");
@@ -337,6 +320,102 @@ pub fn handback(view: &Handback) -> String {
         &format!("  run state        {}", run_state.display()),
     );
     out
+}
+
+/// **The account that leaves the host**, over the same fact set the Handback renders.
+///
+/// A terminal wants fixed width; markdown wants a table. Two independently-chosen lists would
+/// drift *invisibly*, because nobody ever sees both renderings of one Run — which is why this
+/// takes [`Facts`] rather than composing its own.
+///
+/// **It carries each observation's three-valued mark and never its `Reason`.** `Reason::of`
+/// composes `<call site>: exit N: <first stderr line>`, so a reason is raw child stderr, and
+/// `observe` already forbids rendering that for host checks on the grounds that a misprovisioned
+/// host is exactly where an HTTPS `origin` embeds a token. The Handback prints reasons on the
+/// host, where the human already has them; a comment that is appended and never edited must not.
+///
+/// **No summary boolean.** A public surface is bound at least as hard as a private one.
+///
+/// Host and run-state path are published deliberately: the audience is the one already trusted
+/// with the dispatch comment, which named both.
+pub fn job_comment(view: &Facts) -> String {
+    let Facts {
+        found,
+        observation,
+        verdict,
+        contract,
+        coverage,
+        furthest,
+        blocker,
+        run_state,
+    } = view;
+    let (made, budget) = found.attempt_counter();
+    let mut out = String::new();
+    line(
+        &mut out,
+        &format!("**Run `{}` on `{}`**", found.run_id, found.hostname),
+    );
+    line(&mut out, "");
+    line(
+        &mut out,
+        &handback_verdict(verdict, observation, found, blocker.as_deref()),
+    );
+    line(&mut out, "");
+    line(&mut out, "| | |");
+    line(&mut out, "|---|---|");
+    let mut cell = |label: &str, value: &str| {
+        line(&mut out, &format!("| {label} | {value} |"));
+    };
+    cell("furthest stage", &furthest.to_string());
+    cell("attempts", &format!("{made} of {budget} (working)"));
+    cell(
+        "spend",
+        &format!("${:.2} (API pricing)", found.total_spend()),
+    );
+    cell("tool denials", &found.denial_count().to_string());
+    // The four completion observations, each with its mark and nothing else.
+    cell("PR", &marked(&observation.pr));
+    cell("tree clean", &marked(&observation.tree_clean));
+    cell("commits ahead", &marked(&observation.commits_ahead));
+    cell("checks pending", &marked(&observation.checks_pending));
+    cell("base drift", &marked(&observation.base_drift));
+    cell(
+        "fan-out",
+        &match fanout_totals(found) {
+            Observed::Present((spawned, returned)) => {
+                format!("{spawned} spawned, {returned} returned")
+            }
+            other => negative_mark(&other).to_string(),
+        },
+    );
+    // Presence **and** absence: naming only one of them is how a partial contract reads whole.
+    cell(
+        "verify contract present",
+        &or_none(&contract.present.join(", ")),
+    );
+    cell(
+        "verify contract missing",
+        &or_none(&contract.missing.join(", ")),
+    );
+    cell("verify coverage", &marked(coverage));
+    cell("run state", &format!("`{}`", run_state.display()));
+    out
+}
+
+/// The mark, and never the reason behind it.
+fn marked<T: std::fmt::Display>(found: &Observed<T>) -> String {
+    match found {
+        Observed::Present(value) => value.to_string(),
+        other => negative_mark(other).to_string(),
+    }
+}
+
+fn or_none(said: &str) -> String {
+    if said.is_empty() {
+        crate::observe::ABSENT_MARK.to_string()
+    } else {
+        said.to_string()
+    }
 }
 
 /// The fresh verdict, plus the parentheticals the line is allowed to carry: red CI names the
@@ -570,6 +649,7 @@ fn item_outcome(outcome: &Observed<Outcome>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decide::VerifyCoverage;
     use crate::observe::{Pr, Reason};
     use crate::view::Fanout;
     use std::path::PathBuf;
@@ -781,6 +861,26 @@ mod tests {
         })
     }
 
+    /// One fact set, built the way `view::gather` builds it.
+    fn facts_of(
+        found: RunView,
+        observation: Observation,
+        verdict: Verdict,
+        coverage: Observed<VerifyCoverage>,
+        blocker: Option<&str>,
+    ) -> Facts {
+        Facts {
+            found,
+            observation,
+            verdict,
+            contract: contract(),
+            coverage,
+            furthest: Stage::PrOpen,
+            blocker: blocker.map(str::to_string),
+            run_state: PathBuf::from("/home/op/.grind/runs/20260806-122620-snapper-28/run.json"),
+        }
+    }
+
     /// The Handback over one fact set, with the two things a caller varies most.
     fn handed_back(observation: &Observation, verdict: &Verdict) -> String {
         handed_back_with(observation, verdict, &coverage(), None)
@@ -792,16 +892,13 @@ mod tests {
         coverage: &Observed<VerifyCoverage>,
         blocker: Option<&str>,
     ) -> String {
-        handback(&Handback {
-            found: &found(),
-            observation,
-            verdict,
-            contract: &contract(),
-            coverage,
-            furthest: Stage::PrOpen,
+        handback(&facts_of(
+            found(),
+            observation.clone(),
+            verdict.clone(),
+            coverage.clone(),
             blocker,
-            run_state: Path::new("/home/op/.grind/runs/20260806-122620-snapper-28/run.json"),
-        })
+        ))
     }
 
     #[test]
@@ -809,16 +906,13 @@ mod tests {
         // Run 2's Handback said `[exhausted]` with `PR —` over an open, green, twelve-commit PR.
         let mut record = found();
         record.state = "exhausted".to_string();
-        let text = handback(&Handback {
-            found: &record,
-            observation: &observation(),
-            verdict: &Verdict::Completed,
-            contract: &contract(),
-            coverage: &coverage(),
-            furthest: Stage::PrOpen,
-            blocker: None,
-            run_state: Path::new("/x/run.json"),
-        });
+        let text = handback(&facts_of(
+            record,
+            observation(),
+            Verdict::Completed,
+            coverage(),
+            None,
+        ));
         assert!(text.starts_with("Verdict  completed"), "{text}");
         assert!(
             !text.contains("exhausted"),
@@ -897,16 +991,13 @@ mod tests {
         clean.attempts.iter_mut().for_each(|a| {
             a.permission_denials.clear();
         });
-        let text = handback(&Handback {
-            found: &clean,
-            observation: &observation(),
-            verdict: &Verdict::Completed,
-            contract: &contract(),
-            coverage: &coverage(),
-            furthest: Stage::PrOpen,
-            blocker: None,
-            run_state: Path::new("/x/run.json"),
-        });
+        let text = handback(&facts_of(
+            clean,
+            observation(),
+            Verdict::Completed,
+            coverage(),
+            None,
+        ));
         assert!(text.contains("tool denials 0"), "{text}");
         assert!(
             !text.contains("denied "),
@@ -956,16 +1047,13 @@ mod tests {
             .attempts
             .iter_mut()
             .for_each(|a| a.fanout = Observed::Absent);
-        let text = handback(&Handback {
-            found: &quiet,
-            observation: &observation(),
-            verdict: &Verdict::Completed,
-            contract: &contract(),
-            coverage: &coverage(),
-            furthest: Stage::PrOpen,
-            blocker: None,
-            run_state: Path::new("/x/run.json"),
-        });
+        let text = handback(&facts_of(
+            quiet,
+            observation(),
+            Verdict::Completed,
+            coverage(),
+            None,
+        ));
         assert!(
             !text.contains("fan-out"),
             "a Run that spawned nothing:\n{text}"
@@ -1038,6 +1126,106 @@ mod tests {
         absent.pr = Observed::Absent;
         let uncorroborated = handed_back(&absent, &Verdict::Uncorroborated(vec!["PR open".into()]));
         assert!(uncorroborated.contains("DONE promised"), "{uncorroborated}");
+    }
+
+    // --- the account that leaves the host ------------------------------------------------------
+
+    fn commented(observation: &Observation, verdict: &Verdict) -> String {
+        job_comment(&facts_of(
+            found(),
+            observation.clone(),
+            verdict.clone(),
+            coverage(),
+            None,
+        ))
+    }
+
+    #[test]
+    fn both_renderers_given_one_fact_set_make_the_same_five_claims() {
+        let facts = facts_of(found(), observation(), Verdict::Completed, coverage(), None);
+        let terminal = handback(&facts);
+        let markdown = job_comment(&facts);
+        for claim in [
+            "completed",
+            "3 of 8",
+            "26.69",
+            "https://github.com/FlorianRiquelme/snapper/pull/30",
+            "/home/op/.grind/runs/20260806-122620-snapper-28/run.json",
+        ] {
+            assert!(terminal.contains(claim), "the Handback drops `{claim}`");
+            assert!(markdown.contains(claim), "the comment drops `{claim}`");
+        }
+        // And the comment says which host is holding the Run state it points at.
+        assert!(markdown.contains("snapper.local"), "{markdown}");
+    }
+
+    #[test]
+    fn no_rendered_comment_contains_a_reason_built_by_reason_of() {
+        // `Reason::of` composes `<call site>: exit N: <first stderr line>`, so a reason is raw
+        // child stderr — and a misprovisioned host is exactly where an HTTPS `origin` embeds a
+        // token. An observation that could not be made shows its mark and nothing else.
+        let mut blind = observation();
+        blind.pr = Observed::Unobservable(Reason::of(
+            "gh pr view",
+            &crate::world::Completed {
+                stdout: String::new(),
+                stderr: "fatal: Authentication failed for 'https://ghp_secret@github.com/o/n'\n"
+                    .to_string(),
+                code: Some(128),
+            },
+        ));
+        blind.base_drift = Observed::Unobservable(Reason::saying("git symbolic-ref: exit 1"));
+        let markdown = commented(&blind, &Verdict::Unobserved(vec!["PR open: x".into()]));
+        assert!(!markdown.contains("ghp_secret"), "{markdown}");
+        assert!(!markdown.contains("exit 128"), "{markdown}");
+        assert!(!markdown.contains("symbolic-ref"), "{markdown}");
+        assert!(
+            markdown.contains(UNOBSERVABLE_MARK),
+            "the mark still shows:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn the_comment_names_verify_contract_presence_and_absence_and_not_one_of_them() {
+        let markdown = commented(&observation(), &Verdict::Completed);
+        assert!(markdown.contains("verify contract present"), "{markdown}");
+        assert!(markdown.contains("verify contract missing"), "{markdown}");
+        assert!(markdown.contains("ts-lint"), "{markdown}");
+        assert!(markdown.contains("rust-fmt"), "{markdown}");
+    }
+
+    #[test]
+    fn the_comment_carries_the_four_completion_observations_and_the_fan_out_arithmetic() {
+        let markdown = commented(&observation(), &Verdict::Completed);
+        for named in [
+            "PR",
+            "tree clean",
+            "commits ahead",
+            "checks pending",
+            "fan-out",
+            "tool denials",
+            "run state",
+        ] {
+            assert!(markdown.contains(named), "the comment drops `{named}`");
+        }
+        assert!(markdown.contains("4 spawned, 4 returned"), "{markdown}");
+    }
+
+    #[test]
+    fn nothing_in_the_comment_is_a_summary_boolean_or_a_quality_word() {
+        // A public surface is bound at least as hard as a private one.
+        let markdown = commented(&observation(), &Verdict::Completed).to_lowercase();
+        for banned in [
+            "rejected",
+            "approved",
+            "healthy",
+            "passing",
+            "all good",
+            "looks good",
+            "everything",
+        ] {
+            assert!(!markdown.contains(banned), "`{banned}`:\n{markdown}");
+        }
     }
 
     #[test]

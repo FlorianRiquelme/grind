@@ -518,6 +518,7 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
                     record.run_id
                 ));
             }
+            report_to_the_job_issue(record);
             return Ok(Outcome {
                 run_id: record.run_id.clone(),
                 state: record.state.as_str(),
@@ -687,6 +688,45 @@ fn adopt_or_create_worktree(repo_path: &Path, branch: &str) -> Result<PathBuf, R
     }
     world::print_line(&format!("  created worktree: {}", wanted.display()));
     Ok(wanted)
+}
+
+/// **The account that leaves the host**, posted on the Job issue at every terminal state.
+///
+/// Not the PR: the PR body is entirely the Run's, and supervisor prose beside the Run's own
+/// narrative reads as a verdict on the work.
+///
+/// **Appended, never edited.** A Blocked Run a human clears and resumes reaches a terminal
+/// state twice, and two comments are the honest account.
+///
+/// **Best-effort.** On failure, log and move on — no retry loop, and **never a verdict change**.
+/// A Run that finished must not become `unobserved` because GitHub was down at 04:00.
+fn report_to_the_job_issue(record: &RunRecord) {
+    let Some(home) = world::home() else {
+        world::print_line("  note: $HOME is unset, so nothing was posted on the Job issue");
+        return;
+    };
+    // The **same construction** the Handback uses, so the two renderings cannot be fed
+    // different lists.
+    let Some(facts) = crate::view::gather(&home, &record.run_id) else {
+        world::print_line("  note: could not compose the terminal comment");
+        return;
+    };
+    let posted = world::run(
+        &[
+            "gh".to_string(),
+            "issue".to_string(),
+            "comment".to_string(),
+            record.job.issue.to_string(),
+            "--repo".to_string(),
+            record.job.target_repo.clone(),
+            "--body".to_string(),
+            crate::render::job_comment(&facts),
+        ],
+        None,
+    );
+    if posted.code != Some(0) {
+        world::print_line("  note: could not post the terminal comment on the Job issue");
+    }
 }
 
 /// The dispatch comment, and nothing else. Grind adds and never classifies (ADR-0012): no

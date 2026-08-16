@@ -12,8 +12,10 @@
 //! because the wall is working.
 
 use crate::attempt::{self, Attempt};
+use crate::decide::{self, Stage, Verdict, VerifyContract, VerifyCoverage};
 use crate::job::{self, Job};
 use crate::observe::{self, Observation, Observed, Reason};
+use crate::policy;
 use crate::world;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -62,6 +64,72 @@ impl RunView {
             .map(|a| a.permission_denials.len())
             .sum()
     }
+}
+
+/// Everything a terminal Run is reported from, **owned and built once**.
+///
+/// The Handback and the Job-issue comment differ only in where they send the human to look — a
+/// terminal wants fixed width, markdown wants a table. Two independently-chosen lists would
+/// drift *invisibly*, because nobody ever sees both renderings of one Run. So there is one fact
+/// set and two renderers over it, and this is the fact set.
+///
+/// It lives here rather than in `render` because gathering it reads the world, and `render` is
+/// pure — every function there returns a `String`.
+pub struct Facts {
+    pub found: RunView,
+    pub observation: Observation,
+    /// The **fresh** verdict, never the recorded state. The two are produced moments apart, and
+    /// Run 2's Handback printed `[exhausted]` over an open, green, twelve-commit PR.
+    pub verdict: Verdict,
+    pub contract: VerifyContract,
+    pub coverage: Observed<VerifyCoverage>,
+    pub furthest: Stage,
+    /// What must be cleared, when the Run stopped for a human. The recorded state is consulted
+    /// for this one fact — no fresh verdict can carry it — and never printed as a verdict.
+    pub blocker: Option<String>,
+    pub run_state: PathBuf,
+}
+
+/// Gather them. **One construction**, reached from `cli`'s Handback and from the supervisor's
+/// terminal comment alike, so the two renderings cannot be fed different lists.
+pub fn gather(home: &Path, run_id: &str) -> Option<Facts> {
+    let Lookup::Here(found) = load(home, run_id) else {
+        return None;
+    };
+    let found = *found;
+    let observation = observe_fresh(
+        Path::new(&found.worktree),
+        &found.job.handoff_sha,
+        world::now_iso(),
+    );
+    let signals = decide::signals_of(&observation);
+    let promised = found.attempts.last().is_some_and(|a| a.done_promise);
+    let verdict = decide::verdict(&signals, promised);
+    let contract = verify_contract_of(&found.worktree);
+    let coverage = decide::verify_coverage(&contract, &observation.changed_files);
+    let furthest = decide::furthest_stage(&observation);
+    let blocker = (found.state == "blocked")
+        .then(|| policy::what_must_be_cleared(&found.attempts))
+        .flatten();
+    Some(Facts {
+        run_state: record_path(home, run_id),
+        found,
+        observation,
+        verdict,
+        contract,
+        coverage,
+        furthest,
+        blocker,
+    })
+}
+
+/// Which contracted steps the target repo declares, read off its worktree. A justfile may
+/// legitimately delegate to npm scripts, so `package.json`'s scripts count as evidence.
+pub fn verify_contract_of(worktree: &str) -> VerifyContract {
+    let worktree = Path::new(worktree);
+    let justfile = world::read_to_string(&worktree.join("justfile")).ok();
+    let package = world::read_to_string(&worktree.join("package.json")).ok();
+    decide::verify_contract(justfile.as_deref(), package.as_deref())
 }
 
 /// The answer to *is this Run here*. **An unknown run id is `NotHere`, never an error** — a Run

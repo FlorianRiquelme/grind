@@ -9,7 +9,7 @@
 //! Nothing here invokes an agent. A view built out of the thing that gets rate-limited is
 //! unavailable during exactly the stall it exists to explain.
 
-use crate::decide::{self, VerifyContract};
+use crate::decide;
 use crate::job::{self, Check, Depth, Refusal};
 use crate::observe::{self, Observed, Outcome};
 use crate::render::{self, DoctorLine, SingleRun};
@@ -93,42 +93,22 @@ fn finish(outcome: Result<supervisor::Outcome, Refusal>) -> i32 {
     let Some(home) = world::home() else {
         return INCOHERENT_INPUT;
     };
-    match view::load(&home, &outcome.run_id) {
-        Lookup::Here(found) => {
-            let observation = observe_for(&found);
-            // The verdict the Handback prints and the verdict the process exits on are **one
-            // computation**. It used to be computed twice, moments apart, and spent on an exit
-            // code while the projection printed the recorded state instead.
-            let signals = decide::signals_of(&observation);
-            let promised = found.attempts.last().is_some_and(|a| a.done_promise);
-            let verdict = decide::verdict(&signals, promised);
-            // The recorded state is consulted for exactly one fact — that the Run stopped for a
-            // human — because no fresh verdict can carry it. It is never printed as a verdict.
-            let blocker = (outcome.state == "blocked")
-                .then(|| crate::policy::what_must_be_cleared(&found.attempts))
-                .flatten();
-            let contract = contract_of(&found.worktree);
-            let coverage = decide::verify_coverage(&contract, &observation.changed_files);
-            print(&render::handback(&render::Handback {
-                found: &found,
-                observation: &observation,
-                verdict: &verdict,
-                contract: &contract,
-                coverage: &coverage,
-                furthest: decide::furthest_stage(&observation),
-                blocker: blocker.as_deref(),
-                run_state: &view::record_path(&home, &outcome.run_id),
-            }));
-            if matches!(verdict, decide::Verdict::Unobserved(_)) {
-                Observability::CouldNotAnswer.code()
-            } else {
-                Observability::Answered.code()
-            }
-        }
-        // A record that cannot even be found or read here is itself a failure to observe —
-        // the Handback that this command exists to produce never got composed, so a bare `0`
-        // would tell a caller checking `$?` that everything answered when nothing did.
-        _ => Observability::CouldNotAnswer.code(),
+    // The verdict the Handback prints and the verdict the process exits on are **one
+    // computation**, gathered by the same function the supervisor's terminal comment uses. It
+    // used to be computed twice, moments apart, and spent on an exit code while the projection
+    // printed the recorded state instead.
+    //
+    // A record that cannot be found or read here is itself a failure to observe — the Handback
+    // this command exists to produce never got composed, so a bare `0` would tell a caller
+    // checking `$?` that everything answered when nothing did.
+    let Some(facts) = view::gather(&home, &outcome.run_id) else {
+        return Observability::CouldNotAnswer.code();
+    };
+    print(&render::handback(&facts));
+    if matches!(facts.verdict, decide::Verdict::Unobserved(_)) {
+        Observability::CouldNotAnswer.code()
+    } else {
+        Observability::Answered.code()
     }
 }
 
@@ -187,7 +167,7 @@ fn status_one(run_id: &str) -> i32 {
                 observation: &observation,
                 live: &live,
                 verdict: &verdict,
-                contract: &contract_of(&found.worktree),
+                contract: &view::verify_contract_of(&found.worktree),
                 furthest: decide::furthest_stage(&observation),
                 supervisor_here: &here,
                 run_state: &view::record_path(&home, run_id),
@@ -208,13 +188,6 @@ fn observe_for(found: &view::RunView) -> observe::Observation {
         &found.job.handoff_sha,
         world::now_iso(),
     )
-}
-
-fn contract_of(worktree: &str) -> VerifyContract {
-    let worktree = Path::new(worktree);
-    let justfile = world::read_to_string(&worktree.join("justfile")).ok();
-    let package = world::read_to_string(&worktree.join("package.json")).ok();
-    decide::verify_contract(justfile.as_deref(), package.as_deref())
 }
 
 // --- doctor -------------------------------------------------------------------------------------

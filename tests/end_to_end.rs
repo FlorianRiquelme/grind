@@ -109,6 +109,12 @@ impl Sandbox {
         serde_json::from_str(&raw).expect("the record parses")
     }
 
+    /// Make `gh issue comment` fail, the way GitHub being down at 04:00 does.
+    fn gh_cannot_comment(&self) -> &Self {
+        fs::write(self.fake().join("gh/comment.code"), "1").expect("write a comment failure");
+        self
+    }
+
     fn clone_path(&self) -> PathBuf {
         self.home.join(".grind/repos").join(OWNER).join(NAME)
     }
@@ -930,12 +936,85 @@ fn the_dispatch_comment_still_carries_the_run_id_and_the_hostname() {
     let run_id = record["run_id"].as_str().expect("a run id").to_string();
     let host = record["hostname"].as_str().expect("a hostname").to_string();
     let posted = comments_on_the_job_issue(&box_);
-    assert_eq!(posted.len(), 1, "one dispatch comment: {posted:?}");
-    let body = &posted[0];
+    let body = posted.first().expect("the dispatch comment is the first");
     assert!(body.contains(&run_id), "{body}");
     assert!(body.contains(&host), "{body}");
     assert!(body.contains("Dispatched as Run"), "{body}");
     assert!(body.contains("~/.grind/runs/"), "{body}");
+}
+
+#[test]
+fn a_completed_run_posts_exactly_one_terminal_comment_on_the_job_issue() {
+    // Everything only the supervisor knows survives the host. Between the dispatch comment and
+    // nothing, the human's only instrument was SSH.
+    let box_ = sandbox("terminal-comment");
+    box_.scenario(&["success_done"]).pr_appears_at(1);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+
+    let posted = comments_on_the_job_issue(&box_);
+    assert_eq!(
+        posted.len(),
+        2,
+        "the dispatch comment and one more: {posted:?}"
+    );
+    let terminal = &posted[1];
+    let record = box_.record();
+    assert!(
+        terminal.contains(record["run_id"].as_str().expect("a run id")),
+        "{terminal}"
+    );
+    assert!(
+        terminal.contains(record["hostname"].as_str().expect("a host")),
+        "{terminal}"
+    );
+    assert!(terminal.contains("completed"), "{terminal}");
+    assert!(terminal.contains("| attempts |"), "{terminal}");
+    assert!(terminal.contains("| spend |"), "{terminal}");
+    assert!(terminal.contains("| run state |"), "{terminal}");
+    assert!(terminal.contains("verify contract present"), "{terminal}");
+    assert!(terminal.contains("verify contract missing"), "{terminal}");
+}
+
+#[test]
+fn a_blocked_run_resumed_to_completion_posts_two_terminal_comments() {
+    // Append, never edit. A Run that reaches a terminal state twice leaves two comments, and
+    // two comments are the honest account.
+    let box_ = sandbox("two-terminal-comments");
+    box_.scenario(&["denied", "denied", "denied", "success_done"])
+        .pr_appears_at(4);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert_eq!(box_.record()["state"], "blocked");
+    assert_eq!(comments_on_the_job_issue(&box_).len(), 2);
+
+    let run_id = box_.record()["run_id"]
+        .as_str()
+        .expect("a run id")
+        .to_string();
+    let (out, err, code) = box_.run(&["resume", &run_id]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert_eq!(box_.record()["state"], "completed");
+    let posted = comments_on_the_job_issue(&box_);
+    assert_eq!(posted.len(), 3, "dispatch, blocked, completed: {posted:?}");
+    assert!(posted[2].contains("completed"), "{}", posted[2]);
+}
+
+#[test]
+fn a_gh_that_fails_on_issue_comment_still_exits_on_the_runs_real_verdict() {
+    // Best-effort. A Run that finished must not become `unobserved` because GitHub was down.
+    let box_ = sandbox("comment-fails");
+    box_.scenario(&["success_done"])
+        .pr_appears_at(1)
+        .gh_cannot_comment();
+
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "the Run's real verdict:\n{out}\n{err}");
+    assert_eq!(box_.record()["state"], "completed");
+    assert!(
+        out.contains("could not post the terminal comment"),
+        "logged, never raised:\n{out}"
+    );
 }
 
 #[test]
