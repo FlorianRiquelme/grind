@@ -7,8 +7,10 @@ human is not present for, and stops at an open PR.
 
 **Job**:
 One unit of queued work, filed as a GitHub issue in the repo the work happens in. Names a
-target repo, a branch, a Handoff SHA and an Anchor artifact. What makes it a Job is what its
-body names, never a label — Grind applies none (ADR-0012).
+target repo, a branch, a Handoff SHA, an Anchor artifact and a pinned plugin version, and may
+name a model and an **Intent** — one line on the work's nature, never a requirement. It carries
+no spend ceiling: ADR-0010 withdrew it. What makes it a Job is what its body names, never a
+label — Grind applies none (ADR-0012).
 _Avoid_: ticket, task, plan
 
 **Enqueue**:

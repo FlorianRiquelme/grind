@@ -92,6 +92,10 @@ pub struct Job {
     pub branch: String,
     pub handoff_sha: String,
     pub anchor: String,
+    /// One line on the work's **nature**, and never a requirement. A second place stating what
+    /// the work *is* drifts from the Anchor, which is the same argument that keeps a declared
+    /// branch contract out. No validator: it is prose.
+    pub intent: Option<String>,
     pub model: Option<String>,
     pub plugin: PluginPin,
 }
@@ -198,6 +202,7 @@ pub fn from_issue_json(raw: &str) -> Result<Job, Refusal> {
     let plugin = PluginPin::parse(&required("pinned plugin version")?)?;
     // No `budget ceiling` row is read. ADR-0010 withdrew the ceiling, and a Job still carrying
     // the row is ignored the way any unknown row is.
+    let intent = optional("intent");
     let model = optional("model");
 
     Ok(Job {
@@ -209,6 +214,7 @@ pub fn from_issue_json(raw: &str) -> Result<Job, Refusal> {
         branch,
         handoff_sha,
         anchor,
+        intent,
         model,
         plugin,
     })
@@ -884,9 +890,25 @@ mod tests {
 
     #[test]
     fn an_optional_row_reading_none_is_the_same_as_no_row() {
-        let rows = format!("{FULL_ROWS}\n| Model | - |");
+        for blank in ["none", "-", "n/a", ""] {
+            let rows = format!("{FULL_ROWS}\n| Model | {blank} |\n| Intent | {blank} |");
+            let job = from_issue_json(&issue_json(&rows)).expect("a complete Job");
+            assert_eq!(job.model, None, "model `{blank}`");
+            assert_eq!(job.intent, None, "intent `{blank}`");
+        }
+    }
+
+    #[test]
+    fn an_intent_row_is_read_as_prose_with_no_validator_over_it() {
+        let rows = format!("{FULL_ROWS}\n| Intent | A settled plan transcribed into one module. |");
         let job = from_issue_json(&issue_json(&rows)).expect("a complete Job");
-        assert_eq!(job.model, None);
+        assert_eq!(
+            job.intent.as_deref(),
+            Some("A settled plan transcribed into one module.")
+        );
+        // Absent is the ordinary case, and the ordinary case is silence.
+        let bare = from_issue_json(&issue_json(FULL_ROWS)).expect("a complete Job");
+        assert_eq!(bare.intent, None);
     }
 
     #[test]

@@ -10,8 +10,10 @@ Run it **from the session that prepared the branch** — the plan is in context,
 cwd. A cold invocation is the same steps asking more questions, never a second mode.
 
 Grind reads the Job back with `job::from_issue_json` (`src/job.rs:139`). The table in
-[JOB-TEMPLATE.md](JOB-TEMPLATE.md) is that parser's contract; nothing tests the seam, so a change
-to either belongs in the same diff.
+[JOB-TEMPLATE.md](JOB-TEMPLATE.md) is that parser's contract, and `tests/enqueue_template.rs`
+parses the template's own example table through that parser — so a required row renamed on either
+side turns `just verify` red. A change to either still belongs in the same diff: the test catches
+a rename, not a meaning that drifted.
 
 ## 1. Derive everything you can
 

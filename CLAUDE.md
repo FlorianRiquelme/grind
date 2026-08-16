@@ -139,10 +139,11 @@ change carries a safety property, not for coverage's sake.
 - **`skills/enqueue/` ships a skill, not code, and its table is a contract with `src/job.rs`.**
   Enqueue is invoked from a session in the **target** repo, so it is symlinked into
   `~/.claude/skills/` to be loadable at all; it lives here because the Job table it writes is what
-  `job::from_issue_json` reads back, and **nothing tests that seam** — no test spans a skill and a
-  parser. One repo means one diff, which is the whole of the mitigation. Change either half and
-  check the other. It is not a `docs/provisioned-host.md` item: a host needs `grind run`, never
-  Enqueue.
+  `job::from_issue_json` reads back. **`tests/enqueue_template.rs` spans that seam**: it parses
+  the template's own example table through the real parser, so a required row renamed on either
+  side turns `just verify` red. It catches a rename and never a meaning that drifted, so *change
+  either half and check the other* still holds. It is not a `docs/provisioned-host.md` item: a
+  host needs `grind run`, never Enqueue.
 
 ## Agent skills
 

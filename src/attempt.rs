@@ -201,7 +201,7 @@ Job:            {url}
 Branch:         {branch}
 Handoff SHA:    {handoff}
 Anchor artifact: {anchor}
-
+{intent}
 The Handoff SHA bounds your **output**, not your **reading**. Everything you add sits in
 front of it and is what gets reviewed; read as far around it as you need, including work
 that landed after it.
@@ -238,7 +238,18 @@ Stop at an open PR. Do not merge it.",
         handoff = job.handoff_sha,
         anchor = job.anchor,
         issue = job.issue,
+        intent = intent_line(job.intent.as_deref()),
     )
+}
+
+/// **Default is silence.** The first `Option`-gated line in the prompt: saying nothing about
+/// the work's nature is honest, and a wrong constant is not — which is exactly what *this slice
+/// is transcription, not design* was.
+fn intent_line(intent: Option<&str>) -> String {
+    match intent {
+        Some(said) => format!("Intent:         {said}\n"),
+        None => String::new(),
+    }
 }
 
 /// What a child left behind, **after** it landed on disk.
@@ -519,6 +530,7 @@ mod tests {
             branch: "feat/28-slice-1b".to_string(),
             handoff_sha: "9d1f4c7a".to_string(),
             anchor: "docs/plans/a.md".to_string(),
+            intent: None,
             model: None,
             plugin: PluginPin::parse("compound-engineering@compound-engineering-plugin 3.21.3")
                 .unwrap(),
@@ -797,6 +809,36 @@ mod tests {
             prompt.contains("on each attempt"),
             "a per-Attempt read, not a pinned view: {prompt}"
         );
+    }
+
+    #[test]
+    fn a_job_with_an_intent_row_puts_that_line_in_the_built_prompt() {
+        let stated = Job {
+            intent: Some("A settled plan transcribed into one module.".to_string()),
+            ..job()
+        };
+        let prompt = dispatch(&conditions(None), &stated).prompt().to_string();
+        assert!(
+            prompt.contains("Intent:         A settled plan transcribed into one module."),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn a_job_with_no_intent_row_puts_no_characterisation_of_the_work_in_the_prompt() {
+        // Default is silence. Saying nothing about the work's nature is honest; a wrong
+        // constant is not, which is exactly what *this slice is transcription, not design* was.
+        let prompt = built_dispatch_prompt();
+        assert!(!prompt.contains("Intent"), "{prompt}");
+        for characterisation in [
+            "transcription",
+            "mechanical",
+            "straightforward",
+            "exploratory",
+            "greenfield",
+        ] {
+            assert!(!prompt.contains(characterisation), "{prompt}");
+        }
     }
 
     #[test]
