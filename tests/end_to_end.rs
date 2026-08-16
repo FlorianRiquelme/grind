@@ -121,6 +121,14 @@ impl Sandbox {
         self
     }
 
+    /// Rewrite the Job issue's `Anchor artifact` row.
+    fn anchor_becomes(&self, path: &str) -> &Self {
+        let issue = self.fake().join("gh/issue.json");
+        let raw = fs::read_to_string(&issue).expect("the Job issue");
+        fs::write(&issue, raw.replace("docs/plans/a-plan.md", path)).expect("rewrite it");
+        self
+    }
+
     fn run_dir(&self) -> PathBuf {
         fs::read_dir(self.home.join(".grind/runs"))
             .expect("runs")
@@ -807,6 +815,54 @@ fn a_dirty_worktree_refuses_and_nothing_is_dispatched_onto_it() {
         !box_.home.join(".grind/runs").exists(),
         "nothing is dispatched onto a dirty worktree"
     );
+}
+
+#[test]
+fn a_job_whose_anchor_artifact_is_not_on_disk_refuses() {
+    // A Run handed a path to nothing invents requirements, satisfies them, and opens a green PR.
+    let box_ = sandbox("anchor-absent");
+    box_.scenario(&["success_done"])
+        .anchor_becomes("docs/plans/a-plan-that-was-never-written.md");
+
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(
+        code,
+        Some(2),
+        "a refusal is incoherent input:\n{out}\n{err}"
+    );
+    assert!(
+        err.contains("docs/plans/a-plan-that-was-never-written.md"),
+        "the refusal names the path:\n{err}"
+    );
+    let lowered = err.to_lowercase();
+    for quality in ["bad", "invalid", "wrong", "reject"] {
+        assert!(!lowered.contains(quality), "no quality word:\n{err}");
+    }
+    assert!(!box_.home.join(".grind/runs").exists());
+}
+
+#[test]
+fn an_anchor_artifact_that_is_present_but_empty_proceeds() {
+    // Presence, never shape. An admission check must not arrive through the back door of an
+    // admission rule, so nothing here reads R-IDs or a readiness field.
+    let box_ = sandbox("anchor-empty");
+    let clone = box_.clone_path();
+    git(&clone, &["checkout", "-q", BRANCH]);
+    fs::write(clone.join("docs/plans/empty.md"), "").expect("an empty Anchor");
+    git(&clone, &["add", "-A"]);
+    git(
+        &clone,
+        &["commit", "-q", "-m", "an Anchor with nothing in it"],
+    );
+    git(&clone, &["checkout", "-q", "main"]);
+
+    box_.scenario(&["success_done"])
+        .anchor_becomes("docs/plans/empty.md")
+        .pr_appears_at(1);
+
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert_eq!(box_.record()["state"], "completed");
 }
 
 #[test]

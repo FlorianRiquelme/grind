@@ -277,6 +277,19 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         job::Reachability::Refuse(refusal) => return Err(refusal),
     }
 
+    // A Run handed a path to nothing cannot invent requirements, satisfy them, and open a green
+    // PR. Presence only: the Anchor's **shape** is never checked — no R-IDs, no readiness field
+    // — because an admission check must not arrive through the back door of an admission rule.
+    // It cannot live in `refuse_unless_host_ready`, which runs before the worktree exists.
+    if !world::exists(&worktree.join(&job.anchor)) {
+        return Err(Refusal::saying(format!(
+            "the Anchor artifact `{}` is not in the worktree at {}, so nothing is dispatched \
+             onto it",
+            job.anchor,
+            worktree.display()
+        )));
+    }
+
     let run_id = format!(
         "{}-{}-{}",
         world::now_stamp(),
