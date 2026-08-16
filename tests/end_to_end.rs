@@ -312,9 +312,20 @@ fn sandbox(name: &str) -> Sandbox {
     // about the worktree, so `origin` has to be reachable — and a local one keeps *no network*
     // structural rather than merely unexercised.
     let origin = fake.join("origin.git");
+    // `-b main` explicitly: without it the bare repo takes the machine's `init.defaultBranch`,
+    // its HEAD points at a branch nothing ever pushes, and `remote set-head -a` cannot resolve
+    // `origin/HEAD` — which base drift reads. A green laptop and a red CI, from one config
+    // difference.
     git(
         &home,
-        &["init", "--bare", "-q", origin.to_str().expect("utf-8")],
+        &[
+            "init",
+            "--bare",
+            "-q",
+            "-b",
+            "main",
+            origin.to_str().expect("utf-8"),
+        ],
     );
     git(
         &clone,
