@@ -250,6 +250,7 @@ mod tests {
                 "docs/residual-review-findings/a.md".to_string(),
                 "src/lib.rs".to_string(),
             ]),
+            base_drift: Observed::Unobservable(Reason::saying("not measured in this fixture")),
         }
     }
 

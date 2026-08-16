@@ -103,6 +103,38 @@ impl fmt::Display for Pr {
     }
 }
 
+/// **Base drift**: the target repo's default branch moving after the Handoff SHA.
+///
+/// A count and the paths that overlap the Run's own diff. **No boolean, no `Diverged` variant,
+/// no summary field** — ADR-0006's seventh prohibited shape, and the tempting argument for it
+/// (*"`main` moved, so don't open the PR"*) reads as caution rather than as the quality
+/// judgement ADR-0003 refuses. It is surfaced when non-zero and enforced never.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BaseDrift {
+    pub default_branch: String,
+    /// Commits on the default branch since the Handoff SHA.
+    pub commits: u64,
+    /// The paths that moved and that the Run's own diff also touches. Two files claiming
+    /// ADR-0001 have different names, so git merges clean and reports nothing.
+    pub overlapping: Vec<String>,
+}
+
+impl fmt::Display for BaseDrift {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} commit{} on {} since the Handoff SHA",
+            self.commits,
+            if self.commits == 1 { "" } else { "s" },
+            self.default_branch
+        )?;
+        if !self.overlapping.is_empty() {
+            write!(f, ", also touching {}", self.overlapping.join(", "))?;
+        }
+        Ok(())
+    }
+}
+
 /// Everything a Run's state is read from, each signal independently observed and independently
 /// observable. The verify contract is deliberately not here: it is a decision about which
 /// contracted steps a target repo declares, and it lives with the module that makes it.
@@ -120,6 +152,7 @@ pub struct Observation {
     /// Every path `<handoff-sha>..HEAD` touches — **the Run's own diff**, and the input the
     /// three listings above are drawn from.
     pub changed_files: Observed<Vec<String>>,
+    pub base_drift: Observed<BaseDrift>,
 }
 
 // --- one classifier per call site -----------------------------------------------------
@@ -301,6 +334,73 @@ pub fn changed_files(completed: &Completed) -> Observed<Vec<String>> {
     Observed::Present(names)
 }
 
+/// `git symbolic-ref --short refs/remotes/origin/HEAD`, and the whole of *which branch is the
+/// base* (KTD17). It is local after the fetch Dispatch already performed, needs no network of
+/// its own, and needs no new Job row.
+///
+/// A missing or unreadable `origin/HEAD` — which is what a clone whose fetch has never
+/// succeeded looks like — is **could not observe**, never *no drift*.
+pub fn default_branch(completed: &Completed) -> Observed<String> {
+    if completed.code != Some(0) {
+        return Observed::Unobservable(Reason::of("git symbolic-ref origin/HEAD", completed));
+    }
+    let named = completed.stdout.trim();
+    if named.is_empty() {
+        return Observed::Unobservable(Reason::saying(
+            "git symbolic-ref origin/HEAD: no default branch named",
+        ));
+    }
+    Observed::Present(named.to_string())
+}
+
+/// The drift itself, from a count and a name-only diff against the default branch, intersected
+/// with the Run's own diff.
+///
+/// A default branch that has not moved is a **present** count of zero, not an absence: *it did
+/// not move* is a fact, and the whole point of the three-valued reading is that *I could not
+/// look* is a different one.
+pub fn base_drift(
+    default_branch: &Observed<String>,
+    counted: &Completed,
+    moved: &Completed,
+    run_diff: &Observed<Vec<String>>,
+) -> Observed<BaseDrift> {
+    let named = match default_branch {
+        Observed::Present(named) => named.clone(),
+        other => {
+            return Observed::Unobservable(other.reason().cloned().unwrap_or_else(|| {
+                Reason::saying("no default branch to measure base drift against")
+            }));
+        }
+    };
+    if counted.code != Some(0) {
+        return Observed::Unobservable(Reason::of("git rev-list --count against origin", counted));
+    }
+    let Ok(commits) = counted.stdout.trim().parse::<u64>() else {
+        return Observed::Unobservable(Reason::of("git rev-list --count against origin", counted));
+    };
+    if moved.code != Some(0) {
+        return Observed::Unobservable(Reason::of("git diff --name-only against origin", moved));
+    }
+    let ours: &[String] = match run_diff {
+        Observed::Present(files) => files,
+        Observed::Absent => &[],
+        Observed::Unobservable(reason) => return Observed::Unobservable(reason.clone()),
+    };
+    let overlapping: Vec<String> = moved
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty() && ours.iter().any(|mine| mine == path))
+        .map(str::to_string)
+        .collect();
+    Observed::Present(BaseDrift {
+        default_branch: named,
+        commits,
+        overlapping,
+    })
+}
+
 /// One artifact directory, **scoped to the Run's own diff**.
 ///
 /// The whole-directory listing this replaces counted other people's files: `furthest stage`
@@ -362,6 +462,47 @@ pub fn observe_run(
         &format!("{handoff_sha}..HEAD"),
     ]));
     let changed = changed_files(&diffed);
+
+    // Base drift, against `origin/HEAD` in the same repository the worktree belongs to.
+    let base = default_branch(&run(&argv(&[
+        "git",
+        "symbolic-ref",
+        "--short",
+        "refs/remotes/origin/HEAD",
+    ])));
+    let drift = match &base {
+        Observed::Present(named) => base_drift(
+            &base,
+            &run(&argv(&[
+                "git",
+                "rev-list",
+                "--count",
+                &format!("{handoff_sha}..{named}"),
+            ])),
+            &run(&argv(&[
+                "git",
+                "diff",
+                "--name-only",
+                &format!("{handoff_sha}..{named}"),
+            ])),
+            &changed,
+        ),
+        // No default branch to measure against, and no commands worth running for it.
+        other => base_drift(
+            other,
+            &Completed {
+                stdout: String::new(),
+                stderr: String::new(),
+                code: None,
+            },
+            &Completed {
+                stdout: String::new(),
+                stderr: String::new(),
+                code: None,
+            },
+            &changed,
+        ),
+    };
 
     // The head commit first, the Job's branch as a fallback. Both stay pure parses over raw
     // output, and the existing three-valued classification was never wrong here — it was the
@@ -436,6 +577,7 @@ pub fn observe_run(
         residual_findings: scoped_listing(&changed, RESIDUAL_DIR),
         ledger_entries: scoped_listing(&changed, LEDGER_DIR),
         changed_files: changed,
+        base_drift: drift,
     }
 }
 
@@ -930,6 +1072,147 @@ mod tests {
         assert_eq!(observation.pr, Observed::Absent);
         assert_eq!(observation.checks_pending, Observed::Absent);
         assert_eq!(observation.checks_red, Observed::Absent);
+    }
+
+    // --- base drift ----------------------------------------------------------------------------
+
+    fn on_main() -> Observed<String> {
+        default_branch(&completed("origin/main\n", "", Some(0)))
+    }
+
+    fn ours() -> Observed<Vec<String>> {
+        Observed::Present(vec![
+            "docs/adr/0013-a-decision.md".to_string(),
+            "src/observe.rs".to_string(),
+        ])
+    }
+
+    #[test]
+    fn drift_with_no_readable_origin_head_is_could_not_observe_and_never_zero() {
+        // What a clone whose fetch has never succeeded looks like. Recording it as *no drift*
+        // is the exact shape the three-valued reading exists to remove.
+        for broken in [
+            completed(
+                "",
+                "fatal: ref refs/remotes/origin/HEAD is not a symbolic ref\n",
+                Some(1),
+            ),
+            completed("", "", Some(0)),
+            completed("", "", None),
+        ] {
+            let base = default_branch(&broken);
+            assert!(matches!(base, Observed::Unobservable(_)), "{base:?}");
+            let drift = base_drift(
+                &base,
+                &completed("0\n", "", Some(0)),
+                &completed("", "", Some(0)),
+                &ours(),
+            );
+            assert!(matches!(drift, Observed::Unobservable(_)), "{drift:?}");
+        }
+    }
+
+    #[test]
+    fn a_default_branch_that_has_not_moved_is_a_present_zero_with_no_overlap() {
+        let drift = base_drift(
+            &on_main(),
+            &completed("0\n", "", Some(0)),
+            &completed("", "", Some(0)),
+            &ours(),
+        );
+        assert_eq!(
+            drift,
+            Observed::Present(BaseDrift {
+                default_branch: "origin/main".to_string(),
+                commits: 0,
+                overlapping: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn a_default_branch_that_moved_into_a_path_the_run_touched_yields_the_count_and_that_path() {
+        let drift = base_drift(
+            &on_main(),
+            &completed("4\n", "", Some(0)),
+            &completed("docs/adr/0013-a-decision.md\nREADME.md\n", "", Some(0)),
+            &ours(),
+        );
+        let Observed::Present(found) = drift else {
+            panic!("both halves are readable");
+        };
+        assert_eq!(found.commits, 4);
+        assert_eq!(found.overlapping, vec!["docs/adr/0013-a-decision.md"]);
+        assert!(found.to_string().contains("4 commits on origin/main"));
+    }
+
+    #[test]
+    fn a_default_branch_that_moved_elsewhere_yields_the_count_and_no_overlap() {
+        let drift = base_drift(
+            &on_main(),
+            &completed("9\n", "", Some(0)),
+            &completed("README.md\nCHANGELOG.md\n", "", Some(0)),
+            &ours(),
+        );
+        let Observed::Present(found) = drift else {
+            panic!("both halves are readable");
+        };
+        assert_eq!(found.commits, 9);
+        assert!(found.overlapping.is_empty());
+    }
+
+    #[test]
+    fn a_run_diff_that_could_not_be_read_leaves_the_drift_unobserved() {
+        let drift = base_drift(
+            &on_main(),
+            &completed("4\n", "", Some(0)),
+            &completed("README.md\n", "", Some(0)),
+            &Observed::Unobservable(Reason::saying("git diff --name-only: exit 128")),
+        );
+        assert!(matches!(drift, Observed::Unobservable(_)), "{drift:?}");
+    }
+
+    #[test]
+    fn an_unreadable_count_or_diff_against_the_default_branch_is_could_not_observe() {
+        let blind = completed("", "fatal: bad revision\n", Some(128));
+        assert!(matches!(
+            base_drift(&on_main(), &blind, &completed("", "", Some(0)), &ours()),
+            Observed::Unobservable(_)
+        ));
+        assert!(matches!(
+            base_drift(&on_main(), &completed("2\n", "", Some(0)), &blind, &ours()),
+            Observed::Unobservable(_)
+        ));
+        assert!(matches!(
+            base_drift(
+                &on_main(),
+                &completed("not a number\n", "", Some(0)),
+                &completed("", "", Some(0)),
+                &ours()
+            ),
+            Observed::Unobservable(_)
+        ));
+    }
+
+    #[test]
+    fn no_type_in_the_drift_carries_a_boolean_or_a_summary_over_the_count() {
+        // ADR-0006's seventh prohibited shape. The tempting argument — *`main` moved, so don't
+        // open the PR* — reads as caution rather than as the quality judgement ADR-0003
+        // refuses.
+        let shape = format!(
+            "{:?}",
+            BaseDrift {
+                default_branch: "origin/main".to_string(),
+                commits: 4,
+                overlapping: vec!["docs/adr/0013.md".to_string()],
+            }
+        )
+        .to_lowercase();
+        for banned in [
+            "diverged", "drifted", "stale", "conflict", "true", "false", "ok", "healthy",
+        ] {
+            assert!(!shape.contains(banned), "{shape}");
+        }
     }
 
     #[test]

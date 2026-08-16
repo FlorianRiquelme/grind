@@ -418,6 +418,11 @@ mod tests {
             ]),
             ledger_entries: Observed::Absent,
             changed_files: Observed::Present(vec!["docs/plans/a.md".to_string()]),
+            base_drift: Observed::Present(crate::observe::BaseDrift {
+                default_branch: "origin/main".to_string(),
+                commits: 0,
+                overlapping: vec![],
+            }),
         }
     }
 
