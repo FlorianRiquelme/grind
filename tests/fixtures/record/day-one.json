@@ -63,7 +63,8 @@
       "permission_denials": [],
       "done_promise": false,
       "rate_limited": false,
-      "result_tail": "API Error: Connection closed mid-response. The response above may be incomplete."
+      "result_tail": "API Error: Connection closed mid-response. The response above may be incomplete.",
+      "fanout": { "present": [3, 3] }
     },
     {
       "n": 2,
@@ -83,7 +84,8 @@
       "permission_denials": [],
       "done_promise": false,
       "rate_limited": false,
-      "result_tail": "{\"is_error\":true,\"subtype\":\"success\",\"stop_reason\":\"stop_sequence\",\"total_cost_usd\":23.5,\"result\":\"API Error: Connection closed mid-resp"
+      "result_tail": "{\"is_error\":true,\"subtype\":\"success\",\"stop_reason\":\"stop_sequence\",\"total_cost_usd\":23.5,\"result\":\"API Error: Connection closed mid-resp",
+      "fanout": { "unobservable": "the transcript could not be read" }
     },
     {
       "n": 3,
@@ -108,7 +110,8 @@
       "permission_denials": [],
       "done_promise": false,
       "rate_limited": true,
-      "result_tail": "You've hit your session limit · resets 5pm (Europe/Berlin)"
+      "result_tail": "You've hit your session limit · resets 5pm (Europe/Berlin)",
+      "fanout": "absent"
     },
     {
       "n": 4,
@@ -141,7 +144,8 @@
       ],
       "done_promise": true,
       "rate_limited": false,
-      "result_tail": "The failing check was a formatting step; fixed and pushed. PR is open, stopping here. <promise>DONE</promise>"
+      "result_tail": "The failing check was a formatting step; fixed and pushed. PR is open, stopping here. <promise>DONE</promise>",
+      "fanout": { "present": [1, 1] }
     }
   ]
 }

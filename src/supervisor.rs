@@ -13,7 +13,7 @@
 use crate::attempt::{self, Attempt, Conditions, DENIED_TOOLS, Invocation, Mode};
 use crate::decide::{self, Verdict};
 use crate::job::{self, Job, Refusal};
-use crate::observe::{Observation, Observed, Outcome as ItemOutcome};
+use crate::observe::{Observation, Observed, Outcome as ItemOutcome, Reason};
 use crate::policy::{self, Budget, Next, Stop};
 use crate::world::{self, LockHandle, TryLock};
 use serde::{Deserialize, Serialize};
@@ -561,9 +561,28 @@ fn run_one_attempt(
     )
     .map_err(|reason| Refusal::saying(reason.to_string()))?;
 
-    let classified = raw.classify(n, mode, &started_at, &world::now_iso());
+    // Gathered before `push_attempt`: the attempt list is append-only with no mutating
+    // accessor, so this is the one wire between transcript reading and record building — and it
+    // runs in the direction the topology already allows.
+    let classified = raw
+        .classify(n, mode, &started_at, &world::now_iso())
+        .with_fanout(fanout_of(record));
     record.push_attempt(classified);
     Ok(())
+}
+
+/// The Attempt's fan-out arithmetic. `world` reads the file; a pure counter reads the text.
+fn fanout_of(record: &RunRecord) -> Observed<(u64, u64)> {
+    let Some(home) = world::home() else {
+        return Observed::Unobservable(Reason::saying("$HOME is unset"));
+    };
+    let transcript = crate::view::transcript_path(&home, &record.worktree, &record.session_id);
+    match world::read_to_string(&transcript) {
+        Ok(text) => crate::view::fanout_counts(&text),
+        Err(said) => Observed::Unobservable(Reason::saying(&format!(
+            "the transcript could not be read: {said}"
+        ))),
+    }
 }
 
 fn announce(record: &RunRecord, observation: &Observation, verdict: &Verdict) {

@@ -5,7 +5,7 @@
 //! neither cleanly pure nor cleanly I/O (ADR-0007).
 
 use crate::job::Job;
-use crate::observe::Reason;
+use crate::observe::{Observed, Reason};
 use crate::world;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -321,6 +321,14 @@ pub struct Attempt {
     pub done_promise: bool,
     pub rate_limited: bool,
     pub result_tail: String,
+    /// **Spawned and returned, per Attempt.** A fan-out degrading on attempt 3 of a Run that
+    /// finishes on attempt 8 leaves something durable.
+    ///
+    /// Three-valued, because two bare `Option<u64>` fields would collapse *no fan-out* and
+    /// *could not read the transcript*. **No summary, boolean or health word sits over the two
+    /// integers**: a count of processes must never become an assertion about a review
+    /// (ADR-0006's sixth prohibited shape).
+    pub fanout: Observed<(u64, u64)>,
 }
 
 impl Attempt {
@@ -338,6 +346,13 @@ impl Attempt {
     /// crash loop free: no budget spent, no rate-limit match, immediate re-entry, forever, with
     /// `attempt N of M` reporting the Run as barely started. Absence of evidence is not evidence
     /// of no work, and `parse_ok` is the field that already separates the two.
+    /// The fan-out arithmetic, gathered before the Attempt is pushed — `RunRecord.attempts` is
+    /// append-only with no mutating accessor, so it cannot be filled in afterwards (KTD9).
+    pub fn with_fanout(mut self, fanout: Observed<(u64, u64)>) -> Self {
+        self.fanout = fanout;
+        self
+    }
+
     pub fn is_wait(&self) -> bool {
         self.parse_ok
             && self.total_cost_usd.unwrap_or(0.0) <= 0.0
@@ -439,6 +454,10 @@ pub fn classify(
             },
             1500,
         ),
+        // Could not observe until somebody reads the transcript, which is `supervisor`'s job
+        // before it pushes the Attempt. A path that forgets records *could not observe* rather
+        // than `(0, 0)`, which is the honest direction for an omission.
+        fanout: Observed::Unobservable(Reason::saying("the transcript was not read")),
     }
 }
 
@@ -1074,6 +1093,7 @@ mod tests {
             done_promise: false,
             rate_limited: limited,
             result_tail: String::new(),
+            fanout: Observed::Absent,
         }
     }
 

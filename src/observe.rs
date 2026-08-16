@@ -12,6 +12,7 @@
 //! literals instead of a process.
 
 use crate::world::Completed;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Observed absent. Distinct from [`UNOBSERVABLE_MARK`] wherever a human reads it — reading a
@@ -27,7 +28,12 @@ pub const UNOBSERVABLE_MARK: &str = "?";
 /// `unwrap_or_default()` free, and each collapses three states into two *silently*. A
 /// dedicated enum has none of them, so every collapse has to be written out where a reader
 /// could see it (ADR-0006).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// It derives `Serialize`/`Deserialize` because the record carries one — the per-Attempt
+/// fan-out arithmetic. Two bare `Option<u64>` fields would collapse absent and unobservable,
+/// which is the whole point of the type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Observed<T> {
     Present(T),
     Absent,
@@ -36,7 +42,7 @@ pub enum Observed<T> {
 
 /// Why a signal could not be observed. A newtype rather than a bare `String` so the reason has
 /// to be composed on purpose, and so it cannot be swapped for a value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Reason(String);
 
 impl Reason {

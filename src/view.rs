@@ -400,6 +400,59 @@ pub fn fanout(text: &str) -> Observed<Vec<Fanout>> {
     Observed::Present(found)
 }
 
+/// **Spawned and returned, both read from the parent transcript** (KTD8). Spawns are the
+/// tool-use blocks naming the fan-out tool; returns are the `tool_result` blocks that pair to
+/// them by id. The subagent files on disk are the third source and are deliberately unused:
+/// they have zero observed disagreements with these counts, so they add reading and no
+/// information.
+///
+/// **No summary, boolean or health word sits over the two integers.** A count of processes must
+/// never become an assertion about a review, and whether a returned subagent errored is
+/// unproven across 203 observations and is not modelled.
+///
+/// The `tool_use` → `tool_result` pairing is **assumed**, not verified. Where a spawn carries no
+/// id it cannot be paired, so it counts as spawned and never as returned — which reads low
+/// rather than high, the safe direction for a number nobody should fold into a verdict.
+pub fn fanout_counts(text: &str) -> Observed<(u64, u64)> {
+    let mut spawned: Vec<String> = Vec::new();
+    let mut unidentified = 0u64;
+    let mut returned = 0u64;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(serde_json::Value::Array(parts)) =
+            value.get("message").and_then(|m| m.get("content"))
+        else {
+            continue;
+        };
+        for part in parts {
+            let named = part
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default();
+            if FANOUT_TOOLS.contains(&named) {
+                match part.get("id").and_then(|i| i.as_str()) {
+                    Some(id) => spawned.push(id.to_string()),
+                    None => unidentified += 1,
+                }
+                continue;
+            }
+            if part.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                && let Some(paired) = part.get("tool_use_id").and_then(|i| i.as_str())
+                && spawned.iter().any(|id| id == paired)
+            {
+                returned += 1;
+            }
+        }
+    }
+    let total = spawned.len() as u64 + unidentified;
+    if total == 0 {
+        return nothing_recognised(text, "fan-out spawn");
+    }
+    Observed::Present((total, returned))
+}
+
 /// Observe a Run's durable artifacts fresh. **Reads and never writes** — this path observes and
 /// persists nothing, which is the whole difference from the script's `cmd_status`.
 pub fn observe_fresh(worktree: &Path, handoff_sha: &str, at: String) -> Observation {
@@ -564,6 +617,71 @@ mod tests {
             Observed::Absent
         );
         assert_ne!(fanout(EMPTY), fanout(FANOUT_UNRECOGNISED));
+    }
+
+    // --- fan-out, per Attempt, as two integers -------------------------------------------------
+
+    /// A parent transcript spawning `spawns` and returning the first `returns` of them.
+    fn spawning(spawns: usize, returns: usize) -> String {
+        let mut lines = Vec::new();
+        for n in 0..spawns {
+            lines.push(format!(
+                r#"{{"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_{n}","name":"Agent","input":{{"description":"do the thing"}}}}]}}}}"#
+            ));
+        }
+        for n in 0..returns {
+            lines.push(format!(
+                r#"{{"message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_{n}","content":"done"}}]}}}}"#
+            ));
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn an_attempt_that_spawned_three_and_saw_three_return_records_both_integers() {
+        assert_eq!(fanout_counts(&spawning(3, 3)), Observed::Present((3, 3)));
+    }
+
+    #[test]
+    fn an_attempt_that_spawned_three_and_saw_two_return_says_so_and_nothing_else() {
+        // A count of processes must never become an assertion about a review.
+        let found = fanout_counts(&spawning(3, 2));
+        assert_eq!(found, Observed::Present((3, 2)));
+        let rendered = format!("{found:?}").to_lowercase();
+        for banned in ["health", "degraded", "ok", "complete", "true", "false"] {
+            assert!(!rendered.contains(banned), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn an_attempt_with_no_transcript_records_could_not_observe_rather_than_zero_zero() {
+        // `(0, 0)` claims the Run fanned out to nobody. Nothing was read.
+        let unread: Observed<(u64, u64)> =
+            Observed::Unobservable(Reason::saying("the transcript could not be read"));
+        assert_ne!(unread, Observed::Present((0, 0)));
+        // And a transcript full of tool calls naming something else is the same kind of silence.
+        assert!(matches!(
+            fanout_counts(FANOUT_UNRECOGNISED),
+            Observed::Unobservable(_)
+        ));
+        assert_eq!(fanout_counts(EMPTY), Observed::Absent);
+    }
+
+    #[test]
+    fn the_record_round_trips_both_integers_through_the_reader() {
+        // One shared `Attempt` type, so there is no reader mirror to drift — and the
+        // `deny_unknown_fields` parity test binds only the record's top-level fields, so a
+        // duplicate attempt type inside `view` would not be caught by it.
+        let found: RunView = serde_json::from_str(DAY_ONE).expect("the day-one record");
+        assert_eq!(found.attempts[0].fanout, Observed::Present((3, 3)));
+        assert!(matches!(
+            found.attempts[1].fanout,
+            Observed::Unobservable(_)
+        ));
+        assert_eq!(found.attempts[2].fanout, Observed::Absent);
+        let written = serde_json::to_string(&found.attempts[0]).expect("serialise");
+        let read: crate::attempt::Attempt = serde_json::from_str(&written).expect("deserialise");
+        assert_eq!(read.fanout, found.attempts[0].fanout);
     }
 
     #[test]

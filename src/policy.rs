@@ -226,6 +226,7 @@ mod tests {
             done_promise: false,
             rate_limited,
             result_tail: String::new(),
+            fanout: crate::observe::Observed::Absent,
         }
     }
 
