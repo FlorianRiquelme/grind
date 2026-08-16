@@ -185,17 +185,29 @@ fn build(conditions: &Conditions, mode: Mode, prompt: String) -> Invocation {
     Invocation { argv, prompt, mode }
 }
 
+/// The Run is told only what Grind can know.
+///
+/// Two constants went out of it. *No human present* invited the Run to ask a question and wait
+/// for an answer; *unsupervised* says the same thing about attention without implying anyone is
+/// there to be addressed. And *this slice is transcription, not design* is false of any Job
+/// wider than a rewrite — the half that is true of every Job, **do not re-open decisions the
+/// Anchor records**, survives the half that is not.
+///
+/// Nothing reads the narrative or the closing keyword back. They are asked for because the
+/// human reads them, and a Grind that keyed a verdict on either would be grading prose.
 fn dispatch_prompt(job: &Job) -> String {
     format!(
-        "You are a Grind Run, executing unattended with no human present.
+        "You are a Grind Run, executing unattended and unsupervised. Nobody is watching this
+session and no question you ask will be answered, so decide and proceed.
 
 Job:            {url}
 Branch:         {branch}
 Handoff SHA:    {handoff}
 Anchor artifact: {anchor}
 
-Everything behind the Handoff SHA is context the human prepared for you — read it.
-Everything you add in front of it is reviewable output.
+The Handoff SHA bounds your **output**, not your **reading**. Everything you add sits in
+front of it and is what gets reviewed; read as far around it as you need, including work
+that landed after it.
 
 Invoke the `lfg` skill against the Anchor artifact, resolving the skill name against the
 available-skills list (it may be namespaced, e.g. `compound-engineering:lfg`):
@@ -203,8 +215,12 @@ available-skills list (it may be namespaced, e.g. `compound-engineering:lfg`):
     {anchor}
 
 The Anchor artifact is the requirements you must satisfy. Everything else you need is
-discoverable from this branch. Its contents are already decided — this slice is
-transcription, not design. Do not re-open decisions it records.
+discoverable from this branch. Do not re-open decisions it records.
+
+Before you create a file in a shared sequential namespace — a numbered ADR, a migration, a
+changelog entry — read the current state of that namespace. Read it again on each attempt
+rather than trusting a view you took earlier: other work lands while you run, and two files
+claiming one number is a collision a human has to unpick by hand.
 
 Definition of done: `just verify` passes.
 
@@ -212,11 +228,19 @@ If a step of `just verify` cannot be made green, say so plainly in the PR body a
 the step intact. Never weaken, trim, skip or remove a step of the verify entrypoint to
 make it pass — a gutted gate is worse than one that fails honestly.
 
+Put a narrative in the PR body: the decisions you took, whatever was non-obvious, and
+anything that surprised you. Those are categories and not a template — no headings, no
+order, no required sections, and nothing at all where there is nothing to say.
+
+Put `Closes #{issue}` in the PR body where this PR delivers the whole Job. Where the Job is
+wider than the code, reference it without the keyword instead.
+
 Stop at an open PR. Do not merge it.",
         url = job.url,
         branch = job.branch,
         handoff = job.handoff_sha,
         anchor = job.anchor,
+        issue = job.issue,
     )
 }
 
@@ -476,6 +500,13 @@ mod tests {
         }
     }
 
+    /// Every prompt change is asserted against the **built** prompt string, never against the
+    /// constant it came from.
+    fn built_dispatch_prompt() -> String {
+        let built = dispatch(&conditions(None, None), &job());
+        built.prompt().to_string()
+    }
+
     fn denials_of(invocation: &Invocation) -> Vec<String> {
         let argv = invocation.argv();
         let at = argv
@@ -651,6 +682,91 @@ mod tests {
                 .prompt()
                 .contains("Stop at an open PR. Do not merge it.")
         );
+    }
+
+    #[test]
+    fn the_dispatch_prompt_says_unsupervised_rather_than_alone() {
+        // *No human present* invited the Run to ask a question and wait for an answer.
+        let prompt = built_dispatch_prompt();
+        assert!(prompt.contains("unsupervised"), "{prompt}");
+        assert!(!prompt.contains("no human present"), "{prompt}");
+        assert!(
+            prompt.contains("executing unattended"),
+            "the phrase that was right stays: {prompt}"
+        );
+    }
+
+    #[test]
+    fn the_dispatch_prompt_stops_calling_the_work_transcription() {
+        // False of any Job wider than a rewrite, and this one is a slice with design left in it.
+        let prompt = built_dispatch_prompt();
+        assert!(!prompt.contains("transcription"), "{prompt}");
+        assert!(
+            prompt.contains("Do not re-open decisions it records"),
+            "the half that is true of every Job survives: {prompt}"
+        );
+    }
+
+    #[test]
+    fn the_dispatch_prompt_bounds_output_rather_than_reading() {
+        let prompt = built_dispatch_prompt();
+        let at = prompt
+            .find("Handoff SHA bounds")
+            .expect("the Handoff SHA paragraph");
+        let paragraph = &prompt[at..at + 200.min(prompt.len() - at)];
+        assert!(paragraph.contains("output"), "{paragraph}");
+        assert!(paragraph.contains("reading"), "{paragraph}");
+    }
+
+    #[test]
+    fn the_dispatch_prompt_asks_for_a_narrative_by_category_and_not_by_template() {
+        // Naming a structure is how a narrative Grind promised not to parse becomes one it
+        // parses.
+        let prompt = built_dispatch_prompt();
+        for category in ["decisions you took", "non-obvious", "surprised you"] {
+            assert!(prompt.contains(category), "missing {category}: {prompt}");
+        }
+        assert!(prompt.contains("no headings"), "{prompt}");
+        assert!(prompt.contains("no required sections"), "{prompt}");
+    }
+
+    #[test]
+    fn the_dispatch_prompt_asks_for_the_closing_keyword_and_licenses_declining_it() {
+        let prompt = built_dispatch_prompt();
+        assert!(prompt.contains("Closes #28"), "{prompt}");
+        assert!(
+            prompt.contains("without the keyword"),
+            "a Job wider than its code closes nothing: {prompt}"
+        );
+    }
+
+    #[test]
+    fn the_dispatch_prompt_names_the_shared_sequential_namespaces() {
+        let prompt = built_dispatch_prompt();
+        for named in ["numbered ADR", "migration", "changelog entry"] {
+            assert!(prompt.contains(named), "missing {named}: {prompt}");
+        }
+        assert!(
+            prompt.contains("on each attempt"),
+            "a per-Attempt read, not a pinned view: {prompt}"
+        );
+    }
+
+    #[test]
+    fn nothing_observes_the_narrative_or_the_closing_keyword() {
+        // Asserted as an absence, over the two modules that could grow a reader for either.
+        // `include_str!` rather than the filesystem: reading a file at run time from inside
+        // `src/` is what `tests/topology.rs` forbids everywhere but `world`.
+        const OBSERVE: &str = include_str!("observe.rs");
+        const DECIDE: &str = include_str!("decide.rs");
+        for (name, source) in [("observe", OBSERVE), ("decide", DECIDE)] {
+            for reader in ["narrative", "Closes #", "closes #", "surprised"] {
+                assert!(
+                    !source.contains(reader),
+                    "`{name}` must not read the Run's prose back; it names `{reader}`"
+                );
+            }
+        }
     }
 
     #[test]
