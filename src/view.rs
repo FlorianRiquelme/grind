@@ -349,15 +349,8 @@ pub fn fanout(text: &str) -> Vec<Fanout> {
 /// Observe a Run's durable artifacts fresh. **Reads and never writes** — this path observes and
 /// persists nothing, which is the whole difference from the script's `cmd_status`.
 pub fn observe_fresh(worktree: &Path, handoff_sha: &str, at: String) -> Observation {
-    let readable = world::is_dir(worktree);
     let mut run = |argv: &[String]| world::run(argv, Some(worktree));
-    let mut list = |relative: &str| {
-        world::list_with_extension(&worktree.join(relative), "md")
-            .into_iter()
-            .map(|p| p.strip_prefix(worktree).unwrap_or(&p).display().to_string())
-            .collect::<Vec<String>>()
-    };
-    observe::observe_run(at, handoff_sha, readable, &mut run, &mut list)
+    observe::observe_run(at, handoff_sha, &mut run)
 }
 
 #[cfg(test)]

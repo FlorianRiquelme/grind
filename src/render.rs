@@ -417,6 +417,7 @@ mod tests {
                 "docs/residual-review-findings/a.md".to_string(),
             ]),
             ledger_entries: Observed::Absent,
+            changed_files: Observed::Present(vec!["docs/plans/a.md".to_string()]),
         }
     }
 

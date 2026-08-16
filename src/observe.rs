@@ -117,6 +117,9 @@ pub struct Observation {
     pub plan_files: Observed<Vec<String>>,
     pub residual_findings: Observed<Vec<String>>,
     pub ledger_entries: Observed<Vec<String>>,
+    /// Every path `<handoff-sha>..HEAD` touches — **the Run's own diff**, and the input the
+    /// three listings above are drawn from.
+    pub changed_files: Observed<Vec<String>>,
 }
 
 // --- one classifier per call site -----------------------------------------------------
@@ -276,17 +279,52 @@ fn string_at(value: &serde_json::Value, key: &str) -> String {
         .to_uppercase()
 }
 
-/// A directory listing. `readable` is the caller's answer to *did the directory this lives
-/// under exist at all* — without it, a worktree that has gone missing reads as a Run that
-/// produced no plan.
-pub fn listing(readable: bool, what: &str, entries: Vec<String>) -> Observed<Vec<String>> {
-    if !readable {
-        return Observed::Unobservable(Reason::saying(&format!("{what}: worktree unreadable")));
+/// `git diff --name-only <handoff-sha>..HEAD` — **the Run's own diff**, and the input every
+/// artifact listing is drawn from.
+///
+/// A failed diff is could-not-observe, never an empty listing: a worktree that has gone missing
+/// must not read as a Run that produced nothing.
+pub fn changed_files(completed: &Completed) -> Observed<Vec<String>> {
+    if completed.code != Some(0) {
+        return Observed::Unobservable(Reason::of("git diff --name-only", completed));
     }
-    if entries.is_empty() {
+    let names: Vec<String> = completed
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
         return Observed::Absent;
     }
-    Observed::Present(entries)
+    Observed::Present(names)
+}
+
+/// One artifact directory, **scoped to the Run's own diff**.
+///
+/// The whole-directory listing this replaces counted other people's files: `furthest stage`
+/// read the repo's history rather than the Run's, so a fresh Run read `planned` at dispatch on
+/// any repo where a previous Run had merged a plan. Every one of these files is already in the
+/// PR's own diff, so scoping costs one command and no new state.
+pub fn scoped_listing(changed: &Observed<Vec<String>>, directory: &str) -> Observed<Vec<String>> {
+    let prefix = format!("{directory}/");
+    match changed {
+        Observed::Unobservable(reason) => Observed::Unobservable(reason.clone()),
+        Observed::Absent => Observed::Absent,
+        Observed::Present(files) => {
+            let mine: Vec<String> = files
+                .iter()
+                .filter(|path| path.starts_with(&prefix) && path.ends_with(".md"))
+                .cloned()
+                .collect();
+            if mine.is_empty() {
+                Observed::Absent
+            } else {
+                Observed::Present(mine)
+            }
+        }
+    }
 }
 
 // --- observing a Run, once ---------------------------------------------------------------
@@ -306,9 +344,7 @@ pub const LEDGER_DIR: &str = "docs/ledger";
 pub fn observe_run(
     observed_at: String,
     handoff_sha: &str,
-    worktree_readable: bool,
     run: &mut dyn FnMut(&[String]) -> Completed,
-    list: &mut dyn FnMut(&str) -> Vec<String>,
 ) -> Observation {
     let argv = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<String>>();
 
@@ -319,6 +355,13 @@ pub fn observe_run(
         &format!("{handoff_sha}..HEAD"),
     ]));
     let status = run(&argv(&["git", "status", "--porcelain"]));
+    let diffed = run(&argv(&[
+        "git",
+        "diff",
+        "--name-only",
+        &format!("{handoff_sha}..HEAD"),
+    ]));
+    let changed = changed_files(&diffed);
 
     // The head commit first, the Job's branch as a fallback. Both stay pure parses over raw
     // output, and the existing three-valued classification was never wrong here — it was the
@@ -389,9 +432,10 @@ pub fn observe_run(
         pr: found,
         checks_pending,
         checks_red,
-        plan_files: listing(worktree_readable, "plan", list(PLAN_DIR)),
-        residual_findings: listing(worktree_readable, "residual findings", list(RESIDUAL_DIR)),
-        ledger_entries: listing(worktree_readable, "ledger", list(LEDGER_DIR)),
+        plan_files: scoped_listing(&changed, PLAN_DIR),
+        residual_findings: scoped_listing(&changed, RESIDUAL_DIR),
+        ledger_entries: scoped_listing(&changed, LEDGER_DIR),
+        changed_files: changed,
     }
 }
 
@@ -739,6 +783,8 @@ mod tests {
                     completed("3333333333333333333333333333333333333333\n", "", Some(0))
                 } else if joined.contains("rev-list") {
                     completed("12\n", "", Some(0))
+                } else if joined.contains("diff --name-only") {
+                    completed("src/lib.rs\n", "", Some(0))
                 } else if joined.contains("pr list") {
                     by_head.clone()
                 } else if joined.contains("statusCheckRollup") {
@@ -749,8 +795,35 @@ mod tests {
                     completed("", "", Some(0))
                 }
             };
-            let mut list = |_: &str| Vec::new();
-            observe_run("at".to_string(), "9d1f4c7a", true, &mut run, &mut list)
+            observe_run("at".to_string(), "9d1f4c7a", &mut run)
+        };
+        (observation, seen)
+    }
+
+    /// One observation whose only interesting input is the Run's own diff: no commits, no PR,
+    /// so the stage ladder is reading the listings and nothing else.
+    fn observing_with_diff(names: &str) -> (Observation, Vec<String>) {
+        let names = names.to_string();
+        let mut seen: Vec<String> = Vec::new();
+        let observation = {
+            let mut run = |argv: &[String]| {
+                let joined = argv.join(" ");
+                seen.push(joined.clone());
+                if joined.contains("diff --name-only") {
+                    completed(&names, "", Some(0))
+                } else if joined.contains("rev-parse HEAD") {
+                    completed("3333333333333333333333333333333333333333\n", "", Some(0))
+                } else if joined.contains("rev-list") {
+                    completed("0\n", "", Some(0))
+                } else if joined.contains("pr list") {
+                    completed("[]", "", Some(0))
+                } else if joined.contains("pr view") {
+                    no_pr_on_this_branch()
+                } else {
+                    completed("", "", Some(0))
+                }
+            };
+            observe_run("at".to_string(), "9d1f4c7a", &mut run)
         };
         (observation, seen)
     }
@@ -973,15 +1046,75 @@ mod tests {
 
     #[test]
     fn an_unreadable_worktree_is_not_a_run_that_produced_nothing() {
-        assert_eq!(listing(true, "plan", vec![]), Observed::Absent);
+        // A failed diff is could-not-observe. An empty listing read as absence is how a
+        // worktree that has gone missing becomes a Run that produced no plan.
+        let missing = completed("", "fatal: not a git repository\n", Some(128));
+        assert!(matches!(changed_files(&missing), Observed::Unobservable(_)));
         assert!(matches!(
-            listing(false, "plan", vec![]),
+            scoped_listing(&changed_files(&missing), PLAN_DIR),
             Observed::Unobservable(_)
         ));
+        assert_eq!(changed_files(&completed("", "", Some(0))), Observed::Absent);
+    }
+
+    // --- listings scoped to the Run's own diff -------------------------------------------------
+
+    #[test]
+    fn a_plan_file_the_run_itself_added_advances_the_ladder_and_one_it_did_not_does_not() {
+        let mine = changed_files(&completed(
+            "docs/plans/2026-08-15-a-plan.md\nsrc/lib.rs\n",
+            "",
+            Some(0),
+        ));
         assert_eq!(
-            listing(true, "plan", vec!["docs/plans/a.md".into()]),
-            Observed::Present(vec!["docs/plans/a.md".into()])
+            scoped_listing(&mine, PLAN_DIR),
+            Observed::Present(vec!["docs/plans/2026-08-15-a-plan.md".to_string()])
         );
+        // A previous Run's merged plan is in the repo and not in this Run's diff.
+        let elsewhere = changed_files(&completed("src/lib.rs\nREADME.md\n", "", Some(0)));
+        assert_eq!(scoped_listing(&elsewhere, PLAN_DIR), Observed::Absent);
+        assert_eq!(scoped_listing(&elsewhere, RESIDUAL_DIR), Observed::Absent);
+        assert_eq!(scoped_listing(&elsewhere, LEDGER_DIR), Observed::Absent);
+    }
+
+    #[test]
+    fn a_directory_that_merely_prefixes_another_is_not_swept_up() {
+        let near = changed_files(&completed(
+            "docs/plans-archive/old.md\ndocs/plans/new.md\n",
+            "",
+            Some(0),
+        ));
+        assert_eq!(
+            scoped_listing(&near, PLAN_DIR),
+            Observed::Present(vec!["docs/plans/new.md".to_string()])
+        );
+    }
+
+    #[test]
+    fn all_five_rungs_are_still_reachable_from_diff_scoped_listings() {
+        // Trimming the ladder to the Run-scoped rungs would throw away the distinction between
+        // a Run that died before planning and one that died after, which is why the stage
+        // exists at all.
+        let stage = |o: &Observation| crate::decide::furthest_stage(o).to_string();
+
+        // A fresh Run on a repo where a previous Run merged a plan reads `dispatched`.
+        let (fresh, _) = observing_with_diff("");
+        assert_eq!(stage(&fresh), "dispatched");
+
+        let (mut walk, _) = observing_with_diff("docs/plans/a.md\n");
+        assert_eq!(stage(&walk), "planned");
+        walk.commits_ahead = Observed::Present(3);
+        assert_eq!(stage(&walk), "implemented");
+        walk.residual_findings =
+            Observed::Present(vec!["docs/residual-review-findings/r.md".to_string()]);
+        assert_eq!(stage(&walk), "reviewed");
+        walk.pr = Observed::Present(Pr {
+            number: 30,
+            url: "https://github.com/o/n/pull/30".to_string(),
+            state: "OPEN".to_string(),
+            is_draft: false,
+        });
+        assert_eq!(stage(&walk), "pr-open");
     }
 
     // --- the host item list's classifiers -------------------------------------------------
