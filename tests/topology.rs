@@ -105,6 +105,30 @@ fn environment_access_is_named_in_exactly_one_module_and_it_is_world() {
     );
 }
 
+/// **Grind adds, never classifies** (ADR-0012). A comment is additive and ungoverned; a label,
+/// an assignee, a project and a milestone are shared namespaces the target repo's owner
+/// governs. `QUEUE_LABEL` erased a triage fact — `ready-for-agent`, one of the five canonical
+/// triage roles — to record a queue fact, and the repair is subtractive, so the carrier is the
+/// absence of the spelling rather than a check on which label is applied.
+#[test]
+fn no_path_in_src_classifies_an_issue() {
+    let sources = sources();
+    for classifying in [
+        "--add-label",
+        "--remove-label",
+        "--add-assignee",
+        "--remove-assignee",
+        "--milestone",
+        "--project",
+    ] {
+        let offenders = files_naming(&sources, classifying);
+        assert!(
+            offenders.is_empty(),
+            "`{classifying}` must reach no argv Grind builds; found it in {offenders:?}"
+        );
+    }
+}
+
 #[test]
 fn main_delegates_to_cli_and_does_nothing_else() {
     let main = fs::read_to_string(src_dir().join("main.rs")).expect("read src/main.rs");

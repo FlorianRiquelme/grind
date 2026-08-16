@@ -14,10 +14,15 @@
 //! The denial globs bind the `claude` child and nothing else — `run(argv, cwd)` reaches every
 //! forbidden operation from Grind's own process with nothing in front of it. Grind's own
 //! process never spawns `git reset --hard`, `git rebase`, `git push --force`, a branch
-//! deletion, or `gh pr merge`. It writes to exactly two places: the dispatch-time label
-//! removal and comment on the Job issue. Doctor never performs a write to prove a credential
-//! step. The concrete vector is the dirty-worktree refusal — an agent making a stuck Dispatch
-//! go through reaches for `git reset --hard`, which is idiomatic and invisible to the globs.
+//! deletion, or `gh pr merge`.
+//!
+//! **One place, two writes** (ADR-0012). Grind writes on the Job issue and nowhere else, and
+//! both writes are comments: the dispatch comment, and the terminal-state comment. It applies
+//! no label, assignee, project or milestone on any repo — a comment is additive and ungoverned,
+//! while a label is a shared namespace someone else owns. Doctor never performs a write to
+//! prove a credential step. The concrete vector is the dirty-worktree refusal — an agent making
+//! a stuck Dispatch go through reaches for `git reset --hard`, which is idiomatic and invisible
+//! to the globs.
 
 use std::fs::{self, File};
 use std::io::Write;

@@ -1,10 +1,21 @@
 #!/bin/sh
 # The fake `gh`, reached from a replaced `PATH` so no real `gh` is reachable at all.
 #
-# Dispatch removes a label and comments on the Job issue, so a fall-through here would mutate a
-# real GitHub issue from a routine `just verify`. **Anything unimplemented fails loudly.**
+# Grind comments on the Job issue, so a fall-through here would mutate a real GitHub issue from
+# a routine `just verify`. **Anything unimplemented fails loudly.**
+#
+# The `issue edit` arm stays after ADR-0012 deleted the label removal: an accidental
+# reintroduction has to be caught by an assertion on the log below rather than escape.
 F="${HOME:?}/.fake/gh"
 COUNT=$(cat "${HOME}/.fake/counter" 2>/dev/null || echo 0)
+
+# Every invocation, one argument per line. The assertion on what Grind writes has to be on what
+# was actually posted, not on the absence of an error — an `issue edit` that reappears is caught
+# here rather than escaping.
+{
+  printf -- '--- gh\n'
+  for a in "$@"; do printf '%s\n' "$a"; done
+} >> "${HOME}/.fake/gh.log"
 
 case "$1 $2" in
   "issue view")    cat "$F/issue.json"; exit 0 ;;

@@ -6,10 +6,10 @@
 //! variable, which is racy under parallel tests and `unsafe` in Rust 2024.
 //!
 //! **`PATH` is replaced, not prepended to.** It holds the fakes and a toolbox of symlinks to
-//! the real `git` and the shell utilities the fakes need — nothing else. Dispatch removes a
-//! label and comments on the Job issue, so a fall-through to a real `gh` would mutate a real
-//! GitHub issue from a routine `just verify`. Hermeticity here is structural rather than
-//! asserted.
+//! the real `git` and the shell utilities the fakes need — nothing else. Grind comments on the
+//! Job issue, so a fall-through to a real `gh` would mutate a real GitHub issue from a routine
+//! `just verify`. Hermeticity here is structural rather than asserted. `origin` is a bare repo
+//! on disk, so the fetch Dispatch performs is real git that still reaches no network.
 //!
 //! Every fake substitutes **raw stdout, stderr and exit code**, never a domain value. That is
 //! the only fidelity that can express a truncated parse or replay a dropped connection.
@@ -140,20 +140,52 @@ impl Sandbox {
 
     /// The argv of each attempt, in order, as the fake actually received it.
     fn argvs(&self) -> Vec<Vec<String>> {
-        let Ok(log) = fs::read_to_string(self.fake().join("argv.log")) else {
-            return Vec::new();
-        };
-        let mut all = Vec::new();
-        let mut current = Vec::new();
-        for line in log.lines() {
-            if line.starts_with("--- attempt") {
-                all.push(std::mem::take(&mut current));
-            } else {
-                current.push(line.to_string());
-            }
-        }
-        all
+        split_log(&self.fake().join("argv.log"), "--- attempt")
     }
+
+    /// Every `gh` invocation, in order. The assertion on what Grind writes is on what was
+    /// actually posted, never on the absence of an error.
+    fn gh_calls(&self) -> Vec<Vec<String>> {
+        split_log(&self.fake().join("gh.log"), "--- gh")
+    }
+}
+
+/// A fake's argument log, split into one `Vec` per invocation.
+fn split_log(path: &Path, separator: &str) -> Vec<Vec<String>> {
+    let Ok(log) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut all = Vec::new();
+    let mut current = Vec::new();
+    for line in log.lines() {
+        if line.starts_with(separator) {
+            all.push(std::mem::take(&mut current));
+        } else {
+            current.push(line.to_string());
+        }
+    }
+    all.push(current);
+    all.retain(|call: &Vec<String>| !call.is_empty());
+    all
+}
+
+/// Every comment body Grind posted on the Job issue, in order. A body carries newlines and the
+/// log is one line per argument, so everything after `--body` is rejoined.
+fn comments_on_the_job_issue(box_: &Sandbox) -> Vec<String> {
+    box_.gh_calls()
+        .into_iter()
+        .filter(|call| {
+            call.first().is_some_and(|a| a == "issue")
+                && call.get(1).is_some_and(|a| a == "comment")
+        })
+        .map(|call| {
+            let at = call
+                .iter()
+                .position(|a| a == "--body")
+                .expect("a --body argument");
+            call[at + 1..].join("\n")
+        })
+        .collect()
 }
 
 fn git(cwd: &Path, args: &[&str]) -> String {
@@ -815,6 +847,61 @@ fn a_dirty_worktree_refuses_and_nothing_is_dispatched_onto_it() {
         !box_.home.join(".grind/runs").exists(),
         "nothing is dispatched onto a dirty worktree"
     );
+}
+
+#[test]
+fn a_complete_run_issues_no_gh_issue_edit_at_all() {
+    // Grind adds and never classifies (ADR-0012). `ready-for-agent` is one of the five canonical
+    // triage roles, so removing it erased a triage fact to record a queue fact.
+    let box_ = sandbox("no-issue-edit");
+    box_.scenario(&["success_done"]).pr_appears_at(1);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+
+    let calls = box_.gh_calls();
+    assert!(!calls.is_empty(), "the fake saw `gh` at all");
+    for call in &calls {
+        assert_ne!(
+            call.first()
+                .map(String::as_str)
+                .zip(call.get(1).map(String::as_str)),
+            Some(("issue", "edit")),
+            "no path applies or removes a label: {call:?}"
+        );
+        for classifying in [
+            "--add-label",
+            "--remove-label",
+            "--add-assignee",
+            "--remove-assignee",
+            "--milestone",
+            "--project",
+        ] {
+            assert!(
+                !call.iter().any(|a| a == classifying),
+                "`{classifying}` reached `gh`: {call:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_dispatch_comment_still_carries_the_run_id_and_the_hostname() {
+    // Half of the only off-host surface leg 1 has, kept byte-identical.
+    let box_ = sandbox("dispatch-comment");
+    box_.scenario(&["success_done"]).pr_appears_at(1);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+
+    let record = box_.record();
+    let run_id = record["run_id"].as_str().expect("a run id").to_string();
+    let host = record["hostname"].as_str().expect("a hostname").to_string();
+    let posted = comments_on_the_job_issue(&box_);
+    assert_eq!(posted.len(), 1, "one dispatch comment: {posted:?}");
+    let body = &posted[0];
+    assert!(body.contains(&run_id), "{body}");
+    assert!(body.contains(&host), "{body}");
+    assert!(body.contains("Dispatched as Run"), "{body}");
+    assert!(body.contains("~/.grind/runs/"), "{body}");
 }
 
 #[test]

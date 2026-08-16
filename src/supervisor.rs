@@ -20,11 +20,6 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Dispatch dequeues by removing this label. The queue is a label query over GitHub issues
-/// rather than a thing held anywhere, so removing it is what stops the queue view returning a
-/// Job that is already running.
-pub const QUEUE_LABEL: &str = "ready-for-agent";
-
 /// Compiled constants, snapshotted into the record at dispatch. There is no environment
 /// override (ADR-0008), so the record is what makes *attempt N of M with M from the record*
 /// true and what makes a re-entry under different conditions visible rather than silent.
@@ -320,7 +315,7 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
     world::create_dir_all(&run_dir).map_err(Refusal::saying)?;
     record.save(&record_path(&run_dir))?;
 
-    dequeue_and_point_at_this_host(&record);
+    point_at_this_host(&record);
 
     world::print_line(&format!("  plugin pinned to {}", record.plugin_dir));
     world::print_line(&format!(
@@ -630,30 +625,13 @@ fn adopt_or_create_worktree(repo_path: &Path, branch: &str) -> Result<PathBuf, R
     Ok(wanted)
 }
 
-/// The two writes Grind's own process makes, and the only ones. Neither is allowed to stop a
-/// Run: the Job issue is a pointer, and a pointer that failed to update is not worth abandoning
-/// a dispatched Run over.
-fn dequeue_and_point_at_this_host(record: &RunRecord) {
+/// The dispatch comment, and nothing else. Grind adds and never classifies (ADR-0012): no
+/// label, no assignee, no project, no milestone, on any repo. It is not allowed to stop a Run
+/// either — the Job issue is a pointer, and a pointer that failed to update is not worth
+/// abandoning a dispatched Run over.
+fn point_at_this_host(record: &RunRecord) {
     let number = record.job.issue.to_string();
     let repo = record.job.target_repo.clone();
-    let removed = world::run(
-        &[
-            "gh".to_string(),
-            "issue".to_string(),
-            "edit".to_string(),
-            number.clone(),
-            "--repo".to_string(),
-            repo.clone(),
-            "--remove-label".to_string(),
-            QUEUE_LABEL.to_string(),
-        ],
-        None,
-    );
-    if removed.code != Some(0) {
-        world::print_line(&format!(
-            "  note: could not remove `{QUEUE_LABEL}` from the Job issue"
-        ));
-    }
     // The only thing that travels between hosts is a pointer, and it travels on the Job issue.
     let body = format!(
         "Dispatched as Run `{}` on `{}`.\n\nRun state lives on that host at `~/.grind/runs/{}/`.",
