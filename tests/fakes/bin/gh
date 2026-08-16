@@ -23,6 +23,23 @@ case "$1 $2" in
   "issue comment") printf 'comment posted\n'; exit 0 ;;
   "auth status")   printf 'github.com: Logged in to github.com account tester (oauth_token)\n'; exit 0 ;;
   "ssh-key list")  printf '2026-08-01\ttester\tauthentication\n2026-08-01\ttester\tsigning\n'; exit 0 ;;
+  "pr list")
+      # The head-commit lookup. `gh pr list` answers with an array and exits 0 when nothing
+      # matched, so *no PR yet* is an answer here rather than a failure — and the same
+      # appears-gate applies, because the world moves underneath a Run.
+      APPEARS=$(cat "$F/pr_from" 2>/dev/null || echo 1)
+      if [ ! -f "$F/pr.code" ] && [ "$COUNT" -lt "$APPEARS" ]; then
+        printf '[]\n'
+        exit 0
+      fi
+      [ -f "$F/pr.stderr" ] && cat "$F/pr.stderr" >&2
+      if [ -f "$F/pr.stdout" ]; then
+        printf '['
+        cat "$F/pr.stdout"
+        printf ']\n'
+      fi
+      exit "$(cat "$F/pr.code" 2>/dev/null || echo 0)"
+      ;;
   "pr view")
       KIND=pr
       for a in "$@"; do

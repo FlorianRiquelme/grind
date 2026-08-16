@@ -168,8 +168,38 @@ fn says_no_pr(stderr: &str) -> bool {
     said.contains("no pull requests found") || said.contains("no open pull requests")
 }
 
+/// `gh pr list --search <head-sha> --state all --json number,url,state,isDraft`.
+///
+/// **A Run's identity on GitHub is the commit it pushed, not the branch its Job named.** Run 2
+/// pushed to `…-run` while its Job named `…-seam`, so the branch lookup answered truthfully
+/// about the wrong question and the Handback said `PR —` over an open, green, twelve-commit PR.
+///
+/// An empty array is `Absent` — the search ran and matched nothing. Anything unreadable is
+/// could-not-observe, the direction that withholds a verdict rather than inventing one.
+pub fn pr_by_head(completed: &Completed) -> Observed<Pr> {
+    if completed.code != Some(0) {
+        return Observed::Unobservable(Reason::of("gh pr list --search", completed));
+    }
+    let body = completed.stdout.trim();
+    let Ok(serde_json::Value::Array(matched)) = serde_json::from_str::<serde_json::Value>(body)
+    else {
+        return Observed::Unobservable(Reason::saying("gh pr list --search: unreadable JSON"));
+    };
+    let Some(first) = matched.first() else {
+        return Observed::Absent;
+    };
+    match parse_pr_value(first) {
+        Some(found) => Observed::Present(found),
+        None => Observed::Unobservable(Reason::saying("gh pr list --search: unreadable JSON")),
+    }
+}
+
 fn parse_pr(body: &str) -> Option<Pr> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    parse_pr_value(&value)
+}
+
+fn parse_pr_value(value: &serde_json::Value) -> Option<Pr> {
     Some(Pr {
         number: value.get("number")?.as_u64()?,
         url: value.get("url")?.as_str()?.to_string(),
@@ -289,21 +319,74 @@ pub fn observe_run(
         &format!("{handoff_sha}..HEAD"),
     ]));
     let status = run(&argv(&["git", "status", "--porcelain"]));
-    let pr_view = run(&argv(&[
-        "gh",
-        "pr",
-        "view",
-        "--json",
-        "number,url,state,isDraft",
-    ]));
-    let rollup = run(&argv(&["gh", "pr", "view", "--json", "statusCheckRollup"]));
-    let (checks_pending, checks_red) = checks(&rollup);
+
+    // The head commit first, the Job's branch as a fallback. Both stay pure parses over raw
+    // output, and the existing three-valued classification was never wrong here — it was the
+    // question that was wrong.
+    let head = run(&argv(&["git", "rev-parse", "HEAD"]));
+    let by_head = if head.code == Some(0) && !head.stdout.trim().is_empty() {
+        pr_by_head(&run(&argv(&[
+            "gh",
+            "pr",
+            "list",
+            "--search",
+            head.stdout.trim(),
+            "--state",
+            "all",
+            "--json",
+            "number,url,state,isDraft",
+        ])))
+    } else {
+        Observed::Unobservable(Reason::of("git rev-parse HEAD", &head))
+    };
+    let found = match by_head {
+        Observed::Present(found) => Observed::Present(found),
+        // Nothing matched the commit, so ask the branch — which is still the right question on
+        // a Run that pushed where its Job said it would.
+        Observed::Absent => pr(&run(&argv(&[
+            "gh",
+            "pr",
+            "view",
+            "--json",
+            "number,url,state,isDraft",
+        ]))),
+        // Blind stays blind. A head lookup that could not be made must not become *no PR*
+        // because the branch lookup also found nothing.
+        Observed::Unobservable(reason) => match pr(&run(&argv(&[
+            "gh",
+            "pr",
+            "view",
+            "--json",
+            "number,url,state,isDraft",
+        ]))) {
+            Observed::Present(fallback) => Observed::Present(fallback),
+            _ => Observed::Unobservable(reason),
+        },
+    };
+
+    // The rollup resolves against **the PR the lookup found**, by number. Two independent
+    // lookups can disagree about whether a PR exists at all.
+    let (checks_pending, checks_red) = match &found {
+        Observed::Present(open) => checks(&run(&argv(&[
+            "gh",
+            "pr",
+            "view",
+            &open.number.to_string(),
+            "--json",
+            "statusCheckRollup",
+        ]))),
+        Observed::Absent => (Observed::Absent, Observed::Absent),
+        Observed::Unobservable(reason) => (
+            Observed::Unobservable(reason.clone()),
+            Observed::Unobservable(reason.clone()),
+        ),
+    };
 
     Observation {
         observed_at,
         commits_ahead: commits_ahead(&counted),
         tree_clean: tree_clean(&status),
-        pr: pr(&pr_view),
+        pr: found,
         checks_pending,
         checks_red,
         plan_files: listing(worktree_readable, "plan", list(PLAN_DIR)),
@@ -633,6 +716,147 @@ mod tests {
                 .to_string()
                 .contains("gh auth login")
         );
+    }
+
+    // --- the PR is found by head commit ------------------------------------------------------
+
+    const PR_JSON: &str =
+        r#"{"number":30,"url":"https://github.com/o/n/pull/30","state":"OPEN","isDraft":false}"#;
+
+    /// One whole observation from literals: the head-commit lookup, the branch fallback, and
+    /// the rollup, plus every argv the sequence actually built.
+    fn observing(
+        by_head: Completed,
+        by_branch: Completed,
+        rollup: Completed,
+    ) -> (Observation, Vec<String>) {
+        let mut seen: Vec<String> = Vec::new();
+        let observation = {
+            let mut run = |argv: &[String]| {
+                let joined = argv.join(" ");
+                seen.push(joined.clone());
+                if joined.contains("rev-parse HEAD") {
+                    completed("3333333333333333333333333333333333333333\n", "", Some(0))
+                } else if joined.contains("rev-list") {
+                    completed("12\n", "", Some(0))
+                } else if joined.contains("pr list") {
+                    by_head.clone()
+                } else if joined.contains("statusCheckRollup") {
+                    rollup.clone()
+                } else if joined.contains("pr view") {
+                    by_branch.clone()
+                } else {
+                    completed("", "", Some(0))
+                }
+            };
+            let mut list = |_: &str| Vec::new();
+            observe_run("at".to_string(), "9d1f4c7a", true, &mut run, &mut list)
+        };
+        (observation, seen)
+    }
+
+    fn no_pr_on_this_branch() -> Completed {
+        completed(
+            "",
+            "no pull requests found for branch \"feat/28-slice-1b-seam\"\n",
+            Some(1),
+        )
+    }
+
+    #[test]
+    fn a_pr_on_a_branch_the_job_did_not_name_is_found_by_head_commit() {
+        // Run 2's shape exactly: pushed to `…-run`, the Job named `…-seam`. The branch lookup
+        // answers truthfully about the wrong question.
+        let (observation, seen) = observing(
+            completed(&format!("[{PR_JSON}]"), "", Some(0)),
+            no_pr_on_this_branch(),
+            completed(r#"{"statusCheckRollup":[]}"#, "", Some(0)),
+        );
+        let Observed::Present(found) = &observation.pr else {
+            panic!("the head commit finds it: {:?}", observation.pr);
+        };
+        assert_eq!(found.number, 30);
+        assert!(
+            seen.iter()
+                .any(|argv| argv
+                    .contains("pr list --search 3333333333333333333333333333333333333333")),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn the_branch_fallback_still_finds_a_pr_when_the_head_lookup_returns_nothing() {
+        let (observation, _) = observing(
+            completed("[]", "", Some(0)),
+            completed(PR_JSON, "", Some(0)),
+            completed(r#"{"statusCheckRollup":[]}"#, "", Some(0)),
+        );
+        let Observed::Present(found) = &observation.pr else {
+            panic!("the branch is still the right question for a Run that pushed where it said");
+        };
+        assert_eq!(found.number, 30);
+    }
+
+    #[test]
+    fn a_gh_auth_failure_is_could_not_observe_on_both_paths_and_never_absent() {
+        let code: i32 = GH_AUTH_CODE.trim().parse().expect("the recorded exit code");
+        let broken = completed(GH_AUTH_STDOUT, GH_AUTH_STDERR, Some(code));
+        let (observation, _) = observing(broken.clone(), broken.clone(), broken);
+        assert!(
+            matches!(observation.pr, Observed::Unobservable(_)),
+            "{:?}",
+            observation.pr
+        );
+        assert!(matches!(
+            observation.checks_pending,
+            Observed::Unobservable(_)
+        ));
+        assert!(matches!(observation.checks_red, Observed::Unobservable(_)));
+    }
+
+    #[test]
+    fn unreadable_json_from_either_lookup_is_could_not_observe() {
+        assert!(matches!(
+            pr_by_head(&completed("not json at all", "", Some(0))),
+            Observed::Unobservable(_)
+        ));
+        assert!(matches!(
+            pr_by_head(&completed(r#"[{"url":"x"}]"#, "", Some(0))),
+            Observed::Unobservable(_)
+        ));
+        let (observation, _) = observing(
+            completed("not json at all", "", Some(0)),
+            completed("also not json", "", Some(0)),
+            completed("", "", Some(0)),
+        );
+        assert!(matches!(observation.pr, Observed::Unobservable(_)));
+    }
+
+    #[test]
+    fn the_check_rollup_resolves_against_the_same_pr_the_lookup_found() {
+        // Two independent lookups can disagree about whether a PR exists at all.
+        let (_, seen) = observing(
+            completed(&format!("[{PR_JSON}]"), "", Some(0)),
+            no_pr_on_this_branch(),
+            completed(r#"{"statusCheckRollup":[]}"#, "", Some(0)),
+        );
+        assert!(
+            seen.iter()
+                .any(|argv| argv == "gh pr view 30 --json statusCheckRollup"),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_pr_anywhere_reads_checks_as_absent_rather_than_could_not_observe() {
+        let (observation, _) = observing(
+            completed("[]", "", Some(0)),
+            no_pr_on_this_branch(),
+            completed("", "", Some(0)),
+        );
+        assert_eq!(observation.pr, Observed::Absent);
+        assert_eq!(observation.checks_pending, Observed::Absent);
+        assert_eq!(observation.checks_red, Observed::Absent);
     }
 
     #[test]
