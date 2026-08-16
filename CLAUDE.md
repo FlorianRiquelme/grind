@@ -35,6 +35,7 @@ a `String` — so every decision is testable from literals with no network.
 ```
 grind run <issue>       dispatch a Job now (issue number or URL)
 grind resume <run-id>   re-enter a Run that died
+grind resume --all      re-enter every Run on this host a restart cut off
 grind status [run-id]   roster when bare; one Run's live view when named
 grind doctor            check the provisioned-host list
 grind --version         which copy of the binary is this
@@ -79,9 +80,28 @@ change carries a safety property, not for coverage's sake.
   convention, and aliasing to dodge it is intent.
 - **Grind never gates** (ADR-0003). Verdict language describes what happened, never quality.
   A completed Run means the pipeline finished, not that the code is good. Never add
-  something that blocks a PR from existing on the strength of a finding. Two shapes carry
-  this in the base and are prohibited (ADR-0006): a verdict variant meaning *rejected*, and
-  a summary boolean on the verify contract — `if !vc.ok { return }` is a gate one line away.
+  something that blocks a PR from existing on the strength of a finding. ADR-0006's prohibited
+  shapes are now **seven**, and the two this build was most tempted by are both in it: a
+  **fan-out health summary** over the spawned/returned pair, and a **base-drift summary** —
+  *`main` moved, so don't open the PR* reads as caution and is the quality judgement ADR-0003
+  refuses. The older two still bite hardest: a verdict variant meaning *rejected*, and a summary
+  boolean on the verify contract, where `if !vc.ok { return }` is a gate one line away.
+- **A Wait never spends the attempt budget, and is keyed on work done.** An Attempt that
+  parsed, cost nothing and took at most one turn did no work (`Attempt::is_wait`). The
+  predicate never reads `rate_limited` — keying on cause is how six of Run 2's eight Attempts
+  came to spend the same budget as the three that built twelve commits. **`parse_ok == false` is
+  never a Wait**, and that clause is load-bearing: a crash leaves cost and turns both absent, so
+  reading absence as *did no work* makes every crash loop free and endless. A run of Waits is
+  bounded by `CONSECUTIVE_WAITS`, counted off the persisted list so a reboot cannot reset it.
+- **`Blocked` is a supervisor state and a policy stop, never a `Verdict` variant.** ADR-0006
+  prohibits `Verdict::{Rejected, Blocked, Failed}` by name because those words judge the *work*;
+  a Blocker is a fact about the *world*, in the same family as `RateLimited`. Refusing to build
+  it at all reads the prohibition too widely — adding it to the verdict type is the forbidden
+  shape.
+- **Grind writes comments on the Job issue and nothing else** (ADR-0012). No label, assignee,
+  project or milestone, on any repo — `world`'s stated invariant is *one place, two writes*, and
+  both writes are comments. `QUEUE_LABEL` erased a triage fact to record a queue fact.
+  `tests/topology.rs` carries the absence of every classifying flag.
 - **Grind is a scheduler, not a pipeline** (ADR-0001). Everything between plan and open PR
   belongs to `lfg`. Don't reimplement stages it already runs.
 - **The plugin version is pinned per Job and frozen per Run** (ADR-0002 as amended by #42 and
