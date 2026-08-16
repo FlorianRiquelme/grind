@@ -640,6 +640,38 @@ fn scenario_f_an_unobservable_run_pauses_before_looking_again_and_spends_no_atte
     );
 }
 
+#[test]
+fn scenario_g_a_repeated_denial_with_no_progress_stops_for_a_human_and_resumes() {
+    // A Run refused the same operation twice over stops instead of spending its remaining
+    // budget against it — and it never spent the budget, so it re-enters where it stopped once
+    // the human has cleared the obstacle. The world changed, not the number.
+    let box_ = sandbox("g-blocked");
+    box_.scenario(&["denied", "denied", "denied", "success_done"])
+        .pr_appears_at(4);
+
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+
+    let record = box_.record();
+    assert_eq!(record["state"], "blocked", "stdout:\n{out}");
+    let attempts = record["attempts"].as_array().expect("attempts").len();
+    assert_eq!(attempts, 3, "it stopped at once rather than spending eight");
+    assert!(record["attempt_budget"].as_u64().expect("a budget") > attempts as u64);
+    assert!(
+        out.contains("git push --force-with-lease"),
+        "the Handback names what must be cleared:\n{out}"
+    );
+
+    let run_id = record["run_id"].as_str().expect("a run id").to_string();
+    let (out, err, code) = box_.run(&["resume", &run_id]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert!(
+        !out.contains("run already"),
+        "a Blocked Run re-enters rather than short-circuiting:\n{out}"
+    );
+    assert_eq!(box_.record()["state"], "completed");
+}
+
 // --- the exit code reports observability, never health ----------------------------------------
 
 /// Dispatch a Run that stops short of completion, and hand back its run id.

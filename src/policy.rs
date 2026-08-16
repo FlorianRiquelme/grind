@@ -9,7 +9,7 @@
 
 use crate::attempt::{self, Attempt, Mode};
 use crate::decide::Verdict;
-use crate::observe::Observed;
+use crate::observe::{Observed, Reason};
 use std::time::Duration;
 
 /// The conditions a Run was dispatched under, **read from the record rather than the
@@ -56,6 +56,78 @@ pub enum Stop {
     Uncorroborated(Vec<String>),
     Unobserved(Vec<String>),
     Exhausted,
+    /// An obstacle only a human can clear, carrying **what must be cleared**.
+    ///
+    /// A stop and a supervisor state, and deliberately **never a `Verdict` variant**: ADR-0006
+    /// prohibits `Verdict::{Rejected, Blocked, Failed}` by name because those words are quality
+    /// judgements about the *work*. A Blocker is a fact about the *world*, in the same family
+    /// as the rate limit the base has carried since day one.
+    Blocked(String),
+}
+
+/// Did this working Attempt fail to advance the Run?
+///
+/// **Three-valued, mandatory.** `commits_ahead` read zero for all eight of Run 2's Attempts
+/// against twelve real commits, so a terminal state keyed on it gets the same guard every other
+/// observation gets: blind must not read as blocked. The first working Attempt of a process has
+/// nothing to compare against and reads *could not observe* for that reason.
+pub fn stalled(before: Option<&Observed<u64>>, now: &Observed<u64>) -> Observed<bool> {
+    match (before, now) {
+        (Some(Observed::Present(was)), Observed::Present(is)) => Observed::Present(is <= was),
+        (None, _) => Observed::Unobservable(Reason::saying(
+            "no earlier commit count to compare this Attempt against",
+        )),
+        _ => Observed::Unobservable(Reason::saying(
+            "the commit count was not observed on both sides of this Attempt",
+        )),
+    }
+}
+
+/// **A Blocker: the same denied invocation on two consecutive working Attempts that both failed
+/// to advance.** Supervisor-authoritative, read from the recorded denials.
+///
+/// Three clauses are load-bearing. **Two working Attempts, not one** — a Run may legitimately
+/// probe a denied tool once and route around it, which is exactly what Run 2 did on the Attempt
+/// that opened its PR. **An `Unobservable` progress reading never fires it** — see `stalled`.
+/// And **the Run's own declaration never fires it alone**: nothing here reads the Run's prose,
+/// which is *observed, never declared* holding here too.
+///
+/// `stalls` carries one reading per working Attempt, newest last.
+pub fn blocker(attempts: &[Attempt], stalls: &[Observed<bool>]) -> Option<Stop> {
+    let recent: Vec<&Observed<bool>> = stalls.iter().rev().take(2).collect();
+    if recent.len() < 2 || !recent.iter().all(|s| s == &&Observed::Present(true)) {
+        return None;
+    }
+    let worked: Vec<&Attempt> = attempts.iter().filter(|a| !a.is_wait()).collect();
+    let [.., before, last] = worked.as_slice() else {
+        return None;
+    };
+    let earlier = denied_invocations(before);
+    denied_invocations(last)
+        .into_iter()
+        .find(|denial| earlier.contains(denial))
+        .map(Stop::Blocked)
+}
+
+/// A denial as an identity, so *the same invocation twice* is a comparison rather than a guess.
+fn denied_invocations(attempt: &Attempt) -> Vec<String> {
+    attempt
+        .permission_denials
+        .iter()
+        .map(|denial| {
+            let tool = denial
+                .get("tool_name")
+                .and_then(|t| t.as_str())
+                .unwrap_or("?");
+            let input = denial.get("tool_input");
+            let said = input
+                .and_then(|i| i.get("command"))
+                .and_then(|c| c.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| input.map(ToString::to_string).unwrap_or_default());
+            format!("{tool}({said})")
+        })
+        .collect()
 }
 
 /// The whole policy, as one pure function over the attempt list and the verdict.
@@ -481,6 +553,153 @@ mod tests {
         for ceiling in ["deadline", "max_wall", "timeout", "elapsed"] {
             assert!(!fields.contains(ceiling), "{fields}");
         }
+    }
+
+    // --- a Blocker stops at once ---------------------------------------------------------------
+
+    fn denying(n: usize, command: &str) -> Attempt {
+        Attempt {
+            permission_denials: vec![serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            })],
+            ..attempt(n, Mode::Resume, false)
+        }
+    }
+
+    fn stalled_twice() -> Vec<Observed<bool>> {
+        vec![
+            Observed::Unobservable(Reason::saying("nothing earlier")),
+            Observed::Present(true),
+            Observed::Present(true),
+        ]
+    }
+
+    #[test]
+    fn the_same_denial_on_two_consecutive_working_attempts_with_no_progress_fires_the_blocker() {
+        let attempts = [
+            attempt(1, Mode::Dispatch, false),
+            denying(2, "git push --force-with-lease"),
+            denying(3, "git push --force-with-lease"),
+        ];
+        let Some(Stop::Blocked(what)) = blocker(&attempts, &stalled_twice()) else {
+            panic!("a repeated denial with no progress is a fact about the world");
+        };
+        assert!(what.contains("git push --force-with-lease"), "{what}");
+    }
+
+    #[test]
+    fn a_single_denial_on_one_working_attempt_does_not_fire_it() {
+        // A Run may probe a denied tool once and route around it, which is what Run 2 did on
+        // the Attempt that opened its PR.
+        let attempts = [
+            attempt(1, Mode::Dispatch, false),
+            attempt(2, Mode::Resume, false),
+            denying(3, "git push --force-with-lease"),
+        ];
+        assert_eq!(blocker(&attempts, &stalled_twice()), None);
+    }
+
+    #[test]
+    fn two_denials_of_different_invocations_do_not_fire_it() {
+        let attempts = [
+            attempt(1, Mode::Dispatch, false),
+            denying(2, "git push --force-with-lease"),
+            denying(3, "gh pr merge 30"),
+        ];
+        assert_eq!(blocker(&attempts, &stalled_twice()), None);
+    }
+
+    #[test]
+    fn a_denial_on_a_working_attempt_that_advanced_does_not_fire_it() {
+        let attempts = [
+            attempt(1, Mode::Dispatch, false),
+            denying(2, "git push --force-with-lease"),
+            denying(3, "git push --force-with-lease"),
+        ];
+        let advanced = vec![
+            Observed::Unobservable(Reason::saying("nothing earlier")),
+            Observed::Present(true),
+            Observed::Present(false),
+        ];
+        assert_eq!(blocker(&attempts, &advanced), None);
+    }
+
+    #[test]
+    fn an_unobservable_commit_count_on_either_attempt_never_fires_it() {
+        // Blind must not read as blocked. `commits_ahead` read zero for all eight of Run 2's
+        // Attempts against twelve real commits.
+        let attempts = [
+            attempt(1, Mode::Dispatch, false),
+            denying(2, "git push --force-with-lease"),
+            denying(3, "git push --force-with-lease"),
+        ];
+        let blind = Observed::Unobservable(Reason::saying("git rev-list --count: exit 128"));
+        for stalls in [
+            vec![Observed::Present(true), blind.clone()],
+            vec![blind.clone(), Observed::Present(true)],
+            vec![blind.clone(), blind.clone()],
+        ] {
+            assert_eq!(blocker(&attempts, &stalls), None, "{stalls:?}");
+        }
+    }
+
+    #[test]
+    fn a_declaration_with_no_recorded_denial_does_not_fire_it_on_its_own() {
+        // Observed, never declared. Nothing here reads the Run's prose.
+        let declaring = |n: usize| Attempt {
+            result_tail: "I am blocked: the signer is dead and I cannot sign a commit.".to_string(),
+            ..attempt(n, Mode::Resume, false)
+        };
+        let attempts = [
+            attempt(1, Mode::Dispatch, false),
+            declaring(2),
+            declaring(3),
+        ];
+        assert_eq!(blocker(&attempts, &stalled_twice()), None);
+    }
+
+    #[test]
+    fn the_first_working_attempt_of_a_process_has_nothing_to_compare_against() {
+        let now = Observed::Present(3);
+        assert!(matches!(stalled(None, &now), Observed::Unobservable(_)));
+        assert_eq!(
+            stalled(Some(&Observed::Present(3)), &Observed::Present(3)),
+            Observed::Present(true)
+        );
+        assert_eq!(
+            stalled(Some(&Observed::Present(3)), &Observed::Present(4)),
+            Observed::Present(false)
+        );
+        assert!(matches!(
+            stalled(
+                Some(&Observed::Unobservable(Reason::saying("x"))),
+                &Observed::Present(4)
+            ),
+            Observed::Unobservable(_)
+        ));
+    }
+
+    #[test]
+    fn a_blocker_is_a_stop_and_never_a_verdict_variant() {
+        // ADR-0006 prohibits `Verdict::{Rejected, Blocked, Failed}` by name. The words are
+        // quality judgements about the work; a Blocker is a fact about the world.
+        let variants = [
+            format!("{:?}", Verdict::Completed),
+            format!("{:?}", Verdict::Uncorroborated(vec![])),
+            format!("{:?}", Verdict::Unobserved(vec![])),
+            format!("{:?}", Verdict::Incomplete(vec![])),
+        ];
+        for variant in variants {
+            let said = variant.to_lowercase();
+            for banned in ["blocked", "rejected", "failed"] {
+                assert!(!said.contains(banned), "{variant}");
+            }
+        }
+        assert!(matches!(
+            Stop::Blocked("Bash(git push --force)".to_string()),
+            Stop::Blocked(_)
+        ));
     }
 
     #[test]

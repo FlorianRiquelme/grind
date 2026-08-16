@@ -38,8 +38,12 @@ pub const REOBSERVE_PAUSE_SECONDS: u64 = 15;
 /// consecutive Waits and then cleared, so the bound has to sit well above it.
 pub const CONSECUTIVE_WAITS: usize = 12;
 
-/// **Seven states, and none of them is `running`.** A SIGKILLed supervisor would sit in
+/// **Eight states, and none of them is `running`.** A SIGKILLed supervisor would sit in
 /// `running` forever, which is why the roster observes liveness for itself instead.
+///
+/// `Blocked` is the eighth, and it is a supervisor state rather than a `Verdict` variant for
+/// the reason ADR-0006 gives: a Blocker is a fact about the world, in the same family as
+/// `RateLimited`, and not a judgement about the work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum State {
@@ -50,6 +54,7 @@ enum State {
     Uncorroborated,
     Unobserved,
     Exhausted,
+    Blocked,
 }
 
 impl State {
@@ -62,6 +67,7 @@ impl State {
             State::Uncorroborated => "uncorroborated",
             State::Unobserved => "unobserved",
             State::Exhausted => "exhausted",
+            State::Blocked => "blocked",
         }
     }
 }
@@ -396,6 +402,13 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
     };
     let worktree = PathBuf::from(&record.worktree);
     let mut reobservations = 0usize;
+    // One reading per working Attempt, newest last: *did this Attempt fail to advance*. Held
+    // for the process rather than recorded, because the record carries no per-Attempt commit
+    // count — a fresh process needs two more working Attempts before a Blocker can fire, which
+    // is the safe direction.
+    let mut stalls: Vec<Observed<bool>> = Vec::new();
+    let mut commits_before: Option<Observed<u64>> = None;
+    let mut working_seen = attempt::working(record.attempts());
 
     loop {
         // The first pass has no attempt to classify, so the loop starts by attempting.
@@ -410,10 +423,29 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
         let stop = loop {
             let observation =
                 crate::view::observe_fresh(&worktree, &record.job.handoff_sha, world::now_iso());
+            // The progress window advances once per working Attempt, and only ever forward.
+            let working_now = attempt::working(record.attempts());
+            if working_now > working_seen {
+                working_seen = working_now;
+                stalls.push(policy::stalled(
+                    commits_before.as_ref(),
+                    &observation.commits_ahead,
+                ));
+                commits_before = Some(observation.commits_ahead.clone());
+            }
             let signals = decide::signals_of(&observation);
             let promised = record.attempts().last().is_some_and(|a| a.done_promise);
             let verdict = decide::verdict(&signals, promised);
             announce(record, &observation, &verdict);
+
+            // A Blocker stops at once rather than spending the rest of the budget against a
+            // wall the Run cannot move — and it never overrides a decided Run: where the
+            // artifacts agree, the Run finished, denials and all.
+            if !matches!(verdict, Verdict::Completed)
+                && let Some(stop) = policy::blocker(record.attempts(), &stalls)
+            {
+                break Some(stop);
+            }
 
             match policy::next(
                 record.attempts(),
@@ -470,12 +502,21 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
                 Stop::Uncorroborated(_) => State::Uncorroborated,
                 Stop::Unobserved(_) => State::Unobserved,
                 Stop::Exhausted => State::Exhausted,
+                Stop::Blocked(_) => State::Blocked,
             };
             record.save(&path)?;
             if let Stop::Unobserved(blind) = &stop {
                 for said in blind {
                     world::print_line(&format!("    could not observe {said}"));
                 }
+            }
+            // Resumable, because it never spent the budget: the world changed, not the number.
+            if let Stop::Blocked(what) = &stop {
+                world::print_line(&format!(
+                    "    stopped for a human — {what} was refused twice with no progress; \
+                     `grind resume {}` once it is cleared",
+                    record.run_id
+                ));
             }
             return Ok(Outcome {
                 run_id: record.run_id.clone(),
@@ -731,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn the_seven_states_round_trip_and_none_of_them_is_running() {
+    fn the_eight_states_round_trip_and_none_of_them_is_running() {
         let all = [
             State::Dispatched,
             State::RateLimited,
@@ -740,13 +781,31 @@ mod tests {
             State::Uncorroborated,
             State::Unobserved,
             State::Exhausted,
+            State::Blocked,
         ];
         for state in all {
             let text = serde_json::to_string(&state).unwrap();
             assert_eq!(serde_json::from_str::<State>(&text).unwrap(), state);
             assert_ne!(state.as_str(), "running");
         }
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
+    }
+
+    #[test]
+    fn a_blocked_run_is_resumable_and_a_completed_or_exhausted_one_is_not() {
+        // A Blocker never spent the budget — the world changed, not the number — so the hand
+        // `resume` path has nothing to refuse. `--all` excludes it for a different reason: a
+        // stopped Run must not be re-entered at the one moment nobody is watching.
+        for resumable in [
+            State::Dispatched,
+            State::RateLimited,
+            State::Died,
+            State::Uncorroborated,
+            State::Unobserved,
+            State::Blocked,
+        ] {
+            assert!(!matches!(resumable, State::Completed | State::Exhausted));
+        }
     }
 
     #[test]
