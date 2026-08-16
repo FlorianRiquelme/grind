@@ -106,7 +106,6 @@ pub struct Conditions<'a> {
     pub session_id: &'a str,
     pub plugin_dir: &'a str,
     pub model: Option<&'a str>,
-    pub spend_cap: Option<&'a str>,
 }
 
 /// A built invocation. **Private fields, and `build` is the only constructor** — so an argv
@@ -175,10 +174,8 @@ fn build(conditions: &Conditions, mode: Mode, prompt: String) -> Invocation {
     }
     argv.push("--plugin-dir".to_string());
     argv.push(conditions.plugin_dir.to_string());
-    if let Some(cap) = conditions.spend_cap {
-        argv.push("--max-budget-usd".to_string());
-        argv.push(cap.to_string());
-    }
+    // No `--max-budget-usd`. ADR-0010: spend is recorded, never bounded — a number someone
+    // guessed at Enqueue must not kill a Run mid-work for being larger than the guess.
     // The last thing appended, on every path, from the one builder.
     argv.push("--disallowedTools".to_string());
     argv.extend(DENIED_TOOLS.iter().map(|glob| glob.to_string()));
@@ -522,27 +519,25 @@ mod tests {
             branch: "feat/28-slice-1b".to_string(),
             handoff_sha: "9d1f4c7a".to_string(),
             anchor: "docs/plans/a.md".to_string(),
-            budget: Some("$12.50".to_string()),
             model: None,
             plugin: PluginPin::parse("compound-engineering@compound-engineering-plugin 3.21.3")
                 .unwrap(),
         }
     }
 
-    fn conditions<'a>(model: Option<&'a str>, cap: Option<&'a str>) -> Conditions<'a> {
+    fn conditions(model: Option<&str>) -> Conditions<'_> {
         Conditions {
             claude_bin: "/home/op/.grind/bin/claude",
             session_id: "d51b4c39-ce1d-449b-8366-04b9b1aa6573",
             plugin_dir: "/home/op/.claude/plugins/cache/m/n/3.21.3",
             model,
-            spend_cap: cap,
         }
     }
 
     /// Every prompt change is asserted against the **built** prompt string, never against the
     /// constant it came from.
     fn built_dispatch_prompt() -> String {
-        let built = dispatch(&conditions(None, None), &job());
+        let built = dispatch(&conditions(None), &job());
         built.prompt().to_string()
     }
 
@@ -557,7 +552,7 @@ mod tests {
 
     #[test]
     fn every_built_argv_carries_all_twelve_globs_on_all_three_paths() {
-        let conditions = conditions(None, None);
+        let conditions = conditions(None);
         for invocation in [
             dispatch(&conditions, &job()),
             resume(&conditions),
@@ -661,7 +656,7 @@ mod tests {
 
     #[test]
     fn the_first_attempt_opens_a_session_and_every_later_one_resumes_it() {
-        let conditions = conditions(None, None);
+        let conditions = conditions(None);
         let first = dispatch(&conditions, &job());
         assert!(first.argv().contains(&"--session-id".to_string()));
         assert!(!first.argv().contains(&"--resume".to_string()));
@@ -676,7 +671,7 @@ mod tests {
 
     #[test]
     fn the_argv_shape_is_the_one_two_runs_actually_used() {
-        let invocation = dispatch(&conditions(Some("claude-opus-5"), Some("12.50")), &job());
+        let invocation = dispatch(&conditions(Some("claude-opus-5")), &job());
         let argv = invocation.argv();
         assert_eq!(argv[0], "/home/op/.grind/bin/claude");
         assert_eq!(
@@ -691,23 +686,36 @@ mod tests {
             argv.windows(2)
                 .any(|w| w[0] == "--model" && w[1] == "claude-opus-5")
         );
-        assert!(
-            argv.windows(2)
-                .any(|w| w[0] == "--max-budget-usd" && w[1] == "12.50")
-        );
         assert!(argv.windows(2).any(|w| w[0] == "--plugin-dir"));
     }
 
     #[test]
-    fn no_budget_ceiling_and_no_model_mean_no_flags_for_them() {
-        let invocation = dispatch(&conditions(None, None), &job());
-        assert!(!invocation.argv().contains(&"--max-budget-usd".to_string()));
+    fn no_built_argv_on_any_of_the_three_paths_carries_a_spend_ceiling() {
+        // ADR-0010: spend is recorded, never bounded. A number someone guessed at Enqueue must
+        // not kill a Run mid-work for being larger than the guess.
+        let conditions = conditions(Some("claude-opus-5"));
+        for invocation in [
+            dispatch(&conditions, &job()),
+            resume(&conditions),
+            ci_babysit(&conditions),
+        ] {
+            assert!(
+                !invocation.argv().contains(&"--max-budget-usd".to_string()),
+                "{:?}",
+                invocation.mode()
+            );
+        }
+    }
+
+    #[test]
+    fn no_model_means_no_flag_for_it() {
+        let invocation = dispatch(&conditions(None), &job());
         assert!(!invocation.argv().contains(&"--model".to_string()));
     }
 
     #[test]
     fn the_dispatch_prompt_carries_the_jobs_own_four_facts() {
-        let invocation = dispatch(&conditions(None, None), &job());
+        let invocation = dispatch(&conditions(None), &job());
         for fact in [
             "issues/28",
             "feat/28-slice-1b",

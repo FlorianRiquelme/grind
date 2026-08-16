@@ -460,11 +460,8 @@ fn scenario_a_a_real_run_shape_with_the_literal_argv_of_every_attempt() {
                 "Bash(gh api*merge*)",
             ]
         );
-        // Fixed at dispatch and read from the record on every attempt.
-        assert!(
-            argv.windows(2)
-                .any(|w| w[0] == "--max-budget-usd" && w[1] == "12.50")
-        );
+        // No spend ceiling on any of them, and the Job issue still carries the row (ADR-0010).
+        assert!(!argv.contains(&"--max-budget-usd".to_string()));
         assert!(argv.contains(&"bypassPermissions".to_string()));
         assert!(
             argv.windows(2)

@@ -535,7 +535,6 @@ fn run_one_attempt(
     mode: Mode,
 ) -> Result<(), Refusal> {
     let n = record.attempts().len() + 1;
-    let spend_cap = job::spend_cap(record.job.budget.as_deref());
     let conditions = Conditions {
         claude_bin: &record.claude_bin,
         session_id: &record.session_id,
@@ -543,7 +542,6 @@ fn run_one_attempt(
         // spans hours of rate-limit sleeps, and a version changing mid-Run is silent.
         plugin_dir: &record.plugin_dir,
         model: record.model.as_deref(),
-        spend_cap: spend_cap.as_deref(),
     };
     let invocation: Invocation = match mode {
         Mode::Dispatch => attempt::dispatch(&conditions, &record.job),

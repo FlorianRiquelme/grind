@@ -92,7 +92,6 @@ pub struct Job {
     pub branch: String,
     pub handoff_sha: String,
     pub anchor: String,
-    pub budget: Option<String>,
     pub model: Option<String>,
     pub plugin: PluginPin,
 }
@@ -197,7 +196,8 @@ pub fn from_issue_json(raw: &str) -> Result<Job, Refusal> {
     let anchor = required("anchor artifact")?;
     validate_anchor(&anchor)?;
     let plugin = PluginPin::parse(&required("pinned plugin version")?)?;
-    let budget = optional("budget ceiling");
+    // No `budget ceiling` row is read. ADR-0010 withdrew the ceiling, and a Job still carrying
+    // the row is ignored the way any unknown row is.
     let model = optional("model");
 
     Ok(Job {
@@ -209,7 +209,6 @@ pub fn from_issue_json(raw: &str) -> Result<Job, Refusal> {
         branch,
         handoff_sha,
         anchor,
-        budget,
         model,
         plugin,
     })
@@ -655,20 +654,6 @@ fn short(sha: &str) -> String {
     sha.chars().take(8).collect()
 }
 
-/// A `budget ceiling` row becomes the spend cap on every `claude` invocation.
-pub fn spend_cap(budget: Option<&str>) -> Option<String> {
-    let raw = budget?;
-    if is_blank_row(raw) {
-        return None;
-    }
-    let number: String = raw
-        .chars()
-        .skip_while(|c| !c.is_ascii_digit())
-        .take_while(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    (!number.is_empty()).then_some(number)
-}
-
 // --- the two scanners the plugin pin needs -----------------------------------------------
 
 fn find_version(text: &str) -> Option<String> {
@@ -877,31 +862,30 @@ mod tests {
 
     #[test]
     fn the_full_table_reads_every_row_including_the_optional_ones() {
-        let rows = format!("{FULL_ROWS}\n| Budget ceiling | $12.50 |\n| Model | claude-opus-5 |");
+        let rows = format!("{FULL_ROWS}\n| Model | claude-opus-5 |");
         let job = from_issue_json(&issue_json(&rows)).expect("a complete Job");
         assert_eq!(job.issue, 28);
         assert_eq!(job.target_repo, "FlorianRiquelme/snapper");
         assert_eq!(job.handoff_sha, "9d1f4c7a2b6e0538d4a17c9b3e5f8021ac6d4e77");
         assert_eq!(job.anchor, "docs/plans/2026-08-05-002-plan.md");
-        assert_eq!(job.budget.as_deref(), Some("$12.50"));
         assert_eq!(job.model.as_deref(), Some("claude-opus-5"));
         assert_eq!(job.labels, vec!["grind:queued".to_string()]);
     }
 
     #[test]
-    fn a_budget_ceiling_becomes_a_cap_and_an_absent_one_does_not() {
-        assert_eq!(spend_cap(Some("$12.50")).as_deref(), Some("12.50"));
-        assert_eq!(spend_cap(Some("USD 8")).as_deref(), Some("8"));
-        assert_eq!(spend_cap(Some("none")), None);
-        assert_eq!(spend_cap(Some("-")), None);
-        assert_eq!(spend_cap(None), None);
+    fn a_job_still_carrying_a_budget_ceiling_row_parses_and_the_row_is_ignored() {
+        // ADR-0010 withdrew the ceiling. A Job filed before that is still a readable Job, and
+        // the row is ignored the way any unknown row is.
+        let rows = format!("{FULL_ROWS}\n| Budget ceiling | $12.50 |");
+        let job = from_issue_json(&issue_json(&rows)).expect("a readable Job");
+        assert_eq!(job.anchor, "docs/plans/2026-08-05-002-plan.md");
+        assert!(!format!("{job:?}").contains("12.50"));
     }
 
     #[test]
     fn an_optional_row_reading_none_is_the_same_as_no_row() {
-        let rows = format!("{FULL_ROWS}\n| Budget ceiling | none |\n| Model | - |");
+        let rows = format!("{FULL_ROWS}\n| Model | - |");
         let job = from_issue_json(&issue_json(&rows)).expect("a complete Job");
-        assert_eq!(job.budget, None);
         assert_eq!(job.model, None);
     }
 

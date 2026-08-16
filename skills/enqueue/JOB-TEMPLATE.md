@@ -19,11 +19,11 @@ dropped. Everything else in the body is prose Grind never reads.
 **All five are required and refused at dispatch if missing.** A row reading `none`, `-`, `n/a` or
 empty counts as missing, so never write a placeholder into a required row.
 
-**Rows not to write.** `Budget ceiling` — ADR-0010 removed the ceiling; a Run is bounded by
-Attempts that did work, never by spend. `Model` — silence was right on both real Jobs. `Intent`
-is a one-line statement of the work's *nature*, written only once
-[#63](https://github.com/FlorianRiquelme/grind/issues/63) lands, and only when there is something
-true to say.
+**Rows not to write.** `Model` — silence was right on both real Jobs. `Intent` is a one-line
+statement of the work's *nature*, written only when there is something true to say.
+
+There is no `Budget ceiling` row. ADR-0010 withdrew the ceiling and the parser no longer reads
+one; a Run is bounded by Attempts that did work, never by spend.
 
 Parenthetical context after a value is fine — it survives the strip and is how a Handoff SHA says
 which commit it is.
