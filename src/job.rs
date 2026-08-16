@@ -573,18 +573,82 @@ pub fn worktree_to_create(repo_path: &Path, branch: &str) -> PathBuf {
         .join(format!("grind-{}", branch.replace('/', "-")))
 }
 
-/// A HEAD that differs from the Handoff SHA is a **note on the dispatch plan, never a
-/// refusal** — the information without a new gate.
-pub fn head_note(head: &str, handoff_sha: &str) -> Option<String> {
+/// What Dispatch does about the worktree it adopted. One question — *does this worktree
+/// contain the Handoff SHA* — and exactly one answer to it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reachability {
+    /// The worktree is at the Handoff SHA. Nothing to say.
+    Proceed,
+    /// Worth knowing, and never a gate.
+    Note(String),
+    /// Not the worktree the Job named. Incoherent input, in the dirty-worktree register.
+    Refuse(Refusal),
+}
+
+/// Reachability from git's own exit statuses, replacing a string comparison that fired
+/// identically when the worktree was harmlessly ahead and when it did not contain the Handoff
+/// SHA at all. Run 2's worktree was behind and fast-forwardable at second zero, and the note
+/// said the same thing it says when everything is fine.
+///
+/// `ancestor_exit` is `git merge-base --is-ancestor <handoff> HEAD`; `handoff_contains_head` is
+/// the **reverse** call, which is the only thing that separates *behind* from *diverged* — exit
+/// 1 from the forward call says only *not an ancestor*.
+pub fn reachability(
+    fetch_ok: bool,
+    ancestor_exit: Option<i32>,
+    handoff_contains_head: bool,
+    head: &str,
+    handoff_sha: &str,
+) -> Reachability {
     let head = head.trim();
     let handoff = handoff_sha.trim();
-    (head != handoff).then(|| {
-        format!(
-            "worktree HEAD {} != Handoff SHA {}",
+    // The row to get right: a fetch that could not be made leaves the question unanswered, and
+    // an unanswered question is neither a clean bill of health nor a refusal.
+    if !fetch_ok {
+        return Reachability::Note(format!(
+            "could not fetch, so whether this worktree contains {} was not observed",
+            short(handoff)
+        ));
+    }
+    match ancestor_exit {
+        Some(0) if same_commit(head, handoff) => Reachability::Proceed,
+        Some(0) => Reachability::Note(format!(
+            "worktree HEAD {} is ahead of Handoff SHA {}",
             short(head),
             short(handoff)
-        )
-    })
+        )),
+        // Grind never fast-forwards and never moves the worktree: the declared clone may be a
+        // symlink to the human's own (ADR-0008), so a visible refusal is traded for an
+        // invisible mutation deliberately.
+        Some(1) if handoff_contains_head => Reachability::Refuse(Refusal::saying(format!(
+            "worktree HEAD {} is behind Handoff SHA {} — fast-forward and re-dispatch",
+            short(head),
+            short(handoff)
+        ))),
+        Some(1) => Reachability::Refuse(Refusal::saying(format!(
+            "Handoff SHA {} is not in the history of worktree HEAD {}",
+            short(handoff),
+            short(head)
+        ))),
+        Some(128) => Reachability::Refuse(Refusal::saying(format!(
+            "Handoff SHA {} is not an object in the worktree at HEAD {}",
+            short(handoff),
+            short(head)
+        ))),
+        other => Reachability::Refuse(Refusal::saying(format!(
+            "could not read whether the worktree contains {}: git merge-base exited {}",
+            short(handoff),
+            other.map_or_else(|| "on a signal".to_string(), |c| c.to_string())
+        ))),
+    }
+}
+
+/// Two spellings of one commit. The `Handoff SHA` row may legitimately carry an abbreviation —
+/// the scan above accepts seven characters — so equality is a prefix over the shorter of the
+/// two, asked only of a pair git has already called an ancestor.
+fn same_commit(head: &str, handoff: &str) -> bool {
+    let n = head.len().min(handoff.len());
+    n >= 7 && head.as_bytes()[..n] == handoff.as_bytes()[..n]
 }
 
 fn short(sha: &str) -> String {
@@ -879,12 +943,103 @@ mod tests {
         assert_eq!(adopt_worktree(porcelain, "feat/28-slice-1b"), None);
     }
 
+    // --- reachability, all six rows of the table ---------------------------------------------
+
+    const HEAD_SHA: &str = "3333333333333333333333333333333333333333";
+    const HANDOFF: &str = "9d1f4c7a2b6e0538d4a17c9b3e5f8021ac6d4e77";
+
+    fn refusal_of(r: &Reachability) -> String {
+        match r {
+            Reachability::Refuse(refusal) => refusal.to_string(),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn a_head_off_the_handoff_sha_is_a_note_and_not_a_refusal() {
-        assert_eq!(head_note("abc123", "abc123"), None);
-        let note = head_note("9d1f4c7a2b6e", "1111111111").expect("a note");
-        assert!(note.contains("9d1f4c7a"));
-        assert!(note.contains("11111111"));
+    fn a_worktree_at_the_handoff_sha_proceeds_silently() {
+        assert_eq!(
+            reachability(true, Some(0), true, HANDOFF, HANDOFF),
+            Reachability::Proceed
+        );
+        // An abbreviated row is the same commit, not a different one.
+        assert_eq!(
+            reachability(true, Some(0), true, HANDOFF, "9d1f4c7"),
+            Reachability::Proceed
+        );
+    }
+
+    #[test]
+    fn a_worktree_ahead_of_the_handoff_sha_proceeds_with_a_note() {
+        let Reachability::Note(note) = reachability(true, Some(0), false, HEAD_SHA, HANDOFF) else {
+            panic!("a worktree that contains the Handoff SHA and has moved on is a note");
+        };
+        assert!(note.contains("ahead"), "{note}");
+    }
+
+    #[test]
+    fn a_worktree_behind_the_handoff_sha_refuses_saying_fast_forward() {
+        // Run 2's opening condition: behind and fast-forwardable at second zero.
+        let said = refusal_of(&reachability(true, Some(1), true, HEAD_SHA, HANDOFF));
+        assert!(said.contains("fast-forward"), "{said}");
+        assert!(
+            said.contains("33333333") && said.contains("9d1f4c7a"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn a_handoff_sha_off_this_history_refuses_without_offering_a_fast_forward() {
+        let said = refusal_of(&reachability(true, Some(1), false, HEAD_SHA, HANDOFF));
+        assert!(!said.contains("fast-forward"), "{said}");
+        assert!(said.contains("not in the history"), "{said}");
+    }
+
+    #[test]
+    fn a_handoff_sha_that_is_not_an_object_here_refuses() {
+        let said = refusal_of(&reachability(true, Some(128), false, HEAD_SHA, HANDOFF));
+        assert!(said.contains("not an object"), "{said}");
+    }
+
+    #[test]
+    fn a_failed_fetch_is_a_note_and_never_a_refusal_or_a_clean_bill_of_health() {
+        // The row to get right. Every ancestor answer under a failed fetch is unobserved.
+        for exit in [Some(0), Some(1), Some(128), None] {
+            let observed = reachability(false, exit, false, HEAD_SHA, HANDOFF);
+            let Reachability::Note(note) = observed else {
+                panic!("a failed fetch is a note, got {observed:?}");
+            };
+            assert!(note.contains("not observed"), "{note}");
+        }
+    }
+
+    #[test]
+    fn a_merge_base_that_could_not_be_run_says_so_rather_than_passing() {
+        let said = refusal_of(&reachability(true, None, false, HEAD_SHA, HANDOFF));
+        assert!(said.contains("could not read"), "{said}");
+    }
+
+    #[test]
+    fn no_reachability_answer_carries_a_quality_word() {
+        let all = [
+            reachability(true, Some(0), true, HANDOFF, HANDOFF),
+            reachability(true, Some(0), false, HEAD_SHA, HANDOFF),
+            reachability(true, Some(1), true, HEAD_SHA, HANDOFF),
+            reachability(true, Some(1), false, HEAD_SHA, HANDOFF),
+            reachability(true, Some(128), false, HEAD_SHA, HANDOFF),
+            reachability(false, Some(0), false, HEAD_SHA, HANDOFF),
+            reachability(true, None, false, HEAD_SHA, HANDOFF),
+        ];
+        for answer in &all {
+            let said = match answer {
+                Reachability::Proceed => String::new(),
+                Reachability::Note(note) => note.clone(),
+                Reachability::Refuse(refusal) => refusal.to_string(),
+            }
+            .to_lowercase();
+            for quality in ["bad", "invalid", "wrong", "fail", "error", "reject"] {
+                assert!(!said.contains(quality), "{said}");
+            }
+        }
     }
 
     // --- the host item list ---------------------------------------------------------------

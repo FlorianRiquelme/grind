@@ -239,9 +239,42 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
             dirty.stdout.trim()
         )));
     }
+    // Four impure calls and no branching in any of them; `job::reachability` is the whole of
+    // the decision. The fetch is network, so it sits outside the *presence only, local, free,
+    // no network* comment that scopes the host-readiness check above — and it is what makes the
+    // same Job produce the same answer on a laptop and on a box.
+    let fetched = world::run(&words(&["git", "fetch"]), Some(&repo_path));
     let head = world::run(&words(&["git", "rev-parse", "HEAD"]), Some(&worktree));
-    if let Some(note) = job::head_note(&head.stdout, &job.handoff_sha) {
-        world::print_line(&format!("  note: {note}"));
+    let contains = world::run(
+        &[
+            "git".to_string(),
+            "merge-base".to_string(),
+            "--is-ancestor".to_string(),
+            job.handoff_sha.clone(),
+            "HEAD".to_string(),
+        ],
+        Some(&worktree),
+    );
+    let reverse = world::run(
+        &[
+            "git".to_string(),
+            "merge-base".to_string(),
+            "--is-ancestor".to_string(),
+            "HEAD".to_string(),
+            job.handoff_sha.clone(),
+        ],
+        Some(&worktree),
+    );
+    match job::reachability(
+        fetched.code == Some(0),
+        contains.code,
+        reverse.code == Some(0),
+        &head.stdout,
+        &job.handoff_sha,
+    ) {
+        job::Reachability::Proceed => {}
+        job::Reachability::Note(note) => world::print_line(&format!("  note: {note}")),
+        job::Reachability::Refuse(refusal) => return Err(refusal),
     }
 
     let run_id = format!(

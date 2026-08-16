@@ -109,6 +109,18 @@ impl Sandbox {
         serde_json::from_str(&raw).expect("the record parses")
     }
 
+    fn clone_path(&self) -> PathBuf {
+        self.home.join(".grind/repos").join(OWNER).join(NAME)
+    }
+
+    /// Rewrite the Job issue's `Handoff SHA` row.
+    fn handoff_becomes(&self, sha: &str) -> &Self {
+        let path = self.fake().join("gh/issue.json");
+        let raw = fs::read_to_string(&path).expect("the Job issue");
+        fs::write(&path, raw.replace(&self.handoff_sha, sha)).expect("rewrite the Job issue");
+        self
+    }
+
     fn run_dir(&self) -> PathBuf {
         fs::read_dir(self.home.join(".grind/runs"))
             .expect("runs")
@@ -213,19 +225,24 @@ fn sandbox(name: &str) -> Sandbox {
     git(&clone, &["config", "user.email", "run@example.invalid"]);
     git(&clone, &["config", "user.name", "Grind Test"]);
     git(&clone, &["config", "commit.gpgsign", "false"]);
+    // A bare repo on disk stands in for `origin`. Dispatch fetches before it asks anything
+    // about the worktree, so `origin` has to be reachable — and a local one keeps *no network*
+    // structural rather than merely unexercised.
+    let origin = fake.join("origin.git");
+    git(
+        &home,
+        &["init", "--bare", "-q", origin.to_str().expect("utf-8")],
+    );
     git(
         &clone,
-        &[
-            "remote",
-            "add",
-            "origin",
-            &format!("git@github.com:{OWNER}/{NAME}.git"),
-        ],
+        &["remote", "add", "origin", origin.to_str().expect("utf-8")],
     );
     fs::write(clone.join("README.md"), "the human's context\n").expect("seed a file");
     git(&clone, &["add", "-A"]);
     git(&clone, &["commit", "-q", "-m", "the human stops here"]);
     let handoff_sha = git(&clone, &["rev-parse", "HEAD"]);
+    git(&clone, &["push", "-q", "origin", "main"]);
+    git(&clone, &["remote", "set-head", "origin", "-a"]);
     git(&clone, &["checkout", "-q", "-b", BRANCH]);
     fs::create_dir_all(clone.join("docs/plans")).expect("a plan directory");
     fs::write(clone.join("docs/plans/a-plan.md"), "# a plan\n").expect("a plan");
@@ -789,6 +806,65 @@ fn a_dirty_worktree_refuses_and_nothing_is_dispatched_onto_it() {
     assert!(
         !box_.home.join(".grind/runs").exists(),
         "nothing is dispatched onto a dirty worktree"
+    );
+}
+
+#[test]
+fn a_worktree_behind_the_handoff_sha_refuses_at_second_zero() {
+    // Run 2's opening condition. The string comparison this replaces printed the same note here
+    // as it printed on a worktree that was harmlessly ahead, and the Run proceeded — the signer
+    // outage, the denied force-push and five hours of `pr: null` are all downstream of it.
+    let box_ = sandbox("behind-the-handoff");
+    box_.scenario(&["success_done"]);
+
+    // A commit the branch does not have, reachable as an object and nothing else.
+    let clone = box_.clone_path();
+    git(&clone, &["checkout", "-q", BRANCH]);
+    fs::write(clone.join("docs/plans/later.md"), "# the human moved on\n").expect("a later plan");
+    git(&clone, &["add", "-A"]);
+    git(&clone, &["commit", "-q", "-m", "the human moved on"]);
+    let ahead = git(&clone, &["rev-parse", "HEAD"]);
+    git(&clone, &["reset", "--hard", "-q", "HEAD~1"]);
+    git(&clone, &["checkout", "-q", "main"]);
+    box_.handoff_becomes(&ahead);
+
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(
+        code,
+        Some(2),
+        "a refusal is incoherent input:\n{out}\n{err}"
+    );
+    assert!(
+        err.contains("fast-forward"),
+        "the one refusal that names its repair:\n{err}"
+    );
+    assert!(
+        !box_.home.join(".grind/runs").exists(),
+        "nothing is dispatched onto a worktree that does not contain the Handoff SHA"
+    );
+}
+
+#[test]
+fn a_handoff_sha_off_this_worktrees_history_refuses() {
+    let box_ = sandbox("handoff-elsewhere");
+    box_.scenario(&["success_done"]);
+
+    // An unrelated root commit: neither an ancestor nor a descendant of the branch.
+    let clone = box_.clone_path();
+    git(&clone, &["checkout", "-q", "--orphan", "elsewhere"]);
+    fs::write(clone.join("README.md"), "another history entirely\n").expect("seed it");
+    git(&clone, &["add", "-A"]);
+    git(&clone, &["commit", "-q", "-m", "elsewhere"]);
+    let elsewhere = git(&clone, &["rev-parse", "HEAD"]);
+    git(&clone, &["checkout", "-q", "main"]);
+    box_.handoff_becomes(&elsewhere);
+
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(2), "{out}\n{err}");
+    assert!(err.contains("not in the history"), "{err}");
+    assert!(
+        !err.contains("fast-forward"),
+        "there is nothing to fast-forward to:\n{err}"
     );
 }
 
