@@ -328,16 +328,22 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
 
     point_at_this_host(&record);
 
-    world::print_line(&format!("  plugin pinned to {}", record.plugin_dir));
-    world::print_line(&format!(
-        "  model {}",
-        record
-            .model
-            .as_deref()
-            .unwrap_or("(session default — unpinned)")
-    ));
-    world::print_line(&format!("  claude {}", record.claude_bin));
-    world::print_line(&format!("  run {run_id}"));
+    say(
+        &run_dir,
+        &format!("  plugin pinned to {}", record.plugin_dir),
+    );
+    say(
+        &run_dir,
+        &format!(
+            "  model {}",
+            record
+                .model
+                .as_deref()
+                .unwrap_or("(session default — unpinned)")
+        ),
+    );
+    say(&run_dir, &format!("  claude {}", record.claude_bin));
+    say(&run_dir, &format!("  run {run_id}"));
 
     supervise(&mut record, &run_dir)
 }
@@ -436,7 +442,7 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
             let signals = decide::signals_of(&observation);
             let promised = record.attempts().last().is_some_and(|a| a.done_promise);
             let verdict = decide::verdict(&signals, promised);
-            announce(record, &observation, &verdict);
+            announce(run_dir, record, &observation, &verdict);
 
             // A Blocker stops at once rather than spending the rest of the budget against a
             // wall the Run cannot move — and it never overrides a decided Run: where the
@@ -456,16 +462,20 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
             ) {
                 Next::Reobserve(pause) => {
                     reobservations += 1;
-                    world::print_line(&format!(
-                        "    a signal could not be observed — sleeping {}s before looking again",
-                        pause.as_secs()
-                    ));
+                    say(
+                        run_dir,
+                        &format!(
+                            "    a signal could not be observed — sleeping {}s before looking again",
+                            pause.as_secs()
+                        ),
+                    );
                     world::sleep(pause);
                     continue;
                 }
                 Next::SpendCiBudget => {
                     reobservations = 0;
-                    world::print_line(
+                    say(
+                        run_dir,
                         "    decided, and a check came back red — spending the one CI budget",
                     );
                     run_one_attempt(record, run_dir, &worktree, Mode::CiBabysit)?;
@@ -476,10 +486,13 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
                     reobservations = 0;
                     record.state = State::RateLimited;
                     record.save(&path)?;
-                    world::print_line(&format!(
-                        "    rate limited — sleeping {}s, then re-entering",
-                        nap.as_secs()
-                    ));
+                    say(
+                        run_dir,
+                        &format!(
+                            "    rate limited — sleeping {}s, then re-entering",
+                            nap.as_secs()
+                        ),
+                    );
                     world::sleep(nap);
                     break None;
                 }
@@ -487,7 +500,8 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
                     reobservations = 0;
                     record.state = State::Died;
                     record.save(&path)?;
-                    world::print_line(
+                    say(
+                        run_dir,
                         "    ended without a DONE promise — re-entering at the stage that died",
                     );
                     break None;
@@ -507,18 +521,21 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
             record.save(&path)?;
             if let Stop::Unobserved(blind) = &stop {
                 for said in blind {
-                    world::print_line(&format!("    could not observe {said}"));
+                    say(run_dir, &format!("    could not observe {said}"));
                 }
             }
             // Resumable, because it never spent the budget: the world changed, not the number.
             if let Stop::Blocked(what) = &stop {
-                world::print_line(&format!(
-                    "    stopped for a human — {what} was refused twice with no progress; \
+                say(
+                    run_dir,
+                    &format!(
+                        "    stopped for a human — {what} was refused twice with no progress; \
                      `grind resume {}` once it is cleared",
-                    record.run_id
-                ));
+                        record.run_id
+                    ),
+                );
             }
-            report_to_the_job_issue(record);
+            report_to_the_job_issue(run_dir, record);
             return Ok(Outcome {
                 run_id: record.run_id.clone(),
                 state: record.state.as_str(),
@@ -551,7 +568,7 @@ fn run_one_attempt(
     };
 
     let started_at = world::now_iso();
-    world::print_line(&format!("  [{started_at}] attempt {n} ({mode}) …"));
+    say(run_dir, &format!("  [{started_at}] attempt {n} ({mode}) …"));
 
     let raw = attempt::run(
         &invocation,
@@ -586,7 +603,7 @@ fn fanout_of(record: &RunRecord) -> Observed<(u64, u64)> {
     }
 }
 
-fn announce(record: &RunRecord, observation: &Observation, verdict: &Verdict) {
+fn announce(run_dir: &Path, record: &RunRecord, observation: &Observation, verdict: &Verdict) {
     let last = record.attempts().last();
     let outcome = match last {
         Some(a) if a.done_promise => "DONE promised".to_string(),
@@ -594,11 +611,14 @@ fn announce(record: &RunRecord, observation: &Observation, verdict: &Verdict) {
         None => "no attempt".to_string(),
     };
     let cost = last.and_then(|a| a.total_cost_usd).unwrap_or(0.0);
-    world::print_line(&format!(
-        "    -> {outcome} | stage={} | commits={} | cost=${cost:.2} | {verdict:?}",
-        decide::furthest_stage(observation),
-        observation.commits_ahead,
-    ));
+    say(
+        run_dir,
+        &format!(
+            "    -> {outcome} | stage={} | commits={} | cost=${cost:.2} | {verdict:?}",
+            decide::furthest_stage(observation),
+            observation.commits_ahead,
+        ),
+    );
 }
 
 // --- dispatch's own steps ------------------------------------------------------------------
@@ -700,15 +720,18 @@ fn adopt_or_create_worktree(repo_path: &Path, branch: &str) -> Result<PathBuf, R
 ///
 /// **Best-effort.** On failure, log and move on — no retry loop, and **never a verdict change**.
 /// A Run that finished must not become `unobserved` because GitHub was down at 04:00.
-fn report_to_the_job_issue(record: &RunRecord) {
+fn report_to_the_job_issue(run_dir: &Path, record: &RunRecord) {
     let Some(home) = world::home() else {
-        world::print_line("  note: $HOME is unset, so nothing was posted on the Job issue");
+        say(
+            run_dir,
+            "  note: $HOME is unset, so nothing was posted on the Job issue",
+        );
         return;
     };
     // The **same construction** the Handback uses, so the two renderings cannot be fed
     // different lists.
     let Some(facts) = crate::view::gather(&home, &record.run_id) else {
-        world::print_line("  note: could not compose the terminal comment");
+        say(run_dir, "  note: could not compose the terminal comment");
         return;
     };
     let posted = world::run(
@@ -725,7 +748,10 @@ fn report_to_the_job_issue(record: &RunRecord) {
         None,
     );
     if posted.code != Some(0) {
-        world::print_line("  note: could not post the terminal comment on the Job issue");
+        say(
+            run_dir,
+            "  note: could not post the terminal comment on the Job issue",
+        );
     }
 }
 
@@ -765,6 +791,26 @@ fn words(parts: &[&str]) -> Vec<String> {
 
 fn record_path(run_dir: &Path) -> PathBuf {
     run_dir.join("run.json")
+}
+
+/// `~/.grind/runs/<run-id>/supervisor.log` — beside the record and the raw attempt files.
+///
+/// Still Run state, so still never committed: it lives outside every checkout, which holds
+/// structurally rather than by a `.gitignore` line.
+fn log_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("supervisor.log")
+}
+
+/// The supervisor's narration, to stdout **and** to a file that outlives the terminal.
+///
+/// What the supervisor said is the only account of a Run between the dispatch comment and a
+/// terminal state, and it died with the host. Leaving the file to the service manager makes it
+/// a per-platform question, which is how you get two internally-consistent wrong answers.
+///
+/// A log that cannot be written is not worth abandoning a Run over.
+fn say(run_dir: &Path, line: &str) {
+    world::print_line(line);
+    let _ = world::append_line(&log_path(run_dir), line);
 }
 
 /// A session id with no dependency on a uuid crate. It has to be unique per Run and stable for

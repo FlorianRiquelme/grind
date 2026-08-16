@@ -296,11 +296,27 @@ pub fn sleep(duration: Duration) {
 /// killed. Rust's stdout is line-buffered already; the flush is what makes that a property of
 /// this function rather than of the standard library's current choice.
 ///
-/// This and `cli`'s printing of the `String`s `render` returns are the only two writers.
+/// This, `cli`'s printing of the `String`s `render` returns, and [`append_line`] are the three
+/// writers of output.
 pub fn print_line(line: &str) {
     let mut out = std::io::stdout();
     let _ = writeln!(out, "{line}");
     let _ = out.flush();
+}
+
+/// The supervisor's narration, to a file that outlives the terminal it was said to.
+///
+/// **Line-buffered and flushed per line, exactly as stdout already is**, so a working Run
+/// reaching a file never looks dead. A log that cannot be written is not worth abandoning a Run
+/// over, so the failure comes back as a value and the caller may ignore it.
+pub fn append_line(path: &Path, line: &str) -> Result<(), String> {
+    let mut file = File::options()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    writeln!(file, "{line}").map_err(|e| format!("{}: {e}", path.display()))?;
+    file.flush().map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Refusals go to stderr, so a Run's own output stays parseable when it is piped.

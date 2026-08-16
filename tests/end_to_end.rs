@@ -944,6 +944,71 @@ fn the_dispatch_comment_still_carries_the_run_id_and_the_hostname() {
 }
 
 #[test]
+fn a_completed_run_leaves_a_supervisor_log_beside_its_record() {
+    // What the supervisor said is the only account of a Run between the dispatch comment and a
+    // terminal state, and it died with the terminal it was said to.
+    let box_ = sandbox("supervisor-log");
+    box_.scenario(&["success_done"]).pr_appears_at(1);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+
+    let log = fs::read_to_string(box_.run_dir().join("supervisor.log")).expect("a supervisor log");
+    assert!(log.contains("attempt 1 (dispatch)"), "{log}");
+    assert!(log.contains("plugin pinned to"), "{log}");
+    for said in log.lines() {
+        assert!(
+            out.contains(said),
+            "the log carries the lines that reached stdout; `{said}` did not:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn the_supervisor_log_is_appended_across_a_resume_rather_than_truncated() {
+    let box_ = sandbox("supervisor-log-append");
+    box_.scenario(&["denied", "denied", "denied", "success_done"])
+        .pr_appears_at(4);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    let log = box_.run_dir().join("supervisor.log");
+    let before = fs::read_to_string(&log).expect("a supervisor log");
+
+    let run_id = box_.record()["run_id"]
+        .as_str()
+        .expect("a run id")
+        .to_string();
+    let (out, err, code) = box_.run(&["resume", &run_id]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    let after = fs::read_to_string(&log).expect("a supervisor log");
+    assert!(
+        after.starts_with(&before),
+        "a resume appends rather than truncating:\n{after}"
+    );
+    assert!(after.len() > before.len(), "and it wrote something new");
+}
+
+#[test]
+fn a_run_whose_log_cannot_be_written_still_exits_on_its_real_verdict() {
+    // A log that cannot be written is not worth abandoning a Run over.
+    let box_ = sandbox("supervisor-log-unwritable");
+    box_.scenario(&["success_done"]).pr_appears_at(1);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+
+    // Replace the log with a directory, which nothing can append a line to, and re-enter.
+    let log = box_.run_dir().join("supervisor.log");
+    fs::remove_file(&log).expect("drop the log");
+    fs::create_dir(&log).expect("put something unwritable in its place");
+    let run_id = box_.record()["run_id"]
+        .as_str()
+        .expect("a run id")
+        .to_string();
+    let (out, err, code) = box_.run(&["resume", &run_id]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert!(out.contains("run already completed"), "{out}");
+}
+
+#[test]
 fn a_completed_run_posts_exactly_one_terminal_comment_on_the_job_issue() {
     // Everything only the supervisor knows survives the host. Between the dispatch comment and
     // nothing, the human's only instrument was SSH.
