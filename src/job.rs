@@ -193,7 +193,7 @@ pub fn from_issue_json(raw: &str) -> Result<Job, Refusal> {
     validate_repo(&target_repo)?;
     let branch = required("branch")?;
     validate_branch(&branch)?;
-    let handoff_sha = required("handoff sha")?;
+    let handoff_sha = extract_handoff_sha(&required("handoff sha")?)?;
     let anchor = required("anchor artifact")?;
     validate_anchor(&anchor)?;
     let plugin = PluginPin::parse(&required("pinned plugin version")?)?;
@@ -287,6 +287,28 @@ fn validate_branch(branch: &str) -> Result<(), Refusal> {
         )));
     }
     Ok(())
+}
+
+/// The `Handoff SHA` row is the one required row that still trusts the human's formatting —
+/// Run 2's read `` `723ca91…` (`main` after #29) `` and every consumer took the whole cell.
+/// Take the longest run of `[0-9a-f]` and accept it at a commit's length, 7 to 40.
+///
+/// A bare function beside the three validators, and not a newtype: `PluginPin` earns its type
+/// because `Latest` must be unspellable (ADR-0006), and a SHA has no forbidden spelling, only
+/// a required shape. No regex crate either — ADR-0005's single dependency holds.
+fn extract_handoff_sha(cell: &str) -> Result<String, Refusal> {
+    let mut longest = "";
+    for run in cell.split(|c: char| !matches!(c, '0'..='9' | 'a'..='f')) {
+        if run.len() > longest.len() {
+            longest = run;
+        }
+    }
+    if (7..=40).contains(&longest.len()) {
+        return Ok(longest.to_string());
+    }
+    Err(Refusal::saying(format!(
+        "the `handoff sha` row carries no run of 7 to 40 hex characters: {cell}"
+    )))
 }
 
 fn validate_anchor(anchor: &str) -> Result<(), Refusal> {
@@ -703,6 +725,52 @@ mod tests {
                 "the refusal must name the blank row: {refusal}"
             );
         }
+    }
+
+    #[test]
+    fn a_handoff_sha_row_carrying_parenthetical_context_yields_the_bare_sha() {
+        // The shape `docs/findings/0002` recorded, which every consumer took whole.
+        let rows = FULL_ROWS.replace(
+            "`9d1f4c7a2b6e0538d4a17c9b3e5f8021ac6d4e77`",
+            "`723ca91` (`main` after #29)",
+        );
+        let job = from_issue_json(&issue_json(&rows)).expect("a readable Job");
+        assert_eq!(job.handoff_sha, "723ca91");
+    }
+
+    #[test]
+    fn a_bare_forty_character_sha_survives_the_scan_unchanged() {
+        let job = from_issue_json(&issue_json(FULL_ROWS)).expect("a readable Job");
+        assert_eq!(job.handoff_sha, "9d1f4c7a2b6e0538d4a17c9b3e5f8021ac6d4e77");
+    }
+
+    #[test]
+    fn a_handoff_sha_row_with_no_hex_run_refuses_and_names_the_row() {
+        let rows = FULL_ROWS.replace(
+            "`9d1f4c7a2b6e0538d4a17c9b3e5f8021ac6d4e77`",
+            "whichever tip the pull request sits on",
+        );
+        let refusal = from_issue_json(&issue_json(&rows)).expect_err("must refuse");
+        assert!(
+            refusal.to_string().contains("handoff sha"),
+            "the refusal must name the row: {refusal}"
+        );
+        let lowered = refusal.to_string().to_lowercase();
+        for quality in ["bad", "invalid", "wrong", "fail", "error", "reject"] {
+            assert!(
+                !lowered.contains(quality),
+                "a refusal is incoherent input, never a judgement: {refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hex_run_shorter_than_a_short_sha_refuses_rather_than_truncating() {
+        // Six characters is not a commit, and yielding it would hand `handoff..HEAD` a
+        // revision that resolves to something else or to nothing.
+        let rows = FULL_ROWS.replace("`9d1f4c7a2b6e0538d4a17c9b3e5f8021ac6d4e77`", "`abc123`");
+        let refusal = from_issue_json(&issue_json(&rows)).expect_err("must refuse");
+        assert!(refusal.to_string().contains("handoff sha"), "{refusal}");
     }
 
     #[test]
