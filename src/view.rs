@@ -199,7 +199,7 @@ pub fn live(transcript: &Path, now_epoch: u64) -> Live {
             None => vec![String::new(); 3],
         },
         fanout: match &text {
-            Some(body) => Observed::Present(fanout(body)),
+            Some(body) => fanout(body),
             None => Observed::Unobservable(Reason::saying("the transcript could not be read")),
         },
         freshness: match newest {
@@ -252,9 +252,7 @@ fn seconds_since(at: SystemTime, now_epoch: u64) -> u64 {
 /// costs its own values and nothing else.
 pub fn now_skill(text: &str) -> Observed<String> {
     let mut last: Option<String> = None;
-    let mut lines = 0usize;
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        lines += 1;
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
@@ -264,11 +262,56 @@ pub fn now_skill(text: &str) -> Observed<String> {
             last = Some(skill.to_string());
         }
     }
-    match (last, lines) {
-        (Some(skill), _) => Observed::Present(skill),
-        (None, 0) => Observed::Absent,
-        (None, _) => Observed::Absent,
+    match last {
+        Some(skill) => Observed::Present(skill),
+        // The same *nothing recognised* rule the fan-out matcher carries. This field is not
+        // currently broken; the rule is what keeps it from breaking silently the way the
+        // fan-out one did.
+        None => nothing_recognised(text, "attributionSkill"),
     }
+}
+
+/// The tool a fan-out spawn names. The CLI calls it `Agent`; `Task` is the former spelling, and
+/// matching only that one printed `none` on every Run that fanned out — **203 spawns to 0**
+/// across sixty transcripts. The fixture that should have caught it is authored, so it asserted
+/// the matcher against itself and caught nothing.
+pub const FANOUT_TOOLS: [&str; 2] = ["Agent", "Task"];
+
+/// Every tool-use block in a transcript, whatever it named.
+///
+/// This is what separates *nothing recognised* from *nothing there*. A transcript full of tool
+/// calls and no recognised spawn is a matcher that has gone stale, and reading it as `Absent`
+/// is indistinguishable from a Run that genuinely fanned out to nobody.
+pub fn tool_calls(text: &str) -> usize {
+    let mut calls = 0usize;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(serde_json::Value::Array(parts)) =
+            value.get("message").and_then(|m| m.get("content"))
+        else {
+            continue;
+        };
+        calls += parts
+            .iter()
+            .filter(|part| part.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+            .count();
+    }
+    calls
+}
+
+/// *Could not observe*, with the tool-call count in the reason — or `Absent` where there was
+/// nothing in the transcript to recognise in the first place.
+fn nothing_recognised<T>(text: &str, what: &str) -> Observed<T> {
+    let calls = tool_calls(text);
+    if calls == 0 {
+        return Observed::Absent;
+    }
+    Observed::Unobservable(Reason::saying(&format!(
+        "{calls} tool call{} in the transcript and no recognised `{what}`",
+        if calls == 1 { "" } else { "s" }
+    )))
 }
 
 /// The last-words block, fixed at exactly `wanted` lines so `watch -n 30` never jitters.
@@ -313,7 +356,11 @@ fn one_line(text: &str) -> String {
 
 /// Fan-out as a count with descriptions — *blocked on five agents, newest wrote forty seconds
 /// ago* has to be an available answer.
-pub fn fanout(text: &str) -> Vec<Fanout> {
+///
+/// Both spellings are recognised (`FANOUT_TOOLS`), and a transcript carrying tool-use blocks
+/// with **zero** recognised spawns reads *could not observe* rather than `Absent`. Widening the
+/// matcher alone would leave the next rename exactly as silent as this one was.
+pub fn fanout(text: &str) -> Observed<Vec<Fanout>> {
     let mut found = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -331,7 +378,11 @@ pub fn fanout(text: &str) -> Vec<Fanout> {
             continue;
         };
         for part in parts {
-            if part.get("name").and_then(|n| n.as_str()) == Some("Task")
+            let named = part
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default();
+            if FANOUT_TOOLS.contains(&named)
                 && let Some(description) = part
                     .get("input")
                     .and_then(|i| i.get("description"))
@@ -343,7 +394,10 @@ pub fn fanout(text: &str) -> Vec<Fanout> {
             }
         }
     }
-    found
+    if found.is_empty() {
+        return nothing_recognised(text, "fan-out spawn");
+    }
+    Observed::Present(found)
 }
 
 /// Observe a Run's durable artifacts fresh. **Reads and never writes** — this path observes and
@@ -364,6 +418,10 @@ mod tests {
     const FANOUT_PARENT: &str = include_str!(
         "../tests/fixtures/transcript/fanout/8f2c1a70-4b3d-4e51-9c02-6a7d5e8b1f43.jsonl"
     );
+    const FANOUT_AGENT: &str =
+        include_str!("../tests/fixtures/transcript/fanout/spelling-agent.jsonl");
+    const FANOUT_UNRECOGNISED: &str =
+        include_str!("../tests/fixtures/transcript/fanout/no-recognised-spawn.jsonl");
 
     #[test]
     fn the_read_only_reader_parses_the_same_fixture_the_writer_does() {
@@ -466,10 +524,58 @@ mod tests {
     }
 
     #[test]
-    fn fan_out_reads_as_a_count_with_descriptions() {
-        let found = fanout(FANOUT_PARENT);
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].description, "review the diff for regressions");
+    fn fan_out_reads_as_a_count_with_descriptions_under_either_tool_name() {
+        // Support, not proof: both of these are authored, so they assert the matcher against
+        // itself. The load-bearing assertion is the negative-recognition test below.
+        let Observed::Present(former) = fanout(FANOUT_PARENT) else {
+            panic!("the former spelling is still recognised");
+        };
+        assert_eq!(former.len(), 1);
+        assert_eq!(former[0].description, "review the diff for regressions");
+
+        let Observed::Present(current) = fanout(FANOUT_AGENT) else {
+            panic!("the current spelling is recognised");
+        };
+        assert_eq!(current.len(), 2);
+        assert_eq!(current[0].description, "review the diff for regressions");
+    }
+
+    #[test]
+    fn tool_calls_with_no_recognised_spawn_are_could_not_observe_and_never_absent() {
+        // The one authoring cannot fake. Widening the matcher alone would leave the next rename
+        // exactly as silent as this one was: 203 spawns to 0 across sixty transcripts, printed
+        // as `none` every time.
+        let found = fanout(FANOUT_UNRECOGNISED);
+        let Observed::Unobservable(reason) = &found else {
+            panic!("a transcript full of tool calls is not a Run that fanned out to nobody");
+        };
+        assert!(
+            reason.to_string().contains('3'),
+            "the tool-call count is in the reason: {reason}"
+        );
+        assert_ne!(found, Observed::Absent);
+    }
+
+    #[test]
+    fn an_empty_transcript_is_absent_and_stays_distinguishable_from_a_stale_matcher() {
+        assert_eq!(fanout(EMPTY), Observed::Absent);
+        assert_eq!(
+            fanout("{\"message\":{\"content\":\"just prose\"}}"),
+            Observed::Absent
+        );
+        assert_ne!(fanout(EMPTY), fanout(FANOUT_UNRECOGNISED));
+    }
+
+    #[test]
+    fn the_live_stage_carries_the_same_nothing_recognised_rule() {
+        // Not currently broken. The rule is what keeps it from breaking silently the way the
+        // fan-out matcher did.
+        let found = now_skill(FANOUT_UNRECOGNISED);
+        assert!(matches!(found, Observed::Unobservable(_)), "{found:?}");
+        assert_eq!(
+            now_skill(FANOUT_AGENT),
+            Observed::Present("compound-engineering:ce-code-review".to_string())
+        );
     }
 
     #[test]
