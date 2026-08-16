@@ -98,6 +98,13 @@ pub fn blocker(attempts: &[Attempt], stalls: &[Observed<bool>]) -> Option<Stop> 
     if recent.len() < 2 || !recent.iter().all(|s| s == &&Observed::Present(true)) {
         return None;
     }
+    what_must_be_cleared(attempts).map(Stop::Blocked)
+}
+
+/// The denied invocation the **last two working Attempts** have in common, which is the whole
+/// of *what must be cleared*. Separated from the stop so the Handback can name it on a Run it
+/// only found blocked in the record.
+pub fn what_must_be_cleared(attempts: &[Attempt]) -> Option<String> {
     let worked: Vec<&Attempt> = attempts.iter().filter(|a| !a.is_wait()).collect();
     let [.., before, last] = worked.as_slice() else {
         return None;
@@ -106,7 +113,6 @@ pub fn blocker(attempts: &[Attempt], stalls: &[Observed<bool>]) -> Option<Stop> 
     denied_invocations(last)
         .into_iter()
         .find(|denial| earlier.contains(denial))
-        .map(Stop::Blocked)
 }
 
 /// A denial as an identity, so *the same invocation twice* is a comparison rather than a guess.

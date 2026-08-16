@@ -7,7 +7,7 @@
 //! **Verdict language describes what happened, never quality** (ADR-0003). Check every string
 //! this module emits against that rule; there is a test at the bottom that does.
 
-use crate::decide::{Stage, Verdict, VerifyContract};
+use crate::decide::{Stage, Verdict, VerifyContract, VerifyCoverage};
 use crate::observe::{Observation, Observed, Outcome, UNOBSERVABLE_MARK};
 use crate::view::{Live, RosterRow, RunView};
 use std::path::Path;
@@ -175,70 +175,266 @@ pub fn not_here(run_id: &str, hostname: &str) -> String {
     )
 }
 
+/// Everything a Handback is composed from. **One fact set, and both renderers take it.**
+///
+/// Two independently-chosen lists would drift *invisibly*, because nobody ever sees both
+/// renderings of one Run. The verdict is the **fresh** one, computed from the observation
+/// beside it rather than read off the record: the two are produced moments apart, and Run 2's
+/// Handback said `[exhausted]` with `PR —` over an open, green, twelve-commit PR.
+pub struct Handback<'a> {
+    pub found: &'a RunView,
+    pub observation: &'a Observation,
+    pub verdict: &'a Verdict,
+    pub contract: &'a VerifyContract,
+    pub coverage: &'a Observed<VerifyCoverage>,
+    pub furthest: Stage,
+    /// What must be cleared, when the Run stopped for a human. A fact about the world, carried
+    /// beside the verdict rather than inside it.
+    pub blocker: Option<&'a str>,
+    pub run_state: &'a Path,
+}
+
+/// One line of the observation block, with the mark it came back with.
+struct Row {
+    label: &'static str,
+    value: String,
+    unobserved: bool,
+}
+
 /// What a finished Run leaves for the human to pick up. Its shape is what the morning costs.
-pub fn handback(
-    found: &RunView,
-    observation: &Observation,
-    contract: &VerifyContract,
-    furthest: Stage,
-    run_state: &Path,
-) -> String {
+///
+/// **Five claims and nothing else at that weight** (#16). Everything that only points at
+/// something moves to the trailing block, everything that is a permanent negative does not
+/// print at all, and everything that could not be observed groups where the eye can see that it
+/// is a different kind of row rather than a mark down a column it reads as uniform.
+pub fn handback(view: &Handback) -> String {
+    let Handback {
+        found,
+        observation,
+        verdict,
+        contract,
+        coverage,
+        furthest,
+        blocker,
+        run_state,
+    } = view;
     let mut out = String::new();
-    line(
-        &mut out,
-        &format!("Run     {}  [{}]", found.run_id, found.state),
-    );
-    line(&mut out, &format!("Job     {}", found.job.url));
+
+    // The fresh verdict, in the top position, and the recorded state nowhere. Where the two
+    // disagree the fresh one is right by construction, and printing both asks the human to
+    // adjudicate between two things Grind produced.
     line(
         &mut out,
         &format!(
-            "Branch  {}  (worktree {})",
-            found.job.branch, found.worktree
+            "Verdict  {}",
+            handback_verdict(verdict, observation, found, *blocker)
         ),
     );
-    line(&mut out, &format!("Session {}", found.session_id));
-    line(&mut out, &format!("Model   {}", model_of(found)));
+    line(&mut out, "");
+    line(&mut out, &format!("Run      {}", found.run_id));
+    line(&mut out, &format!("Job      {}", found.job.url));
+    line(&mut out, &format!("Branch   {}", found.job.branch));
+    line(&mut out, &format!("Model    {}", model_of(found)));
+    let (made, budget) = found.attempt_counter();
     line(
         &mut out,
         &format!(
-            "Attempts {}   spend ${:.2} (API pricing)   tool denials {}",
-            crate::attempt::working(&found.attempts),
+            "Attempts {made} of {budget}   spend ${:.2} (API pricing)   tool denials {}",
             found.total_spend(),
             found.denial_count()
         ),
     );
     line(&mut out, "");
-    line(&mut out, &format!("  furthest stage    {furthest}"));
-    line(
-        &mut out,
-        &format!("  commits ahead     {}", observation.commits_ahead),
-    );
-    line(
-        &mut out,
-        &format!("  plan              {}", listing(&observation.plan_files)),
-    );
-    line(&mut out, &format!("  PR                {}", observation.pr));
-    line(
-        &mut out,
-        &format!(
-            "  review residuals  {}",
-            count(&observation.residual_findings)
-        ),
-    );
-    line(
-        &mut out,
-        &format!("  ledger entries    {}", count(&observation.ledger_entries)),
-    );
-    line(
-        &mut out,
-        &format!("  verify contract   {}", contract_line(contract)),
-    );
+
+    let mut rows = vec![
+        Row {
+            label: "furthest stage",
+            value: furthest.to_string(),
+            unobserved: false,
+        },
+        row("commits ahead", &observation.commits_ahead),
+        row("PR", &observation.pr),
+        row("tree clean", &observation.tree_clean),
+        row("checks pending", &observation.checks_pending),
+        Row {
+            label: "verify contract",
+            value: contract_line(contract),
+            unobserved: false,
+        },
+    ];
+    // The same rule five times: **surface the surprise, never the permanent negative.** A row
+    // that could not be observed still prints — in the block below — because *I could not look*
+    // is a surprise too.
+    if found.denial_count() > 0 {
+        rows.push(Row {
+            label: "denied",
+            value: denied_invocations(found).join("; "),
+            unobserved: false,
+        });
+    }
+    if let Observed::Present(open) = &observation.pr
+        && open.is_draft
+    {
+        rows.push(Row {
+            label: "draft",
+            value: "yes".to_string(),
+            unobserved: false,
+        });
+    }
+    if let Some(drift) = surprising(&observation.base_drift, |d| d.commits > 0) {
+        rows.push(Row {
+            label: "base drift",
+            value: drift.0,
+            unobserved: drift.1,
+        });
+    }
+    // Two integers, and **no summary, boolean or health word over them**. A count of processes
+    // must never become an assertion about a review.
+    match fanout_totals(found) {
+        Observed::Present((spawned, returned)) if spawned > 0 => rows.push(Row {
+            label: "fan-out",
+            value: format!("{spawned} spawned, {returned} returned"),
+            unobserved: false,
+        }),
+        Observed::Unobservable(reason) => rows.push(Row {
+            label: "fan-out",
+            value: format!("{UNOBSERVABLE_MARK}  {reason}"),
+            unobserved: true,
+        }),
+        _ => {}
+    }
+    if let Some(estimate) = surprising(coverage, |c| !c.uncovered.is_empty()) {
+        rows.push(Row {
+            label: "verify coverage",
+            value: estimate.0,
+            unobserved: estimate.1,
+        });
+    }
+
+    for seen in rows.iter().filter(|r| !r.unobserved) {
+        line(&mut out, &format!("  {:<17} {}", seen.label, seen.value));
+    }
+    // Empty on a Run where nothing failed to observe, and the Handback is flat.
+    let blind: Vec<&Row> = rows.iter().filter(|r| r.unobserved).collect();
+    if !blind.is_empty() {
+        line(&mut out, "");
+        line(&mut out, "  could not observe");
+        for row in blind {
+            line(&mut out, &format!("    {:<15} {}", row.label, row.value));
+        }
+    }
+
+    // Things you type at something, rather than claims about the world. The session handle is
+    // worthless off its host, and the worktree path is a place rather than a fact.
     line(&mut out, "");
     line(
         &mut out,
-        &format!("  run state         {}", run_state.display()),
+        &format!("  session          {}", found.session_id),
+    );
+    line(&mut out, &format!("  worktree         {}", found.worktree));
+    line(
+        &mut out,
+        &format!("  run state        {}", run_state.display()),
     );
     out
+}
+
+/// The fresh verdict, plus the parentheticals the line is allowed to carry: red CI names the
+/// repair budget it spent, a Blocker names what must be cleared. Same line, same renderer, no
+/// second surface.
+fn handback_verdict(
+    verdict: &Verdict,
+    observation: &Observation,
+    found: &RunView,
+    blocker: Option<&str>,
+) -> String {
+    let mut said = verdict_line(verdict, observation);
+    if matches!(observation.checks_red, Observed::Present(true)) {
+        said = format!("{said} — ${:.2} of repair spent", repair_spend(found));
+    }
+    if let Some(what) = blocker {
+        said = format!("{said}  (a Blocker: {what} must be cleared)");
+    }
+    said
+}
+
+/// What the one bounded CI-babysit invocation cost, which is the whole of the repair budget.
+fn repair_spend(found: &RunView) -> f64 {
+    found
+        .attempts
+        .iter()
+        .filter(|a| a.mode == crate::attempt::Mode::CiBabysit)
+        .filter_map(|a| a.total_cost_usd)
+        .sum()
+}
+
+/// The Run's fan-out arithmetic, summed over its Attempts. **Two integers and no summary.**
+fn fanout_totals(found: &RunView) -> Observed<(u64, u64)> {
+    let mut totals: Option<(u64, u64)> = None;
+    let mut blind: Option<crate::observe::Reason> = None;
+    for attempt in &found.attempts {
+        match &attempt.fanout {
+            Observed::Present((spawned, returned)) => {
+                let (s, r) = totals.unwrap_or((0, 0));
+                totals = Some((s + spawned, r + returned));
+            }
+            Observed::Unobservable(reason) => blind = Some(reason.clone()),
+            Observed::Absent => {}
+        }
+    }
+    match (totals, blind) {
+        (Some(counted), _) => Observed::Present(counted),
+        (None, Some(reason)) => Observed::Unobservable(reason),
+        (None, None) => Observed::Absent,
+    }
+}
+
+/// A value worth printing, and whether it is worth printing because nobody could look.
+///
+/// `Absent`, and `Present` that the predicate calls unsurprising, print nothing at all.
+fn surprising<T: std::fmt::Display>(
+    found: &Observed<T>,
+    worth_saying: impl Fn(&T) -> bool,
+) -> Option<(String, bool)> {
+    match found {
+        Observed::Present(value) if worth_saying(value) => Some((value.to_string(), false)),
+        Observed::Present(_) | Observed::Absent => None,
+        Observed::Unobservable(reason) => Some((format!("{UNOBSERVABLE_MARK}  {reason}"), true)),
+    }
+}
+
+fn row<T: std::fmt::Display>(label: &'static str, found: &Observed<T>) -> Row {
+    Row {
+        label,
+        value: match found {
+            Observed::Unobservable(reason) => format!("{UNOBSERVABLE_MARK}  {reason}"),
+            other => other.to_string(),
+        },
+        unobserved: matches!(found, Observed::Unobservable(_)),
+    }
+}
+
+/// The denied invocations, as the record holds them. Listed only when the count is non-zero.
+fn denied_invocations(found: &RunView) -> Vec<String> {
+    found
+        .attempts
+        .iter()
+        .flat_map(|a| a.permission_denials.iter())
+        .map(|denial| {
+            denial
+                .get("tool_input")
+                .and_then(|i| i.get("command"))
+                .and_then(|c| c.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    denial
+                        .get("tool_name")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("an unnamed tool")
+                        .to_string()
+                })
+        })
+        .collect()
 }
 
 /// Doctor's report. Items marked *step* appear as unchecked, with **no boolean beside them** —
@@ -358,21 +554,6 @@ fn contract_line(contract: &VerifyContract) -> String {
             contract.present.join(", "),
             contract.missing.join(", ")
         ),
-    }
-}
-
-fn listing(found: &Observed<Vec<String>>) -> String {
-    match found {
-        Observed::Present(entries) => entries.join(", "),
-        other => negative_mark(other).to_string(),
-    }
-}
-
-fn count(found: &Observed<Vec<String>>) -> String {
-    match found {
-        Observed::Present(entries) => entries.len().to_string(),
-        Observed::Absent => "0".to_string(),
-        other => negative_mark(other).to_string(),
     }
 }
 
@@ -593,49 +774,284 @@ mod tests {
         assert!(contract_line(&none).starts_with("none present; missing:"));
     }
 
+    fn coverage() -> Observed<VerifyCoverage> {
+        Observed::Present(VerifyCoverage {
+            uncovered: vec![],
+            changed: 4,
+        })
+    }
+
+    /// The Handback over one fact set, with the two things a caller varies most.
+    fn handed_back(observation: &Observation, verdict: &Verdict) -> String {
+        handed_back_with(observation, verdict, &coverage(), None)
+    }
+
+    fn handed_back_with(
+        observation: &Observation,
+        verdict: &Verdict,
+        coverage: &Observed<VerifyCoverage>,
+        blocker: Option<&str>,
+    ) -> String {
+        handback(&Handback {
+            found: &found(),
+            observation,
+            verdict,
+            contract: &contract(),
+            coverage,
+            furthest: Stage::PrOpen,
+            blocker,
+            run_state: Path::new("/home/op/.grind/runs/20260806-122620-snapper-28/run.json"),
+        })
+    }
+
     #[test]
-    fn the_handback_names_where_run_state_lives() {
-        let text = handback(
-            &found(),
-            &observation(),
-            &contract(),
-            Stage::PrOpen,
-            Path::new("/home/op/.grind/runs/20260806-122620-snapper-28/run.json"),
+    fn the_handback_renders_the_fresh_verdict_in_the_top_position_and_never_the_recorded_state() {
+        // Run 2's Handback said `[exhausted]` with `PR —` over an open, green, twelve-commit PR.
+        let mut record = found();
+        record.state = "exhausted".to_string();
+        let text = handback(&Handback {
+            found: &record,
+            observation: &observation(),
+            verdict: &Verdict::Completed,
+            contract: &contract(),
+            coverage: &coverage(),
+            furthest: Stage::PrOpen,
+            blocker: None,
+            run_state: Path::new("/x/run.json"),
+        });
+        assert!(text.starts_with("Verdict  completed"), "{text}");
+        assert!(
+            !text.contains("exhausted"),
+            "printing both asks the human to adjudicate between two things Grind produced:\n{text}"
         );
-        assert!(text.contains(
-            "run state         /home/op/.grind/runs/20260806-122620-snapper-28/run.json"
-        ));
-        for named in [
-            "Job",
-            "Branch",
-            "worktree",
-            "Session",
-            "Model",
-            "Attempts",
-            "tool denials",
-        ] {
+    }
+
+    #[test]
+    fn the_handback_names_where_run_state_lives_and_keeps_the_model_a_fact() {
+        let text = handed_back(&observation(), &Verdict::Completed);
+        assert!(
+            text.contains(
+                "run state        /home/op/.grind/runs/20260806-122620-snapper-28/run.json"
+            )
+        );
+        for named in ["Job", "Branch", "Model", "Attempts", "tool denials"] {
             assert!(text.contains(named), "the Handback must name {named}");
         }
         assert!(text.contains("furthest stage"));
         assert!(text.contains("commits ahead"));
-        assert!(text.contains("plan"));
-        assert!(text.contains("review residuals"));
-        assert!(text.contains("ledger entries"));
+    }
+
+    #[test]
+    fn the_handback_carries_no_plan_residual_or_ledger_count() {
+        // Three whole-directory listings that counted other people's files, every one of which
+        // is already in the PR's own diff.
+        let text = handed_back(&observation(), &Verdict::Completed);
+        for dropped in ["plan  ", "review residuals", "ledger entries"] {
+            assert!(!text.contains(dropped), "`{dropped}` still prints:\n{text}");
+        }
+        // And the observations behind them still feed the stage ladder.
+        assert!(matches!(
+            observation().plan_files,
+            Observed::Present(_) | Observed::Absent
+        ));
+    }
+
+    #[test]
+    fn the_session_handle_and_the_worktree_move_into_the_trailing_pointer_block() {
+        // Things you type at something, not claims about the world — and a session handle is
+        // worthless off its host.
+        let text = handed_back(&observation(), &Verdict::Completed);
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle}\n{text}"))
+        };
+        assert!(at("\n  session ") > at("furthest stage"), "{text}");
+        assert!(at("\n  worktree ") > at("furthest stage"), "{text}");
+        assert!(at("\n  session ") < at("\n  run state"), "{text}");
+        assert!(
+            !text.contains("\nSession "),
+            "not a top-level fact:\n{text}"
+        );
     }
 
     #[test]
     fn attempt_n_of_m_counts_working_attempts_only_on_every_surface_that_prints_it() {
         // The day-one record holds four Attempts, of which attempt 3 cost $0 and ran one turn.
-        let text = handback(
-            &found(),
-            &observation(),
-            &contract(),
-            Stage::PrOpen,
-            Path::new("/x/run.json"),
-        );
-        assert!(text.contains("Attempts 3"), "{text}");
+        let text = handed_back(&observation(), &Verdict::Completed);
+        assert!(text.contains("Attempts 3 of 8"), "{text}");
         let single = rendered(&observation(), &live(3), &Verdict::Completed);
         assert!(single.contains("attempt 3 of 8"), "{single}");
+    }
+
+    #[test]
+    fn a_denial_count_prints_unconditionally_and_the_invocations_only_when_non_zero() {
+        let text = handed_back(&observation(), &Verdict::Completed);
+        assert!(text.contains("tool denials 1"), "{text}");
+        assert!(
+            text.contains("denied "),
+            "the one denial is listed:\n{text}"
+        );
+        assert!(text.contains("git push --force-with-lease"), "{text}");
+
+        let mut clean = found();
+        clean.attempts.iter_mut().for_each(|a| {
+            a.permission_denials.clear();
+        });
+        let text = handback(&Handback {
+            found: &clean,
+            observation: &observation(),
+            verdict: &Verdict::Completed,
+            contract: &contract(),
+            coverage: &coverage(),
+            furthest: Stage::PrOpen,
+            blocker: None,
+            run_state: Path::new("/x/run.json"),
+        });
+        assert!(text.contains("tool denials 0"), "{text}");
+        assert!(
+            !text.contains("denied "),
+            "a zero-length list is a permanent negative:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_draft_pr_surfaces_the_flag_and_a_non_draft_one_prints_no_row() {
+        assert!(!handed_back(&observation(), &Verdict::Completed).contains("draft"));
+        let mut draft = observation();
+        draft.pr = Observed::Present(Pr {
+            number: 30,
+            url: "https://github.com/o/n/pull/30".to_string(),
+            state: "OPEN".to_string(),
+            is_draft: true,
+        });
+        assert!(handed_back(&draft, &Verdict::Completed).contains("draft"));
+    }
+
+    #[test]
+    fn base_drift_surfaces_only_when_non_zero() {
+        assert!(!handed_back(&observation(), &Verdict::Completed).contains("base drift"));
+        let mut drifted = observation();
+        drifted.base_drift = Observed::Present(crate::observe::BaseDrift {
+            default_branch: "origin/main".to_string(),
+            commits: 4,
+            overlapping: vec!["docs/adr/0013.md".to_string()],
+        });
+        let text = handed_back(&drifted, &Verdict::Completed);
+        assert!(text.contains("base drift"), "{text}");
+        assert!(text.contains("docs/adr/0013.md"), "{text}");
+    }
+
+    #[test]
+    fn the_fan_out_arithmetic_surfaces_as_two_integers_with_no_summary_word() {
+        // The day-one record holds (3, 3) and (1, 1) across its Attempts.
+        let text = handed_back(&observation(), &Verdict::Completed);
+        assert!(text.contains("fan-out"), "{text}");
+        assert!(text.contains("4 spawned, 4 returned"), "{text}");
+        for banned in ["healthy", "degraded", "complete fan-out", "all returned"] {
+            assert!(!text.contains(banned), "{text}");
+        }
+
+        let mut quiet = found();
+        quiet
+            .attempts
+            .iter_mut()
+            .for_each(|a| a.fanout = Observed::Absent);
+        let text = handback(&Handback {
+            found: &quiet,
+            observation: &observation(),
+            verdict: &Verdict::Completed,
+            contract: &contract(),
+            coverage: &coverage(),
+            furthest: Stage::PrOpen,
+            blocker: None,
+            run_state: Path::new("/x/run.json"),
+        });
+        assert!(
+            !text.contains("fan-out"),
+            "a Run that spawned nothing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_verify_coverage_estimate_surfaces_the_paths_and_is_labelled_an_estimate() {
+        assert!(!handed_back(&observation(), &Verdict::Completed).contains("verify coverage"));
+        let uncovered = Observed::Present(VerifyCoverage {
+            uncovered: vec!["docs/adr/0013.md".to_string()],
+            changed: 4,
+        });
+        let text = handed_back_with(&observation(), &Verdict::Completed, &uncovered, None);
+        assert!(text.contains("verify coverage"), "{text}");
+        assert!(text.contains("estimate"), "{text}");
+        assert!(text.contains("docs/adr/0013.md"), "{text}");
+    }
+
+    #[test]
+    fn the_could_not_observe_block_is_empty_on_a_fully_observed_run() {
+        let flat = handed_back(&observation(), &Verdict::Completed);
+        assert!(!flat.contains("could not observe"), "{flat}");
+
+        let mut blind = observation();
+        blind.tree_clean = Observed::Unobservable(Reason::saying("git status: exit 128"));
+        let text = handed_back(&blind, &Verdict::Unobserved(vec!["tree clean: x".into()]));
+        assert!(text.contains("could not observe"), "{text}");
+        let block = text.split("could not observe").nth(1).expect("the block");
+        assert!(block.contains("tree clean"), "{block}");
+        // And as a row it appears there and nowhere else. The verdict line names the blind
+        // signal too, which is the verdict speaking rather than a row.
+        let before = text.split("could not observe").next().expect("the rows");
+        assert!(!before.contains("\n  tree clean"), "{before}");
+    }
+
+    #[test]
+    fn red_ci_puts_the_spent_repair_budget_on_the_verdict_line() {
+        let mut red = observation();
+        red.checks_red = Observed::Present(true);
+        let text = handed_back(&red, &Verdict::Completed);
+        let said = text.lines().next().expect("the verdict line");
+        assert!(said.contains("completed"), "{said}");
+        assert!(said.contains("a check came back red"), "{said}");
+        // The day-one record's CI-babysit attempt cost $3.18.
+        assert!(said.contains("$3.18 of repair spent"), "{said}");
+    }
+
+    #[test]
+    fn a_blocker_puts_what_must_be_cleared_on_the_verdict_line() {
+        let text = handed_back_with(
+            &observation(),
+            &Verdict::Incomplete(vec!["PR open".into()]),
+            &coverage(),
+            Some("git push --force-with-lease"),
+        );
+        let said = text.lines().next().expect("the verdict line");
+        assert!(said.contains("a Blocker"), "{said}");
+        assert!(said.contains("git push --force-with-lease"), "{said}");
+        assert!(said.contains("must be cleared"), "{said}");
+    }
+
+    #[test]
+    fn no_did_not_declare_done_line_prints_on_the_completed_path() {
+        let text = handed_back(&observation(), &Verdict::Completed);
+        assert!(!text.to_lowercase().contains("did not declare"), "{text}");
+        assert!(!text.contains("DONE"), "{text}");
+        // Where the promise was made and the artifacts disagree, it still says so.
+        let mut absent = observation();
+        absent.pr = Observed::Absent;
+        let uncorroborated = handed_back(&absent, &Verdict::Uncorroborated(vec!["PR open".into()]));
+        assert!(uncorroborated.contains("DONE promised"), "{uncorroborated}");
+    }
+
+    #[test]
+    fn nothing_the_handback_renders_is_a_summary_boolean() {
+        // `tree clean  true` is a three-valued observation of one named fact, which is the
+        // opposite of a fold. What must not exist is a word standing over the rest of them.
+        let text = handed_back(&observation(), &Verdict::Completed).to_lowercase();
+        for banned in [" ok ", "healthy", "passing", "all good", "everything"] {
+            assert!(!text.contains(banned), "`{banned}`:\n{text}");
+        }
+        let verdict = text.lines().next().expect("the verdict line");
+        for banned in ["true", "false", "ok"] {
+            assert!(!verdict.contains(banned), "`{banned}` in `{verdict}`");
+        }
     }
 
     #[test]
@@ -690,13 +1106,8 @@ mod tests {
                 &live(3),
                 &Verdict::Unobserved(vec!["PR open: connection reset".into()]),
             ),
-            handback(
-                &found(),
-                &observation(),
-                &contract(),
-                Stage::Reviewed,
-                Path::new("/x/run.json"),
-            ),
+            handed_back(&observation(), &Verdict::Completed),
+            handed_back(&observation(), &Verdict::Incomplete(vec!["PR open".into()])),
             roster("snapper.local", &[]),
             not_here("20260806-122620-snapper-28", "snapper.local"),
         ];

@@ -96,19 +96,29 @@ fn finish(outcome: Result<supervisor::Outcome, Refusal>) -> i32 {
     match view::load(&home, &outcome.run_id) {
         Lookup::Here(found) => {
             let observation = observe_for(&found);
-            print(&render::handback(
-                &found,
-                &observation,
-                &contract_of(&found.worktree),
-                decide::furthest_stage(&observation),
-                &view::record_path(&home, &outcome.run_id),
-            ));
-            // Mirrors `status_one`: the exit code answers for what the fresh observation
-            // actually showed, not for the state the loop recorded on its way out — the two
-            // are read moments apart, and the Handback above is already keyed to the fresh one.
+            // The verdict the Handback prints and the verdict the process exits on are **one
+            // computation**. It used to be computed twice, moments apart, and spent on an exit
+            // code while the projection printed the recorded state instead.
             let signals = decide::signals_of(&observation);
             let promised = found.attempts.last().is_some_and(|a| a.done_promise);
             let verdict = decide::verdict(&signals, promised);
+            // The recorded state is consulted for exactly one fact — that the Run stopped for a
+            // human — because no fresh verdict can carry it. It is never printed as a verdict.
+            let blocker = (outcome.state == "blocked")
+                .then(|| crate::policy::what_must_be_cleared(&found.attempts))
+                .flatten();
+            let contract = contract_of(&found.worktree);
+            let coverage = decide::verify_coverage(&contract, &observation.changed_files);
+            print(&render::handback(&render::Handback {
+                found: &found,
+                observation: &observation,
+                verdict: &verdict,
+                contract: &contract,
+                coverage: &coverage,
+                furthest: decide::furthest_stage(&observation),
+                blocker: blocker.as_deref(),
+                run_state: &view::record_path(&home, &outcome.run_id),
+            }));
             if matches!(verdict, decide::Verdict::Unobserved(_)) {
                 Observability::CouldNotAnswer.code()
             } else {
