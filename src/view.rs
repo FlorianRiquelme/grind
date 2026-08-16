@@ -11,7 +11,7 @@
 //! that both readers parse the same bytes — not the compiler, which is blind to it precisely
 //! because the wall is working.
 
-use crate::attempt::Attempt;
+use crate::attempt::{self, Attempt};
 use crate::job::{self, Job};
 use crate::observe::{self, Observation, Observed, Reason};
 use crate::world;
@@ -45,10 +45,11 @@ pub struct RunView {
 }
 
 impl RunView {
-    /// *attempt N of M*, with **M from the record**. Re-entering under a different environment
-    /// cannot make this misreport a Run's own budget.
+    /// *attempt N of M*, with **M from the record** and N counting **working Attempts only**.
+    /// Re-entering under a different environment cannot make this misreport a Run's own budget,
+    /// and a Run that spent six Attempts probing a wall is not six Attempts into its budget.
     pub fn attempt_counter(&self) -> (usize, usize) {
-        (self.attempts.len(), self.attempt_budget)
+        (attempt::working(&self.attempts), self.attempt_budget)
     }
 
     pub fn total_spend(&self) -> f64 {
@@ -375,7 +376,9 @@ mod tests {
     fn the_read_only_reader_parses_the_same_fixture_the_writer_does() {
         let found: RunView = serde_json::from_str(DAY_ONE).expect("the base's record shape");
         assert_eq!(found.run_id, "20260806-122620-snapper-28");
-        assert_eq!(found.attempt_counter(), (4, 8));
+        // Four Attempts, of which one — attempt 3, $0 and one turn — did no work.
+        assert_eq!(found.attempt_counter(), (3, 8));
+        assert_eq!(found.attempts.len(), 4);
         assert_eq!(found.denied_tools.len(), 7);
         assert_eq!(found.denial_count(), 1);
         assert!(
@@ -409,7 +412,7 @@ mod tests {
         value["attempt_budget"] = serde_json::json!(3);
         let found: RunView = serde_json::from_value(value).unwrap();
         // The environment has no say: there is no override to read, and M is a record field.
-        assert_eq!(found.attempt_counter(), (4, 3));
+        assert_eq!(found.attempt_counter(), (3, 3));
     }
 
     #[test]

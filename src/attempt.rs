@@ -315,6 +315,45 @@ pub struct Attempt {
     pub result_tail: String,
 }
 
+impl Attempt {
+    /// **A Wait is an Attempt that did no work**, and it is keyed on work done rather than on
+    /// cause — this predicate never reads `rate_limited`. Six of Run 2's eight Attempts cost $0
+    /// and ran one turn each, probing a wall, and spent the same budget as the three that built
+    /// twelve commits.
+    ///
+    /// Derived, never persisted: the three fields it reads are already on the record, so there
+    /// is no migration and no reader mirror to keep in step.
+    ///
+    /// **An Attempt whose stdout did not parse is never a Wait, and that clause is
+    /// load-bearing.** A child that dies before emitting parseable JSON leaves both the cost and
+    /// the turn count absent, so a predicate reading absence as *did no work* would make every
+    /// crash loop free: no budget spent, no rate-limit match, immediate re-entry, forever, with
+    /// `attempt N of M` reporting the Run as barely started. Absence of evidence is not evidence
+    /// of no work, and `parse_ok` is the field that already separates the two.
+    pub fn is_wait(&self) -> bool {
+        self.parse_ok
+            && self.total_cost_usd.unwrap_or(0.0) <= 0.0
+            && self.num_turns.unwrap_or(0) <= 1
+    }
+}
+
+/// How many of these Attempts did work. **The attempt budget counts these and no others**, on
+/// every surface that prints *attempt N of M*.
+pub fn working(attempts: &[Attempt]) -> usize {
+    attempts.iter().filter(|a| !a.is_wait()).count()
+}
+
+/// The run of Waits at the end of the list — the only bound on a Run that never does work,
+/// since Waits by design spend no attempt budget.
+///
+/// Counted from the **recorded** list rather than held loop-local, because the bound has to
+/// survive a restart: `resume --all` re-enters rate-limited and died Runs at boot, so a
+/// loop-local count would hand a permanently-walled Run a fresh allowance at every reboot and
+/// never terminate.
+pub fn trailing_waits(attempts: &[Attempt]) -> usize {
+    attempts.iter().rev().take_while(|a| a.is_wait()).count()
+}
+
 /// The pure classifier over a raw triple.
 ///
 /// **`subtype` is not the outcome.** It read `success` on all five of Run 1's attempts including
@@ -961,6 +1000,72 @@ mod tests {
         assert!(CI_BABYSIT_PROMPT.contains("one invocation"));
         assert!(CI_BABYSIT_PROMPT.contains("do not open a second PR"));
         assert!(CI_BABYSIT_PROMPT.contains("Never weaken, trim or skip a step of `just verify`"));
+    }
+
+    // --- the Wait predicate -------------------------------------------------------------------
+
+    fn shaped(parse_ok: bool, cost: Option<f64>, turns: Option<u64>, limited: bool) -> Attempt {
+        Attempt {
+            n: 1,
+            mode: Mode::Resume,
+            started_at: "s".to_string(),
+            ended_at: "e".to_string(),
+            exit_code: Some(1),
+            is_error: true,
+            parse_ok,
+            subtype: None,
+            stop_reason: None,
+            api_error_status: None,
+            terminal_reason: None,
+            num_turns: turns,
+            total_cost_usd: cost,
+            usage: None,
+            permission_denials: vec![],
+            done_promise: false,
+            rate_limited: limited,
+            result_tail: String::new(),
+        }
+    }
+
+    #[test]
+    fn an_attempt_with_real_cost_and_many_turns_is_never_a_wait() {
+        // Keyed on work done, never on cause: the flag says rate-limited and the Attempt still
+        // did work, so it still spends the budget.
+        assert!(!shaped(true, Some(37.04), Some(187), true).is_wait());
+        assert!(!shaped(true, Some(37.04), Some(187), false).is_wait());
+    }
+
+    #[test]
+    fn an_attempt_that_parsed_with_no_cost_and_no_turns_is_a_wait() {
+        assert!(shaped(true, Some(0.0), Some(1), true).is_wait());
+        assert!(shaped(true, None, None, false).is_wait());
+        assert!(
+            shaped(true, Some(0.0), Some(1), false).is_wait(),
+            "a Wait is never keyed on the rate-limit flag"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_attempt_is_never_a_wait_even_with_both_fields_absent() {
+        // The load-bearing clause. A child that dies before emitting parseable JSON leaves both
+        // fields absent, and reading that as *did no work* makes every crash loop free.
+        assert!(!shaped(false, None, None, false).is_wait());
+        assert!(!shaped(false, None, None, true).is_wait());
+    }
+
+    #[test]
+    fn the_wait_arithmetic_reads_the_attempt_list_and_nothing_else() {
+        let list = [
+            shaped(true, Some(3.0), Some(40), false),
+            shaped(true, Some(0.0), Some(1), true),
+            shaped(false, None, None, false),
+            shaped(true, None, None, true),
+            shaped(true, Some(0.0), Some(0), true),
+        ];
+        assert_eq!(working(&list), 2);
+        assert_eq!(trailing_waits(&list), 2);
+        assert_eq!(trailing_waits(&[]), 0);
+        assert_eq!(working(&[]), 0);
     }
 
     #[test]

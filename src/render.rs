@@ -202,7 +202,7 @@ pub fn handback(
         &mut out,
         &format!(
             "Attempts {}   spend ${:.2} (API pricing)   tool denials {}",
-            found.attempts.len(),
+            crate::attempt::working(&found.attempts),
             found.total_spend(),
             found.denial_count()
         ),
@@ -615,6 +615,21 @@ mod tests {
         assert!(text.contains("plan"));
         assert!(text.contains("review residuals"));
         assert!(text.contains("ledger entries"));
+    }
+
+    #[test]
+    fn attempt_n_of_m_counts_working_attempts_only_on_every_surface_that_prints_it() {
+        // The day-one record holds four Attempts, of which attempt 3 cost $0 and ran one turn.
+        let text = handback(
+            &found(),
+            &observation(),
+            &contract(),
+            Stage::PrOpen,
+            Path::new("/x/run.json"),
+        );
+        assert!(text.contains("Attempts 3"), "{text}");
+        let single = rendered(&observation(), &live(3), &Verdict::Completed);
+        assert!(single.contains("attempt 3 of 8"), "{single}");
     }
 
     #[test]

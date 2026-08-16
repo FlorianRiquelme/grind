@@ -32,6 +32,11 @@ pub const REOBSERVATIONS: usize = 3;
 /// time instead. Not per-Job and not recorded: like `REOBSERVATIONS`, it is Grind's own policy
 /// knob rather than a fact the record needs to freeze.
 pub const REOBSERVE_PAUSE_SECONDS: u64 = 15;
+/// How many Waits in a row before *nothing is happening forever* becomes terminal. A Wait
+/// spends no attempt budget, so without this a permanently-walled Run never stops. Twelve is
+/// six hours at the recorded limit sleep; Run 2's real three-hour wall produced five
+/// consecutive Waits and then cleared, so the bound has to sit well above it.
+pub const CONSECUTIVE_WAITS: usize = 12;
 
 /// **Seven states, and none of them is `running`.** A SIGKILLed supervisor would sit in
 /// `running` forever, which is why the roster observes liveness for itself instead.
@@ -387,6 +392,7 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
         limit_sleep: Duration::from_secs(record.limit_sleep_seconds),
         reobservations: REOBSERVATIONS,
         reobserve_pause: Duration::from_secs(REOBSERVE_PAUSE_SECONDS),
+        consecutive_waits: CONSECUTIVE_WAITS,
     };
     let worktree = PathBuf::from(&record.worktree);
     let mut reobservations = 0usize;

@@ -582,6 +582,11 @@ fn scenario_d_a_rate_limit_announces_the_recorded_sleep_rather_than_burning_the_
     assert_eq!(attempts.len(), 1, "it slept rather than burning attempts");
     assert_eq!(attempts[0]["rate_limited"], true);
     assert_eq!(attempts[0]["api_error_status"], "429");
+    // And it did no work, so it is a Wait: it parsed, cost nothing and took one turn. Nothing
+    // records that as a field — the predicate is derived from these three.
+    assert_eq!(attempts[0]["parse_ok"], true);
+    assert_eq!(attempts[0]["total_cost_usd"], 0.0);
+    assert_eq!(attempts[0]["num_turns"], 1);
     assert_eq!(
         attempts[0]["subtype"], "success",
         "subtype is not the outcome"

@@ -7,7 +7,7 @@
 //! **Never a pre-flight quota check** (ADR-0004). Even a perfectly informed supervisor would be
 //! wrong about what a stage costs, so Grind sleeps long and re-enters rather than predicting.
 
-use crate::attempt::{Attempt, Mode};
+use crate::attempt::{self, Attempt, Mode};
 use crate::decide::Verdict;
 use crate::observe::Observed;
 use std::time::Duration;
@@ -26,6 +26,11 @@ pub struct Budget {
     /// laptop wake is the case this exists for — has a real chance to clear before the next
     /// look. Sourced from a compiled constant beside `REOBSERVATIONS`, never per-Job.
     pub reobserve_pause: Duration,
+    /// How many Waits in a row before *nothing is happening forever* becomes terminal. Waits
+    /// never spend `attempts`, so this is the only thing bounding a Run against a permanent
+    /// wall. Grind's own policy knob, from a compiled constant like `reobservations` — not a
+    /// record field and not per-Job.
+    pub consecutive_waits: usize,
 }
 
 /// What the loop does next.
@@ -84,7 +89,16 @@ pub fn next(
             }
         }
         Verdict::Incomplete(_) => {
-            if attempts.len() >= budget.attempts {
+            // Working Attempts only, read from the Attempt list and never from an observation.
+            // A progress-based cap would have killed Run 2 *faster*: `commits_ahead` read zero
+            // for all eight of its Attempts while twelve real commits existed.
+            if attempt::working(attempts) >= budget.attempts {
+                return Next::Stop(Stop::Exhausted);
+            }
+            // Wall-clock never bounds a Run; a run of Waits does. Any working Attempt ends the
+            // run by construction, and the count comes off the persisted list so a restart
+            // cannot reset it.
+            if attempt::trailing_waits(attempts) >= budget.consecutive_waits {
                 return Next::Stop(Stop::Exhausted);
             }
             match attempts.last() {
@@ -115,9 +129,11 @@ mod tests {
             limit_sleep: Duration::from_secs(limit_sleep_secs),
             reobservations: 3,
             reobserve_pause: Duration::from_secs(reobserve_pause_secs),
+            consecutive_waits: 12,
         }
     }
 
+    /// An Attempt that **did work** — real cost, many turns. The budget counts these.
     fn attempt(n: usize, mode: Mode, rate_limited: bool) -> Attempt {
         Attempt {
             n,
@@ -131,14 +147,39 @@ mod tests {
             stop_reason: None,
             api_error_status: rate_limited.then(|| "429".to_string()),
             terminal_reason: Some("api_error".to_string()),
-            num_turns: Some(1),
-            total_cost_usd: Some(0.0),
+            num_turns: Some(37),
+            total_cost_usd: Some(2.35),
             usage: None,
             permission_denials: vec![],
             done_promise: false,
             rate_limited,
             result_tail: String::new(),
         }
+    }
+
+    /// An Attempt that did **no** work: it parsed, cost nothing and took one turn. Run 2's
+    /// attempts 3 through 7, exactly.
+    fn wait(n: usize, rate_limited: bool) -> Attempt {
+        Attempt {
+            num_turns: Some(1),
+            total_cost_usd: Some(0.0),
+            ..attempt(n, Mode::Resume, rate_limited)
+        }
+    }
+
+    /// A child that died before emitting parseable JSON. Never a Wait, whatever is absent.
+    fn crashed(n: usize) -> Attempt {
+        Attempt {
+            parse_ok: false,
+            subtype: Some("unparseable-output".to_string()),
+            num_turns: None,
+            total_cost_usd: None,
+            ..attempt(n, Mode::Resume, false)
+        }
+    }
+
+    fn incomplete() -> Verdict {
+        Verdict::Incomplete(vec!["PR open".to_string()])
     }
 
     fn clear() -> Observed<bool> {
@@ -317,6 +358,129 @@ mod tests {
             ),
             Next::Reenter
         );
+    }
+
+    // --- a Wait is an Attempt that did no work -----------------------------------------------
+
+    #[test]
+    fn a_wait_does_not_decrement_the_attempt_budget() {
+        // Eight Waits and one working Attempt against a budget of eight: one spent, not nine.
+        let mut attempts: Vec<Attempt> = (1..=8).map(|n| wait(n, true)).collect();
+        attempts.push(attempt(9, Mode::Resume, false));
+        assert_ne!(
+            next(&attempts, &incomplete(), &clear(), 0, &budget(8, 1800)),
+            Next::Stop(Stop::Exhausted)
+        );
+    }
+
+    #[test]
+    fn a_run_of_consecutive_waits_terminates_on_its_own_bound() {
+        // Waits spend nothing, so this counter is the only thing standing between a permanent
+        // wall and a Run that never stops.
+        let eleven: Vec<Attempt> = (1..=11).map(|n| wait(n, true)).collect();
+        assert_eq!(
+            next(&eleven, &incomplete(), &clear(), 0, &budget(8, 1800)),
+            Next::SleepThenReenter(Duration::from_secs(1800))
+        );
+        let twelve: Vec<Attempt> = (1..=12).map(|n| wait(n, true)).collect();
+        assert_eq!(
+            next(&twelve, &incomplete(), &clear(), 0, &budget(8, 1800)),
+            Next::Stop(Stop::Exhausted),
+            "*nothing is happening forever* is still terminal"
+        );
+    }
+
+    #[test]
+    fn a_working_attempt_ends_the_run_of_waits() {
+        let mut attempts: Vec<Attempt> = (1..=11).map(|n| wait(n, true)).collect();
+        attempts.push(attempt(12, Mode::Resume, false));
+        attempts.extend((13..=15).map(|n| wait(n, true)));
+        assert_eq!(
+            crate::attempt::trailing_waits(&attempts),
+            3,
+            "the count is of the trailing run, not of the list"
+        );
+        assert_eq!(
+            next(&attempts, &incomplete(), &clear(), 0, &budget(8, 1800)),
+            Next::SleepThenReenter(Duration::from_secs(1800))
+        );
+    }
+
+    #[test]
+    fn the_consecutive_wait_bound_survives_a_re_entry() {
+        // The count is derived from the persisted list, so a fresh process reads the same
+        // number the one that died would have. A loop-local counter would hand a
+        // permanently-walled Run a fresh allowance at every reboot and never terminate — and
+        // `resume --all` re-enters rate-limited Runs at boot by design.
+        let twelve: Vec<Attempt> = (1..=12).map(|n| wait(n, true)).collect();
+        let after_a_restart = twelve.clone();
+        assert_eq!(
+            next(
+                &after_a_restart,
+                &incomplete(),
+                &clear(),
+                0,
+                &budget(8, 1800)
+            ),
+            Next::Stop(Stop::Exhausted)
+        );
+    }
+
+    #[test]
+    fn an_unparseable_child_spends_the_budget_and_never_loops_forever() {
+        // The load-bearing clause of the predicate. A crash leaves both cost and turns absent,
+        // and reading absence as *did no work* would make every crash loop free.
+        let eight: Vec<Attempt> = (1..=8).map(crashed).collect();
+        assert_eq!(crate::attempt::working(&eight), 8);
+        assert_eq!(
+            next(&eight, &incomplete(), &clear(), 0, &budget(8, 1800)),
+            Next::Stop(Stop::Exhausted)
+        );
+    }
+
+    #[test]
+    fn replaying_run_2s_eight_attempt_shapes_leaves_five_waits_and_three_working_attempts() {
+        // `docs/findings/0002`: attempt 1 at $37.04 and 187 turns, attempt 2 at $7.06,
+        // attempts 3–7 at $0 and one turn each, attempt 8 at $20.22 — the Attempt that opened
+        // the PR. Under the recorded budget of eight, three working Attempts is not exhaustion.
+        let mut run2 = vec![
+            Attempt {
+                num_turns: Some(187),
+                total_cost_usd: Some(37.04),
+                ..attempt(1, Mode::Dispatch, false)
+            },
+            Attempt {
+                num_turns: Some(52),
+                total_cost_usd: Some(7.06),
+                ..attempt(2, Mode::Resume, false)
+            },
+        ];
+        run2.extend((3..=7).map(|n| wait(n, true)));
+        run2.push(Attempt {
+            num_turns: Some(96),
+            total_cost_usd: Some(20.22),
+            ..attempt(8, Mode::Resume, false)
+        });
+
+        assert_eq!(crate::attempt::working(&run2), 3);
+        assert_eq!(run2.len() - crate::attempt::working(&run2), 5);
+        assert_ne!(
+            next(&run2, &incomplete(), &clear(), 0, &budget(8, 1800)),
+            Next::Stop(Stop::Exhausted),
+            "eight Attempts against a budget of eight, of which five did no work"
+        );
+    }
+
+    #[test]
+    fn wall_clock_is_not_a_bound_and_does_not_become_one() {
+        // Nothing in the budget names a duration a Run may take. The two `Duration`s here are
+        // both waits Grind performs, never ceilings on the Run.
+        let fields = format!("{:?}", budget(8, 1800));
+        assert!(fields.contains("limit_sleep"), "{fields}");
+        assert!(fields.contains("reobserve_pause"), "{fields}");
+        for ceiling in ["deadline", "max_wall", "timeout", "elapsed"] {
+            assert!(!fields.contains(ceiling), "{fields}");
+        }
     }
 
     #[test]
