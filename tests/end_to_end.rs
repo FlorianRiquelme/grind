@@ -135,6 +135,32 @@ impl Sandbox {
         self
     }
 
+    /// Stage a record as a Run in some state with some supervisor, so `resume --all` has a
+    /// roster to sort. Built from a real record, so every field the base forces at construction
+    /// is present and nothing here is a hand-written shape the reader would refuse.
+    fn stage(&self, template: &serde_json::Value, run_id: &str, state: &str, pid: u32) {
+        let mut record = template.clone();
+        record["run_id"] = serde_json::json!(run_id);
+        record["state"] = serde_json::json!(state);
+        record["supervisor_pid"] = serde_json::json!(pid);
+        record["supervisor_identity"] = serde_json::json!(identity_of(pid));
+        record["attempts"] = serde_json::json!([]);
+        let dir = self.home.join(".grind/runs").join(run_id);
+        fs::create_dir_all(&dir).expect("a staged run directory");
+        fs::write(
+            dir.join("run.json"),
+            serde_json::to_string_pretty(&record).expect("serialise") + "\n",
+        )
+        .expect("stage a record");
+    }
+
+    fn state_of(&self, run_id: &str) -> String {
+        let raw = fs::read_to_string(self.home.join(".grind/runs").join(run_id).join("run.json"))
+            .expect("a staged record");
+        let record: serde_json::Value = serde_json::from_str(&raw).expect("it parses");
+        record["state"].as_str().expect("a state").to_string()
+    }
+
     fn run_dir(&self) -> PathBuf {
         fs::read_dir(self.home.join(".grind/runs"))
             .expect("runs")
@@ -192,6 +218,17 @@ fn comments_on_the_job_issue(box_: &Sandbox) -> Vec<String> {
             call[at + 1..].join("\n")
         })
         .collect()
+}
+
+/// A process's start stamp, exactly as `world::process_start_stamp` reads it. A pid nothing is
+/// running under yields nothing, which is what *stale* looks like after a reboot.
+fn identity_of(pid: u32) -> Option<String> {
+    let out = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()
+        .expect("ps");
+    let stamp = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !stamp.is_empty()).then_some(stamp)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> String {
@@ -673,6 +710,157 @@ fn scenario_g_a_repeated_denial_with_no_progress_stops_for_a_human_and_resumes()
         "a Blocked Run re-enters rather than short-circuiting:\n{out}"
     );
     assert_eq!(box_.record()["state"], "completed");
+}
+
+// --- surviving a reboot -------------------------------------------------------------------------
+
+/// A completed Run's record, to stage cut-off and stopped Runs from.
+fn a_real_record(box_: &Sandbox) -> serde_json::Value {
+    box_.scenario(&["success_done"]).pr_appears_at(1);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    let record = box_.record();
+    let _ = fs::remove_dir_all(box_.home.join(".grind/runs"));
+    record
+}
+
+/// A pid nothing is running under. After a reboot every recorded pid is stale by construction.
+const GONE: u32 = 999_999;
+
+#[test]
+fn resume_all_re_enters_the_cut_off_and_never_the_stopped() {
+    // Two records staged as cut off and two as stopped re-enter exactly two Runs.
+    let box_ = sandbox("resume-all");
+    let template = a_real_record(&box_);
+    for (run_id, state) in [
+        ("r-dispatched", "dispatched"),
+        ("r-limited", "rate_limited"),
+        ("r-died", "died"),
+        ("r-blocked", "blocked"),
+        ("r-unobserved", "unobserved"),
+        ("r-uncorroborated", "uncorroborated"),
+    ] {
+        box_.stage(&template, run_id, state, GONE);
+    }
+
+    let (out, err, code) = box_.run(&["resume", "--all"]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    for cut_off in ["r-dispatched", "r-limited", "r-died"] {
+        assert!(out.contains(&format!("re-entered {cut_off}")), "{out}");
+    }
+    for stopped in ["r-blocked", "r-unobserved", "r-uncorroborated"] {
+        assert!(
+            !out.contains(stopped),
+            "a stopped Run is a deliberate decision:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn resume_all_re_enters_no_run_whose_recorded_supervisor_is_alive() {
+    let box_ = sandbox("resume-all-alive");
+    let template = a_real_record(&box_);
+    // This test process is unambiguously alive, and its start stamp matches itself.
+    let alive = std::process::id();
+    assert!(identity_of(alive).is_some(), "ps must answer for this pid");
+    box_.stage(&template, "r-alive", "dispatched", alive);
+    box_.stage(&template, "r-gone", "dispatched", GONE);
+
+    let (out, err, code) = box_.run(&["resume", "--all"]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert!(out.contains("re-entered r-gone"), "{out}");
+    assert!(!out.contains("r-alive"), "{out}");
+}
+
+#[test]
+fn a_cut_off_run_whose_worktree_is_dirty_is_skipped_and_the_skip_is_recorded() {
+    // A machine that just rebooted is exactly where someone was mid-edit, and this is the one
+    // path that starts an agent with nobody present. A skip rather than a refusal, because one
+    // unre-enterable Run must not stop the others.
+    let box_ = sandbox("resume-all-dirty");
+    let template = a_real_record(&box_);
+    box_.stage(&template, "r-dirty", "died", GONE);
+    box_.stage(&template, "r-clean", "died", GONE);
+    let worktree = PathBuf::from(template["worktree"].as_str().expect("a worktree"));
+    fs::write(worktree.join("uncommitted.txt"), "work the human left\n").expect("dirty it");
+
+    let (out, err, code) = box_.run(&["resume", "--all"]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert!(out.contains("skipped    r-dirty"), "{out}");
+    assert!(
+        out.contains("skipped    r-clean"),
+        "both share one worktree:\n{out}"
+    );
+    let log = fs::read_to_string(box_.home.join(".grind/runs/r-dirty/supervisor.log"))
+        .expect("the skip is recorded");
+    assert!(log.contains("skipped at boot"), "{log}");
+}
+
+#[test]
+fn a_skipped_run_does_not_stop_the_others_from_re_entering() {
+    let box_ = sandbox("resume-all-partial");
+    let template = a_real_record(&box_);
+    box_.stage(&template, "r-good", "died", GONE);
+    // A record nothing can read. There is deliberately no migration read path, and a record
+    // written before this build lacks fields the base forces at construction.
+    let old = box_.home.join(".grind/runs/r-ancient");
+    fs::create_dir_all(&old).expect("a staged run directory");
+    fs::write(
+        old.join("run.json"),
+        r#"{"run_id":"r-ancient","state":"died","attempts":[]}"#,
+    )
+    .expect("stage a pre-build record");
+
+    let (out, err, code) = box_.run(&["resume", "--all"]);
+    assert_eq!(code, Some(0), "never a panic:\n{out}\n{err}");
+    assert!(out.contains("re-entered r-good"), "{out}");
+    assert!(out.contains("skipped    r-ancient"), "{out}");
+}
+
+#[test]
+fn the_supervisors_resume_all_spawns_outlive_it_and_it_exits_on_what_it_started() {
+    // `resume --all` reports which Runs it started and exits on that, never on any Run's
+    // verdict. The children keep going after it is gone.
+    let box_ = sandbox("resume-all-detached");
+    let template = a_real_record(&box_);
+    box_.stage(&template, "r-detached", "died", GONE);
+    box_.scenario(&["success_done"]).pr_appears_at(1);
+
+    let started = Instant::now();
+    let (out, err, code) = box_.run(&["resume", "--all"]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "it spawns and exits rather than waiting on a Run"
+    );
+    assert!(out.contains("re-entered r-detached"), "{out}");
+    assert!(
+        !out.contains("Verdict"),
+        "it never reports what a Run concluded:\n{out}"
+    );
+
+    // The child is still alive after its parent is gone, and finishes the Run.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while box_.state_of("r-detached") != "completed" {
+        assert!(
+            Instant::now() < deadline,
+            "the spawned supervisor must outlive `resume --all`; it left the Run at {}",
+            box_.state_of("r-detached")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn resume_all_is_not_parsed_as_a_run_id_named_all() {
+    let box_ = sandbox("resume-all-arm");
+    let (out, err, code) = box_.run(&["resume", "--all"]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert!(
+        !out.contains("no Run `--all`") && !err.contains("--all"),
+        "slice patterns match by position, so the generic arm would bind it:\n{out}\n{err}"
+    );
+    assert!(out.contains("no Run on this host was cut off"), "{out}");
 }
 
 // --- the exit code reports observability, never health ----------------------------------------

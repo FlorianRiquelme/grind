@@ -1,0 +1,32 @@
+; A boot-time one-shot: fire once, spawn one supervisor per cut-off Run, exit. Nothing is
+; resident and nothing watches anything (ADR-0011).
+;
+; Install as a **user** unit, so `$HOME` resolves to the dispatching user's:
+;
+;   cp dist/systemd/grind-resume-all.service ~/.config/systemd/user/
+;   systemctl --user enable grind-resume-all.service
+;
+; `$HOME` is the only variable Grind reads and there is no override (ADR-0008), so a unit with a
+; different `User=` resolves a different `~/.grind` and re-enters nothing. That is the point.
+
+[Unit]
+Description=Re-enter every Grind Run this host cut off
+Documentation=https://github.com/FlorianRiquelme/grind
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/grind resume --all
+
+; **The one piece of real machinery in this file, and getting it wrong is silent.**
+;
+; A `Type=oneshot` service takes its cgroup with it when `ExecStart` exits. `grind resume --all`
+; spawns one detached supervisor per cut-off Run and exits immediately, so the default would kill
+; every Run seconds after boot with nothing saying so. `KillMode=process` limits systemd's stop
+; action to the main process and leaves the supervisors it spawned alone.
+KillMode=process
+RemainAfterExit=no
+
+[Install]
+WantedBy=default.target

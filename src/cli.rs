@@ -37,6 +37,11 @@ impl Observability {
 /// **incoherent input**, never a health verdict and never a gate.
 const INCOHERENT_INPUT: i32 = 2;
 
+/// What the shipped templates in `dist/` call themselves. The check asks the service manager
+/// what it has **loaded** under these names, never the filesystem what is on disk under them.
+const BOOT_ONE_SHOT_LABEL: &str = "com.grind.resume-all";
+const BOOT_ONE_SHOT_UNIT: &str = "grind-resume-all.service";
+
 pub fn run() -> i32 {
     let args = world::args();
     let rest: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -50,6 +55,9 @@ pub fn run() -> i32 {
             0
         }
         ["run", issue] => finish(supervisor::dispatch(issue)),
+        // **Before** the generic arm: slice patterns match by position, so that one would
+        // otherwise bind `run_id = "--all"` and dispatch it as a run id.
+        ["resume", "--all"] => resume_all(),
         ["resume", run_id] => finish(supervisor::resume(run_id)),
         ["status"] => status_roster(),
         ["status", run_id] => status_one(run_id),
@@ -71,6 +79,7 @@ const USAGE: &str = "grind — dispatch and supervise headless `lfg` Runs agains
 
     grind run <issue>       dispatch a Job now (issue number or URL)
     grind resume <run-id>   re-enter a Run that died
+    grind resume --all      re-enter every Run on this host a restart cut off
     grind status [run-id]   roster when bare; one Run's live view when named
     grind doctor            check the provisioned-host list
     grind --version         which copy of the binary is this
@@ -110,6 +119,30 @@ fn finish(outcome: Result<supervisor::Outcome, Refusal>) -> i32 {
     } else {
         Observability::Answered.code()
     }
+}
+
+/// **Reports what it started, never what any Run concluded.** `finish` is built around one
+/// `Outcome` and one Handback; N detached children have neither a single outcome nor a single
+/// verdict-derived exit code, and inventing one would be a summary over N Runs.
+fn resume_all() -> i32 {
+    let report = match supervisor::resume_all() {
+        Ok(report) => report,
+        Err(refusal) => {
+            print_err(&render::refusal(&refusal.to_string()));
+            return INCOHERENT_INPUT;
+        }
+    };
+    if report.started.is_empty() && report.skipped.is_empty() {
+        print("no Run on this host was cut off.\n");
+        return Observability::Answered.code();
+    }
+    for run_id in &report.started {
+        print(&format!("re-entered {run_id}"));
+    }
+    for (run_id, why) in &report.skipped {
+        print(&format!("skipped    {run_id}: {why}"));
+    }
+    Observability::Answered.code()
 }
 
 // --- status ------------------------------------------------------------------------------------
@@ -302,6 +335,28 @@ fn check(home: &Path, clones: &[(String, PathBuf)], check: Check) -> Observed<Ou
         Check::PluginInstalled => observe::plugin_installed(
             !world::list_dir(&home.join(".claude").join("plugins").join("cache")).is_empty(),
         ),
+        // Spelled `cfg!` rather than `std::env::consts::OS`, which is the idiomatic runtime
+        // spelling: `tests/topology.rs` string-matches the literal `std::env` and asserts only
+        // `world` names it, so the idiom would turn `just verify` red on a carrier that must
+        // pass unrelaxed.
+        Check::BootOneShot => {
+            let asked = if cfg!(target_os = "macos") {
+                Some(format!(
+                    "launchctl print gui/$(id -u)/{BOOT_ONE_SHOT_LABEL}"
+                ))
+            } else if cfg!(target_os = "linux") {
+                Some(format!("systemctl --user is-enabled {BOOT_ONE_SHOT_UNIT}"))
+            } else {
+                None
+            };
+            match asked {
+                // Read-only on both platforms: doctor never performs a write to prove a step.
+                Some(command) => {
+                    observe::boot_one_shot(&world::run(&words(&["sh", "-c", &command]), None))
+                }
+                None => observe::unchecked("no boot one-shot is defined for this platform"),
+            }
+        }
         Check::GhAuthStore => {
             observe::gh_auth_store(&world::run(&words(&["gh", "auth", "status"]), None))
         }
@@ -384,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn the_surface_is_five_shapes_and_none_of_them_is_list() {
+    fn the_surface_is_six_shapes_and_none_of_them_is_list() {
         // A bare status that resolves to one Run is Grind selecting, and the repair
         // "pick the one in flight" would pick a zombie.
         assert!(!USAGE.contains("grind list"));
@@ -392,6 +447,7 @@ mod tests {
         for shape in [
             "grind run <issue>",
             "grind resume <run-id>",
+            "grind resume --all",
             "grind status [run-id]",
             "grind doctor",
             "grind --version",
@@ -399,6 +455,10 @@ mod tests {
             assert!(USAGE.contains(shape), "the surface must name {shape}");
         }
         assert!(USAGE.contains("roster when bare"));
+        // Not a boot verb — that names a command after its caller. Not a bare `resume` either:
+        // a typo would mutate every branch on the host.
+        assert!(!USAGE.contains("grind boot"));
+        assert!(!USAGE.contains("grind resume\n"));
     }
 
     #[test]

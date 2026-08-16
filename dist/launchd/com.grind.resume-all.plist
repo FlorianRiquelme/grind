@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  A boot-time one-shot: fire once, spawn one supervisor per cut-off Run, exit. Nothing is
+  resident and nothing watches anything (ADR-0011).
+
+  Install as a **user** agent, so `$HOME` resolves to the dispatching user's:
+
+      cp dist/launchd/com.grind.resume-all.plist ~/Library/LaunchAgents/
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.grind.resume-all.plist
+
+  A plist copied into place and never bootstrapped is not loaded, and it fails one reboot later
+  with a Run stranded — which is why `grind doctor` checks for *loaded* rather than *present*.
+
+  `AbandonProcessGroup` is the load-bearing key. Without it launchd reaps the whole process group
+  when the job exits, and this job's entire purpose is to spawn detached supervisors and exit —
+  so every re-entered Run would die seconds after boot, silently. It is the launchd half of the
+  systemd unit's `KillMode=process`.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.grind.resume-all</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/grind</string>
+    <string>resume</string>
+    <string>--all</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>AbandonProcessGroup</key>
+  <true/>
+
+  <!-- What it started and what it skipped. Each Run's own narration goes to its
+       `~/.grind/runs/<run-id>/supervisor.log`. -->
+  <key>StandardOutPath</key>
+  <string>/tmp/grind-resume-all.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/grind-resume-all.log</string>
+</dict>
+</plist>

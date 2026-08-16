@@ -94,19 +94,35 @@ at boot** and calls `grind resume --all`, so a restart re-enters the Runs it cut
 leaving them at `died` until a human looks. Nothing watches a supervisor while the host is up, and
 nothing needs to.
 
-**Decided, not yet on the list above.** The item is *a boot-time one-shot calling
-`grind resume --all` is installed and loaded* — `RunAtLoad` on darwin, `Type=oneshot` on linux —
-and it is marked **doctor**: a Dispatch works perfectly well without it, so refusing one would gate
-a Job on something unrelated to it (ADR-0003). It is written here without a mark on purpose,
-because the marks above are bound to `job::host_items()` by
-`every_item_carries_the_mark_the_document_gives_it`, and this item has no `Check` behind it yet.
-**Both halves land together or neither does.**
+- **A boot-time one-shot calling `grind resume --all` is loaded.** — *doctor* — `RunAtLoad` on
+  darwin, `Type=oneshot` on linux. A Dispatch works perfectly well without it, so refusing one
+  would gate a Job on something unrelated to it (ADR-0003).
 
-Two costs to carry into that build. It is the **first platform-branching check** — `launchctl
-print` against `systemctl is-enabled`, where every existing check is one command everywhere. And it
-must verify **loaded**, not merely present: a plist sitting on disk that was never bootstrapped is
-the likeliest way this fails, and it fails silently, one reboot later, with a Run stranded and
-nothing saying so.
+  Templates ship in `dist/` — the first thing Grind ships that is neither the binary nor
+  documentation. Install them by hand and edit the path to `grind` if it is not
+  `/usr/local/bin/grind`:
+
+  ```sh
+  # darwin
+  cp dist/launchd/com.grind.resume-all.plist ~/Library/LaunchAgents/
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.grind.resume-all.plist
+
+  # linux
+  cp dist/systemd/grind-resume-all.service ~/.config/systemd/user/
+  systemctl --user enable grind-resume-all.service
+  ```
+
+  Two costs. It is the **first platform-branching check** — `launchctl print` against
+  `systemctl --user is-enabled`, where every existing check is one command everywhere. And it
+  verifies **loaded**, not merely present: a plist sitting on disk that was never bootstrapped is
+  the likeliest way this fails, and it fails silently, one reboot later, with a Run stranded and
+  nothing saying so.
+
+  The systemd unit carries the one piece of real machinery in this build. A `Type=oneshot`
+  service takes its cgroup with it when `ExecStart` exits, and `grind resume --all` spawns one
+  detached supervisor per cut-off Run and exits immediately — so the default would kill every Run
+  seconds after boot, silently. `KillMode=process` is what stops that, and
+  `AbandonProcessGroup` is the launchd half of the same problem.
 
 ## Credentials
 

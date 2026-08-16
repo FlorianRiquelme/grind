@@ -283,6 +283,38 @@ pub fn args() -> Vec<String> {
     std::env::args().skip(1).collect()
 }
 
+/// This binary's own path, so a boot one-shot re-enters with the copy that is running rather
+/// than with whatever `PATH` resolves to under a service manager's environment.
+pub fn current_exe() -> Option<PathBuf> {
+    std::env::current_exe().ok()
+}
+
+/// A child that **outlives this process**, in its own process group.
+///
+/// Never a thread: Rust terminates detached threads when `main` returns, and the boot one-shot's
+/// whole shape is *spawn and exit*, so a thread-per-Run boot path re-enters nothing and reports
+/// success while doing it. The new process group is what keeps a SIGHUP to the parent's terminal
+/// from taking the supervisors with it; the systemd unit's own `KillMode` is the other half, and
+/// it lives in `dist/`.
+///
+/// Nothing is waited on and nothing is piped — the child owns its own stdio and writes its own
+/// `supervisor.log`.
+pub fn spawn_detached(argv: &[String]) -> Result<u32, String> {
+    use std::os::unix::process::CommandExt;
+    let Some((program, rest)) = argv.split_first() else {
+        return Err("empty argv".to_string());
+    };
+    Command::new(program)
+        .args(rest)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|child| child.id())
+        .map_err(|e| e.to_string())
+}
+
 pub fn exit(code: i32) -> ! {
     std::process::exit(code)
 }

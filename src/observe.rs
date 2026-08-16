@@ -616,6 +616,29 @@ fn unsatisfied(what: &str) -> Observed<Outcome> {
     Observed::Present(Outcome::Unsatisfied(what.to_string()))
 }
 
+/// The boot one-shot: **loaded**, not merely present.
+///
+/// A plist copied into `~/Library/LaunchAgents` and never bootstrapped is the likeliest way this
+/// fails, and it fails one reboot later with a Run stranded and nothing saying so. So the check
+/// asks the service manager what it has loaded rather than asking the filesystem what is there.
+///
+/// A service manager that could not be reached at all is **could not observe**, never
+/// unsatisfied: *no such unit* and *no `launchctl` on this box* are different facts, and the
+/// second one is about the check rather than about the host.
+pub fn boot_one_shot(completed: &Completed) -> Observed<Outcome> {
+    match completed.code {
+        Some(0) => satisfied("a boot one-shot calling `grind resume --all` is loaded"),
+        // `sh` could not run the service manager, or there was no exit code at all.
+        Some(127) | None => Observed::Unobservable(Reason::saying(
+            "the service manager could not be reached to ask what it has loaded",
+        )),
+        Some(_) => unsatisfied(
+            "no boot one-shot calling `grind resume --all` is loaded — a plist or unit on disk \
+             that was never bootstrapped counts as absent; see dist/",
+        ),
+    }
+}
+
 /// `~/.grind/repos/<owner>/<name>` exists, and — at doctor's depth — its `origin` names the
 /// target repo. `origin` is `None` at dispatch depth, which is what makes the dispatch subset a
 /// shallower run of the same item rather than a second item.
@@ -1515,6 +1538,61 @@ mod tests {
         assert!(said.contains("gpg.format"), "{said}");
         assert!(said.contains("public key"), "{said}");
         assert!(said.contains("commit.gpgsign"), "{said}");
+    }
+
+    #[test]
+    fn a_boot_one_shot_is_satisfied_only_when_the_service_manager_says_it_is_loaded() {
+        // `launchctl print` on a loaded agent, and `systemctl --user is-enabled` on an enabled
+        // unit, both exit zero.
+        let loaded = completed(
+            "com.grind.resume-all = {\n\tactive count = 0\n}\n",
+            "",
+            Some(0),
+        );
+        assert_eq!(
+            boot_one_shot(&loaded),
+            Observed::Present(Outcome::Satisfied(
+                "a boot one-shot calling `grind resume --all` is loaded".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_plist_on_disk_that_was_never_bootstrapped_is_unsatisfied_and_never_satisfied() {
+        // The likeliest way this fails, and it fails one reboot later with a Run stranded. The
+        // check asks the service manager what it has loaded, never the filesystem what is there.
+        for never_loaded in [
+            completed(
+                "",
+                "Could not find service \"com.grind.resume-all\"\n",
+                Some(113),
+            ),
+            completed("disabled\n", "", Some(1)),
+            completed(
+                "",
+                "Failed to get unit file state: No such file or directory\n",
+                Some(1),
+            ),
+        ] {
+            let found = boot_one_shot(&never_loaded);
+            assert!(
+                matches!(found, Observed::Present(Outcome::Unsatisfied(_))),
+                "{found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_service_manager_that_cannot_be_reached_is_could_not_observe_never_unsatisfied() {
+        // *No such unit* and *no `launchctl` on this box* are different facts, and the second is
+        // about the check rather than about the host.
+        for unreachable in [
+            completed("", "sh: launchctl: command not found\n", Some(127)),
+            completed("", "", None),
+        ] {
+            let found = boot_one_shot(&unreachable);
+            assert!(matches!(found, Observed::Unobservable(_)), "{found:?}");
+        }
     }
 
     #[test]

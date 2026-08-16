@@ -395,6 +395,95 @@ pub fn resume(run_id: &str) -> Result<Outcome, Refusal> {
     supervise(&mut record, &run_dir)
 }
 
+/// What `resume --all` started, and what it declined to. **Never what any Run concluded**:
+/// N detached children have neither a single outcome nor a single verdict-derived exit code,
+/// and inventing one would be a summary over N Runs.
+#[derive(Debug, Default)]
+pub struct Reentry {
+    pub started: Vec<String>,
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Re-enter every Run on this host that a restart **cut off**.
+///
+/// *Cut off* is `Dispatched`, `RateLimited` or `Died` **with a stale supervisor**. Liveness
+/// needs nothing new: after a reboot every recorded pid is stale by construction, so the
+/// existing process-identity check answers it, and the edge — a fast reboot plus a pid collision
+/// plus a colliding start stamp — fails toward *declining to re-enter*, which is the safe
+/// direction.
+///
+/// **The stopped are never re-entered**: `Uncorroborated`, `Unobserved` and `Blocked` are
+/// deliberate decisions, and overriding one at the moment nobody is watching is the failure this
+/// path is most able to cause. `Unobserved` is the arguable one and is excluded on purpose —
+/// re-entering it means a blind Run mutating a branch.
+///
+/// **Concurrent, never serial** — one detached child per kept Run, each taking its own dispatch
+/// lock, so genuinely independent Runs proceed in parallel and a second child on one branch gets
+/// the existing `WouldBlock` refusal for free. Serial re-entry would be ordering, and ordering is
+/// the human's act.
+pub fn resume_all() -> Result<Reentry, Refusal> {
+    let home = world::home().ok_or_else(|| Refusal::saying("$HOME is unset"))?;
+    let exe = world::current_exe()
+        .ok_or_else(|| Refusal::saying("could not find the `grind` binary to re-enter with"))?;
+    let mut report = Reentry::default();
+
+    for run_dir in world::list_dir(&job::runs_dir(&home)) {
+        let Some(run_id) = run_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Ok(record) = RunRecord::load(&record_path(&run_dir)) else {
+            // A record written before this build lacks fields the base now forces, and there is
+            // deliberately no migration read path. Skipping is the only honest answer.
+            report.skipped.push((
+                run_id.to_string(),
+                "its record could not be read".to_string(),
+            ));
+            continue;
+        };
+        if !matches!(
+            record.state,
+            State::Dispatched | State::RateLimited | State::Died
+        ) {
+            continue;
+        }
+        let supervisor = crate::view::supervisor_here(
+            record.supervisor_identity.as_deref(),
+            world::process_start_stamp(record.supervisor_pid).as_deref(),
+        );
+        if !matches!(supervisor, Observed::Present(false)) {
+            continue;
+        }
+        // `resume` runs no precondition checks and the new refusals live in `dispatch`, so boot
+        // re-entry inherits none of them. A machine that just rebooted is exactly where someone
+        // was mid-edit, and this is the one path that starts an agent with nobody present.
+        // A **skip** rather than a refusal, because one unre-enterable Run must not stop the
+        // others.
+        let worktree = PathBuf::from(&record.worktree);
+        let dirty = world::run(&words(&["git", "status", "--porcelain"]), Some(&worktree));
+        if dirty.code != Some(0) || job::is_dirty(&dirty.stdout) {
+            let why = format!(
+                "its worktree at {} is dirty or unreadable",
+                worktree.display()
+            );
+            say(&run_dir, &format!("  skipped at boot: {why}"));
+            report.skipped.push((run_id.to_string(), why));
+            continue;
+        }
+        match world::spawn_detached(&[
+            exe.display().to_string(),
+            "resume".to_string(),
+            run_id.to_string(),
+        ]) {
+            Ok(_) => report.started.push(run_id.to_string()),
+            Err(why) => {
+                say(&run_dir, &format!("  could not re-enter at boot: {why}"));
+                report.skipped.push((run_id.to_string(), why));
+            }
+        }
+    }
+    Ok(report)
+}
+
 // --- the loop ---------------------------------------------------------------------------------
 
 fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal> {

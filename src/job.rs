@@ -407,6 +407,9 @@ pub enum Check {
     OnPath(&'static str),
     GitVersionFloor,
     PluginInstalled,
+    /// The **first platform-branching check** in a list where every other one is a single
+    /// command everywhere: `launchctl print` on darwin, `systemctl --user is-enabled` on linux.
+    BootOneShot,
     GhAuthStore,
     SshKeyPassphraseless,
     SshKeyBothTypes,
@@ -472,6 +475,12 @@ pub fn host_items() -> &'static [HostItem] {
             depth: Depth::Dispatch,
             check: Check::PluginInstalled,
             doc_anchor: "The `lfg` plugin is installed.",
+        },
+        HostItem {
+            name: "boot one-shot loaded",
+            depth: Depth::Doctor,
+            check: Check::BootOneShot,
+            doc_anchor: "A boot-time one-shot calling `grind resume --all` is loaded.",
         },
         HostItem {
             name: "credential: gh auth store",
@@ -1164,6 +1173,21 @@ mod tests {
         assert!(
             !dispatch_subset().iter().any(|i| i.name == "just on PATH"),
             "`just` is doctor's, not dispatch's — the failure is the Run's, not the Dispatch's"
+        );
+    }
+
+    #[test]
+    fn the_boot_one_shot_is_doctors_and_never_a_dispatch_precondition() {
+        // A Dispatch works perfectly well without it, so refusing one would gate a Job on
+        // something unrelated to it (ADR-0003).
+        let item = host_items()
+            .iter()
+            .find(|i| i.check == Check::BootOneShot)
+            .expect("the boot one-shot is listed");
+        assert_eq!(item.depth, Depth::Doctor);
+        assert!(
+            !dispatch_subset().iter().any(|i| i.name == item.name),
+            "no dispatch path may consult the boot one-shot"
         );
     }
 
