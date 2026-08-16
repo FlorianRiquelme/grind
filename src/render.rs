@@ -1160,6 +1160,49 @@ mod tests {
     }
 
     #[test]
+    fn the_comment_renders_at_every_one_of_the_five_terminal_states() {
+        // completed, uncorroborated, unobserved, exhausted and blocked. Exhaustion reads as an
+        // incomplete verdict over a Run whose budget ran out, and a Blocker rides the same line.
+        let mut absent = observation();
+        absent.pr = Observed::Absent;
+        let each: [(&str, String); 5] = [
+            ("completed", commented(&observation(), &Verdict::Completed)),
+            (
+                "uncorroborated",
+                commented(&absent, &Verdict::Uncorroborated(vec!["PR open".into()])),
+            ),
+            (
+                "unobserved",
+                commented(&absent, &Verdict::Unobserved(vec!["PR open: reset".into()])),
+            ),
+            (
+                "exhausted",
+                commented(&absent, &Verdict::Incomplete(vec!["PR open".into()])),
+            ),
+            (
+                "blocked",
+                job_comment(&facts_of(
+                    found(),
+                    absent.clone(),
+                    Verdict::Incomplete(vec!["PR open".into()]),
+                    coverage(),
+                    Some("git push --force-with-lease"),
+                )),
+            ),
+        ];
+        for (state, markdown) in each {
+            assert!(
+                markdown.contains("**Run `20260806-122620-snapper-28`"),
+                "the {state} comment names the Run:\n{markdown}"
+            );
+            assert!(
+                markdown.contains("| run state |"),
+                "the {state} comment carries the table:\n{markdown}"
+            );
+        }
+    }
+
+    #[test]
     fn no_rendered_comment_contains_a_reason_built_by_reason_of() {
         // `Reason::of` composes `<call site>: exit N: <first stderr line>`, so a reason is raw
         // child stderr — and a misprovisioned host is exactly where an HTTPS `origin` embeds a
