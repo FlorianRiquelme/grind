@@ -129,16 +129,44 @@ change carries a safety property, not for coverage's sake.
   Bash(git -C*)
   Bash(git switch main*)
   Bash(gh api*merge*)
+  Bash(git push*--force*)
+  Bash(git push*--delete*)
+  Bash(git push*:*)
+  Bash(git push* -f)
+  Bash(git push* -f *)
+  Bash(git reset*--hard*)
+  Bash(git branch* -D*)
+  Bash(git branch*--delete*)
+  Bash(git*--force-with-lease*)
+  Bash(git -c*)
+  Bash(git*update-ref*)
   ```
 
-  The last five close spellings the first seven miss, and they rely on two documented matcher
-  facts: a `*` may appear anywhere in the pattern, not only at the end, and a rule is matched
-  against each subcommand after splitting on `&&`, `;` and `|`. Two are deliberately broad.
-  `Bash(git -C*)` refuses **every** `git -C`, because a Run works inside its own worktree via
-  cwd, so `-C` pointing anywhere is outside the shape it should have — and enumerating `-C` ×
-  each forbidden verb is whack-a-mole. `Bash(git push*+*)` catches the `+refspec` force and will
-  also refuse a push to a branch with a literal `+` in its name, which is an acceptable false
-  refusal for a barrier of this kind. Widening the list is safe and welcome; narrowing it is not.
+  They rely on two documented matcher facts: a `*` may appear anywhere in the pattern, not only
+  at the end, and a rule is matched against each subcommand after splitting on `&&`, `;` and `|`.
+
+  **The first twelve each anchor their flag immediately after the verb, and git accepts the flag
+  anywhere.** `git push origin --force`, `git push origin main --force`,
+  `git push -u origin main --force`, `git push origin -f`, `git push origin --force-with-lease`,
+  `git push origin --delete feat/x`, `git push origin :feat/x`,
+  `git branch --delete --force feat/x`, `git reset HEAD~3 --hard`, `git branch feat/x -D`,
+  `git -c x rebase` and `git update-ref -d refs/heads/x` were **all allowed** — and those are the
+  forms people and agents most often type. The eleven position-independent globs below the
+  twelve close them.
+
+  Four are deliberately broad. `Bash(git -C*)` and `Bash(git -c*)` refuse **every** `git -C` and
+  `git -c`, because a Run works inside its own worktree via cwd, so a prefix pointing anywhere is
+  outside the shape it should have — and enumerating the prefix × each forbidden verb is
+  whack-a-mole. `Bash(git push*+*)` catches the `+refspec` force and will also refuse a push to a
+  branch with a literal `+` in its name. `Bash(git push*:*)` catches the `:branch` delete refspec
+  and will also refuse a push naming an explicit `user@host:path` remote, which is not the shape
+  a Run pushes in. Both are acceptable false refusals for a barrier of this kind.
+
+  `-f` is spelled ` -f` and ` -f ` rather than `-f`, because `-f` as a bare substring appears
+  inside ordinary branch names and the broad glob would refuse the push. `-D` is not: it is
+  uppercase, so `git branch -d feat/x` — the safe delete — stays allowed.
+
+  Widening the list is safe and welcome; narrowing it is not.
 
   Denials are inherited by subagents and survive `bypassPermissions`. Don't loosen the list to
   make a Run go through — and note that **nothing sits behind it**: no credential can withhold

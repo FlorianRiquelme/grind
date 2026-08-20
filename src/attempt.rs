@@ -22,7 +22,7 @@ use std::path::Path;
 /// Weakening the list is **intent**, and no carrier defends against intent. What is typeable is
 /// the narrower, omission-shaped property below: every invocation carries them. The contents
 /// stay prose, in `CLAUDE.md`, where they already are.
-pub const DENIED_TOOLS: [&str; 12] = [
+pub const DENIED_TOOLS: [&str; 23] = [
     "Bash(gh pr merge*)",
     "Bash(git push --force*)",
     "Bash(git push -f*)",
@@ -43,6 +43,36 @@ pub const DENIED_TOOLS: [&str; 12] = [
     "Bash(git switch main*)",
     // Merge through the API rather than `gh pr merge`.
     "Bash(gh api*merge*)",
+    // --- the same operations with the flag off the front ---------------------------------
+    //
+    // Every glob above anchors its flag immediately after the verb, and **git accepts the flag
+    // anywhere**: `git push origin --force`, `git push -u origin main --force`,
+    // `git reset HEAD~3 --hard` and `git branch --delete --force feat/x` are the forms people
+    // and agents most often type, and all four were allowed. These eleven are the same
+    // operations, position-independent.
+    "Bash(git push*--force*)",
+    "Bash(git push*--delete*)",
+    // `git push origin :feat/x` deletes a branch through the refspec. Also refuses a push
+    // naming an explicit `user@host:path` remote, which is not the shape a Run pushes in —
+    // it pushes to the `origin` its worktree already has.
+    "Bash(git push*:*)",
+    // `-f` as its own argument, in the two positions it can take. Deliberately **not**
+    // `git push*-f*`: a branch named `fix/PROJ-1 -form` is unlikely, but `-f` as a bare
+    // substring appears inside ordinary branch names and that glob would refuse the push.
+    "Bash(git push* -f)",
+    "Bash(git push* -f *)",
+    "Bash(git reset*--hard*)",
+    "Bash(git branch* -D*)",
+    "Bash(git branch*--delete*)",
+    // Force-push under its safest-sounding spelling. It is still a force-push, and
+    // `--force-with-lease` reads like a concession a stuck Run would reach for.
+    "Bash(git*--force-with-lease*)",
+    // The lowercase sibling of `Bash(git -C*)`. `git -c x rebase` moves the verb off the front
+    // exactly as `-C` does, and glob matching is byte-exact, so the uppercase glob never saw it.
+    "Bash(git -c*)",
+    // Branch deletion and history rewriting one layer below the porcelain:
+    // `git update-ref -d refs/heads/x` deletes, `git update-ref refs/heads/main <sha>` rewrites.
+    "Bash(git*update-ref*)",
 ];
 
 /// Re-entry rides Claude Code's own session resume, not an `lfg` return value: `lfg` exposes no
@@ -641,31 +671,103 @@ mod tests {
 
     #[test]
     fn each_forbidden_operation_has_a_glob_that_refuses_it_under_the_documented_matcher() {
-        // Table of forbidden operation -> a candidate command string that performs it. This is
-        // the coverage the membership test above cannot give: the globs were present all along
-        // for the seven original spellings, and still missed the five spellings below.
-        let table: [(&str, &str); 12] = [
-            ("merge via gh pr merge", "gh pr merge 123 --squash"),
-            ("force push with --force", "git push --force origin feat/x"),
-            ("force push with -f", "git push -f"),
-            ("hard reset", "git reset --hard HEAD~3"),
-            ("rebase", "git rebase main"),
-            ("checkout main", "git checkout main"),
-            ("branch delete with -D", "git branch -D feat/x"),
-            ("branch delete via push", "git push --delete origin feat/x"),
-            ("the +refspec force", "git push origin +main"),
+        // Table of forbidden operation -> **every spelling that performs it**, flag-first and
+        // flag-last. This is the coverage the membership test above cannot give, and one
+        // spelling per row is what let the whole list read complete while
+        // `git push origin --force` went straight through: git accepts the flag anywhere, and
+        // a table that only ever types it in one position never asks.
+        let table: [(&str, &[&str]); 15] = [
+            (
+                "merge via gh pr merge",
+                &["gh pr merge 123 --squash", "gh pr merge --squash 123"],
+            ),
+            (
+                "force push with --force",
+                &[
+                    "git push --force origin feat/x",
+                    "git push origin --force",
+                    "git push origin main --force",
+                    "git push -u origin main --force",
+                ],
+            ),
+            ("force push with -f", &["git push -f", "git push origin -f"]),
+            (
+                "force push with --force-with-lease",
+                &[
+                    "git push --force-with-lease origin feat/x",
+                    "git push origin --force-with-lease",
+                ],
+            ),
+            (
+                "hard reset",
+                &["git reset --hard HEAD~3", "git reset HEAD~3 --hard"],
+            ),
+            (
+                "rebase",
+                &["git rebase main", "git rebase --onto main feat/x"],
+            ),
+            (
+                "checkout main",
+                &["git checkout main", "git checkout main --force"],
+            ),
+            (
+                "branch delete",
+                &[
+                    "git branch -D feat/x",
+                    "git branch feat/x -D",
+                    "git branch --delete --force feat/x",
+                    "git branch --force --delete feat/x",
+                ],
+            ),
+            (
+                "branch delete via push",
+                &[
+                    "git push --delete origin feat/x",
+                    "git push origin --delete feat/x",
+                    "git push origin :feat/x",
+                ],
+            ),
+            (
+                "the +refspec force",
+                &[
+                    "git push origin +main",
+                    "git push origin +refs/heads/main:refs/heads/main",
+                ],
+            ),
             (
                 "the -C prefix moving the verb off the front",
-                "git -C /tmp/other push --force",
+                &[
+                    "git -C /tmp/other push --force",
+                    "git -C /tmp/other rebase main",
+                ],
             ),
-            ("switch onto main", "git switch main"),
+            (
+                "the -c prefix moving the verb off the front",
+                &["git -c core.pager=cat rebase main", "git -c x push --force"],
+            ),
+            (
+                "switch onto main",
+                &["git switch main", "git switch main --force"],
+            ),
             (
                 "merge through the api",
-                "gh api repos/o/r/pulls/12/merge -X PUT",
+                &[
+                    "gh api repos/o/r/pulls/12/merge -X PUT",
+                    "gh api --method PUT repos/o/r/pulls/12/merge",
+                ],
+            ),
+            (
+                "branch delete and history rewrite through update-ref",
+                &[
+                    "git update-ref -d refs/heads/feat/x",
+                    "git update-ref refs/heads/main abc123",
+                ],
             ),
         ];
-        for (name, candidate) in table {
-            assert!(is_denied(candidate), "{name}: {candidate:?} must be denied");
+        for (name, spellings) in table {
+            for candidate in spellings {
+                assert!(is_denied(candidate), "{name}: {candidate:?} must be denied");
+            }
         }
         // Denials are per-subcommand after splitting on shell operators, so a prefix like `cd`
         // ahead of the forbidden verb must not let it through.
@@ -676,10 +778,18 @@ mod tests {
     fn ordinary_operations_the_barrier_must_not_catch_are_not_denied() {
         for allowed in [
             "git push origin feat/x",
+            "git push -u origin feat/x",
+            // A branch name carrying `-f` or `-D` as a substring is ordinary, and the
+            // position-independent globs are written to leave it alone.
+            "git push -u origin fix/PROJ-1-form-fields",
+            "git push -u origin feat/PROJ-2-Dashboard",
             "git status",
             "git branch -d feat/x",
             "gh pr view 12",
+            "gh pr create --fill",
             "git checkout feat/x",
+            "git fetch origin",
+            "git log --oneline",
         ] {
             assert!(!is_denied(allowed), "{allowed:?} must not be denied");
         }
