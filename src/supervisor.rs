@@ -374,7 +374,16 @@ pub fn resume(run_id: &str) -> Result<Outcome, Refusal> {
     // `policy`'s new reobserve pause exists for may simply have cleared since; refusing to
     // resume it would remove the only recovery path for exactly the fault this fix's other half
     // gives more time to clear.
-    if matches!(record.state, State::Completed | State::Exhausted) {
+    //
+    // **Keyed on the number, not on the state word.** A Run whose last working Attempt landed
+    // `Uncorroborated` or `Unobserved` at 8 of 8 stops in a resumable state at its budget, and
+    // the state-word guard waves it straight into `run_one_attempt` — with no `policy` check
+    // between `resume` and the child, and a recorded Attempt in this project costing $7–$37.
+    // Each further resume spends another and stops in the same state. Refusing on the count
+    // keeps the case the comment above argues for resumable, and refuses only the overspend.
+    if matches!(record.state, State::Completed | State::Exhausted)
+        || attempt::working(record.attempts()) >= record.attempt_budget
+    {
         return Ok(Outcome {
             run_id: record.run_id.clone(),
             state: record.state.as_str(),

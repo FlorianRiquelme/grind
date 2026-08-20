@@ -154,6 +154,20 @@ impl Sandbox {
         .expect("stage a record");
     }
 
+    /// Rewrite one Run's recorded state word, leaving its attempt list alone. The shape a
+    /// resume guard keyed on the word cannot tell apart from the one it means to allow.
+    fn state_becomes(&self, run_id: &str, state: &str) {
+        let path = self.home.join(".grind/runs").join(run_id).join("run.json");
+        let raw = fs::read_to_string(&path).expect("a record");
+        let mut record: serde_json::Value = serde_json::from_str(&raw).expect("it parses");
+        record["state"] = serde_json::json!(state);
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&record).expect("serialise") + "\n",
+        )
+        .expect("rewrite the state");
+    }
+
     fn state_of(&self, run_id: &str) -> String {
         let raw = fs::read_to_string(self.home.join(".grind/runs").join(run_id).join("run.json"))
             .expect("a staged record");
@@ -1022,6 +1036,42 @@ fn resume_on_an_exhausted_run_prints_the_handback_and_starts_nothing() {
         attempts_before,
         "resuming an exhausted Run must not spend a ninth attempt against a recorded budget of eight"
     );
+}
+
+#[test]
+fn resume_at_the_attempt_budget_starts_nothing_whatever_the_state_word_says() {
+    // `Uncorroborated` and `Unobserved` are deliberately resumable: neither stopped because the
+    // budget ran out. But a Run can land one *at* 8 of 8 — and `supervise` runs
+    // `run_one_attempt` before it ever consults `policy::next`, so a guard keyed on the state
+    // word walks that Run into a ninth attempt with no policy check standing in front of it,
+    // stops in the same state, and does it again on the next resume. A recorded Attempt in this
+    // project costs $7–$37.
+    let box_ = sandbox("resume-at-budget");
+    let run_id = a_run_that_did_not_finish(&box_);
+    let attempts_before = box_.record()["attempts"]
+        .as_array()
+        .expect("attempts")
+        .len();
+    assert_eq!(attempts_before, 8);
+
+    for state in ["uncorroborated", "unobserved"] {
+        box_.state_becomes(&run_id, state);
+        let (out, err, code) = box_.run(&["resume", &run_id]);
+        assert_eq!(code, Some(0), "{out}\n{err}");
+        assert!(out.contains(&format!("run already {state}")), "{out}");
+        assert!(
+            out.contains("run state"),
+            "the Handback, not a re-entry:\n{out}"
+        );
+        assert_eq!(
+            box_.record()["attempts"]
+                .as_array()
+                .expect("attempts")
+                .len(),
+            attempts_before,
+            "a Run at 8 of 8 must not spend a ninth attempt because its state word is resumable"
+        );
+    }
 }
 
 // --- the sandbox's own guarantees ------------------------------------------------------------
