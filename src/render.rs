@@ -274,12 +274,31 @@ pub fn handback(view: &Facts) -> String {
     // Two integers, and **no summary, boolean or health word over them**. A count of processes
     // must never become an assertion about a review.
     match fanout_totals(found) {
-        Observed::Present((spawned, returned)) if spawned > 0 => rows.push(Row {
+        FanoutTotals {
+            counted: Some(pair),
+            unread: None,
+        } if pair.0 > 0 => rows.push(Row {
             label: "fan-out",
-            value: format!("{spawned} spawned, {returned} returned"),
+            value: fanout_counted(pair),
             unobserved: false,
         }),
-        Observed::Unobservable(reason) => rows.push(Row {
+        // **Counted and incomplete.** The number stays, because it is real; the mark stays with
+        // it, because an understated total printed bare is indistinguishable from a low one.
+        FanoutTotals {
+            counted: Some(pair),
+            unread: Some(reason),
+        } => rows.push(Row {
+            label: "fan-out",
+            value: format!(
+                "{}  {UNOBSERVABLE_MARK} at least one attempt unread: {reason}",
+                fanout_counted(pair)
+            ),
+            unobserved: true,
+        }),
+        FanoutTotals {
+            counted: None,
+            unread: Some(reason),
+        } => rows.push(Row {
             label: "fan-out",
             value: format!("{UNOBSERVABLE_MARK}  {reason}"),
             unobserved: true,
@@ -379,13 +398,30 @@ pub fn job_comment(view: &Facts) -> String {
     cell("commits ahead", &marked(&observation.commits_ahead));
     cell("checks pending", &marked(&observation.checks_pending));
     cell("base drift", &marked(&observation.base_drift));
+    // The same two facts, with the mark and **never the `Reason`** — the rule the verdict line
+    // above learned the hard way.
     cell(
         "fan-out",
         &match fanout_totals(found) {
-            Observed::Present((spawned, returned)) => {
-                format!("{spawned} spawned, {returned} returned")
-            }
-            other => negative_mark(&other).to_string(),
+            FanoutTotals {
+                counted: Some(pair),
+                unread: None,
+            } => fanout_counted(pair),
+            FanoutTotals {
+                counted: Some(pair),
+                unread: Some(_),
+            } => format!(
+                "{}  {UNOBSERVABLE_MARK} at least one attempt unread",
+                fanout_counted(pair)
+            ),
+            FanoutTotals {
+                counted: None,
+                unread: Some(_),
+            } => UNOBSERVABLE_MARK.to_string(),
+            FanoutTotals {
+                counted: None,
+                unread: None,
+            } => crate::observe::ABSENT_MARK.to_string(),
         },
     );
     // Presence **and** absence: naming only one of them is how a partial contract reads whole.
@@ -471,25 +507,41 @@ fn repair_spend(found: &RunView) -> f64 {
         .sum()
 }
 
-/// The Run's fan-out arithmetic, summed over its Attempts. **Two integers and no summary.**
-fn fanout_totals(found: &RunView) -> Observed<(u64, u64)> {
-    let mut totals: Option<(u64, u64)> = None;
-    let mut blind: Option<crate::observe::Reason> = None;
+/// The Run's fan-out arithmetic across its Attempts: **two integers and no summary**, and —
+/// separately — whether some Attempt's pair could not be read at all.
+///
+/// Two fields rather than an `Observed<(u64, u64)>`, because the two facts are independent and
+/// the type has no variant for *counted, and incomplete*. Folding them cost the second one:
+/// `(Some(counted), _) => Present(counted)` discarded a recorded blind reason whenever at least
+/// one attempt was readable, and both render sites print `Present` as a bare "N spawned,
+/// M returned". A Run whose attempt 3 transcript could not be read therefore reported an
+/// understated total **as a definite fact** — the exact ambiguity between *observed a low
+/// number* and *could not observe some of it* that `Observed` exists to prevent, on the surface
+/// that leaves the host (R94).
+struct FanoutTotals {
+    counted: Option<(u64, u64)>,
+    unread: Option<crate::observe::Reason>,
+}
+
+fn fanout_totals(found: &RunView) -> FanoutTotals {
+    let mut counted: Option<(u64, u64)> = None;
+    let mut unread: Option<crate::observe::Reason> = None;
     for attempt in &found.attempts {
         match &attempt.fanout {
             Observed::Present((spawned, returned)) => {
-                let (s, r) = totals.unwrap_or((0, 0));
-                totals = Some((s + spawned, r + returned));
+                let (s, r) = counted.unwrap_or((0, 0));
+                counted = Some((s + spawned, r + returned));
             }
-            Observed::Unobservable(reason) => blind = Some(reason.clone()),
+            Observed::Unobservable(reason) => unread = Some(reason.clone()),
             Observed::Absent => {}
         }
     }
-    match (totals, blind) {
-        (Some(counted), _) => Observed::Present(counted),
-        (None, Some(reason)) => Observed::Unobservable(reason),
-        (None, None) => Observed::Absent,
-    }
+    FanoutTotals { counted, unread }
+}
+
+/// The two integers, written once so the Handback and the comment cannot spell them differently.
+fn fanout_counted((spawned, returned): (u64, u64)) -> String {
+    format!("{spawned} spawned, {returned} returned")
 }
 
 /// A value worth printing, and whether it is worth printing because nobody could look.
@@ -1057,6 +1109,48 @@ mod tests {
     }
 
     #[test]
+    fn a_total_over_an_attempt_that_could_not_be_read_carries_the_mark_beside_the_number() {
+        // The day-one record's attempt 2 could not be read and its attempts 1 and 4 could, so
+        // 4 is a **floor**, not the total. `(Some(counted), _) => Present(counted)` dropped the
+        // blind reason whenever anything else was readable, and both surfaces print a bare
+        // "N spawned, M returned" — so an understated number left the host as a definite fact.
+        let on_host = handed_back(&observation(), &Verdict::Completed);
+        assert!(on_host.contains("4 spawned, 4 returned"), "{on_host}");
+        assert!(on_host.contains("at least one attempt unread"), "{on_host}");
+        assert!(
+            on_host.contains("the transcript could not be read"),
+            "on the host the reason still shows:\n{on_host}"
+        );
+        assert!(
+            on_host.contains("could not observe"),
+            "and the row joins the blind block:\n{on_host}"
+        );
+
+        // The comment carries the same two facts with the mark and **never the `Reason`**.
+        let markdown = commented(&observation(), &Verdict::Completed);
+        assert!(markdown.contains("4 spawned, 4 returned"), "{markdown}");
+        assert!(
+            markdown.contains("at least one attempt unread"),
+            "{markdown}"
+        );
+        assert!(
+            !markdown.contains("the transcript could not be read"),
+            "{markdown}"
+        );
+
+        // A Run whose every attempt was read says the number and nothing else.
+        let clean = handback(&facts_of(
+            every_attempt_read(),
+            observation(),
+            Verdict::Completed,
+            coverage(),
+            None,
+        ));
+        assert!(clean.contains("4 spawned, 4 returned"), "{clean}");
+        assert!(!clean.contains("at least one attempt unread"), "{clean}");
+    }
+
+    #[test]
     fn the_fan_out_arithmetic_surfaces_as_two_integers_with_no_summary_word() {
         // The day-one record holds (3, 3) and (1, 1) across its Attempts.
         let text = handed_back(&observation(), &Verdict::Completed);
@@ -1097,9 +1191,28 @@ mod tests {
         assert!(text.contains("docs/adr/0013.md"), "{text}");
     }
 
+    /// The day-one record with **every** Attempt's fan-out readable. The fixture's attempt 2 is
+    /// genuinely `Unobservable`, so the record as shipped is not a fully-observed Run — which
+    /// only stopped being visible because `fanout_totals` used to swallow it.
+    fn every_attempt_read() -> RunView {
+        let mut record = found();
+        for attempt in &mut record.attempts {
+            if matches!(attempt.fanout, Observed::Unobservable(_)) {
+                attempt.fanout = Observed::Absent;
+            }
+        }
+        record
+    }
+
     #[test]
     fn the_could_not_observe_block_is_empty_on_a_fully_observed_run() {
-        let flat = handed_back(&observation(), &Verdict::Completed);
+        let flat = handback(&facts_of(
+            every_attempt_read(),
+            observation(),
+            Verdict::Completed,
+            coverage(),
+            None,
+        ));
         assert!(!flat.contains("could not observe"), "{flat}");
 
         let mut blind = observation();
