@@ -454,10 +454,9 @@ pub fn resume_all() -> Result<Reentry, Refusal> {
         let Ok(record) = RunRecord::load(&record_path(&run_dir)) else {
             // A record written before this build lacks fields the base now forces, and there is
             // deliberately no migration read path. Skipping is the only honest answer.
-            report.skipped.push((
-                run_id.to_string(),
-                "its record could not be read".to_string(),
-            ));
+            let why = "its record could not be read".to_string();
+            say(&run_dir, &format!("  skipped at boot: {why}"));
+            report.skipped.push((run_id.to_string(), why));
             continue;
         };
         if !matches!(
@@ -515,7 +514,10 @@ pub fn resume_all() -> Result<Reentry, Refusal> {
             "resume".to_string(),
             run_id.to_string(),
         ]) {
-            Ok(_) => report.started.push(run_id.to_string()),
+            Ok(_) => {
+                say(&run_dir, "  re-entered at boot");
+                report.started.push(run_id.to_string());
+            }
             Err(why) => {
                 say(&run_dir, &format!("  could not re-enter at boot: {why}"));
                 report.skipped.push((run_id.to_string(), why));

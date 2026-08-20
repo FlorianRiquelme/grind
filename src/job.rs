@@ -483,10 +483,10 @@ pub fn host_items() -> &'static [HostItem] {
             doc_anchor: "The `lfg` plugin is installed.",
         },
         HostItem {
-            name: "boot one-shot loaded",
+            name: "restart one-shot loaded",
             depth: Depth::Doctor,
             check: Check::BootOneShot,
-            doc_anchor: "A boot-time one-shot calling `grind resume --all` is loaded.",
+            doc_anchor: "A restart one-shot calling `grind resume --all` is loaded.",
         },
         HostItem {
             name: "credential: gh auth store",

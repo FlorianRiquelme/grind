@@ -616,7 +616,31 @@ fn unsatisfied(what: &str) -> Observed<Outcome> {
     Observed::Present(Outcome::Unsatisfied(what.to_string()))
 }
 
-/// The boot one-shot: **loaded**, not merely present.
+/// **When the restart one-shot actually fires**, which differs by platform and which doctor
+/// cannot check.
+///
+/// The two service managers do not offer the same promise, and the difference is the whole of
+/// the caveat this check carries:
+///
+/// - **linux** fires at boot — but only with `loginctl enable-linger <user>`, without which the
+///   user's systemd instance starts at first login and stops at last logout. The check is
+///   conjunctive for exactly that reason.
+/// - **darwin** fires at **login**. `launchctl bootstrap gui/$(id -u)` puts the job in the GUI
+///   domain, and `RunAtLoad` fires when that domain loads. A LaunchDaemon would fire earlier,
+///   but on a FileVault Mac — the default — `/Users/<user>` is not decrypted until someone
+///   unlocks at the login window, so `~/.grind/runs/` does not exist yet to re-enter from.
+///   There is no shipping shape that re-enters a Run before a human touches the machine.
+///
+/// Doctor **structurally cannot tell the two apart on darwin**: `launchctl print gui/$(id -u)/…`
+/// can only run from inside a logged-in GUI session, which is the very condition it would need
+/// to distinguish. So the caveat rides the satisfied text rather than pretending to be checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fires {
+    AtBoot,
+    AtLogin,
+}
+
+/// The restart one-shot: **loaded**, not merely present.
 ///
 /// A plist copied into `~/Library/LaunchAgents` and never bootstrapped is the likeliest way this
 /// fails, and it fails one reboot later with a Run stranded and nothing saying so. So the check
@@ -625,17 +649,39 @@ fn unsatisfied(what: &str) -> Observed<Outcome> {
 /// A service manager that could not be reached at all is **could not observe**, never
 /// unsatisfied: *no such unit* and *no `launchctl` on this box* are different facts, and the
 /// second one is about the check rather than about the host.
-pub fn boot_one_shot(completed: &Completed) -> Observed<Outcome> {
+pub fn boot_one_shot(completed: &Completed, fires: Fires) -> Observed<Outcome> {
     match completed.code {
-        Some(0) => satisfied("a boot one-shot calling `grind resume --all` is loaded"),
+        Some(0) => satisfied(match fires {
+            Fires::AtBoot => {
+                "a one-shot calling `grind resume --all` is enabled and the user lingers, so it \
+                 fires at boot"
+            }
+            // The claim doctor is allowed to make on darwin. It fires when the GUI domain
+            // loads, and doctor runs from inside that domain, so *loads at boot* and *loads at
+            // login* are indistinguishable from here — it says which one is true rather than
+            // implying it checked.
+            Fires::AtLogin => {
+                "a one-shot calling `grind resume --all` is loaded — it fires at login, not at \
+                 boot, so a restarted host waits for a human before re-entering"
+            }
+        }),
         // `sh` could not run the service manager, or there was no exit code at all.
         Some(127) | None => Observed::Unobservable(Reason::saying(
             "the service manager could not be reached to ask what it has loaded",
         )),
-        Some(_) => unsatisfied(
-            "no boot one-shot calling `grind resume --all` is loaded — a plist or unit on disk \
-             that was never bootstrapped counts as absent; see dist/",
-        ),
+        Some(_) => unsatisfied(match fires {
+            // Two failures behind one exit code, deliberately: an enabled unit without linger
+            // does not start at boot, and the operator's next move is the same either way.
+            Fires::AtBoot => {
+                "no one-shot calling `grind resume --all` is both enabled and lingering — a unit \
+                 on disk that was never enabled counts as absent, and an enabled unit without \
+                 `loginctl enable-linger <user>` does not start at boot; see dist/"
+            }
+            Fires::AtLogin => {
+                "no one-shot calling `grind resume --all` is loaded — a plist on disk that was \
+                 never bootstrapped counts as absent; see dist/"
+            }
+        }),
     }
 }
 
@@ -1596,12 +1642,43 @@ mod tests {
             "",
             Some(0),
         );
-        assert_eq!(
-            boot_one_shot(&loaded),
-            Observed::Present(Outcome::Satisfied(
-                "a boot one-shot calling `grind resume --all` is loaded".to_string()
-            ))
+        let Observed::Present(Outcome::Satisfied(on_linux)) = boot_one_shot(&loaded, Fires::AtBoot)
+        else {
+            panic!("a loaded unit is satisfied");
+        };
+        assert!(on_linux.contains("fires at boot"), "{on_linux}");
+        assert!(on_linux.contains("lingers"), "{on_linux}");
+
+        // **The claim darwin is allowed to make.** Doctor runs from inside the GUI domain whose
+        // loading is the thing in question, so it cannot tell *loads at boot* from *loads at
+        // login* — and the satisfied text says which one is true rather than implying it looked.
+        let Observed::Present(Outcome::Satisfied(on_darwin)) =
+            boot_one_shot(&loaded, Fires::AtLogin)
+        else {
+            panic!("a loaded agent is satisfied");
+        };
+        assert!(
+            on_darwin.contains("fires at login, not at boot"),
+            "{on_darwin}"
         );
+        assert!(
+            on_darwin.contains("waits for a human"),
+            "a satisfied darwin host must still name what the promise is:\n{on_darwin}"
+        );
+    }
+
+    #[test]
+    fn a_user_unit_without_linger_is_unsatisfied_rather_than_quietly_enabled() {
+        // `systemctl --user is-enabled` returns enabled purely from the symlink, with or
+        // without linger, so the check is conjunctive and this is the exit code that carries
+        // the second half. Doctor going green here is the failure: the unit is correct, enabled,
+        // and on a headless box it never runs.
+        let found = boot_one_shot(&completed("", "", Some(1)), Fires::AtBoot);
+        let Observed::Present(Outcome::Unsatisfied(said)) = found else {
+            panic!("expected unsatisfied: {found:?}");
+        };
+        assert!(said.contains("enable-linger"), "{said}");
+        assert!(said.contains("does not start at boot"), "{said}");
     }
 
     #[test]
@@ -1621,7 +1698,7 @@ mod tests {
                 Some(1),
             ),
         ] {
-            let found = boot_one_shot(&never_loaded);
+            let found = boot_one_shot(&never_loaded, Fires::AtLogin);
             assert!(
                 matches!(found, Observed::Present(Outcome::Unsatisfied(_))),
                 "{found:?}"
@@ -1637,7 +1714,7 @@ mod tests {
             completed("", "sh: launchctl: command not found\n", Some(127)),
             completed("", "", None),
         ] {
-            let found = boot_one_shot(&unreachable);
+            let found = boot_one_shot(&unreachable, Fires::AtLogin);
             assert!(matches!(found, Observed::Unobservable(_)), "{found:?}");
         }
     }

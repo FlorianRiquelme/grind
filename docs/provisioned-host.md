@@ -96,12 +96,16 @@ resolves.
 
 ## Lifetime
 
-There is no Grind daemon (ADR-0011). The host owes exactly one thing: something that fires **once
-at boot** and calls `grind resume --all`, so a restart re-enters the Runs it cut off instead of
+There is no Grind daemon (ADR-0011). The host owes exactly one thing: something that fires after a
+restart and calls `grind resume --all`, so a restart re-enters the Runs it cut off instead of
 leaving them at `died` until a human looks. Nothing watches a supervisor while the host is up, and
 nothing needs to.
 
-- **A boot-time one-shot calling `grind resume --all` is loaded.** — *doctor* — `RunAtLoad` on
+**The two platforms do not offer the same promise, and the difference is load-bearing.** linux
+fires at boot; darwin fires at **login**. Say *survives a restart* on linux and *survives a restart
+plus a login* on darwin, and do not let the shorter phrase stand for both.
+
+- **A restart one-shot calling `grind resume --all` is loaded.** — *doctor* — `RunAtLoad` on
   darwin, `Type=oneshot` on linux. A Dispatch works perfectly well without it, so refusing one
   would gate a Job on something unrelated to it (ADR-0003).
 
@@ -114,16 +118,42 @@ nothing needs to.
   cp dist/launchd/com.grind.resume-all.plist ~/Library/LaunchAgents/
   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.grind.resume-all.plist
 
-  # linux
+  # linux — three steps, and the third is what makes it fire at boot
   cp dist/systemd/grind-resume-all.service ~/.config/systemd/user/
   systemctl --user enable grind-resume-all.service
+  loginctl enable-linger "$(id -un)"
   ```
 
+  **linux needs the linger step, and without it the unit is enabled, correct and never runs.**
+  `WantedBy=default.target` on a `--user` unit fires when that user's systemd instance starts,
+  and on a headless box — the deployment this exists for — that instance starts at first login
+  and stops at last logout, not at boot. `systemctl --user is-enabled` returns enabled purely
+  from the symlink either way, so doctor asks both halves in one command; asking only the first
+  is the silent pass this check was added to prevent, one layer down.
+
+  **darwin fires at login, and that is as early as it goes.** `launchctl bootstrap gui/$(id -u)`
+  puts the job in the GUI domain and `RunAtLoad` fires when that domain loads, so a restarted Mac
+  sits with its cut-off Runs un-re-entered until a human logs in. A LaunchDaemon would fire
+  earlier but resolves root's `$HOME`, and `$HOME` is the only variable Grind reads with no
+  override (ADR-0008); setting `HOME` on the daemon does not rescue it either, because on a
+  FileVault Mac — the default — `/Users/<user>` is not decrypted until someone unlocks at the
+  login window, so `~/.grind/runs/` does not exist yet to be read.
+
+  Doctor **cannot check this** and does not pretend to: `launchctl print gui/$(id -u)/…` can only
+  run from inside a logged-in GUI session, which is the very condition it would need to tell
+  *loads at boot* from *loads at login*. The caveat rides its satisfied text instead.
+
   Two costs. It is the **first platform-branching check** — `launchctl print` against
-  `systemctl --user is-enabled`, where every existing check is one command everywhere. And it
-  verifies **loaded**, not merely present: a plist sitting on disk that was never bootstrapped is
-  the likeliest way this fails, and it fails silently, one reboot later, with a Run stranded and
-  nothing saying so.
+  `systemctl --user is-enabled` plus `loginctl show-user … Linger`, where every existing check is
+  one command everywhere. And it verifies **loaded**, not merely present: a plist sitting on disk
+  that was never bootstrapped is the likeliest way this fails, and it fails silently, one reboot
+  later, with a Run stranded and nothing saying so.
+
+  Neither unit writes a log file. `/tmp/grind-resume-all.log` was world-readable and named every
+  cut-off run id and every skipped Run's worktree path, in a mode-1777 directory launchd appends
+  to as the dispatching user while following symlinks. Every line either one prints is appended
+  to the relevant `~/.grind/runs/<run-id>/supervisor.log` anyway, which keeps state inside the
+  single root ADR-0008 declares.
 
   The systemd unit carries the one piece of real machinery in this build. A `Type=oneshot`
   service takes its cgroup with it when `ExecStart` exits, and `grind resume --all` spawns one

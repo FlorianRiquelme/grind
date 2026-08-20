@@ -341,20 +341,33 @@ fn check(home: &Path, clones: &[(String, PathBuf)], check: Check) -> Observed<Ou
         // pass unrelaxed.
         Check::BootOneShot => {
             let asked = if cfg!(target_os = "macos") {
-                Some(format!(
-                    "launchctl print gui/$(id -u)/{BOOT_ONE_SHOT_LABEL}"
+                Some((
+                    format!("launchctl print gui/$(id -u)/{BOOT_ONE_SHOT_LABEL}"),
+                    observe::Fires::AtLogin,
                 ))
             } else if cfg!(target_os = "linux") {
-                Some(format!("systemctl --user is-enabled {BOOT_ONE_SHOT_UNIT}"))
+                // **Conjunctive.** `systemctl --user is-enabled` returns enabled purely from the
+                // symlink, with or without linger — and without `loginctl enable-linger` a
+                // `--user` unit's systemd instance does not start until first login, which on a
+                // headless box is never. Asking only the first half is the same silent-pass
+                // shape this check was added to prevent, one layer down.
+                Some((
+                    format!(
+                        "systemctl --user is-enabled {BOOT_ONE_SHOT_UNIT} >/dev/null 2>&1 && \
+                         [ \"$(loginctl show-user \"$(id -un)\" -p Linger --value)\" = yes ]"
+                    ),
+                    observe::Fires::AtBoot,
+                ))
             } else {
                 None
             };
             match asked {
                 // Read-only on both platforms: doctor never performs a write to prove a step.
-                Some(command) => {
-                    observe::boot_one_shot(&world::run(&words(&["sh", "-c", &command]), None))
-                }
-                None => observe::unchecked("no boot one-shot is defined for this platform"),
+                Some((command, fires)) => observe::boot_one_shot(
+                    &world::run(&words(&["sh", "-c", &command]), None),
+                    fires,
+                ),
+                None => observe::unchecked("no restart one-shot is defined for this platform"),
             }
         }
         Check::GhAuthStore => {
