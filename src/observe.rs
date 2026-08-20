@@ -12,6 +12,7 @@
 //! literals instead of a process.
 
 use crate::world::Completed;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Observed absent. Distinct from [`UNOBSERVABLE_MARK`] wherever a human reads it — reading a
@@ -27,7 +28,12 @@ pub const UNOBSERVABLE_MARK: &str = "?";
 /// `unwrap_or_default()` free, and each collapses three states into two *silently*. A
 /// dedicated enum has none of them, so every collapse has to be written out where a reader
 /// could see it (ADR-0006).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// It derives `Serialize`/`Deserialize` because the record carries one — the per-Attempt
+/// fan-out arithmetic. Two bare `Option<u64>` fields would collapse absent and unobservable,
+/// which is the whole point of the type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Observed<T> {
     Present(T),
     Absent,
@@ -36,7 +42,7 @@ pub enum Observed<T> {
 
 /// Why a signal could not be observed. A newtype rather than a bare `String` so the reason has
 /// to be composed on purpose, and so it cannot be swapped for a value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Reason(String);
 
 impl Reason {
@@ -103,6 +109,38 @@ impl fmt::Display for Pr {
     }
 }
 
+/// **Base drift**: the target repo's default branch moving after the Handoff SHA.
+///
+/// A count and the paths that overlap the Run's own diff. **No boolean, no `Diverged` variant,
+/// no summary field** — ADR-0006's seventh prohibited shape, and the tempting argument for it
+/// (*"`main` moved, so don't open the PR"*) reads as caution rather than as the quality
+/// judgement ADR-0003 refuses. It is surfaced when non-zero and enforced never.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BaseDrift {
+    pub default_branch: String,
+    /// Commits on the default branch since the Handoff SHA.
+    pub commits: u64,
+    /// The paths that moved and that the Run's own diff also touches. Two files claiming
+    /// ADR-0001 have different names, so git merges clean and reports nothing.
+    pub overlapping: Vec<String>,
+}
+
+impl fmt::Display for BaseDrift {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} commit{} on {} since the Handoff SHA",
+            self.commits,
+            if self.commits == 1 { "" } else { "s" },
+            self.default_branch
+        )?;
+        if !self.overlapping.is_empty() {
+            write!(f, ", also touching {}", self.overlapping.join(", "))?;
+        }
+        Ok(())
+    }
+}
+
 /// Everything a Run's state is read from, each signal independently observed and independently
 /// observable. The verify contract is deliberately not here: it is a decision about which
 /// contracted steps a target repo declares, and it lives with the module that makes it.
@@ -117,6 +155,10 @@ pub struct Observation {
     pub plan_files: Observed<Vec<String>>,
     pub residual_findings: Observed<Vec<String>>,
     pub ledger_entries: Observed<Vec<String>>,
+    /// Every path `<handoff-sha>..HEAD` touches — **the Run's own diff**, and the input the
+    /// three listings above are drawn from.
+    pub changed_files: Observed<Vec<String>>,
+    pub base_drift: Observed<BaseDrift>,
 }
 
 // --- one classifier per call site -----------------------------------------------------
@@ -168,8 +210,38 @@ fn says_no_pr(stderr: &str) -> bool {
     said.contains("no pull requests found") || said.contains("no open pull requests")
 }
 
+/// `gh pr list --search <head-sha> --state all --json number,url,state,isDraft`.
+///
+/// **A Run's identity on GitHub is the commit it pushed, not the branch its Job named.** Run 2
+/// pushed to `…-run` while its Job named `…-seam`, so the branch lookup answered truthfully
+/// about the wrong question and the Handback said `PR —` over an open, green, twelve-commit PR.
+///
+/// An empty array is `Absent` — the search ran and matched nothing. Anything unreadable is
+/// could-not-observe, the direction that withholds a verdict rather than inventing one.
+pub fn pr_by_head(completed: &Completed) -> Observed<Pr> {
+    if completed.code != Some(0) {
+        return Observed::Unobservable(Reason::of("gh pr list --search", completed));
+    }
+    let body = completed.stdout.trim();
+    let Ok(serde_json::Value::Array(matched)) = serde_json::from_str::<serde_json::Value>(body)
+    else {
+        return Observed::Unobservable(Reason::saying("gh pr list --search: unreadable JSON"));
+    };
+    let Some(first) = matched.first() else {
+        return Observed::Absent;
+    };
+    match parse_pr_value(first) {
+        Some(found) => Observed::Present(found),
+        None => Observed::Unobservable(Reason::saying("gh pr list --search: unreadable JSON")),
+    }
+}
+
 fn parse_pr(body: &str) -> Option<Pr> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    parse_pr_value(&value)
+}
+
+fn parse_pr_value(value: &serde_json::Value) -> Option<Pr> {
     Some(Pr {
         number: value.get("number")?.as_u64()?,
         url: value.get("url")?.as_str()?.to_string(),
@@ -246,17 +318,119 @@ fn string_at(value: &serde_json::Value, key: &str) -> String {
         .to_uppercase()
 }
 
-/// A directory listing. `readable` is the caller's answer to *did the directory this lives
-/// under exist at all* — without it, a worktree that has gone missing reads as a Run that
-/// produced no plan.
-pub fn listing(readable: bool, what: &str, entries: Vec<String>) -> Observed<Vec<String>> {
-    if !readable {
-        return Observed::Unobservable(Reason::saying(&format!("{what}: worktree unreadable")));
+/// `git diff --name-only <handoff-sha>..HEAD` — **the Run's own diff**, and the input every
+/// artifact listing is drawn from.
+///
+/// A failed diff is could-not-observe, never an empty listing: a worktree that has gone missing
+/// must not read as a Run that produced nothing.
+pub fn changed_files(completed: &Completed) -> Observed<Vec<String>> {
+    if completed.code != Some(0) {
+        return Observed::Unobservable(Reason::of("git diff --name-only", completed));
     }
-    if entries.is_empty() {
+    let names: Vec<String> = completed
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
         return Observed::Absent;
     }
-    Observed::Present(entries)
+    Observed::Present(names)
+}
+
+/// `git symbolic-ref --short refs/remotes/origin/HEAD`, and the whole of *which branch is the
+/// base* (KTD17). It is local after the fetch Dispatch already performed, needs no network of
+/// its own, and needs no new Job row.
+///
+/// A missing or unreadable `origin/HEAD` — which is what a clone whose fetch has never
+/// succeeded looks like — is **could not observe**, never *no drift*.
+pub fn default_branch(completed: &Completed) -> Observed<String> {
+    if completed.code != Some(0) {
+        return Observed::Unobservable(Reason::of("git symbolic-ref origin/HEAD", completed));
+    }
+    let named = completed.stdout.trim();
+    if named.is_empty() {
+        return Observed::Unobservable(Reason::saying(
+            "git symbolic-ref origin/HEAD: no default branch named",
+        ));
+    }
+    Observed::Present(named.to_string())
+}
+
+/// The drift itself, from a count and a name-only diff against the default branch, intersected
+/// with the Run's own diff.
+///
+/// A default branch that has not moved is a **present** count of zero, not an absence: *it did
+/// not move* is a fact, and the whole point of the three-valued reading is that *I could not
+/// look* is a different one.
+pub fn base_drift(
+    default_branch: &Observed<String>,
+    counted: &Completed,
+    moved: &Completed,
+    run_diff: &Observed<Vec<String>>,
+) -> Observed<BaseDrift> {
+    let named = match default_branch {
+        Observed::Present(named) => named.clone(),
+        other => {
+            return Observed::Unobservable(other.reason().cloned().unwrap_or_else(|| {
+                Reason::saying("no default branch to measure base drift against")
+            }));
+        }
+    };
+    if counted.code != Some(0) {
+        return Observed::Unobservable(Reason::of("git rev-list --count against origin", counted));
+    }
+    let Ok(commits) = counted.stdout.trim().parse::<u64>() else {
+        return Observed::Unobservable(Reason::of("git rev-list --count against origin", counted));
+    };
+    if moved.code != Some(0) {
+        return Observed::Unobservable(Reason::of("git diff --name-only against origin", moved));
+    }
+    let ours: &[String] = match run_diff {
+        Observed::Present(files) => files,
+        Observed::Absent => &[],
+        Observed::Unobservable(reason) => return Observed::Unobservable(reason.clone()),
+    };
+    let overlapping: Vec<String> = moved
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty() && ours.iter().any(|mine| mine == path))
+        .map(str::to_string)
+        .collect();
+    Observed::Present(BaseDrift {
+        default_branch: named,
+        commits,
+        overlapping,
+    })
+}
+
+/// One artifact directory, **scoped to the Run's own diff**.
+///
+/// The whole-directory listing this replaces counted other people's files: `furthest stage`
+/// read the repo's history rather than the Run's, so a fresh Run read `planned` at dispatch on
+/// any repo where a previous Run had merged a plan. Every one of these files is already in the
+/// PR's own diff, so scoping costs one command and no new state.
+pub fn scoped_listing(changed: &Observed<Vec<String>>, directory: &str) -> Observed<Vec<String>> {
+    let prefix = format!("{directory}/");
+    match changed {
+        Observed::Unobservable(reason) => Observed::Unobservable(reason.clone()),
+        Observed::Absent => Observed::Absent,
+        Observed::Present(files) => {
+            let mine: Vec<String> = files
+                .iter()
+                .filter(|path| path.starts_with(&prefix) && path.ends_with(".md"))
+                .cloned()
+                .collect();
+            if mine.is_empty() {
+                Observed::Absent
+            } else {
+                Observed::Present(mine)
+            }
+        }
+    }
 }
 
 // --- observing a Run, once ---------------------------------------------------------------
@@ -276,9 +450,7 @@ pub const LEDGER_DIR: &str = "docs/ledger";
 pub fn observe_run(
     observed_at: String,
     handoff_sha: &str,
-    worktree_readable: bool,
     run: &mut dyn FnMut(&[String]) -> Completed,
-    list: &mut dyn FnMut(&str) -> Vec<String>,
 ) -> Observation {
     let argv = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<String>>();
 
@@ -289,26 +461,129 @@ pub fn observe_run(
         &format!("{handoff_sha}..HEAD"),
     ]));
     let status = run(&argv(&["git", "status", "--porcelain"]));
-    let pr_view = run(&argv(&[
-        "gh",
-        "pr",
-        "view",
-        "--json",
-        "number,url,state,isDraft",
+    let diffed = run(&argv(&[
+        "git",
+        "diff",
+        "--name-only",
+        &format!("{handoff_sha}..HEAD"),
     ]));
-    let rollup = run(&argv(&["gh", "pr", "view", "--json", "statusCheckRollup"]));
-    let (checks_pending, checks_red) = checks(&rollup);
+    let changed = changed_files(&diffed);
+
+    // Base drift, against `origin/HEAD` in the same repository the worktree belongs to.
+    let base = default_branch(&run(&argv(&[
+        "git",
+        "symbolic-ref",
+        "--short",
+        "refs/remotes/origin/HEAD",
+    ])));
+    let drift = match &base {
+        Observed::Present(named) => base_drift(
+            &base,
+            &run(&argv(&[
+                "git",
+                "rev-list",
+                "--count",
+                &format!("{handoff_sha}..{named}"),
+            ])),
+            &run(&argv(&[
+                "git",
+                "diff",
+                "--name-only",
+                &format!("{handoff_sha}..{named}"),
+            ])),
+            &changed,
+        ),
+        // No default branch to measure against, and no commands worth running for it.
+        other => base_drift(
+            other,
+            &Completed {
+                stdout: String::new(),
+                stderr: String::new(),
+                code: None,
+            },
+            &Completed {
+                stdout: String::new(),
+                stderr: String::new(),
+                code: None,
+            },
+            &changed,
+        ),
+    };
+
+    // The head commit first, the Job's branch as a fallback. Both stay pure parses over raw
+    // output, and the existing three-valued classification was never wrong here — it was the
+    // question that was wrong.
+    let head = run(&argv(&["git", "rev-parse", "HEAD"]));
+    let by_head = if head.code == Some(0) && !head.stdout.trim().is_empty() {
+        pr_by_head(&run(&argv(&[
+            "gh",
+            "pr",
+            "list",
+            "--search",
+            head.stdout.trim(),
+            "--state",
+            "all",
+            "--json",
+            "number,url,state,isDraft",
+        ])))
+    } else {
+        Observed::Unobservable(Reason::of("git rev-parse HEAD", &head))
+    };
+    let found = match by_head {
+        Observed::Present(found) => Observed::Present(found),
+        // Nothing matched the commit, so ask the branch — which is still the right question on
+        // a Run that pushed where its Job said it would.
+        Observed::Absent => pr(&run(&argv(&[
+            "gh",
+            "pr",
+            "view",
+            "--json",
+            "number,url,state,isDraft",
+        ]))),
+        // Blind stays blind. A head lookup that could not be made must not become *no PR*
+        // because the branch lookup also found nothing.
+        Observed::Unobservable(reason) => match pr(&run(&argv(&[
+            "gh",
+            "pr",
+            "view",
+            "--json",
+            "number,url,state,isDraft",
+        ]))) {
+            Observed::Present(fallback) => Observed::Present(fallback),
+            _ => Observed::Unobservable(reason),
+        },
+    };
+
+    // The rollup resolves against **the PR the lookup found**, by number. Two independent
+    // lookups can disagree about whether a PR exists at all.
+    let (checks_pending, checks_red) = match &found {
+        Observed::Present(open) => checks(&run(&argv(&[
+            "gh",
+            "pr",
+            "view",
+            &open.number.to_string(),
+            "--json",
+            "statusCheckRollup",
+        ]))),
+        Observed::Absent => (Observed::Absent, Observed::Absent),
+        Observed::Unobservable(reason) => (
+            Observed::Unobservable(reason.clone()),
+            Observed::Unobservable(reason.clone()),
+        ),
+    };
 
     Observation {
         observed_at,
         commits_ahead: commits_ahead(&counted),
         tree_clean: tree_clean(&status),
-        pr: pr(&pr_view),
+        pr: found,
         checks_pending,
         checks_red,
-        plan_files: listing(worktree_readable, "plan", list(PLAN_DIR)),
-        residual_findings: listing(worktree_readable, "residual findings", list(RESIDUAL_DIR)),
-        ledger_entries: listing(worktree_readable, "ledger", list(LEDGER_DIR)),
+        plan_files: scoped_listing(&changed, PLAN_DIR),
+        residual_findings: scoped_listing(&changed, RESIDUAL_DIR),
+        ledger_entries: scoped_listing(&changed, LEDGER_DIR),
+        changed_files: changed,
+        base_drift: drift,
     }
 }
 
@@ -339,6 +614,95 @@ fn satisfied(what: &str) -> Observed<Outcome> {
 
 fn unsatisfied(what: &str) -> Observed<Outcome> {
     Observed::Present(Outcome::Unsatisfied(what.to_string()))
+}
+
+/// **When the restart one-shot actually fires**, which differs by platform and which doctor
+/// cannot check.
+///
+/// The two service managers do not offer the same promise, and the difference is the whole of
+/// the caveat this check carries:
+///
+/// - **linux** fires at boot — but only with `loginctl enable-linger <user>`, without which the
+///   user's systemd instance starts at first login and stops at last logout. The check is
+///   conjunctive for exactly that reason.
+/// - **darwin** fires at **login**. `launchctl bootstrap gui/$(id -u)` puts the job in the GUI
+///   domain, and `RunAtLoad` fires when that domain loads. A LaunchDaemon would fire earlier,
+///   but on a FileVault Mac — the default — `/Users/<user>` is not decrypted until someone
+///   unlocks at the login window, so `~/.grind/runs/` does not exist yet to re-enter from.
+///   There is no shipping shape that re-enters a Run before a human touches the machine.
+///
+/// Doctor **structurally cannot tell the two apart on darwin**: `launchctl print gui/$(id -u)/…`
+/// can only run from inside a logged-in GUI session, which is the very condition it would need
+/// to distinguish. So the caveat rides the satisfied text rather than pretending to be checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fires {
+    AtBoot,
+    AtLogin,
+}
+
+/// The restart one-shot: **loaded**, not merely present.
+///
+/// A plist copied into `~/Library/LaunchAgents` and never bootstrapped is the likeliest way this
+/// fails, and it fails one reboot later with a Run stranded and nothing saying so. So the check
+/// asks the service manager what it has loaded rather than asking the filesystem what is there.
+///
+/// A service manager that could not be reached at all is **could not observe**, never
+/// unsatisfied: *no such unit* and *no `launchctl` on this box* are different facts, and the
+/// second one is about the check rather than about the host.
+pub fn boot_one_shot(completed: &Completed, fires: Fires) -> Observed<Outcome> {
+    match completed.code {
+        Some(0) => satisfied(match fires {
+            Fires::AtBoot => {
+                "a one-shot calling `grind resume --all` is enabled and the user lingers, so it \
+                 fires at boot"
+            }
+            // The claim doctor is allowed to make on darwin. It fires when the GUI domain
+            // loads, and doctor runs from inside that domain, so *loads at boot* and *loads at
+            // login* are indistinguishable from here — it says which one is true rather than
+            // implying it checked.
+            Fires::AtLogin => {
+                "a one-shot calling `grind resume --all` is loaded — it fires at login, not at \
+                 boot, so a restarted host waits for a human before re-entering"
+            }
+        }),
+        // `sh` could not run the service manager, or there was no exit code at all.
+        Some(127) | None => Observed::Unobservable(Reason::saying(
+            "the service manager could not be reached to ask what it has loaded",
+        )),
+        Some(_) => unsatisfied(match fires {
+            // Two failures behind one exit code, deliberately: an enabled unit without linger
+            // does not start at boot, and the operator's next move is the same either way.
+            Fires::AtBoot => {
+                "no one-shot calling `grind resume --all` is both enabled and lingering — a unit \
+                 on disk that was never enabled counts as absent, and an enabled unit without \
+                 `loginctl enable-linger <user>` does not start at boot; see dist/"
+            }
+            Fires::AtLogin => {
+                "no one-shot calling `grind resume --all` is loaded — a plist on disk that was \
+                 never bootstrapped counts as absent; see dist/"
+            }
+        }),
+    }
+}
+
+/// When the process under a pid started, as `ps` answered.
+///
+/// **Three-valued, because a `ps` that could not run is not a process that is gone.** Grind
+/// ships as a musl static binary aimed at minimal Linux hosts, and `-p <pid> -o lstart=` is a
+/// procps/BSD spelling busybox `ps` does not implement — so *could not ask* is an ordinary
+/// reading here rather than a theoretical one. It is also the reading `resume --all` **acts**
+/// on: folding it into *gone* re-enters every Run on the host at boot, which is the opposite of
+/// the direction that path's own doc calls safe.
+///
+/// `ps` exits 1 with nothing on stdout when no process matches, which is a fact about the
+/// world; every other failure is a fact about the check.
+pub fn process_start_stamp(completed: &Completed) -> Observed<String> {
+    let stamp = completed.stdout.trim().to_string();
+    match completed.code {
+        Some(0) | Some(1) if !stamp.is_empty() => Observed::Present(stamp),
+        Some(0) | Some(1) => Observed::Absent,
+        _ => Observed::Unobservable(Reason::of("ps -p <pid> -o lstart=", completed)),
+    }
 }
 
 /// `~/.grind/repos/<owner>/<name>` exists, and — at doctor's depth — its `origin` names the
@@ -619,6 +983,33 @@ mod tests {
     }
 
     #[test]
+    fn a_ps_that_could_not_run_is_could_not_observe_and_never_a_process_that_is_gone() {
+        // Three string literals instead of a process, which is the whole point of classifying
+        // away from the spawn. `resume --all` acts on this reading: folding *could not ask*
+        // into *gone* re-enters every Run on the host at boot.
+        assert_eq!(
+            process_start_stamp(&completed("Thu Aug  6 12:26:20 2026\n", "", Some(0))),
+            Observed::Present("Thu Aug  6 12:26:20 2026".to_string())
+        );
+        // `ps` answered, and the answer is that no process matches — a fact about the world.
+        for gone in [completed("", "", Some(1)), completed("\n", "", Some(0))] {
+            assert_eq!(process_start_stamp(&gone), Observed::Absent, "{gone:?}");
+        }
+        // Every other failure is a fact about the check. `-p <pid> -o lstart=` is a procps/BSD
+        // spelling busybox does not implement, and Grind ships aimed at those hosts.
+        for blind in [
+            completed("", "ps: unrecognized option: p\n", Some(127)),
+            completed("", "No such file or directory (os error 2)", None),
+            completed("", "ps: bad -o argument\n", Some(2)),
+        ] {
+            assert!(
+                matches!(process_start_stamp(&blind), Observed::Unobservable(_)),
+                "{blind:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_gh_auth_failure_is_could_not_observe_and_never_absent() {
         let code: i32 = GH_AUTH_CODE.trim().parse().expect("the recorded exit code");
         let observed = pr(&completed(GH_AUTH_STDOUT, GH_AUTH_STDERR, Some(code)));
@@ -633,6 +1024,317 @@ mod tests {
                 .to_string()
                 .contains("gh auth login")
         );
+    }
+
+    // --- the PR is found by head commit ------------------------------------------------------
+
+    const PR_JSON: &str =
+        r#"{"number":30,"url":"https://github.com/o/n/pull/30","state":"OPEN","isDraft":false}"#;
+
+    /// One whole observation from literals: the head-commit lookup, the branch fallback, and
+    /// the rollup, plus every argv the sequence actually built.
+    fn observing(
+        by_head: Completed,
+        by_branch: Completed,
+        rollup: Completed,
+    ) -> (Observation, Vec<String>) {
+        let mut seen: Vec<String> = Vec::new();
+        let observation = {
+            let mut run = |argv: &[String]| {
+                let joined = argv.join(" ");
+                seen.push(joined.clone());
+                if joined.contains("rev-parse HEAD") {
+                    completed("3333333333333333333333333333333333333333\n", "", Some(0))
+                } else if joined.contains("rev-list") {
+                    completed("12\n", "", Some(0))
+                } else if joined.contains("diff --name-only") {
+                    completed("src/lib.rs\n", "", Some(0))
+                } else if joined.contains("pr list") {
+                    by_head.clone()
+                } else if joined.contains("statusCheckRollup") {
+                    rollup.clone()
+                } else if joined.contains("pr view") {
+                    by_branch.clone()
+                } else {
+                    completed("", "", Some(0))
+                }
+            };
+            observe_run("at".to_string(), "9d1f4c7a", &mut run)
+        };
+        (observation, seen)
+    }
+
+    /// One observation whose only interesting input is the Run's own diff: no commits, no PR,
+    /// so the stage ladder is reading the listings and nothing else.
+    fn observing_with_diff(names: &str) -> (Observation, Vec<String>) {
+        let names = names.to_string();
+        let mut seen: Vec<String> = Vec::new();
+        let observation = {
+            let mut run = |argv: &[String]| {
+                let joined = argv.join(" ");
+                seen.push(joined.clone());
+                if joined.contains("diff --name-only") {
+                    completed(&names, "", Some(0))
+                } else if joined.contains("rev-parse HEAD") {
+                    completed("3333333333333333333333333333333333333333\n", "", Some(0))
+                } else if joined.contains("rev-list") {
+                    completed("0\n", "", Some(0))
+                } else if joined.contains("pr list") {
+                    completed("[]", "", Some(0))
+                } else if joined.contains("pr view") {
+                    no_pr_on_this_branch()
+                } else {
+                    completed("", "", Some(0))
+                }
+            };
+            observe_run("at".to_string(), "9d1f4c7a", &mut run)
+        };
+        (observation, seen)
+    }
+
+    fn no_pr_on_this_branch() -> Completed {
+        completed(
+            "",
+            "no pull requests found for branch \"feat/28-slice-1b-seam\"\n",
+            Some(1),
+        )
+    }
+
+    #[test]
+    fn a_pr_on_a_branch_the_job_did_not_name_is_found_by_head_commit() {
+        // Run 2's shape exactly: pushed to `…-run`, the Job named `…-seam`. The branch lookup
+        // answers truthfully about the wrong question.
+        let (observation, seen) = observing(
+            completed(&format!("[{PR_JSON}]"), "", Some(0)),
+            no_pr_on_this_branch(),
+            completed(r#"{"statusCheckRollup":[]}"#, "", Some(0)),
+        );
+        let Observed::Present(found) = &observation.pr else {
+            panic!("the head commit finds it: {:?}", observation.pr);
+        };
+        assert_eq!(found.number, 30);
+        assert!(
+            seen.iter()
+                .any(|argv| argv
+                    .contains("pr list --search 3333333333333333333333333333333333333333")),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn the_branch_fallback_still_finds_a_pr_when_the_head_lookup_returns_nothing() {
+        let (observation, _) = observing(
+            completed("[]", "", Some(0)),
+            completed(PR_JSON, "", Some(0)),
+            completed(r#"{"statusCheckRollup":[]}"#, "", Some(0)),
+        );
+        let Observed::Present(found) = &observation.pr else {
+            panic!("the branch is still the right question for a Run that pushed where it said");
+        };
+        assert_eq!(found.number, 30);
+    }
+
+    #[test]
+    fn a_gh_auth_failure_is_could_not_observe_on_both_paths_and_never_absent() {
+        let code: i32 = GH_AUTH_CODE.trim().parse().expect("the recorded exit code");
+        let broken = completed(GH_AUTH_STDOUT, GH_AUTH_STDERR, Some(code));
+        let (observation, _) = observing(broken.clone(), broken.clone(), broken);
+        assert!(
+            matches!(observation.pr, Observed::Unobservable(_)),
+            "{:?}",
+            observation.pr
+        );
+        assert!(matches!(
+            observation.checks_pending,
+            Observed::Unobservable(_)
+        ));
+        assert!(matches!(observation.checks_red, Observed::Unobservable(_)));
+    }
+
+    #[test]
+    fn unreadable_json_from_either_lookup_is_could_not_observe() {
+        assert!(matches!(
+            pr_by_head(&completed("not json at all", "", Some(0))),
+            Observed::Unobservable(_)
+        ));
+        assert!(matches!(
+            pr_by_head(&completed(r#"[{"url":"x"}]"#, "", Some(0))),
+            Observed::Unobservable(_)
+        ));
+        let (observation, _) = observing(
+            completed("not json at all", "", Some(0)),
+            completed("also not json", "", Some(0)),
+            completed("", "", Some(0)),
+        );
+        assert!(matches!(observation.pr, Observed::Unobservable(_)));
+    }
+
+    #[test]
+    fn the_check_rollup_resolves_against_the_same_pr_the_lookup_found() {
+        // Two independent lookups can disagree about whether a PR exists at all.
+        let (_, seen) = observing(
+            completed(&format!("[{PR_JSON}]"), "", Some(0)),
+            no_pr_on_this_branch(),
+            completed(r#"{"statusCheckRollup":[]}"#, "", Some(0)),
+        );
+        assert!(
+            seen.iter()
+                .any(|argv| argv == "gh pr view 30 --json statusCheckRollup"),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_pr_anywhere_reads_checks_as_absent_rather_than_could_not_observe() {
+        let (observation, _) = observing(
+            completed("[]", "", Some(0)),
+            no_pr_on_this_branch(),
+            completed("", "", Some(0)),
+        );
+        assert_eq!(observation.pr, Observed::Absent);
+        assert_eq!(observation.checks_pending, Observed::Absent);
+        assert_eq!(observation.checks_red, Observed::Absent);
+    }
+
+    // --- base drift ----------------------------------------------------------------------------
+
+    fn on_main() -> Observed<String> {
+        default_branch(&completed("origin/main\n", "", Some(0)))
+    }
+
+    fn ours() -> Observed<Vec<String>> {
+        Observed::Present(vec![
+            "docs/adr/0013-a-decision.md".to_string(),
+            "src/observe.rs".to_string(),
+        ])
+    }
+
+    #[test]
+    fn drift_with_no_readable_origin_head_is_could_not_observe_and_never_zero() {
+        // What a clone whose fetch has never succeeded looks like. Recording it as *no drift*
+        // is the exact shape the three-valued reading exists to remove.
+        for broken in [
+            completed(
+                "",
+                "fatal: ref refs/remotes/origin/HEAD is not a symbolic ref\n",
+                Some(1),
+            ),
+            completed("", "", Some(0)),
+            completed("", "", None),
+        ] {
+            let base = default_branch(&broken);
+            assert!(matches!(base, Observed::Unobservable(_)), "{base:?}");
+            let drift = base_drift(
+                &base,
+                &completed("0\n", "", Some(0)),
+                &completed("", "", Some(0)),
+                &ours(),
+            );
+            assert!(matches!(drift, Observed::Unobservable(_)), "{drift:?}");
+        }
+    }
+
+    #[test]
+    fn a_default_branch_that_has_not_moved_is_a_present_zero_with_no_overlap() {
+        let drift = base_drift(
+            &on_main(),
+            &completed("0\n", "", Some(0)),
+            &completed("", "", Some(0)),
+            &ours(),
+        );
+        assert_eq!(
+            drift,
+            Observed::Present(BaseDrift {
+                default_branch: "origin/main".to_string(),
+                commits: 0,
+                overlapping: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn a_default_branch_that_moved_into_a_path_the_run_touched_yields_the_count_and_that_path() {
+        let drift = base_drift(
+            &on_main(),
+            &completed("4\n", "", Some(0)),
+            &completed("docs/adr/0013-a-decision.md\nREADME.md\n", "", Some(0)),
+            &ours(),
+        );
+        let Observed::Present(found) = drift else {
+            panic!("both halves are readable");
+        };
+        assert_eq!(found.commits, 4);
+        assert_eq!(found.overlapping, vec!["docs/adr/0013-a-decision.md"]);
+        assert!(found.to_string().contains("4 commits on origin/main"));
+    }
+
+    #[test]
+    fn a_default_branch_that_moved_elsewhere_yields_the_count_and_no_overlap() {
+        let drift = base_drift(
+            &on_main(),
+            &completed("9\n", "", Some(0)),
+            &completed("README.md\nCHANGELOG.md\n", "", Some(0)),
+            &ours(),
+        );
+        let Observed::Present(found) = drift else {
+            panic!("both halves are readable");
+        };
+        assert_eq!(found.commits, 9);
+        assert!(found.overlapping.is_empty());
+    }
+
+    #[test]
+    fn a_run_diff_that_could_not_be_read_leaves_the_drift_unobserved() {
+        let drift = base_drift(
+            &on_main(),
+            &completed("4\n", "", Some(0)),
+            &completed("README.md\n", "", Some(0)),
+            &Observed::Unobservable(Reason::saying("git diff --name-only: exit 128")),
+        );
+        assert!(matches!(drift, Observed::Unobservable(_)), "{drift:?}");
+    }
+
+    #[test]
+    fn an_unreadable_count_or_diff_against_the_default_branch_is_could_not_observe() {
+        let blind = completed("", "fatal: bad revision\n", Some(128));
+        assert!(matches!(
+            base_drift(&on_main(), &blind, &completed("", "", Some(0)), &ours()),
+            Observed::Unobservable(_)
+        ));
+        assert!(matches!(
+            base_drift(&on_main(), &completed("2\n", "", Some(0)), &blind, &ours()),
+            Observed::Unobservable(_)
+        ));
+        assert!(matches!(
+            base_drift(
+                &on_main(),
+                &completed("not a number\n", "", Some(0)),
+                &completed("", "", Some(0)),
+                &ours()
+            ),
+            Observed::Unobservable(_)
+        ));
+    }
+
+    #[test]
+    fn no_type_in_the_drift_carries_a_boolean_or_a_summary_over_the_count() {
+        // ADR-0006's seventh prohibited shape. The tempting argument — *`main` moved, so don't
+        // open the PR* — reads as caution rather than as the quality judgement ADR-0003
+        // refuses.
+        let shape = format!(
+            "{:?}",
+            BaseDrift {
+                default_branch: "origin/main".to_string(),
+                commits: 4,
+                overlapping: vec!["docs/adr/0013.md".to_string()],
+            }
+        )
+        .to_lowercase();
+        for banned in [
+            "diverged", "drifted", "stale", "conflict", "true", "false", "ok", "healthy",
+        ] {
+            assert!(!shape.contains(banned), "{shape}");
+        }
     }
 
     #[test]
@@ -749,15 +1451,75 @@ mod tests {
 
     #[test]
     fn an_unreadable_worktree_is_not_a_run_that_produced_nothing() {
-        assert_eq!(listing(true, "plan", vec![]), Observed::Absent);
+        // A failed diff is could-not-observe. An empty listing read as absence is how a
+        // worktree that has gone missing becomes a Run that produced no plan.
+        let missing = completed("", "fatal: not a git repository\n", Some(128));
+        assert!(matches!(changed_files(&missing), Observed::Unobservable(_)));
         assert!(matches!(
-            listing(false, "plan", vec![]),
+            scoped_listing(&changed_files(&missing), PLAN_DIR),
             Observed::Unobservable(_)
         ));
+        assert_eq!(changed_files(&completed("", "", Some(0))), Observed::Absent);
+    }
+
+    // --- listings scoped to the Run's own diff -------------------------------------------------
+
+    #[test]
+    fn a_plan_file_the_run_itself_added_advances_the_ladder_and_one_it_did_not_does_not() {
+        let mine = changed_files(&completed(
+            "docs/plans/2026-08-15-a-plan.md\nsrc/lib.rs\n",
+            "",
+            Some(0),
+        ));
         assert_eq!(
-            listing(true, "plan", vec!["docs/plans/a.md".into()]),
-            Observed::Present(vec!["docs/plans/a.md".into()])
+            scoped_listing(&mine, PLAN_DIR),
+            Observed::Present(vec!["docs/plans/2026-08-15-a-plan.md".to_string()])
         );
+        // A previous Run's merged plan is in the repo and not in this Run's diff.
+        let elsewhere = changed_files(&completed("src/lib.rs\nREADME.md\n", "", Some(0)));
+        assert_eq!(scoped_listing(&elsewhere, PLAN_DIR), Observed::Absent);
+        assert_eq!(scoped_listing(&elsewhere, RESIDUAL_DIR), Observed::Absent);
+        assert_eq!(scoped_listing(&elsewhere, LEDGER_DIR), Observed::Absent);
+    }
+
+    #[test]
+    fn a_directory_that_merely_prefixes_another_is_not_swept_up() {
+        let near = changed_files(&completed(
+            "docs/plans-archive/old.md\ndocs/plans/new.md\n",
+            "",
+            Some(0),
+        ));
+        assert_eq!(
+            scoped_listing(&near, PLAN_DIR),
+            Observed::Present(vec!["docs/plans/new.md".to_string()])
+        );
+    }
+
+    #[test]
+    fn all_five_rungs_are_still_reachable_from_diff_scoped_listings() {
+        // Trimming the ladder to the Run-scoped rungs would throw away the distinction between
+        // a Run that died before planning and one that died after, which is why the stage
+        // exists at all.
+        let stage = |o: &Observation| crate::decide::furthest_stage(o).to_string();
+
+        // A fresh Run on a repo where a previous Run merged a plan reads `dispatched`.
+        let (fresh, _) = observing_with_diff("");
+        assert_eq!(stage(&fresh), "dispatched");
+
+        let (mut walk, _) = observing_with_diff("docs/plans/a.md\n");
+        assert_eq!(stage(&walk), "planned");
+        walk.commits_ahead = Observed::Present(3);
+        assert_eq!(stage(&walk), "implemented");
+        walk.residual_findings =
+            Observed::Present(vec!["docs/residual-review-findings/r.md".to_string()]);
+        assert_eq!(stage(&walk), "reviewed");
+        walk.pr = Observed::Present(Pr {
+            number: 30,
+            url: "https://github.com/o/n/pull/30".to_string(),
+            state: "OPEN".to_string(),
+            is_draft: false,
+        });
+        assert_eq!(stage(&walk), "pr-open");
     }
 
     // --- the host item list's classifiers -------------------------------------------------
@@ -869,6 +1631,92 @@ mod tests {
         assert!(said.contains("gpg.format"), "{said}");
         assert!(said.contains("public key"), "{said}");
         assert!(said.contains("commit.gpgsign"), "{said}");
+    }
+
+    #[test]
+    fn a_boot_one_shot_is_satisfied_only_when_the_service_manager_says_it_is_loaded() {
+        // `launchctl print` on a loaded agent, and `systemctl --user is-enabled` on an enabled
+        // unit, both exit zero.
+        let loaded = completed(
+            "com.grind.resume-all = {\n\tactive count = 0\n}\n",
+            "",
+            Some(0),
+        );
+        let Observed::Present(Outcome::Satisfied(on_linux)) = boot_one_shot(&loaded, Fires::AtBoot)
+        else {
+            panic!("a loaded unit is satisfied");
+        };
+        assert!(on_linux.contains("fires at boot"), "{on_linux}");
+        assert!(on_linux.contains("lingers"), "{on_linux}");
+
+        // **The claim darwin is allowed to make.** Doctor runs from inside the GUI domain whose
+        // loading is the thing in question, so it cannot tell *loads at boot* from *loads at
+        // login* — and the satisfied text says which one is true rather than implying it looked.
+        let Observed::Present(Outcome::Satisfied(on_darwin)) =
+            boot_one_shot(&loaded, Fires::AtLogin)
+        else {
+            panic!("a loaded agent is satisfied");
+        };
+        assert!(
+            on_darwin.contains("fires at login, not at boot"),
+            "{on_darwin}"
+        );
+        assert!(
+            on_darwin.contains("waits for a human"),
+            "a satisfied darwin host must still name what the promise is:\n{on_darwin}"
+        );
+    }
+
+    #[test]
+    fn a_user_unit_without_linger_is_unsatisfied_rather_than_quietly_enabled() {
+        // `systemctl --user is-enabled` returns enabled purely from the symlink, with or
+        // without linger, so the check is conjunctive and this is the exit code that carries
+        // the second half. Doctor going green here is the failure: the unit is correct, enabled,
+        // and on a headless box it never runs.
+        let found = boot_one_shot(&completed("", "", Some(1)), Fires::AtBoot);
+        let Observed::Present(Outcome::Unsatisfied(said)) = found else {
+            panic!("expected unsatisfied: {found:?}");
+        };
+        assert!(said.contains("enable-linger"), "{said}");
+        assert!(said.contains("does not start at boot"), "{said}");
+    }
+
+    #[test]
+    fn a_plist_on_disk_that_was_never_bootstrapped_is_unsatisfied_and_never_satisfied() {
+        // The likeliest way this fails, and it fails one reboot later with a Run stranded. The
+        // check asks the service manager what it has loaded, never the filesystem what is there.
+        for never_loaded in [
+            completed(
+                "",
+                "Could not find service \"com.grind.resume-all\"\n",
+                Some(113),
+            ),
+            completed("disabled\n", "", Some(1)),
+            completed(
+                "",
+                "Failed to get unit file state: No such file or directory\n",
+                Some(1),
+            ),
+        ] {
+            let found = boot_one_shot(&never_loaded, Fires::AtLogin);
+            assert!(
+                matches!(found, Observed::Present(Outcome::Unsatisfied(_))),
+                "{found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_service_manager_that_cannot_be_reached_is_could_not_observe_never_unsatisfied() {
+        // *No such unit* and *no `launchctl` on this box* are different facts, and the second is
+        // about the check rather than about the host.
+        for unreachable in [
+            completed("", "sh: launchctl: command not found\n", Some(127)),
+            completed("", "", None),
+        ] {
+            let found = boot_one_shot(&unreachable, Fires::AtLogin);
+            assert!(matches!(found, Observed::Unobservable(_)), "{found:?}");
+        }
     }
 
     #[test]

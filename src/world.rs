@@ -14,10 +14,15 @@
 //! The denial globs bind the `claude` child and nothing else — `run(argv, cwd)` reaches every
 //! forbidden operation from Grind's own process with nothing in front of it. Grind's own
 //! process never spawns `git reset --hard`, `git rebase`, `git push --force`, a branch
-//! deletion, or `gh pr merge`. It writes to exactly two places: the dispatch-time label
-//! removal and comment on the Job issue. Doctor never performs a write to prove a credential
-//! step. The concrete vector is the dirty-worktree refusal — an agent making a stuck Dispatch
-//! go through reaches for `git reset --hard`, which is idiomatic and invisible to the globs.
+//! deletion, or `gh pr merge`.
+//!
+//! **One place, two writes** (ADR-0012). Grind writes on the Job issue and nowhere else, and
+//! both writes are comments: the dispatch comment, and the terminal-state comment. It applies
+//! no label, assignee, project or milestone on any repo — a comment is additive and ungoverned,
+//! while a label is a shared namespace someone else owns. Doctor never performs a write to
+//! prove a credential step. The concrete vector is the dirty-worktree refusal — an agent making
+//! a stuck Dispatch go through reaches for `git reset --hard`, which is idiomatic and invisible
+//! to the globs.
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -255,10 +260,15 @@ pub fn pid() -> u32 {
     std::process::id()
 }
 
-/// The supervisor's identity beside its pid: a pid alone is reused, and a reused pid reporting
-/// a dead Run as alive is the thing the split exists to stop.
-pub fn process_start_stamp(pid: u32) -> Option<String> {
-    let out = run(
+/// Ask `ps` when the process under this pid started — the supervisor's identity beside its pid,
+/// because a pid alone is reused and a reused pid reporting a dead Run as alive is the thing the
+/// split exists to stop.
+///
+/// **The raw triple, classified by `observe::process_start_stamp`.** The collapse this used to
+/// perform here — `code == Some(0) && !stamp.is_empty()` folded into an `Option` — read a `ps`
+/// that could not run as *no such process*, which `resume --all` then acts on.
+pub fn ps_start_stamp(pid: u32) -> Completed {
+    run(
         &[
             "ps".to_string(),
             "-p".to_string(),
@@ -267,15 +277,45 @@ pub fn process_start_stamp(pid: u32) -> Option<String> {
             "lstart=".to_string(),
         ],
         None,
-    );
-    let stamp = out.stdout.trim().to_string();
-    (out.code == Some(0) && !stamp.is_empty()).then_some(stamp)
+    )
 }
 
 /// Here rather than in `cli` because `std::env` is named in one module, and `cli` parses argv
 /// by hand.
 pub fn args() -> Vec<String> {
     std::env::args().skip(1).collect()
+}
+
+/// This binary's own path, so a boot one-shot re-enters with the copy that is running rather
+/// than with whatever `PATH` resolves to under a service manager's environment.
+pub fn current_exe() -> Option<PathBuf> {
+    std::env::current_exe().ok()
+}
+
+/// A child that **outlives this process**, in its own process group.
+///
+/// Never a thread: Rust terminates detached threads when `main` returns, and the boot one-shot's
+/// whole shape is *spawn and exit*, so a thread-per-Run boot path re-enters nothing and reports
+/// success while doing it. The new process group is what keeps a SIGHUP to the parent's terminal
+/// from taking the supervisors with it; the systemd unit's own `KillMode` is the other half, and
+/// it lives in `dist/`.
+///
+/// Nothing is waited on and nothing is piped — the child owns its own stdio and writes its own
+/// `supervisor.log`.
+pub fn spawn_detached(argv: &[String]) -> Result<u32, String> {
+    use std::os::unix::process::CommandExt;
+    let Some((program, rest)) = argv.split_first() else {
+        return Err("empty argv".to_string());
+    };
+    Command::new(program)
+        .args(rest)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|child| child.id())
+        .map_err(|e| e.to_string())
 }
 
 pub fn exit(code: i32) -> ! {
@@ -291,11 +331,27 @@ pub fn sleep(duration: Duration) {
 /// killed. Rust's stdout is line-buffered already; the flush is what makes that a property of
 /// this function rather than of the standard library's current choice.
 ///
-/// This and `cli`'s printing of the `String`s `render` returns are the only two writers.
+/// This, `cli`'s printing of the `String`s `render` returns, and [`append_line`] are the three
+/// writers of output.
 pub fn print_line(line: &str) {
     let mut out = std::io::stdout();
     let _ = writeln!(out, "{line}");
     let _ = out.flush();
+}
+
+/// The supervisor's narration, to a file that outlives the terminal it was said to.
+///
+/// **Line-buffered and flushed per line, exactly as stdout already is**, so a working Run
+/// reaching a file never looks dead. A log that cannot be written is not worth abandoning a Run
+/// over, so the failure comes back as a value and the caller may ignore it.
+pub fn append_line(path: &Path, line: &str) -> Result<(), String> {
+    let mut file = File::options()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    writeln!(file, "{line}").map_err(|e| format!("{}: {e}", path.display()))?;
+    file.flush().map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Refusals go to stderr, so a Run's own output stays parseable when it is piped.

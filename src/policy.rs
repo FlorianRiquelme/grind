@@ -7,9 +7,9 @@
 //! **Never a pre-flight quota check** (ADR-0004). Even a perfectly informed supervisor would be
 //! wrong about what a stage costs, so Grind sleeps long and re-enters rather than predicting.
 
-use crate::attempt::{Attempt, Mode};
+use crate::attempt::{self, Attempt, Mode};
 use crate::decide::Verdict;
-use crate::observe::Observed;
+use crate::observe::{Observed, Reason};
 use std::time::Duration;
 
 /// The conditions a Run was dispatched under, **read from the record rather than the
@@ -26,6 +26,11 @@ pub struct Budget {
     /// laptop wake is the case this exists for — has a real chance to clear before the next
     /// look. Sourced from a compiled constant beside `REOBSERVATIONS`, never per-Job.
     pub reobserve_pause: Duration,
+    /// How many Waits in a row before *nothing is happening forever* becomes terminal. Waits
+    /// never spend `attempts`, so this is the only thing bounding a Run against a permanent
+    /// wall. Grind's own policy knob, from a compiled constant like `reobservations` — not a
+    /// record field and not per-Job.
+    pub consecutive_waits: usize,
 }
 
 /// What the loop does next.
@@ -51,6 +56,84 @@ pub enum Stop {
     Uncorroborated(Vec<String>),
     Unobserved(Vec<String>),
     Exhausted,
+    /// An obstacle only a human can clear, carrying **what must be cleared**.
+    ///
+    /// A stop and a supervisor state, and deliberately **never a `Verdict` variant**: ADR-0006
+    /// prohibits `Verdict::{Rejected, Blocked, Failed}` by name because those words are quality
+    /// judgements about the *work*. A Blocker is a fact about the *world*, in the same family
+    /// as the rate limit the base has carried since day one.
+    Blocked(String),
+}
+
+/// Did this working Attempt fail to advance the Run?
+///
+/// **Three-valued, mandatory.** `commits_ahead` read zero for all eight of Run 2's Attempts
+/// against twelve real commits, so a terminal state keyed on it gets the same guard every other
+/// observation gets: blind must not read as blocked. The first working Attempt of a process has
+/// nothing to compare against and reads *could not observe* for that reason.
+pub fn stalled(before: Option<&Observed<u64>>, now: &Observed<u64>) -> Observed<bool> {
+    match (before, now) {
+        (Some(Observed::Present(was)), Observed::Present(is)) => Observed::Present(is <= was),
+        (None, _) => Observed::Unobservable(Reason::saying(
+            "no earlier commit count to compare this Attempt against",
+        )),
+        _ => Observed::Unobservable(Reason::saying(
+            "the commit count was not observed on both sides of this Attempt",
+        )),
+    }
+}
+
+/// **A Blocker: the same denied invocation on two consecutive working Attempts that both failed
+/// to advance.** Supervisor-authoritative, read from the recorded denials.
+///
+/// Three clauses are load-bearing. **Two working Attempts, not one** — a Run may legitimately
+/// probe a denied tool once and route around it, which is exactly what Run 2 did on the Attempt
+/// that opened its PR. **An `Unobservable` progress reading never fires it** — see `stalled`.
+/// And **the Run's own declaration never fires it alone**: nothing here reads the Run's prose,
+/// which is *observed, never declared* holding here too.
+///
+/// `stalls` carries one reading per working Attempt, newest last.
+pub fn blocker(attempts: &[Attempt], stalls: &[Observed<bool>]) -> Option<Stop> {
+    let recent: Vec<&Observed<bool>> = stalls.iter().rev().take(2).collect();
+    if recent.len() < 2 || !recent.iter().all(|s| s == &&Observed::Present(true)) {
+        return None;
+    }
+    what_must_be_cleared(attempts).map(Stop::Blocked)
+}
+
+/// The denied invocation the **last two working Attempts** have in common, which is the whole
+/// of *what must be cleared*. Separated from the stop so the Handback can name it on a Run it
+/// only found blocked in the record.
+pub fn what_must_be_cleared(attempts: &[Attempt]) -> Option<String> {
+    let worked: Vec<&Attempt> = attempts.iter().filter(|a| !a.is_wait()).collect();
+    let [.., before, last] = worked.as_slice() else {
+        return None;
+    };
+    let earlier = denied_invocations(before);
+    denied_invocations(last)
+        .into_iter()
+        .find(|denial| earlier.contains(denial))
+}
+
+/// A denial as an identity, so *the same invocation twice* is a comparison rather than a guess.
+fn denied_invocations(attempt: &Attempt) -> Vec<String> {
+    attempt
+        .permission_denials
+        .iter()
+        .map(|denial| {
+            let tool = denial
+                .get("tool_name")
+                .and_then(|t| t.as_str())
+                .unwrap_or("?");
+            let input = denial.get("tool_input");
+            let said = input
+                .and_then(|i| i.get("command"))
+                .and_then(|c| c.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| input.map(ToString::to_string).unwrap_or_default());
+            format!("{tool}({said})")
+        })
+        .collect()
 }
 
 /// The whole policy, as one pure function over the attempt list and the verdict.
@@ -84,7 +167,16 @@ pub fn next(
             }
         }
         Verdict::Incomplete(_) => {
-            if attempts.len() >= budget.attempts {
+            // Working Attempts only, read from the Attempt list and never from an observation.
+            // A progress-based cap would have killed Run 2 *faster*: `commits_ahead` read zero
+            // for all eight of its Attempts while twelve real commits existed.
+            if attempt::working(attempts) >= budget.attempts {
+                return Next::Stop(Stop::Exhausted);
+            }
+            // Wall-clock never bounds a Run; a run of Waits does. Any working Attempt ends the
+            // run by construction, and the count comes off the persisted list so a restart
+            // cannot reset it.
+            if attempt::trailing_waits(attempts) >= budget.consecutive_waits {
                 return Next::Stop(Stop::Exhausted);
             }
             match attempts.last() {
@@ -115,9 +207,11 @@ mod tests {
             limit_sleep: Duration::from_secs(limit_sleep_secs),
             reobservations: 3,
             reobserve_pause: Duration::from_secs(reobserve_pause_secs),
+            consecutive_waits: 12,
         }
     }
 
+    /// An Attempt that **did work** — real cost, many turns. The budget counts these.
     fn attempt(n: usize, mode: Mode, rate_limited: bool) -> Attempt {
         Attempt {
             n,
@@ -131,14 +225,40 @@ mod tests {
             stop_reason: None,
             api_error_status: rate_limited.then(|| "429".to_string()),
             terminal_reason: Some("api_error".to_string()),
-            num_turns: Some(1),
-            total_cost_usd: Some(0.0),
+            num_turns: Some(37),
+            total_cost_usd: Some(2.35),
             usage: None,
             permission_denials: vec![],
             done_promise: false,
             rate_limited,
             result_tail: String::new(),
+            fanout: crate::observe::Observed::Absent,
         }
+    }
+
+    /// An Attempt that did **no** work: it parsed, cost nothing and took one turn. Run 2's
+    /// attempts 3 through 7, exactly.
+    fn wait(n: usize, rate_limited: bool) -> Attempt {
+        Attempt {
+            num_turns: Some(1),
+            total_cost_usd: Some(0.0),
+            ..attempt(n, Mode::Resume, rate_limited)
+        }
+    }
+
+    /// A child that died before emitting parseable JSON. Never a Wait, whatever is absent.
+    fn crashed(n: usize) -> Attempt {
+        Attempt {
+            parse_ok: false,
+            subtype: Some("unparseable-output".to_string()),
+            num_turns: None,
+            total_cost_usd: None,
+            ..attempt(n, Mode::Resume, false)
+        }
+    }
+
+    fn incomplete() -> Verdict {
+        Verdict::Incomplete(vec!["PR open".to_string()])
     }
 
     fn clear() -> Observed<bool> {
@@ -317,6 +437,276 @@ mod tests {
             ),
             Next::Reenter
         );
+    }
+
+    // --- a Wait is an Attempt that did no work -----------------------------------------------
+
+    #[test]
+    fn a_wait_does_not_decrement_the_attempt_budget() {
+        // Eight Waits and one working Attempt against a budget of eight: one spent, not nine.
+        let mut attempts: Vec<Attempt> = (1..=8).map(|n| wait(n, true)).collect();
+        attempts.push(attempt(9, Mode::Resume, false));
+        assert_ne!(
+            next(&attempts, &incomplete(), &clear(), 0, &budget(8, 1800)),
+            Next::Stop(Stop::Exhausted)
+        );
+    }
+
+    #[test]
+    fn a_run_of_consecutive_waits_terminates_on_its_own_bound() {
+        // Waits spend nothing, so this counter is the only thing standing between a permanent
+        // wall and a Run that never stops.
+        let eleven: Vec<Attempt> = (1..=11).map(|n| wait(n, true)).collect();
+        assert_eq!(
+            next(&eleven, &incomplete(), &clear(), 0, &budget(8, 1800)),
+            Next::SleepThenReenter(Duration::from_secs(1800))
+        );
+        let twelve: Vec<Attempt> = (1..=12).map(|n| wait(n, true)).collect();
+        assert_eq!(
+            next(&twelve, &incomplete(), &clear(), 0, &budget(8, 1800)),
+            Next::Stop(Stop::Exhausted),
+            "*nothing is happening forever* is still terminal"
+        );
+    }
+
+    #[test]
+    fn a_working_attempt_ends_the_run_of_waits() {
+        let mut attempts: Vec<Attempt> = (1..=11).map(|n| wait(n, true)).collect();
+        attempts.push(attempt(12, Mode::Resume, false));
+        attempts.extend((13..=15).map(|n| wait(n, true)));
+        assert_eq!(
+            crate::attempt::trailing_waits(&attempts),
+            3,
+            "the count is of the trailing run, not of the list"
+        );
+        assert_eq!(
+            next(&attempts, &incomplete(), &clear(), 0, &budget(8, 1800)),
+            Next::SleepThenReenter(Duration::from_secs(1800))
+        );
+    }
+
+    #[test]
+    fn the_consecutive_wait_bound_survives_a_re_entry() {
+        // The count is derived from the persisted list, so a fresh process reads the same
+        // number the one that died would have. A loop-local counter would hand a
+        // permanently-walled Run a fresh allowance at every reboot and never terminate — and
+        // `resume --all` re-enters rate-limited Runs at boot by design.
+        let twelve: Vec<Attempt> = (1..=12).map(|n| wait(n, true)).collect();
+        let after_a_restart = twelve.clone();
+        assert_eq!(
+            next(
+                &after_a_restart,
+                &incomplete(),
+                &clear(),
+                0,
+                &budget(8, 1800)
+            ),
+            Next::Stop(Stop::Exhausted)
+        );
+    }
+
+    #[test]
+    fn an_unparseable_child_spends_the_budget_and_never_loops_forever() {
+        // The load-bearing clause of the predicate. A crash leaves both cost and turns absent,
+        // and reading absence as *did no work* would make every crash loop free.
+        let eight: Vec<Attempt> = (1..=8).map(crashed).collect();
+        assert_eq!(crate::attempt::working(&eight), 8);
+        assert_eq!(
+            next(&eight, &incomplete(), &clear(), 0, &budget(8, 1800)),
+            Next::Stop(Stop::Exhausted)
+        );
+    }
+
+    #[test]
+    fn replaying_run_2s_eight_attempt_shapes_leaves_five_waits_and_three_working_attempts() {
+        // `docs/findings/0002`: attempt 1 at $37.04 and 187 turns, attempt 2 at $7.06,
+        // attempts 3–7 at $0 and one turn each, attempt 8 at $20.22 — the Attempt that opened
+        // the PR. Under the recorded budget of eight, three working Attempts is not exhaustion.
+        let mut run2 = vec![
+            Attempt {
+                num_turns: Some(187),
+                total_cost_usd: Some(37.04),
+                ..attempt(1, Mode::Dispatch, false)
+            },
+            Attempt {
+                num_turns: Some(52),
+                total_cost_usd: Some(7.06),
+                ..attempt(2, Mode::Resume, false)
+            },
+        ];
+        run2.extend((3..=7).map(|n| wait(n, true)));
+        run2.push(Attempt {
+            num_turns: Some(96),
+            total_cost_usd: Some(20.22),
+            ..attempt(8, Mode::Resume, false)
+        });
+
+        assert_eq!(crate::attempt::working(&run2), 3);
+        assert_eq!(run2.len() - crate::attempt::working(&run2), 5);
+        assert_ne!(
+            next(&run2, &incomplete(), &clear(), 0, &budget(8, 1800)),
+            Next::Stop(Stop::Exhausted),
+            "eight Attempts against a budget of eight, of which five did no work"
+        );
+    }
+
+    #[test]
+    fn wall_clock_is_not_a_bound_and_does_not_become_one() {
+        // Nothing in the budget names a duration a Run may take. The two `Duration`s here are
+        // both waits Grind performs, never ceilings on the Run.
+        let fields = format!("{:?}", budget(8, 1800));
+        assert!(fields.contains("limit_sleep"), "{fields}");
+        assert!(fields.contains("reobserve_pause"), "{fields}");
+        for ceiling in ["deadline", "max_wall", "timeout", "elapsed"] {
+            assert!(!fields.contains(ceiling), "{fields}");
+        }
+    }
+
+    // --- a Blocker stops at once ---------------------------------------------------------------
+
+    fn denying(n: usize, command: &str) -> Attempt {
+        Attempt {
+            permission_denials: vec![serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            })],
+            ..attempt(n, Mode::Resume, false)
+        }
+    }
+
+    fn stalled_twice() -> Vec<Observed<bool>> {
+        vec![
+            Observed::Unobservable(Reason::saying("nothing earlier")),
+            Observed::Present(true),
+            Observed::Present(true),
+        ]
+    }
+
+    #[test]
+    fn the_same_denial_on_two_consecutive_working_attempts_with_no_progress_fires_the_blocker() {
+        let attempts = [
+            attempt(1, Mode::Dispatch, false),
+            denying(2, "git push --force-with-lease"),
+            denying(3, "git push --force-with-lease"),
+        ];
+        let Some(Stop::Blocked(what)) = blocker(&attempts, &stalled_twice()) else {
+            panic!("a repeated denial with no progress is a fact about the world");
+        };
+        assert!(what.contains("git push --force-with-lease"), "{what}");
+    }
+
+    #[test]
+    fn a_single_denial_on_one_working_attempt_does_not_fire_it() {
+        // A Run may probe a denied tool once and route around it, which is what Run 2 did on
+        // the Attempt that opened its PR.
+        let attempts = [
+            attempt(1, Mode::Dispatch, false),
+            attempt(2, Mode::Resume, false),
+            denying(3, "git push --force-with-lease"),
+        ];
+        assert_eq!(blocker(&attempts, &stalled_twice()), None);
+    }
+
+    #[test]
+    fn two_denials_of_different_invocations_do_not_fire_it() {
+        let attempts = [
+            attempt(1, Mode::Dispatch, false),
+            denying(2, "git push --force-with-lease"),
+            denying(3, "gh pr merge 30"),
+        ];
+        assert_eq!(blocker(&attempts, &stalled_twice()), None);
+    }
+
+    #[test]
+    fn a_denial_on_a_working_attempt_that_advanced_does_not_fire_it() {
+        let attempts = [
+            attempt(1, Mode::Dispatch, false),
+            denying(2, "git push --force-with-lease"),
+            denying(3, "git push --force-with-lease"),
+        ];
+        let advanced = vec![
+            Observed::Unobservable(Reason::saying("nothing earlier")),
+            Observed::Present(true),
+            Observed::Present(false),
+        ];
+        assert_eq!(blocker(&attempts, &advanced), None);
+    }
+
+    #[test]
+    fn an_unobservable_commit_count_on_either_attempt_never_fires_it() {
+        // Blind must not read as blocked. `commits_ahead` read zero for all eight of Run 2's
+        // Attempts against twelve real commits.
+        let attempts = [
+            attempt(1, Mode::Dispatch, false),
+            denying(2, "git push --force-with-lease"),
+            denying(3, "git push --force-with-lease"),
+        ];
+        let blind = Observed::Unobservable(Reason::saying("git rev-list --count: exit 128"));
+        for stalls in [
+            vec![Observed::Present(true), blind.clone()],
+            vec![blind.clone(), Observed::Present(true)],
+            vec![blind.clone(), blind.clone()],
+        ] {
+            assert_eq!(blocker(&attempts, &stalls), None, "{stalls:?}");
+        }
+    }
+
+    #[test]
+    fn a_declaration_with_no_recorded_denial_does_not_fire_it_on_its_own() {
+        // Observed, never declared. Nothing here reads the Run's prose.
+        let declaring = |n: usize| Attempt {
+            result_tail: "I am blocked: the signer is dead and I cannot sign a commit.".to_string(),
+            ..attempt(n, Mode::Resume, false)
+        };
+        let attempts = [
+            attempt(1, Mode::Dispatch, false),
+            declaring(2),
+            declaring(3),
+        ];
+        assert_eq!(blocker(&attempts, &stalled_twice()), None);
+    }
+
+    #[test]
+    fn the_first_working_attempt_of_a_process_has_nothing_to_compare_against() {
+        let now = Observed::Present(3);
+        assert!(matches!(stalled(None, &now), Observed::Unobservable(_)));
+        assert_eq!(
+            stalled(Some(&Observed::Present(3)), &Observed::Present(3)),
+            Observed::Present(true)
+        );
+        assert_eq!(
+            stalled(Some(&Observed::Present(3)), &Observed::Present(4)),
+            Observed::Present(false)
+        );
+        assert!(matches!(
+            stalled(
+                Some(&Observed::Unobservable(Reason::saying("x"))),
+                &Observed::Present(4)
+            ),
+            Observed::Unobservable(_)
+        ));
+    }
+
+    #[test]
+    fn a_blocker_is_a_stop_and_never_a_verdict_variant() {
+        // ADR-0006 prohibits `Verdict::{Rejected, Blocked, Failed}` by name. The words are
+        // quality judgements about the work; a Blocker is a fact about the world.
+        let variants = [
+            format!("{:?}", Verdict::Completed),
+            format!("{:?}", Verdict::Uncorroborated(vec![])),
+            format!("{:?}", Verdict::Unobserved(vec![])),
+            format!("{:?}", Verdict::Incomplete(vec![])),
+        ];
+        for variant in variants {
+            let said = variant.to_lowercase();
+            for banned in ["blocked", "rejected", "failed"] {
+                assert!(!said.contains(banned), "{variant}");
+            }
+        }
+        assert!(matches!(
+            Stop::Blocked("Bash(git push --force)".to_string()),
+            Stop::Blocked(_)
+        ));
     }
 
     #[test]

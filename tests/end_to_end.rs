@@ -6,10 +6,10 @@
 //! variable, which is racy under parallel tests and `unsafe` in Rust 2024.
 //!
 //! **`PATH` is replaced, not prepended to.** It holds the fakes and a toolbox of symlinks to
-//! the real `git` and the shell utilities the fakes need — nothing else. Dispatch removes a
-//! label and comments on the Job issue, so a fall-through to a real `gh` would mutate a real
-//! GitHub issue from a routine `just verify`. Hermeticity here is structural rather than
-//! asserted.
+//! the real `git` and the shell utilities the fakes need — nothing else. Grind comments on the
+//! Job issue, so a fall-through to a real `gh` would mutate a real GitHub issue from a routine
+//! `just verify`. Hermeticity here is structural rather than asserted. `origin` is a bare repo
+//! on disk, so the fetch Dispatch performs is real git that still reaches no network.
 //!
 //! Every fake substitutes **raw stdout, stderr and exit code**, never a domain value. That is
 //! the only fidelity that can express a truncated parse or replay a dropped connection.
@@ -109,6 +109,89 @@ impl Sandbox {
         serde_json::from_str(&raw).expect("the record parses")
     }
 
+    /// Make `gh issue comment` fail, the way GitHub being down at 04:00 does.
+    fn gh_cannot_comment(&self) -> &Self {
+        fs::write(self.fake().join("gh/comment.code"), "1").expect("write a comment failure");
+        self
+    }
+
+    fn clone_path(&self) -> PathBuf {
+        self.home.join(".grind/repos").join(OWNER).join(NAME)
+    }
+
+    /// Rewrite the Job issue's `Handoff SHA` row.
+    fn handoff_becomes(&self, sha: &str) -> &Self {
+        let path = self.fake().join("gh/issue.json");
+        let raw = fs::read_to_string(&path).expect("the Job issue");
+        fs::write(&path, raw.replace(&self.handoff_sha, sha)).expect("rewrite the Job issue");
+        self
+    }
+
+    /// Rewrite the Job issue's `Anchor artifact` row.
+    fn anchor_becomes(&self, path: &str) -> &Self {
+        let issue = self.fake().join("gh/issue.json");
+        let raw = fs::read_to_string(&issue).expect("the Job issue");
+        fs::write(&issue, raw.replace("docs/plans/a-plan.md", path)).expect("rewrite it");
+        self
+    }
+
+    /// Stage a record as a Run in some state with some supervisor, so `resume --all` has a
+    /// roster to sort. Built from a real record, so every field the base forces at construction
+    /// is present and nothing here is a hand-written shape the reader would refuse.
+    fn stage(&self, template: &serde_json::Value, run_id: &str, state: &str, pid: u32) {
+        let mut record = template.clone();
+        record["run_id"] = serde_json::json!(run_id);
+        record["state"] = serde_json::json!(state);
+        record["supervisor_pid"] = serde_json::json!(pid);
+        record["supervisor_identity"] = serde_json::json!(identity_of(pid));
+        record["attempts"] = serde_json::json!([]);
+        let dir = self.home.join(".grind/runs").join(run_id);
+        fs::create_dir_all(&dir).expect("a staged run directory");
+        fs::write(
+            dir.join("run.json"),
+            serde_json::to_string_pretty(&record).expect("serialise") + "\n",
+        )
+        .expect("stage a record");
+    }
+
+    /// Rewrite one Run's recorded state word, leaving its attempt list alone. The shape a
+    /// resume guard keyed on the word cannot tell apart from the one it means to allow.
+    /// Replace the toolbox's `ps` with one that cannot answer — busybox does not implement
+    /// `-p <pid> -o lstart=`, and Grind ships as a musl static binary aimed at hosts that run
+    /// it. A shape, not a mock: the binary sees a real exec with a real non-zero exit.
+    fn ps_cannot_answer(&self) -> &Self {
+        let ps = self.home.join(".fake/toolbox/ps");
+        let _ = fs::remove_file(&ps);
+        fs::write(
+            &ps,
+            "#!/bin/sh\necho 'ps: unrecognized option: p' >&2\nexit 127\n",
+        )
+        .expect("write a refusing ps");
+        let mut mode = fs::metadata(&ps).expect("stat").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+        fs::set_permissions(&ps, mode).expect("make it executable");
+        self
+    }
+
+    fn state_becomes(&self, run_id: &str, state: &str) {
+        let path = self.home.join(".grind/runs").join(run_id).join("run.json");
+        let raw = fs::read_to_string(&path).expect("a record");
+        let mut record: serde_json::Value = serde_json::from_str(&raw).expect("it parses");
+        record["state"] = serde_json::json!(state);
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&record).expect("serialise") + "\n",
+        )
+        .expect("rewrite the state");
+    }
+
+    fn state_of(&self, run_id: &str) -> String {
+        let raw = fs::read_to_string(self.home.join(".grind/runs").join(run_id).join("run.json"))
+            .expect("a staged record");
+        let record: serde_json::Value = serde_json::from_str(&raw).expect("it parses");
+        record["state"].as_str().expect("a state").to_string()
+    }
+
     fn run_dir(&self) -> PathBuf {
         fs::read_dir(self.home.join(".grind/runs"))
             .expect("runs")
@@ -120,20 +203,63 @@ impl Sandbox {
 
     /// The argv of each attempt, in order, as the fake actually received it.
     fn argvs(&self) -> Vec<Vec<String>> {
-        let Ok(log) = fs::read_to_string(self.fake().join("argv.log")) else {
-            return Vec::new();
-        };
-        let mut all = Vec::new();
-        let mut current = Vec::new();
-        for line in log.lines() {
-            if line.starts_with("--- attempt") {
-                all.push(std::mem::take(&mut current));
-            } else {
-                current.push(line.to_string());
-            }
-        }
-        all
+        split_log(&self.fake().join("argv.log"), "--- attempt")
     }
+
+    /// Every `gh` invocation, in order. The assertion on what Grind writes is on what was
+    /// actually posted, never on the absence of an error.
+    fn gh_calls(&self) -> Vec<Vec<String>> {
+        split_log(&self.fake().join("gh.log"), "--- gh")
+    }
+}
+
+/// A fake's argument log, split into one `Vec` per invocation.
+fn split_log(path: &Path, separator: &str) -> Vec<Vec<String>> {
+    let Ok(log) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut all = Vec::new();
+    let mut current = Vec::new();
+    for line in log.lines() {
+        if line.starts_with(separator) {
+            all.push(std::mem::take(&mut current));
+        } else {
+            current.push(line.to_string());
+        }
+    }
+    all.push(current);
+    all.retain(|call: &Vec<String>| !call.is_empty());
+    all
+}
+
+/// Every comment body Grind posted on the Job issue, in order. A body carries newlines and the
+/// log is one line per argument, so everything after `--body` is rejoined.
+fn comments_on_the_job_issue(box_: &Sandbox) -> Vec<String> {
+    box_.gh_calls()
+        .into_iter()
+        .filter(|call| {
+            call.first().is_some_and(|a| a == "issue")
+                && call.get(1).is_some_and(|a| a == "comment")
+        })
+        .map(|call| {
+            let at = call
+                .iter()
+                .position(|a| a == "--body")
+                .expect("a --body argument");
+            call[at + 1..].join("\n")
+        })
+        .collect()
+}
+
+/// A process's start stamp, exactly as `world::process_start_stamp` reads it. A pid nothing is
+/// running under yields nothing, which is what *stale* looks like after a reboot.
+fn identity_of(pid: u32) -> Option<String> {
+    let out = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()
+        .expect("ps");
+    let stamp = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !stamp.is_empty()).then_some(stamp)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> String {
@@ -213,19 +339,35 @@ fn sandbox(name: &str) -> Sandbox {
     git(&clone, &["config", "user.email", "run@example.invalid"]);
     git(&clone, &["config", "user.name", "Grind Test"]);
     git(&clone, &["config", "commit.gpgsign", "false"]);
+    // A bare repo on disk stands in for `origin`. Dispatch fetches before it asks anything
+    // about the worktree, so `origin` has to be reachable — and a local one keeps *no network*
+    // structural rather than merely unexercised.
+    let origin = fake.join("origin.git");
+    // `-b main` explicitly: without it the bare repo takes the machine's `init.defaultBranch`,
+    // its HEAD points at a branch nothing ever pushes, and `remote set-head -a` cannot resolve
+    // `origin/HEAD` — which base drift reads. A green laptop and a red CI, from one config
+    // difference.
+    git(
+        &home,
+        &[
+            "init",
+            "--bare",
+            "-q",
+            "-b",
+            "main",
+            origin.to_str().expect("utf-8"),
+        ],
+    );
     git(
         &clone,
-        &[
-            "remote",
-            "add",
-            "origin",
-            &format!("git@github.com:{OWNER}/{NAME}.git"),
-        ],
+        &["remote", "add", "origin", origin.to_str().expect("utf-8")],
     );
     fs::write(clone.join("README.md"), "the human's context\n").expect("seed a file");
     git(&clone, &["add", "-A"]);
     git(&clone, &["commit", "-q", "-m", "the human stops here"]);
     let handoff_sha = git(&clone, &["rev-parse", "HEAD"]);
+    git(&clone, &["push", "-q", "origin", "main"]);
+    git(&clone, &["remote", "set-head", "origin", "-a"]);
     git(&clone, &["checkout", "-q", "-b", BRANCH]);
     fs::create_dir_all(clone.join("docs/plans")).expect("a plan directory");
     fs::write(clone.join("docs/plans/a-plan.md"), "# a plan\n").expect("a plan");
@@ -277,7 +419,7 @@ fn sandbox(name: &str) -> Sandbox {
     // the real `git` need. No real `gh` is reachable at all.
     let toolbox = home.join(".fake/toolbox");
     fs::create_dir_all(&toolbox).expect("a toolbox");
-    for tool in ["git", "sh", "cat", "sed", "dirname", "uname", "ps"] {
+    for tool in ["git", "sh", "cat", "sed", "dirname", "uname", "ps", "mkdir"] {
         let real = which(tool);
         let _ = std::os::unix::fs::symlink(&real, toolbox.join(tool));
     }
@@ -401,13 +543,21 @@ fn scenario_a_a_real_run_shape_with_the_literal_argv_of_every_attempt() {
                 "Bash(git -C*)",
                 "Bash(git switch main*)",
                 "Bash(gh api*merge*)",
+                "Bash(git push*--force*)",
+                "Bash(git push*--delete*)",
+                "Bash(git push*:*)",
+                "Bash(git push* -f)",
+                "Bash(git push* -f *)",
+                "Bash(git reset*--hard*)",
+                "Bash(git branch* -D*)",
+                "Bash(git branch*--delete*)",
+                "Bash(git*--force-with-lease*)",
+                "Bash(git -c*)",
+                "Bash(git*update-ref*)",
             ]
         );
-        // Fixed at dispatch and read from the record on every attempt.
-        assert!(
-            argv.windows(2)
-                .any(|w| w[0] == "--max-budget-usd" && w[1] == "12.50")
-        );
+        // No spend ceiling on any of them, and the Job issue still carries the row (ADR-0010).
+        assert!(!argv.contains(&"--max-budget-usd".to_string()));
         assert!(argv.contains(&"bypassPermissions".to_string()));
         assert!(
             argv.windows(2)
@@ -525,6 +675,11 @@ fn scenario_d_a_rate_limit_announces_the_recorded_sleep_rather_than_burning_the_
     assert_eq!(attempts.len(), 1, "it slept rather than burning attempts");
     assert_eq!(attempts[0]["rate_limited"], true);
     assert_eq!(attempts[0]["api_error_status"], "429");
+    // And it did no work, so it is a Wait: it parsed, cost nothing and took one turn. Nothing
+    // records that as a field — the predicate is derived from these three.
+    assert_eq!(attempts[0]["parse_ok"], true);
+    assert_eq!(attempts[0]["total_cost_usd"], 0.0);
+    assert_eq!(attempts[0]["num_turns"], 1);
     assert_eq!(
         attempts[0]["subtype"], "success",
         "subtype is not the outcome"
@@ -576,6 +731,252 @@ fn scenario_f_an_unobservable_run_pauses_before_looking_again_and_spends_no_atte
         1,
         "re-observing must not cost attempts"
     );
+}
+
+#[test]
+fn scenario_g_a_repeated_denial_with_no_progress_stops_for_a_human_and_resumes() {
+    // A Run refused the same operation twice over stops instead of spending its remaining
+    // budget against it — and it never spent the budget, so it re-enters where it stopped once
+    // the human has cleared the obstacle. The world changed, not the number.
+    let box_ = sandbox("g-blocked");
+    box_.scenario(&["denied", "denied", "denied", "success_done"])
+        .pr_appears_at(4);
+
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+
+    let record = box_.record();
+    assert_eq!(record["state"], "blocked", "stdout:\n{out}");
+    let attempts = record["attempts"].as_array().expect("attempts").len();
+    assert_eq!(attempts, 3, "it stopped at once rather than spending eight");
+    assert!(record["attempt_budget"].as_u64().expect("a budget") > attempts as u64);
+    assert!(
+        out.contains("git push --force-with-lease"),
+        "the Handback names what must be cleared:\n{out}"
+    );
+
+    let run_id = record["run_id"].as_str().expect("a run id").to_string();
+    let (out, err, code) = box_.run(&["resume", &run_id]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert!(
+        !out.contains("run already"),
+        "a Blocked Run re-enters rather than short-circuiting:\n{out}"
+    );
+    assert_eq!(box_.record()["state"], "completed");
+}
+
+// --- surviving a reboot -------------------------------------------------------------------------
+
+/// A completed Run's record, to stage cut-off and stopped Runs from.
+fn a_real_record(box_: &Sandbox) -> serde_json::Value {
+    box_.scenario(&["success_done"]).pr_appears_at(1);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    let record = box_.record();
+    let _ = fs::remove_dir_all(box_.home.join(".grind/runs"));
+    record
+}
+
+/// A pid nothing is running under. After a reboot every recorded pid is stale by construction.
+const GONE: u32 = 999_999;
+
+#[test]
+fn resume_all_re_enters_the_cut_off_and_never_the_stopped() {
+    // Two records staged as cut off and two as stopped re-enter exactly two Runs.
+    let box_ = sandbox("resume-all");
+    let template = a_real_record(&box_);
+    for (run_id, state) in [
+        ("r-dispatched", "dispatched"),
+        ("r-limited", "rate_limited"),
+        ("r-died", "died"),
+        ("r-blocked", "blocked"),
+        ("r-unobserved", "unobserved"),
+        ("r-uncorroborated", "uncorroborated"),
+    ] {
+        box_.stage(&template, run_id, state, GONE);
+    }
+
+    let (out, err, code) = box_.run(&["resume", "--all"]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    for cut_off in ["r-dispatched", "r-limited", "r-died"] {
+        assert!(out.contains(&format!("re-entered {cut_off}")), "{out}");
+    }
+    for stopped in ["r-blocked", "r-unobserved", "r-uncorroborated"] {
+        assert!(
+            !out.contains(stopped),
+            "a stopped Run is a deliberate decision:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn resume_all_re_enters_no_run_whose_recorded_supervisor_is_alive() {
+    let box_ = sandbox("resume-all-alive");
+    let template = a_real_record(&box_);
+    // This test process is unambiguously alive, and its start stamp matches itself.
+    let alive = std::process::id();
+    assert!(identity_of(alive).is_some(), "ps must answer for this pid");
+    box_.stage(&template, "r-alive", "dispatched", alive);
+    box_.stage(&template, "r-gone", "dispatched", GONE);
+
+    let (out, err, code) = box_.run(&["resume", "--all"]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert!(out.contains("re-entered r-gone"), "{out}");
+    assert!(!out.contains("r-alive"), "{out}");
+}
+
+#[test]
+fn a_cut_off_run_whose_worktree_is_dirty_is_skipped_and_the_skip_is_recorded() {
+    // A machine that just rebooted is exactly where someone was mid-edit, and this is the one
+    // path that starts an agent with nobody present. A skip rather than a refusal, because one
+    // unre-enterable Run must not stop the others.
+    let box_ = sandbox("resume-all-dirty");
+    let template = a_real_record(&box_);
+    box_.stage(&template, "r-dirty", "died", GONE);
+    box_.stage(&template, "r-clean", "died", GONE);
+    let worktree = PathBuf::from(template["worktree"].as_str().expect("a worktree"));
+    fs::write(worktree.join("uncommitted.txt"), "work the human left\n").expect("dirty it");
+
+    let (out, err, code) = box_.run(&["resume", "--all"]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert!(out.contains("skipped    r-dirty"), "{out}");
+    assert!(
+        out.contains("skipped    r-clean"),
+        "both share one worktree:\n{out}"
+    );
+    let log = fs::read_to_string(box_.home.join(".grind/runs/r-dirty/supervisor.log"))
+        .expect("the skip is recorded");
+    assert!(log.contains("skipped at boot"), "{log}");
+}
+
+#[test]
+fn a_skipped_run_does_not_stop_the_others_from_re_entering() {
+    let box_ = sandbox("resume-all-partial");
+    let template = a_real_record(&box_);
+    box_.stage(&template, "r-good", "died", GONE);
+    // A record nothing can read. There is deliberately no migration read path, and a record
+    // written before this build lacks fields the base forces at construction.
+    let old = box_.home.join(".grind/runs/r-ancient");
+    fs::create_dir_all(&old).expect("a staged run directory");
+    fs::write(
+        old.join("run.json"),
+        r#"{"run_id":"r-ancient","state":"died","attempts":[]}"#,
+    )
+    .expect("stage a pre-build record");
+
+    let (out, err, code) = box_.run(&["resume", "--all"]);
+    assert_eq!(code, Some(0), "never a panic:\n{out}\n{err}");
+    assert!(out.contains("re-entered r-good"), "{out}");
+    assert!(out.contains("skipped    r-ancient"), "{out}");
+}
+
+#[test]
+fn fan_out_is_recorded_per_attempt_and_never_cumulatively() {
+    // Three Attempts of one Run, each fanning out to two subagents that both return. The Run's
+    // transcript is **one append-only file** — the session id is fixed at dispatch and every
+    // later Attempt resumes it — so reading the whole file on Attempt N counted Attempts 1..N,
+    // and `render::fanout_totals` then summed those pairs: (2,2), (4,4), (6,6) published as
+    // *12 spawned, 12 returned* for a Run that spawned six. R51 says per Attempt.
+    let box_ = sandbox("fanout-per-attempt");
+    box_.scenario(&["fanout", "fanout", "fanout", "success_done"])
+        .pr_appears_at(4);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+
+    let record = box_.record();
+    let attempts = record["attempts"].as_array().expect("attempts");
+    let fanouts: Vec<&serde_json::Value> = attempts.iter().take(3).map(|a| &a["fanout"]).collect();
+    for (n, fanout) in fanouts.iter().enumerate() {
+        assert_eq!(
+            fanout["present"],
+            serde_json::json!([2, 2]),
+            "attempt {} recorded {fanout} rather than its own two: a cumulative read would give \
+             (2,2), (4,4), (6,6)",
+            n + 1
+        );
+    }
+    // And the Handback, which sums those pairs, says six rather than twelve — as does the
+    // comment posted on the Job issue, which is where a wrong number leaves the host.
+    assert!(
+        out.contains("6 spawned, 6 returned"),
+        "the Handback:\n{out}"
+    );
+    let posted = comments_on_the_job_issue(&box_);
+    let terminal = posted.last().expect("a terminal comment");
+    assert!(terminal.contains("6 spawned, 6 returned"), "{terminal}");
+}
+
+#[test]
+fn resume_all_re_enters_nothing_on_a_host_whose_ps_cannot_answer() {
+    // The reading `resume --all` acts on. A `ps` that cannot spawn used to yield no stamp, and
+    // *no stamp* collapsed into *the supervisor is gone* — so every Run on the host read as cut
+    // off and every Run was re-entered at boot, with nobody watching. The safe direction is to
+    // decline, and to say so rather than skip in silence.
+    let box_ = sandbox("resume-all-blind-ps");
+    let template = a_real_record(&box_);
+    box_.stage(&template, "r-dispatched", "dispatched", GONE);
+    box_.stage(&template, "r-died", "died", GONE);
+    box_.ps_cannot_answer();
+
+    let (out, err, code) = box_.run(&["resume", "--all"]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    for run_id in ["r-dispatched", "r-died"] {
+        assert!(
+            !out.contains(&format!("re-entered {run_id}")),
+            "a blind reading must not re-enter {run_id}:\n{out}"
+        );
+        assert!(
+            out.contains(run_id),
+            "and the skip is reported rather than silent:\n{out}"
+        );
+    }
+    assert!(out.contains("could not be read"), "{out}");
+}
+
+#[test]
+fn the_supervisors_resume_all_spawns_outlive_it_and_it_exits_on_what_it_started() {
+    // `resume --all` reports which Runs it started and exits on that, never on any Run's
+    // verdict. The children keep going after it is gone.
+    let box_ = sandbox("resume-all-detached");
+    let template = a_real_record(&box_);
+    box_.stage(&template, "r-detached", "died", GONE);
+    box_.scenario(&["success_done"]).pr_appears_at(1);
+
+    let started = Instant::now();
+    let (out, err, code) = box_.run(&["resume", "--all"]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "it spawns and exits rather than waiting on a Run"
+    );
+    assert!(out.contains("re-entered r-detached"), "{out}");
+    assert!(
+        !out.contains("Verdict"),
+        "it never reports what a Run concluded:\n{out}"
+    );
+
+    // The child is still alive after its parent is gone, and finishes the Run.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while box_.state_of("r-detached") != "completed" {
+        assert!(
+            Instant::now() < deadline,
+            "the spawned supervisor must outlive `resume --all`; it left the Run at {}",
+            box_.state_of("r-detached")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn resume_all_is_not_parsed_as_a_run_id_named_all() {
+    let box_ = sandbox("resume-all-arm");
+    let (out, err, code) = box_.run(&["resume", "--all"]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert!(
+        !out.contains("no Run `--all`") && !err.contains("--all"),
+        "slice patterns match by position, so the generic arm would bind it:\n{out}\n{err}"
+    );
+    assert!(out.contains("no Run on this host was cut off"), "{out}");
 }
 
 // --- the exit code reports observability, never health ----------------------------------------
@@ -728,6 +1129,42 @@ fn resume_on_an_exhausted_run_prints_the_handback_and_starts_nothing() {
     );
 }
 
+#[test]
+fn resume_at_the_attempt_budget_starts_nothing_whatever_the_state_word_says() {
+    // `Uncorroborated` and `Unobserved` are deliberately resumable: neither stopped because the
+    // budget ran out. But a Run can land one *at* 8 of 8 — and `supervise` runs
+    // `run_one_attempt` before it ever consults `policy::next`, so a guard keyed on the state
+    // word walks that Run into a ninth attempt with no policy check standing in front of it,
+    // stops in the same state, and does it again on the next resume. A recorded Attempt in this
+    // project costs $7–$37.
+    let box_ = sandbox("resume-at-budget");
+    let run_id = a_run_that_did_not_finish(&box_);
+    let attempts_before = box_.record()["attempts"]
+        .as_array()
+        .expect("attempts")
+        .len();
+    assert_eq!(attempts_before, 8);
+
+    for state in ["uncorroborated", "unobserved"] {
+        box_.state_becomes(&run_id, state);
+        let (out, err, code) = box_.run(&["resume", &run_id]);
+        assert_eq!(code, Some(0), "{out}\n{err}");
+        assert!(out.contains(&format!("run already {state}")), "{out}");
+        assert!(
+            out.contains("run state"),
+            "the Handback, not a re-entry:\n{out}"
+        );
+        assert_eq!(
+            box_.record()["attempts"]
+                .as_array()
+                .expect("attempts")
+                .len(),
+            attempts_before,
+            "a Run at 8 of 8 must not spend a ninth attempt because its state word is resumable"
+        );
+    }
+}
+
 // --- the sandbox's own guarantees ------------------------------------------------------------
 
 #[test]
@@ -789,6 +1226,306 @@ fn a_dirty_worktree_refuses_and_nothing_is_dispatched_onto_it() {
     assert!(
         !box_.home.join(".grind/runs").exists(),
         "nothing is dispatched onto a dirty worktree"
+    );
+}
+
+#[test]
+fn a_complete_run_issues_no_gh_issue_edit_at_all() {
+    // Grind adds and never classifies (ADR-0012). `ready-for-agent` is one of the five canonical
+    // triage roles, so removing it erased a triage fact to record a queue fact.
+    let box_ = sandbox("no-issue-edit");
+    box_.scenario(&["success_done"]).pr_appears_at(1);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+
+    let calls = box_.gh_calls();
+    assert!(!calls.is_empty(), "the fake saw `gh` at all");
+    for call in &calls {
+        assert_ne!(
+            call.first()
+                .map(String::as_str)
+                .zip(call.get(1).map(String::as_str)),
+            Some(("issue", "edit")),
+            "no path applies or removes a label: {call:?}"
+        );
+        for classifying in [
+            "--add-label",
+            "--remove-label",
+            "--add-assignee",
+            "--remove-assignee",
+            "--milestone",
+            "--project",
+        ] {
+            assert!(
+                !call.iter().any(|a| a == classifying),
+                "`{classifying}` reached `gh`: {call:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_dispatch_comment_still_carries_the_run_id_and_the_hostname() {
+    // Half of the only off-host surface leg 1 has, kept byte-identical.
+    let box_ = sandbox("dispatch-comment");
+    box_.scenario(&["success_done"]).pr_appears_at(1);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+
+    let record = box_.record();
+    let run_id = record["run_id"].as_str().expect("a run id").to_string();
+    let host = record["hostname"].as_str().expect("a hostname").to_string();
+    let posted = comments_on_the_job_issue(&box_);
+    let body = posted.first().expect("the dispatch comment is the first");
+    assert!(body.contains(&run_id), "{body}");
+    assert!(body.contains(&host), "{body}");
+    assert!(body.contains("Dispatched as Run"), "{body}");
+    assert!(body.contains("~/.grind/runs/"), "{body}");
+}
+
+#[test]
+fn a_completed_run_leaves_a_supervisor_log_beside_its_record() {
+    // What the supervisor said is the only account of a Run between the dispatch comment and a
+    // terminal state, and it died with the terminal it was said to.
+    let box_ = sandbox("supervisor-log");
+    box_.scenario(&["success_done"]).pr_appears_at(1);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+
+    let log = fs::read_to_string(box_.run_dir().join("supervisor.log")).expect("a supervisor log");
+    assert!(log.contains("attempt 1 (dispatch)"), "{log}");
+    assert!(log.contains("plugin pinned to"), "{log}");
+    for said in log.lines() {
+        assert!(
+            out.contains(said),
+            "the log carries the lines that reached stdout; `{said}` did not:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn the_supervisor_log_is_appended_across_a_resume_rather_than_truncated() {
+    let box_ = sandbox("supervisor-log-append");
+    box_.scenario(&["denied", "denied", "denied", "success_done"])
+        .pr_appears_at(4);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    let log = box_.run_dir().join("supervisor.log");
+    let before = fs::read_to_string(&log).expect("a supervisor log");
+
+    let run_id = box_.record()["run_id"]
+        .as_str()
+        .expect("a run id")
+        .to_string();
+    let (out, err, code) = box_.run(&["resume", &run_id]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    let after = fs::read_to_string(&log).expect("a supervisor log");
+    assert!(
+        after.starts_with(&before),
+        "a resume appends rather than truncating:\n{after}"
+    );
+    assert!(after.len() > before.len(), "and it wrote something new");
+}
+
+#[test]
+fn a_run_whose_log_cannot_be_written_still_exits_on_its_real_verdict() {
+    // A log that cannot be written is not worth abandoning a Run over.
+    let box_ = sandbox("supervisor-log-unwritable");
+    box_.scenario(&["success_done"]).pr_appears_at(1);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+
+    // Replace the log with a directory, which nothing can append a line to, and re-enter.
+    let log = box_.run_dir().join("supervisor.log");
+    fs::remove_file(&log).expect("drop the log");
+    fs::create_dir(&log).expect("put something unwritable in its place");
+    let run_id = box_.record()["run_id"]
+        .as_str()
+        .expect("a run id")
+        .to_string();
+    let (out, err, code) = box_.run(&["resume", &run_id]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert!(out.contains("run already completed"), "{out}");
+}
+
+#[test]
+fn a_completed_run_posts_exactly_one_terminal_comment_on_the_job_issue() {
+    // Everything only the supervisor knows survives the host. Between the dispatch comment and
+    // nothing, the human's only instrument was SSH.
+    let box_ = sandbox("terminal-comment");
+    box_.scenario(&["success_done"]).pr_appears_at(1);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+
+    let posted = comments_on_the_job_issue(&box_);
+    assert_eq!(
+        posted.len(),
+        2,
+        "the dispatch comment and one more: {posted:?}"
+    );
+    let terminal = &posted[1];
+    let record = box_.record();
+    assert!(
+        terminal.contains(record["run_id"].as_str().expect("a run id")),
+        "{terminal}"
+    );
+    assert!(
+        terminal.contains(record["hostname"].as_str().expect("a host")),
+        "{terminal}"
+    );
+    assert!(terminal.contains("completed"), "{terminal}");
+    assert!(terminal.contains("| attempts |"), "{terminal}");
+    assert!(terminal.contains("| spend |"), "{terminal}");
+    assert!(terminal.contains("| run state |"), "{terminal}");
+    assert!(terminal.contains("verify contract present"), "{terminal}");
+    assert!(terminal.contains("verify contract missing"), "{terminal}");
+}
+
+#[test]
+fn a_blocked_run_resumed_to_completion_posts_two_terminal_comments() {
+    // Append, never edit. A Run that reaches a terminal state twice leaves two comments, and
+    // two comments are the honest account.
+    let box_ = sandbox("two-terminal-comments");
+    box_.scenario(&["denied", "denied", "denied", "success_done"])
+        .pr_appears_at(4);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert_eq!(box_.record()["state"], "blocked");
+    assert_eq!(comments_on_the_job_issue(&box_).len(), 2);
+
+    let run_id = box_.record()["run_id"]
+        .as_str()
+        .expect("a run id")
+        .to_string();
+    let (out, err, code) = box_.run(&["resume", &run_id]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert_eq!(box_.record()["state"], "completed");
+    let posted = comments_on_the_job_issue(&box_);
+    assert_eq!(posted.len(), 3, "dispatch, blocked, completed: {posted:?}");
+    assert!(posted[2].contains("completed"), "{}", posted[2]);
+}
+
+#[test]
+fn a_gh_that_fails_on_issue_comment_still_exits_on_the_runs_real_verdict() {
+    // Best-effort. A Run that finished must not become `unobserved` because GitHub was down.
+    let box_ = sandbox("comment-fails");
+    box_.scenario(&["success_done"])
+        .pr_appears_at(1)
+        .gh_cannot_comment();
+
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "the Run's real verdict:\n{out}\n{err}");
+    assert_eq!(box_.record()["state"], "completed");
+    assert!(
+        out.contains("could not post the terminal comment"),
+        "logged, never raised:\n{out}"
+    );
+}
+
+#[test]
+fn a_job_whose_anchor_artifact_is_not_on_disk_refuses() {
+    // A Run handed a path to nothing invents requirements, satisfies them, and opens a green PR.
+    let box_ = sandbox("anchor-absent");
+    box_.scenario(&["success_done"])
+        .anchor_becomes("docs/plans/a-plan-that-was-never-written.md");
+
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(
+        code,
+        Some(2),
+        "a refusal is incoherent input:\n{out}\n{err}"
+    );
+    assert!(
+        err.contains("docs/plans/a-plan-that-was-never-written.md"),
+        "the refusal names the path:\n{err}"
+    );
+    let lowered = err.to_lowercase();
+    for quality in ["bad", "invalid", "wrong", "reject"] {
+        assert!(!lowered.contains(quality), "no quality word:\n{err}");
+    }
+    assert!(!box_.home.join(".grind/runs").exists());
+}
+
+#[test]
+fn an_anchor_artifact_that_is_present_but_empty_proceeds() {
+    // Presence, never shape. An admission check must not arrive through the back door of an
+    // admission rule, so nothing here reads R-IDs or a readiness field.
+    let box_ = sandbox("anchor-empty");
+    let clone = box_.clone_path();
+    git(&clone, &["checkout", "-q", BRANCH]);
+    fs::write(clone.join("docs/plans/empty.md"), "").expect("an empty Anchor");
+    git(&clone, &["add", "-A"]);
+    git(
+        &clone,
+        &["commit", "-q", "-m", "an Anchor with nothing in it"],
+    );
+    git(&clone, &["checkout", "-q", "main"]);
+
+    box_.scenario(&["success_done"])
+        .anchor_becomes("docs/plans/empty.md")
+        .pr_appears_at(1);
+
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert_eq!(box_.record()["state"], "completed");
+}
+
+#[test]
+fn a_worktree_behind_the_handoff_sha_refuses_at_second_zero() {
+    // Run 2's opening condition. The string comparison this replaces printed the same note here
+    // as it printed on a worktree that was harmlessly ahead, and the Run proceeded — the signer
+    // outage, the denied force-push and five hours of `pr: null` are all downstream of it.
+    let box_ = sandbox("behind-the-handoff");
+    box_.scenario(&["success_done"]);
+
+    // A commit the branch does not have, reachable as an object and nothing else.
+    let clone = box_.clone_path();
+    git(&clone, &["checkout", "-q", BRANCH]);
+    fs::write(clone.join("docs/plans/later.md"), "# the human moved on\n").expect("a later plan");
+    git(&clone, &["add", "-A"]);
+    git(&clone, &["commit", "-q", "-m", "the human moved on"]);
+    let ahead = git(&clone, &["rev-parse", "HEAD"]);
+    git(&clone, &["reset", "--hard", "-q", "HEAD~1"]);
+    git(&clone, &["checkout", "-q", "main"]);
+    box_.handoff_becomes(&ahead);
+
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(
+        code,
+        Some(2),
+        "a refusal is incoherent input:\n{out}\n{err}"
+    );
+    assert!(
+        err.contains("fast-forward"),
+        "the one refusal that names its repair:\n{err}"
+    );
+    assert!(
+        !box_.home.join(".grind/runs").exists(),
+        "nothing is dispatched onto a worktree that does not contain the Handoff SHA"
+    );
+}
+
+#[test]
+fn a_handoff_sha_off_this_worktrees_history_refuses() {
+    let box_ = sandbox("handoff-elsewhere");
+    box_.scenario(&["success_done"]);
+
+    // An unrelated root commit: neither an ancestor nor a descendant of the branch.
+    let clone = box_.clone_path();
+    git(&clone, &["checkout", "-q", "--orphan", "elsewhere"]);
+    fs::write(clone.join("README.md"), "another history entirely\n").expect("seed it");
+    git(&clone, &["add", "-A"]);
+    git(&clone, &["commit", "-q", "-m", "elsewhere"]);
+    let elsewhere = git(&clone, &["rev-parse", "HEAD"]);
+    git(&clone, &["checkout", "-q", "main"]);
+    box_.handoff_becomes(&elsewhere);
+
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(2), "{out}\n{err}");
+    assert!(err.contains("not in the history"), "{err}");
+    assert!(
+        !err.contains("fast-forward"),
+        "there is nothing to fast-forward to:\n{err}"
     );
 }
 

@@ -35,6 +35,7 @@ a `String` — so every decision is testable from literals with no network.
 ```
 grind run <issue>       dispatch a Job now (issue number or URL)
 grind resume <run-id>   re-enter a Run that died
+grind resume --all      re-enter every Run on this host a restart cut off
 grind status [run-id]   roster when bare; one Run's live view when named
 grind doctor            check the provisioned-host list
 grind --version         which copy of the binary is this
@@ -79,9 +80,28 @@ change carries a safety property, not for coverage's sake.
   convention, and aliasing to dodge it is intent.
 - **Grind never gates** (ADR-0003). Verdict language describes what happened, never quality.
   A completed Run means the pipeline finished, not that the code is good. Never add
-  something that blocks a PR from existing on the strength of a finding. Two shapes carry
-  this in the base and are prohibited (ADR-0006): a verdict variant meaning *rejected*, and
-  a summary boolean on the verify contract — `if !vc.ok { return }` is a gate one line away.
+  something that blocks a PR from existing on the strength of a finding. ADR-0006's prohibited
+  shapes are now **seven**, and the two this build was most tempted by are both in it: a
+  **fan-out health summary** over the spawned/returned pair, and a **base-drift summary** —
+  *`main` moved, so don't open the PR* reads as caution and is the quality judgement ADR-0003
+  refuses. The older two still bite hardest: a verdict variant meaning *rejected*, and a summary
+  boolean on the verify contract, where `if !vc.ok { return }` is a gate one line away.
+- **A Wait never spends the attempt budget, and is keyed on work done.** An Attempt that
+  parsed, cost nothing and took at most one turn did no work (`Attempt::is_wait`). The
+  predicate never reads `rate_limited` — keying on cause is how six of Run 2's eight Attempts
+  came to spend the same budget as the three that built twelve commits. **`parse_ok == false` is
+  never a Wait**, and that clause is load-bearing: a crash leaves cost and turns both absent, so
+  reading absence as *did no work* makes every crash loop free and endless. A run of Waits is
+  bounded by `CONSECUTIVE_WAITS`, counted off the persisted list so a reboot cannot reset it.
+- **`Blocked` is a supervisor state and a policy stop, never a `Verdict` variant.** ADR-0006
+  prohibits `Verdict::{Rejected, Blocked, Failed}` by name because those words judge the *work*;
+  a Blocker is a fact about the *world*, in the same family as `RateLimited`. Refusing to build
+  it at all reads the prohibition too widely — adding it to the verdict type is the forbidden
+  shape.
+- **Grind writes comments on the Job issue and nothing else** (ADR-0012). No label, assignee,
+  project or milestone, on any repo — `world`'s stated invariant is *one place, two writes*, and
+  both writes are comments. `QUEUE_LABEL` erased a triage fact to record a queue fact.
+  `tests/topology.rs` carries the absence of every classifying flag.
 - **Grind is a scheduler, not a pipeline** (ADR-0001). Everything between plan and open PR
   belongs to `lfg`. Don't reimplement stages it already runs.
 - **The plugin version is pinned per Job and frozen per Run** (ADR-0002 as amended by #42 and
@@ -109,16 +129,44 @@ change carries a safety property, not for coverage's sake.
   Bash(git -C*)
   Bash(git switch main*)
   Bash(gh api*merge*)
+  Bash(git push*--force*)
+  Bash(git push*--delete*)
+  Bash(git push*:*)
+  Bash(git push* -f)
+  Bash(git push* -f *)
+  Bash(git reset*--hard*)
+  Bash(git branch* -D*)
+  Bash(git branch*--delete*)
+  Bash(git*--force-with-lease*)
+  Bash(git -c*)
+  Bash(git*update-ref*)
   ```
 
-  The last five close spellings the first seven miss, and they rely on two documented matcher
-  facts: a `*` may appear anywhere in the pattern, not only at the end, and a rule is matched
-  against each subcommand after splitting on `&&`, `;` and `|`. Two are deliberately broad.
-  `Bash(git -C*)` refuses **every** `git -C`, because a Run works inside its own worktree via
-  cwd, so `-C` pointing anywhere is outside the shape it should have — and enumerating `-C` ×
-  each forbidden verb is whack-a-mole. `Bash(git push*+*)` catches the `+refspec` force and will
-  also refuse a push to a branch with a literal `+` in its name, which is an acceptable false
-  refusal for a barrier of this kind. Widening the list is safe and welcome; narrowing it is not.
+  They rely on two documented matcher facts: a `*` may appear anywhere in the pattern, not only
+  at the end, and a rule is matched against each subcommand after splitting on `&&`, `;` and `|`.
+
+  **The first twelve each anchor their flag immediately after the verb, and git accepts the flag
+  anywhere.** `git push origin --force`, `git push origin main --force`,
+  `git push -u origin main --force`, `git push origin -f`, `git push origin --force-with-lease`,
+  `git push origin --delete feat/x`, `git push origin :feat/x`,
+  `git branch --delete --force feat/x`, `git reset HEAD~3 --hard`, `git branch feat/x -D`,
+  `git -c x rebase` and `git update-ref -d refs/heads/x` were **all allowed** — and those are the
+  forms people and agents most often type. The eleven position-independent globs below the
+  twelve close them.
+
+  Four are deliberately broad. `Bash(git -C*)` and `Bash(git -c*)` refuse **every** `git -C` and
+  `git -c`, because a Run works inside its own worktree via cwd, so a prefix pointing anywhere is
+  outside the shape it should have — and enumerating the prefix × each forbidden verb is
+  whack-a-mole. `Bash(git push*+*)` catches the `+refspec` force and will also refuse a push to a
+  branch with a literal `+` in its name. `Bash(git push*:*)` catches the `:branch` delete refspec
+  and will also refuse a push naming an explicit `user@host:path` remote, which is not the shape
+  a Run pushes in. Both are acceptable false refusals for a barrier of this kind.
+
+  `-f` is spelled ` -f` and ` -f ` rather than `-f`, because `-f` as a bare substring appears
+  inside ordinary branch names and the broad glob would refuse the push. `-D` is not: it is
+  uppercase, so `git branch -d feat/x` — the safe delete — stays allowed.
+
+  Widening the list is safe and welcome; narrowing it is not.
 
   Denials are inherited by subagents and survive `bypassPermissions`. Don't loosen the list to
   make a Run go through — and note that **nothing sits behind it**: no credential can withhold
@@ -139,10 +187,11 @@ change carries a safety property, not for coverage's sake.
 - **`skills/enqueue/` ships a skill, not code, and its table is a contract with `src/job.rs`.**
   Enqueue is invoked from a session in the **target** repo, so it is symlinked into
   `~/.claude/skills/` to be loadable at all; it lives here because the Job table it writes is what
-  `job::from_issue_json` reads back, and **nothing tests that seam** — no test spans a skill and a
-  parser. One repo means one diff, which is the whole of the mitigation. Change either half and
-  check the other. It is not a `docs/provisioned-host.md` item: a host needs `grind run`, never
-  Enqueue.
+  `job::from_issue_json` reads back. **`tests/enqueue_template.rs` spans that seam**: it parses
+  the template's own example table through the real parser, so a required row renamed on either
+  side turns `just verify` red. It catches a rename and never a meaning that drifted, so *change
+  either half and check the other* still holds. It is not a `docs/provisioned-host.md` item: a
+  host needs `grind run`, never Enqueue.
 
 ## Agent skills
 

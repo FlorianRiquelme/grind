@@ -1,0 +1,45 @@
+; A boot-time one-shot: fire once, spawn one supervisor per cut-off Run, exit. Nothing is
+; resident and nothing watches anything (ADR-0011).
+;
+; Install as a **user** unit, so `$HOME` resolves to the dispatching user's. **Three steps, not
+; two** — the third is what makes this a boot-time one-shot at all:
+;
+;   cp dist/systemd/grind-resume-all.service ~/.config/systemd/user/
+;   systemctl --user enable grind-resume-all.service
+;   loginctl enable-linger "$(id -un)"
+;
+; `WantedBy=default.target` on a `--user` unit fires when that user's systemd instance starts —
+; and on a headless box, which is the deployment this unit exists for, that instance does not
+; start at boot. It starts at first login and stops at last logout. `loginctl enable-linger`
+; is what makes it start at boot and stay up, and without it this file is enabled, correct, and
+; never runs.
+;
+; `systemctl --user is-enabled` returns enabled purely from the symlink, with or without linger,
+; so `grind doctor` asks both halves in one command. Skipping step three is otherwise a silent
+; pass — the same shape the *loaded, not merely present* check was added to prevent, one layer
+; down.
+;
+; `$HOME` is the only variable Grind reads and there is no override (ADR-0008), so a unit with a
+; different `User=` resolves a different `~/.grind` and re-enters nothing. That is the point.
+
+[Unit]
+Description=Re-enter every Grind Run this host cut off
+Documentation=https://github.com/FlorianRiquelme/grind
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/grind resume --all
+
+; **The one piece of real machinery in this file, and getting it wrong is silent.**
+;
+; A `Type=oneshot` service takes its cgroup with it when `ExecStart` exits. `grind resume --all`
+; spawns one detached supervisor per cut-off Run and exits immediately, so the default would kill
+; every Run seconds after boot with nothing saying so. `KillMode=process` limits systemd's stop
+; action to the main process and leaves the supervisors it spawned alone.
+KillMode=process
+RemainAfterExit=no
+
+[Install]
+WantedBy=default.target

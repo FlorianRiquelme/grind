@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  A one-shot: fire once, spawn one supervisor per cut-off Run, exit. Nothing is resident and
+  nothing watches anything (ADR-0011).
+
+  **It fires at login, not at boot, and that is as early as darwin goes.** `launchctl bootstrap
+  gui/$(id -u)` puts the job in the GUI domain, so `RunAtLoad` fires when that domain loads. A
+  restarted Mac therefore sits with its cut-off Runs un-re-entered until a human logs in. The
+  linux unit beside this one does reach boot, with `loginctl enable-linger`; darwin has no
+  equivalent shape:
+
+    - A LaunchDaemon fires before login, but it resolves root's `$HOME` and so a different
+      `~/.grind` — and `$HOME` is the only variable Grind reads, with no override (ADR-0008).
+    - Setting `HOME` on a LaunchDaemon does not rescue it either. On a FileVault Mac — the
+      default — `/Users/<user>` is not decrypted until someone unlocks at the login window, so
+      `~/.grind/runs/` does not exist yet to be read. There is nothing to re-enter from.
+
+  So *survives a restart* here means **survives a restart plus a login**, and `grind doctor` says
+  so in its satisfied text: `launchctl print gui/$(id -u)/…` can only run from inside a
+  logged-in GUI session, which is the very condition it would need to tell the two apart, so it
+  structurally cannot check this and does not pretend to.
+
+  Install as a **user** agent, so `$HOME` resolves to the dispatching user's:
+
+      cp dist/launchd/com.grind.resume-all.plist ~/Library/LaunchAgents/
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.grind.resume-all.plist
+
+  A plist copied into place and never bootstrapped is not loaded, and it fails one reboot later
+  with a Run stranded — which is why `grind doctor` checks for *loaded* rather than *present*.
+
+  `AbandonProcessGroup` is the load-bearing key. Without it launchd reaps the whole process group
+  when the job exits, and this job's entire purpose is to spawn detached supervisors and exit —
+  so every re-entered Run would die seconds after login, silently. It is the launchd half of the
+  systemd unit's `KillMode=process`.
+
+  **No `StandardOutPath` / `StandardErrorPath`.** They held `/tmp/grind-resume-all.log`, and
+  `/tmp` on macOS is mode 1777: launchd opens those keys with `O_CREAT|O_APPEND` as the
+  dispatching user and follows symlinks, so another local account could pre-plant one and
+  redirect the append into a file the grind user owns. The certain half was disclosure — the file
+  is world-readable and named every cut-off run id and every skipped Run's full worktree path.
+  Nothing else in the repo places state outside `~/.grind/` (ADR-0008), and nothing is lost:
+  every line this job prints is also appended to the relevant
+  `~/.grind/runs/<run-id>/supervisor.log`, and `launchctl print gui/$(id -u)/com.grind.resume-all`
+  reports its exit status. The systemd unit has never had log keys either.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.grind.resume-all</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/grind</string>
+    <string>resume</string>
+    <string>--all</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>AbandonProcessGroup</key>
+  <true/>
+</dict>
+</plist>

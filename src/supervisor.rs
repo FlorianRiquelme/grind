@@ -13,17 +13,12 @@
 use crate::attempt::{self, Attempt, Conditions, DENIED_TOOLS, Invocation, Mode};
 use crate::decide::{self, Verdict};
 use crate::job::{self, Job, Refusal};
-use crate::observe::{Observation, Observed, Outcome as ItemOutcome};
+use crate::observe::{Observation, Observed, Outcome as ItemOutcome, Reason};
 use crate::policy::{self, Budget, Next, Stop};
 use crate::world::{self, LockHandle, TryLock};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-/// Dispatch dequeues by removing this label. The queue is a label query over GitHub issues
-/// rather than a thing held anywhere, so removing it is what stops the queue view returning a
-/// Job that is already running.
-pub const QUEUE_LABEL: &str = "ready-for-agent";
 
 /// Compiled constants, snapshotted into the record at dispatch. There is no environment
 /// override (ADR-0008), so the record is what makes *attempt N of M with M from the record*
@@ -37,9 +32,18 @@ pub const REOBSERVATIONS: usize = 3;
 /// time instead. Not per-Job and not recorded: like `REOBSERVATIONS`, it is Grind's own policy
 /// knob rather than a fact the record needs to freeze.
 pub const REOBSERVE_PAUSE_SECONDS: u64 = 15;
+/// How many Waits in a row before *nothing is happening forever* becomes terminal. A Wait
+/// spends no attempt budget, so without this a permanently-walled Run never stops. Twelve is
+/// six hours at the recorded limit sleep; Run 2's real three-hour wall produced five
+/// consecutive Waits and then cleared, so the bound has to sit well above it.
+pub const CONSECUTIVE_WAITS: usize = 12;
 
-/// **Seven states, and none of them is `running`.** A SIGKILLed supervisor would sit in
+/// **Eight states, and none of them is `running`.** A SIGKILLed supervisor would sit in
 /// `running` forever, which is why the roster observes liveness for itself instead.
+///
+/// `Blocked` is the eighth, and it is a supervisor state rather than a `Verdict` variant for
+/// the reason ADR-0006 gives: a Blocker is a fact about the world, in the same family as
+/// `RateLimited`, and not a judgement about the work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum State {
@@ -50,6 +54,7 @@ enum State {
     Uncorroborated,
     Unobserved,
     Exhausted,
+    Blocked,
 }
 
 impl State {
@@ -62,6 +67,7 @@ impl State {
             State::Uncorroborated => "uncorroborated",
             State::Unobserved => "unobserved",
             State::Exhausted => "exhausted",
+            State::Blocked => "blocked",
         }
     }
 }
@@ -239,9 +245,55 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
             dirty.stdout.trim()
         )));
     }
+    // Four impure calls and no branching in any of them; `job::reachability` is the whole of
+    // the decision. The fetch is network, so it sits outside the *presence only, local, free,
+    // no network* comment that scopes the host-readiness check above — and it is what makes the
+    // same Job produce the same answer on a laptop and on a box.
+    let fetched = world::run(&words(&["git", "fetch"]), Some(&repo_path));
     let head = world::run(&words(&["git", "rev-parse", "HEAD"]), Some(&worktree));
-    if let Some(note) = job::head_note(&head.stdout, &job.handoff_sha) {
-        world::print_line(&format!("  note: {note}"));
+    let contains = world::run(
+        &[
+            "git".to_string(),
+            "merge-base".to_string(),
+            "--is-ancestor".to_string(),
+            job.handoff_sha.clone(),
+            "HEAD".to_string(),
+        ],
+        Some(&worktree),
+    );
+    let reverse = world::run(
+        &[
+            "git".to_string(),
+            "merge-base".to_string(),
+            "--is-ancestor".to_string(),
+            "HEAD".to_string(),
+            job.handoff_sha.clone(),
+        ],
+        Some(&worktree),
+    );
+    match job::reachability(
+        fetched.code == Some(0),
+        contains.code,
+        reverse.code == Some(0),
+        &head.stdout,
+        &job.handoff_sha,
+    ) {
+        job::Reachability::Proceed => {}
+        job::Reachability::Note(note) => world::print_line(&format!("  note: {note}")),
+        job::Reachability::Refuse(refusal) => return Err(refusal),
+    }
+
+    // A Run handed a path to nothing cannot invent requirements, satisfy them, and open a green
+    // PR. Presence only: the Anchor's **shape** is never checked — no R-IDs, no readiness field
+    // — because an admission check must not arrive through the back door of an admission rule.
+    // It cannot live in `refuse_unless_host_ready`, which runs before the worktree exists.
+    if !world::exists(&worktree.join(&job.anchor)) {
+        return Err(Refusal::saying(format!(
+            "the Anchor artifact `{}` is not in the worktree at {}, so nothing is dispatched \
+             onto it",
+            job.anchor,
+            worktree.display()
+        )));
     }
 
     let run_id = format!(
@@ -266,7 +318,7 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         attempt_budget: ATTEMPT_BUDGET,
         limit_sleep_seconds: LIMIT_SLEEP_SECONDS,
         supervisor_pid: pid,
-        supervisor_identity: world::process_start_stamp(pid),
+        supervisor_identity: recorded_identity(pid),
         attempts: Vec::new(),
         job,
     };
@@ -274,20 +326,37 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
     world::create_dir_all(&run_dir).map_err(Refusal::saying)?;
     record.save(&record_path(&run_dir))?;
 
-    dequeue_and_point_at_this_host(&record);
+    point_at_this_host(&record);
 
-    world::print_line(&format!("  plugin pinned to {}", record.plugin_dir));
-    world::print_line(&format!(
-        "  model {}",
-        record
-            .model
-            .as_deref()
-            .unwrap_or("(session default — unpinned)")
-    ));
-    world::print_line(&format!("  claude {}", record.claude_bin));
-    world::print_line(&format!("  run {run_id}"));
+    say(
+        &run_dir,
+        &format!("  plugin pinned to {}", record.plugin_dir),
+    );
+    say(
+        &run_dir,
+        &format!(
+            "  model {}",
+            record
+                .model
+                .as_deref()
+                .unwrap_or("(session default — unpinned)")
+        ),
+    );
+    say(&run_dir, &format!("  claude {}", record.claude_bin));
+    say(&run_dir, &format!("  run {run_id}"));
 
     supervise(&mut record, &run_dir)
+}
+
+/// The identity to record beside a pid. `Absent` and `Unobservable` are the same fact at *this*
+/// end — nothing was read that a later reading could be compared against — and `supervisor_here`
+/// already says so out loud when it meets the `None`. Written out rather than collapsed by an
+/// `ok()`, because the collapse at the *reading* end is what #14 was.
+fn recorded_identity(pid: u32) -> Option<String> {
+    match crate::observe::process_start_stamp(&world::ps_start_stamp(pid)) {
+        Observed::Present(stamp) => Some(stamp),
+        Observed::Absent | Observed::Unobservable(_) => None,
+    }
 }
 
 /// Re-enter a Run that died, **reading every condition from the record** rather than the
@@ -316,7 +385,16 @@ pub fn resume(run_id: &str) -> Result<Outcome, Refusal> {
     // `policy`'s new reobserve pause exists for may simply have cleared since; refusing to
     // resume it would remove the only recovery path for exactly the fault this fix's other half
     // gives more time to clear.
-    if matches!(record.state, State::Completed | State::Exhausted) {
+    //
+    // **Keyed on the number, not on the state word.** A Run whose last working Attempt landed
+    // `Uncorroborated` or `Unobserved` at 8 of 8 stops in a resumable state at its budget, and
+    // the state-word guard waves it straight into `run_one_attempt` — with no `policy` check
+    // between `resume` and the child, and a recorded Attempt in this project costing $7–$37.
+    // Each further resume spends another and stops in the same state. Refusing on the count
+    // keeps the case the comment above argues for resumable, and refuses only the overspend.
+    if matches!(record.state, State::Completed | State::Exhausted)
+        || attempt::working(record.attempts()) >= record.attempt_budget
+    {
         return Ok(Outcome {
             run_id: record.run_id.clone(),
             state: record.state.as_str(),
@@ -331,10 +409,122 @@ pub fn resume(run_id: &str) -> Result<Outcome, Refusal> {
 
     let pid = world::pid();
     record.supervisor_pid = pid;
-    record.supervisor_identity = world::process_start_stamp(pid);
+    record.supervisor_identity = recorded_identity(pid);
     record.save(&path)?;
 
     supervise(&mut record, &run_dir)
+}
+
+/// What `resume --all` started, and what it declined to. **Never what any Run concluded**:
+/// N detached children have neither a single outcome nor a single verdict-derived exit code,
+/// and inventing one would be a summary over N Runs.
+#[derive(Debug, Default)]
+pub struct Reentry {
+    pub started: Vec<String>,
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Re-enter every Run on this host that a restart **cut off**.
+///
+/// *Cut off* is `Dispatched`, `RateLimited` or `Died` **with a stale supervisor**. Liveness
+/// needs nothing new: after a reboot every recorded pid is stale by construction, so the
+/// existing process-identity check answers it, and the edge — a fast reboot plus a pid collision
+/// plus a colliding start stamp — fails toward *declining to re-enter*, which is the safe
+/// direction.
+///
+/// **The stopped are never re-entered**: `Uncorroborated`, `Unobserved` and `Blocked` are
+/// deliberate decisions, and overriding one at the moment nobody is watching is the failure this
+/// path is most able to cause. `Unobserved` is the arguable one and is excluded on purpose —
+/// re-entering it means a blind Run mutating a branch.
+///
+/// **Concurrent, never serial** — one detached child per kept Run, each taking its own dispatch
+/// lock, so genuinely independent Runs proceed in parallel and a second child on one branch gets
+/// the existing `WouldBlock` refusal for free. Serial re-entry would be ordering, and ordering is
+/// the human's act.
+pub fn resume_all() -> Result<Reentry, Refusal> {
+    let home = world::home().ok_or_else(|| Refusal::saying("$HOME is unset"))?;
+    let exe = world::current_exe()
+        .ok_or_else(|| Refusal::saying("could not find the `grind` binary to re-enter with"))?;
+    let mut report = Reentry::default();
+
+    for run_dir in world::list_dir(&job::runs_dir(&home)) {
+        let Some(run_id) = run_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Ok(record) = RunRecord::load(&record_path(&run_dir)) else {
+            // A record written before this build lacks fields the base now forces, and there is
+            // deliberately no migration read path. Skipping is the only honest answer.
+            let why = "its record could not be read".to_string();
+            say(&run_dir, &format!("  skipped at boot: {why}"));
+            report.skipped.push((run_id.to_string(), why));
+            continue;
+        };
+        if !matches!(
+            record.state,
+            State::Dispatched | State::RateLimited | State::Died
+        ) {
+            continue;
+        }
+        let supervisor = crate::view::supervisor_here(
+            record.supervisor_identity.as_deref(),
+            &crate::observe::process_start_stamp(&world::ps_start_stamp(record.supervisor_pid)),
+        );
+        match supervisor {
+            // The one reading that means *a restart cut this Run off*.
+            Observed::Present(false) => {}
+            // Still running under the recorded identity: not cut off, and not this path's
+            // business.
+            Observed::Present(true) => continue,
+            // **Could not tell.** `ps -p <pid> -o lstart=` is a procps/BSD spelling busybox does
+            // not implement, and this is the one path that *acts* on the reading rather than
+            // printing it. Skipping is the safe direction, and it is reported rather than
+            // silent: a host where every reading is blind would otherwise re-enter nothing and
+            // say nothing about why.
+            other => {
+                let why = format!(
+                    "whether its supervisor is still running could not be read ({})",
+                    other
+                        .reason()
+                        .map(|r| r.to_string())
+                        .unwrap_or_else(|| "no reason".to_string())
+                );
+                say(&run_dir, &format!("  skipped at boot: {why}"));
+                report.skipped.push((run_id.to_string(), why));
+                continue;
+            }
+        }
+        // `resume` runs no precondition checks and the new refusals live in `dispatch`, so boot
+        // re-entry inherits none of them. A machine that just rebooted is exactly where someone
+        // was mid-edit, and this is the one path that starts an agent with nobody present.
+        // A **skip** rather than a refusal, because one unre-enterable Run must not stop the
+        // others.
+        let worktree = PathBuf::from(&record.worktree);
+        let dirty = world::run(&words(&["git", "status", "--porcelain"]), Some(&worktree));
+        if dirty.code != Some(0) || job::is_dirty(&dirty.stdout) {
+            let why = format!(
+                "its worktree at {} is dirty or unreadable",
+                worktree.display()
+            );
+            say(&run_dir, &format!("  skipped at boot: {why}"));
+            report.skipped.push((run_id.to_string(), why));
+            continue;
+        }
+        match world::spawn_detached(&[
+            exe.display().to_string(),
+            "resume".to_string(),
+            run_id.to_string(),
+        ]) {
+            Ok(_) => {
+                say(&run_dir, "  re-entered at boot");
+                report.started.push(run_id.to_string());
+            }
+            Err(why) => {
+                say(&run_dir, &format!("  could not re-enter at boot: {why}"));
+                report.skipped.push((run_id.to_string(), why));
+            }
+        }
+    }
+    Ok(report)
 }
 
 // --- the loop ---------------------------------------------------------------------------------
@@ -346,9 +536,17 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
         limit_sleep: Duration::from_secs(record.limit_sleep_seconds),
         reobservations: REOBSERVATIONS,
         reobserve_pause: Duration::from_secs(REOBSERVE_PAUSE_SECONDS),
+        consecutive_waits: CONSECUTIVE_WAITS,
     };
     let worktree = PathBuf::from(&record.worktree);
     let mut reobservations = 0usize;
+    // One reading per working Attempt, newest last: *did this Attempt fail to advance*. Held
+    // for the process rather than recorded, because the record carries no per-Attempt commit
+    // count — a fresh process needs two more working Attempts before a Blocker can fire, which
+    // is the safe direction.
+    let mut stalls: Vec<Observed<bool>> = Vec::new();
+    let mut commits_before: Option<Observed<u64>> = None;
+    let mut working_seen = attempt::working(record.attempts());
 
     loop {
         // The first pass has no attempt to classify, so the loop starts by attempting.
@@ -363,10 +561,29 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
         let stop = loop {
             let observation =
                 crate::view::observe_fresh(&worktree, &record.job.handoff_sha, world::now_iso());
+            // The progress window advances once per working Attempt, and only ever forward.
+            let working_now = attempt::working(record.attempts());
+            if working_now > working_seen {
+                working_seen = working_now;
+                stalls.push(policy::stalled(
+                    commits_before.as_ref(),
+                    &observation.commits_ahead,
+                ));
+                commits_before = Some(observation.commits_ahead.clone());
+            }
             let signals = decide::signals_of(&observation);
             let promised = record.attempts().last().is_some_and(|a| a.done_promise);
             let verdict = decide::verdict(&signals, promised);
-            announce(record, &observation, &verdict);
+            announce(run_dir, record, &observation, &verdict);
+
+            // A Blocker stops at once rather than spending the rest of the budget against a
+            // wall the Run cannot move — and it never overrides a decided Run: where the
+            // artifacts agree, the Run finished, denials and all.
+            if !matches!(verdict, Verdict::Completed)
+                && let Some(stop) = policy::blocker(record.attempts(), &stalls)
+            {
+                break Some(stop);
+            }
 
             match policy::next(
                 record.attempts(),
@@ -377,16 +594,20 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
             ) {
                 Next::Reobserve(pause) => {
                     reobservations += 1;
-                    world::print_line(&format!(
-                        "    a signal could not be observed — sleeping {}s before looking again",
-                        pause.as_secs()
-                    ));
+                    say(
+                        run_dir,
+                        &format!(
+                            "    a signal could not be observed — sleeping {}s before looking again",
+                            pause.as_secs()
+                        ),
+                    );
                     world::sleep(pause);
                     continue;
                 }
                 Next::SpendCiBudget => {
                     reobservations = 0;
-                    world::print_line(
+                    say(
+                        run_dir,
                         "    decided, and a check came back red — spending the one CI budget",
                     );
                     run_one_attempt(record, run_dir, &worktree, Mode::CiBabysit)?;
@@ -397,10 +618,13 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
                     reobservations = 0;
                     record.state = State::RateLimited;
                     record.save(&path)?;
-                    world::print_line(&format!(
-                        "    rate limited — sleeping {}s, then re-entering",
-                        nap.as_secs()
-                    ));
+                    say(
+                        run_dir,
+                        &format!(
+                            "    rate limited — sleeping {}s, then re-entering",
+                            nap.as_secs()
+                        ),
+                    );
                     world::sleep(nap);
                     break None;
                 }
@@ -408,7 +632,8 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
                     reobservations = 0;
                     record.state = State::Died;
                     record.save(&path)?;
-                    world::print_line(
+                    say(
+                        run_dir,
                         "    ended without a DONE promise — re-entering at the stage that died",
                     );
                     break None;
@@ -423,13 +648,26 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
                 Stop::Uncorroborated(_) => State::Uncorroborated,
                 Stop::Unobserved(_) => State::Unobserved,
                 Stop::Exhausted => State::Exhausted,
+                Stop::Blocked(_) => State::Blocked,
             };
             record.save(&path)?;
             if let Stop::Unobserved(blind) = &stop {
                 for said in blind {
-                    world::print_line(&format!("    could not observe {said}"));
+                    say(run_dir, &format!("    could not observe {said}"));
                 }
             }
+            // Resumable, because it never spent the budget: the world changed, not the number.
+            if let Stop::Blocked(what) = &stop {
+                say(
+                    run_dir,
+                    &format!(
+                        "    stopped for a human — {what} was refused twice with no progress; \
+                     `grind resume {}` once it is cleared",
+                        record.run_id
+                    ),
+                );
+            }
+            report_to_the_job_issue(run_dir, record);
             return Ok(Outcome {
                 run_id: record.run_id.clone(),
                 state: record.state.as_str(),
@@ -447,7 +685,6 @@ fn run_one_attempt(
     mode: Mode,
 ) -> Result<(), Refusal> {
     let n = record.attempts().len() + 1;
-    let spend_cap = job::spend_cap(record.job.budget.as_deref());
     let conditions = Conditions {
         claude_bin: &record.claude_bin,
         session_id: &record.session_id,
@@ -455,7 +692,6 @@ fn run_one_attempt(
         // spans hours of rate-limit sleeps, and a version changing mid-Run is silent.
         plugin_dir: &record.plugin_dir,
         model: record.model.as_deref(),
-        spend_cap: spend_cap.as_deref(),
     };
     let invocation: Invocation = match mode {
         Mode::Dispatch => attempt::dispatch(&conditions, &record.job),
@@ -464,7 +700,16 @@ fn run_one_attempt(
     };
 
     let started_at = world::now_iso();
-    world::print_line(&format!("  [{started_at}] attempt {n} ({mode}) …"));
+    say(run_dir, &format!("  [{started_at}] attempt {n} ({mode}) …"));
+
+    // **Taken before the child spawns, and this is what makes the pair belong to this Attempt.**
+    // The transcript is keyed on `record.session_id`, which `fresh_session_id` fixes for the
+    // Run's life, and every attempt after the first resumes that session and appends to the same
+    // `.jsonl`. Counting the whole file on Attempt N therefore counted Attempts 1..N — and
+    // `render::fanout_totals` sums those pairs, so a Run fanning out to 2 agents on each of 3
+    // attempts recorded (2,2), (4,4), (6,6) and published *12 spawned, 12 returned*. R51 says
+    // per Attempt; the suffix is what says it.
+    let already_written = transcript_lines(record);
 
     let raw = attempt::run(
         &invocation,
@@ -475,12 +720,48 @@ fn run_one_attempt(
     )
     .map_err(|reason| Refusal::saying(reason.to_string()))?;
 
-    let classified = raw.classify(n, mode, &started_at, &world::now_iso());
+    // Gathered before `push_attempt`: the attempt list is append-only with no mutating
+    // accessor, so this is the one wire between transcript reading and record building — and it
+    // runs in the direction the topology already allows.
+    let classified = raw
+        .classify(n, mode, &started_at, &world::now_iso())
+        .with_fanout(fanout_of(record, already_written));
     record.push_attempt(classified);
     Ok(())
 }
 
-fn announce(record: &RunRecord, observation: &Observation, verdict: &Verdict) {
+/// How much of the Run's transcript exists right now, in lines. A transcript that is not there
+/// yet is zero rather than a refusal: the first Attempt of a Run has nothing to skip, and that
+/// is the same answer.
+///
+/// Read while the child is not running, so the file is quiescent and the last line is whole.
+fn transcript_lines(record: &RunRecord) -> usize {
+    let Some(home) = world::home() else {
+        return 0;
+    };
+    let transcript = crate::view::transcript_path(&home, &record.worktree, &record.session_id);
+    match world::read_to_string(&transcript) {
+        Ok(text) => text.lines().count(),
+        Err(_) => 0,
+    }
+}
+
+/// The Attempt's fan-out arithmetic, over **the lines this Attempt appended** and no earlier
+/// ones. `world` reads the file; a pure counter reads the text.
+fn fanout_of(record: &RunRecord, already_written: usize) -> Observed<(u64, u64)> {
+    let Some(home) = world::home() else {
+        return Observed::Unobservable(Reason::saying("$HOME is unset"));
+    };
+    let transcript = crate::view::transcript_path(&home, &record.worktree, &record.session_id);
+    match world::read_to_string(&transcript) {
+        Ok(text) => crate::view::fanout_since(&text, already_written),
+        Err(said) => Observed::Unobservable(Reason::saying(&format!(
+            "the transcript could not be read: {said}"
+        ))),
+    }
+}
+
+fn announce(run_dir: &Path, record: &RunRecord, observation: &Observation, verdict: &Verdict) {
     let last = record.attempts().last();
     let outcome = match last {
         Some(a) if a.done_promise => "DONE promised".to_string(),
@@ -488,11 +769,14 @@ fn announce(record: &RunRecord, observation: &Observation, verdict: &Verdict) {
         None => "no attempt".to_string(),
     };
     let cost = last.and_then(|a| a.total_cost_usd).unwrap_or(0.0);
-    world::print_line(&format!(
-        "    -> {outcome} | stage={} | commits={} | cost=${cost:.2} | {verdict:?}",
-        decide::furthest_stage(observation),
-        observation.commits_ahead,
-    ));
+    say(
+        run_dir,
+        &format!(
+            "    -> {outcome} | stage={} | commits={} | cost=${cost:.2} | {verdict:?}",
+            decide::furthest_stage(observation),
+            observation.commits_ahead,
+        ),
+    );
 }
 
 // --- dispatch's own steps ------------------------------------------------------------------
@@ -584,30 +868,58 @@ fn adopt_or_create_worktree(repo_path: &Path, branch: &str) -> Result<PathBuf, R
     Ok(wanted)
 }
 
-/// The two writes Grind's own process makes, and the only ones. Neither is allowed to stop a
-/// Run: the Job issue is a pointer, and a pointer that failed to update is not worth abandoning
-/// a dispatched Run over.
-fn dequeue_and_point_at_this_host(record: &RunRecord) {
-    let number = record.job.issue.to_string();
-    let repo = record.job.target_repo.clone();
-    let removed = world::run(
+/// **The account that leaves the host**, posted on the Job issue at every terminal state.
+///
+/// Not the PR: the PR body is entirely the Run's, and supervisor prose beside the Run's own
+/// narrative reads as a verdict on the work.
+///
+/// **Appended, never edited.** A Blocked Run a human clears and resumes reaches a terminal
+/// state twice, and two comments are the honest account.
+///
+/// **Best-effort.** On failure, log and move on — no retry loop, and **never a verdict change**.
+/// A Run that finished must not become `unobserved` because GitHub was down at 04:00.
+fn report_to_the_job_issue(run_dir: &Path, record: &RunRecord) {
+    let Some(home) = world::home() else {
+        say(
+            run_dir,
+            "  note: $HOME is unset, so nothing was posted on the Job issue",
+        );
+        return;
+    };
+    // The **same construction** the Handback uses, so the two renderings cannot be fed
+    // different lists.
+    let Some(facts) = crate::view::gather(&home, &record.run_id) else {
+        say(run_dir, "  note: could not compose the terminal comment");
+        return;
+    };
+    let posted = world::run(
         &[
             "gh".to_string(),
             "issue".to_string(),
-            "edit".to_string(),
-            number.clone(),
+            "comment".to_string(),
+            record.job.issue.to_string(),
             "--repo".to_string(),
-            repo.clone(),
-            "--remove-label".to_string(),
-            QUEUE_LABEL.to_string(),
+            record.job.target_repo.clone(),
+            "--body".to_string(),
+            crate::render::job_comment(&facts),
         ],
         None,
     );
-    if removed.code != Some(0) {
-        world::print_line(&format!(
-            "  note: could not remove `{QUEUE_LABEL}` from the Job issue"
-        ));
+    if posted.code != Some(0) {
+        say(
+            run_dir,
+            "  note: could not post the terminal comment on the Job issue",
+        );
     }
+}
+
+/// The dispatch comment, and nothing else. Grind adds and never classifies (ADR-0012): no
+/// label, no assignee, no project, no milestone, on any repo. It is not allowed to stop a Run
+/// either — the Job issue is a pointer, and a pointer that failed to update is not worth
+/// abandoning a dispatched Run over.
+fn point_at_this_host(record: &RunRecord) {
+    let number = record.job.issue.to_string();
+    let repo = record.job.target_repo.clone();
     // The only thing that travels between hosts is a pointer, and it travels on the Job issue.
     let body = format!(
         "Dispatched as Run `{}` on `{}`.\n\nRun state lives on that host at `~/.grind/runs/{}/`.",
@@ -637,6 +949,26 @@ fn words(parts: &[&str]) -> Vec<String> {
 
 fn record_path(run_dir: &Path) -> PathBuf {
     run_dir.join("run.json")
+}
+
+/// `~/.grind/runs/<run-id>/supervisor.log` — beside the record and the raw attempt files.
+///
+/// Still Run state, so still never committed: it lives outside every checkout, which holds
+/// structurally rather than by a `.gitignore` line.
+fn log_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("supervisor.log")
+}
+
+/// The supervisor's narration, to stdout **and** to a file that outlives the terminal.
+///
+/// What the supervisor said is the only account of a Run between the dispatch comment and a
+/// terminal state, and it died with the host. Leaving the file to the service manager makes it
+/// a per-platform question, which is how you get two internally-consistent wrong answers.
+///
+/// A log that cannot be written is not worth abandoning a Run over.
+fn say(run_dir: &Path, line: &str) {
+    world::print_line(line);
+    let _ = world::append_line(&log_path(run_dir), line);
 }
 
 /// A session id with no dependency on a uuid crate. It has to be unique per Run and stable for
@@ -701,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn the_seven_states_round_trip_and_none_of_them_is_running() {
+    fn the_eight_states_round_trip_and_none_of_them_is_running() {
         let all = [
             State::Dispatched,
             State::RateLimited,
@@ -710,13 +1042,31 @@ mod tests {
             State::Uncorroborated,
             State::Unobserved,
             State::Exhausted,
+            State::Blocked,
         ];
         for state in all {
             let text = serde_json::to_string(&state).unwrap();
             assert_eq!(serde_json::from_str::<State>(&text).unwrap(), state);
             assert_ne!(state.as_str(), "running");
         }
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
+    }
+
+    #[test]
+    fn a_blocked_run_is_resumable_and_a_completed_or_exhausted_one_is_not() {
+        // A Blocker never spent the budget — the world changed, not the number — so the hand
+        // `resume` path has nothing to refuse. `--all` excludes it for a different reason: a
+        // stopped Run must not be re-entered at the one moment nobody is watching.
+        for resumable in [
+            State::Dispatched,
+            State::RateLimited,
+            State::Died,
+            State::Uncorroborated,
+            State::Unobserved,
+            State::Blocked,
+        ] {
+            assert!(!matches!(resumable, State::Completed | State::Exhausted));
+        }
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! Nothing here invokes an agent. A view built out of the thing that gets rate-limited is
 //! unavailable during exactly the stall it exists to explain.
 
-use crate::decide::{self, VerifyContract};
+use crate::decide;
 use crate::job::{self, Check, Depth, Refusal};
 use crate::observe::{self, Observed, Outcome};
 use crate::render::{self, DoctorLine, SingleRun};
@@ -37,6 +37,11 @@ impl Observability {
 /// **incoherent input**, never a health verdict and never a gate.
 const INCOHERENT_INPUT: i32 = 2;
 
+/// What the shipped templates in `dist/` call themselves. The check asks the service manager
+/// what it has **loaded** under these names, never the filesystem what is on disk under them.
+const BOOT_ONE_SHOT_LABEL: &str = "com.grind.resume-all";
+const BOOT_ONE_SHOT_UNIT: &str = "grind-resume-all.service";
+
 pub fn run() -> i32 {
     let args = world::args();
     let rest: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -50,6 +55,9 @@ pub fn run() -> i32 {
             0
         }
         ["run", issue] => finish(supervisor::dispatch(issue)),
+        // **Before** the generic arm: slice patterns match by position, so that one would
+        // otherwise bind `run_id = "--all"` and dispatch it as a run id.
+        ["resume", "--all"] => resume_all(),
         ["resume", run_id] => finish(supervisor::resume(run_id)),
         ["status"] => status_roster(),
         ["status", run_id] => status_one(run_id),
@@ -71,6 +79,7 @@ const USAGE: &str = "grind — dispatch and supervise headless `lfg` Runs agains
 
     grind run <issue>       dispatch a Job now (issue number or URL)
     grind resume <run-id>   re-enter a Run that died
+    grind resume --all      re-enter every Run on this host a restart cut off
     grind status [run-id]   roster when bare; one Run's live view when named
     grind doctor            check the provisioned-host list
     grind --version         which copy of the binary is this
@@ -93,33 +102,47 @@ fn finish(outcome: Result<supervisor::Outcome, Refusal>) -> i32 {
     let Some(home) = world::home() else {
         return INCOHERENT_INPUT;
     };
-    match view::load(&home, &outcome.run_id) {
-        Lookup::Here(found) => {
-            let observation = observe_for(&found);
-            print(&render::handback(
-                &found,
-                &observation,
-                &contract_of(&found.worktree),
-                decide::furthest_stage(&observation),
-                &view::record_path(&home, &outcome.run_id),
-            ));
-            // Mirrors `status_one`: the exit code answers for what the fresh observation
-            // actually showed, not for the state the loop recorded on its way out — the two
-            // are read moments apart, and the Handback above is already keyed to the fresh one.
-            let signals = decide::signals_of(&observation);
-            let promised = found.attempts.last().is_some_and(|a| a.done_promise);
-            let verdict = decide::verdict(&signals, promised);
-            if matches!(verdict, decide::Verdict::Unobserved(_)) {
-                Observability::CouldNotAnswer.code()
-            } else {
-                Observability::Answered.code()
-            }
-        }
-        // A record that cannot even be found or read here is itself a failure to observe —
-        // the Handback that this command exists to produce never got composed, so a bare `0`
-        // would tell a caller checking `$?` that everything answered when nothing did.
-        _ => Observability::CouldNotAnswer.code(),
+    // The verdict the Handback prints and the verdict the process exits on are **one
+    // computation**, gathered by the same function the supervisor's terminal comment uses. It
+    // used to be computed twice, moments apart, and spent on an exit code while the projection
+    // printed the recorded state instead.
+    //
+    // A record that cannot be found or read here is itself a failure to observe — the Handback
+    // this command exists to produce never got composed, so a bare `0` would tell a caller
+    // checking `$?` that everything answered when nothing did.
+    let Some(facts) = view::gather(&home, &outcome.run_id) else {
+        return Observability::CouldNotAnswer.code();
+    };
+    print(&render::handback(&facts));
+    if matches!(facts.verdict, decide::Verdict::Unobserved(_)) {
+        Observability::CouldNotAnswer.code()
+    } else {
+        Observability::Answered.code()
     }
+}
+
+/// **Reports what it started, never what any Run concluded.** `finish` is built around one
+/// `Outcome` and one Handback; N detached children have neither a single outcome nor a single
+/// verdict-derived exit code, and inventing one would be a summary over N Runs.
+fn resume_all() -> i32 {
+    let report = match supervisor::resume_all() {
+        Ok(report) => report,
+        Err(refusal) => {
+            print_err(&render::refusal(&refusal.to_string()));
+            return INCOHERENT_INPUT;
+        }
+    };
+    if report.started.is_empty() && report.skipped.is_empty() {
+        print("no Run on this host was cut off.\n");
+        return Observability::Answered.code();
+    }
+    for run_id in &report.started {
+        print(&format!("re-entered {run_id}"));
+    }
+    for (run_id, why) in &report.skipped {
+        print(&format!("skipped    {run_id}: {why}"));
+    }
+    Observability::Answered.code()
 }
 
 // --- status ------------------------------------------------------------------------------------
@@ -170,14 +193,14 @@ fn status_one(run_id: &str) -> i32 {
             );
             let here = view::supervisor_here(
                 found.supervisor_identity.as_deref(),
-                world::process_start_stamp(found.supervisor_pid).as_deref(),
+                &observe::process_start_stamp(&world::ps_start_stamp(found.supervisor_pid)),
             );
             print(&render::run_view(&SingleRun {
                 found: &found,
                 observation: &observation,
                 live: &live,
                 verdict: &verdict,
-                contract: &contract_of(&found.worktree),
+                contract: &view::verify_contract_of(&found.worktree),
                 furthest: decide::furthest_stage(&observation),
                 supervisor_here: &here,
                 run_state: &view::record_path(&home, run_id),
@@ -198,13 +221,6 @@ fn observe_for(found: &view::RunView) -> observe::Observation {
         &found.job.handoff_sha,
         world::now_iso(),
     )
-}
-
-fn contract_of(worktree: &str) -> VerifyContract {
-    let worktree = Path::new(worktree);
-    let justfile = world::read_to_string(&worktree.join("justfile")).ok();
-    let package = world::read_to_string(&worktree.join("package.json")).ok();
-    decide::verify_contract(justfile.as_deref(), package.as_deref())
 }
 
 // --- doctor -------------------------------------------------------------------------------------
@@ -319,6 +335,41 @@ fn check(home: &Path, clones: &[(String, PathBuf)], check: Check) -> Observed<Ou
         Check::PluginInstalled => observe::plugin_installed(
             !world::list_dir(&home.join(".claude").join("plugins").join("cache")).is_empty(),
         ),
+        // Spelled `cfg!` rather than `std::env::consts::OS`, which is the idiomatic runtime
+        // spelling: `tests/topology.rs` string-matches the literal `std::env` and asserts only
+        // `world` names it, so the idiom would turn `just verify` red on a carrier that must
+        // pass unrelaxed.
+        Check::BootOneShot => {
+            let asked = if cfg!(target_os = "macos") {
+                Some((
+                    format!("launchctl print gui/$(id -u)/{BOOT_ONE_SHOT_LABEL}"),
+                    observe::Fires::AtLogin,
+                ))
+            } else if cfg!(target_os = "linux") {
+                // **Conjunctive.** `systemctl --user is-enabled` returns enabled purely from the
+                // symlink, with or without linger — and without `loginctl enable-linger` a
+                // `--user` unit's systemd instance does not start until first login, which on a
+                // headless box is never. Asking only the first half is the same silent-pass
+                // shape this check was added to prevent, one layer down.
+                Some((
+                    format!(
+                        "systemctl --user is-enabled {BOOT_ONE_SHOT_UNIT} >/dev/null 2>&1 && \
+                         [ \"$(loginctl show-user \"$(id -un)\" -p Linger --value)\" = yes ]"
+                    ),
+                    observe::Fires::AtBoot,
+                ))
+            } else {
+                None
+            };
+            match asked {
+                // Read-only on both platforms: doctor never performs a write to prove a step.
+                Some((command, fires)) => observe::boot_one_shot(
+                    &world::run(&words(&["sh", "-c", &command]), None),
+                    fires,
+                ),
+                None => observe::unchecked("no restart one-shot is defined for this platform"),
+            }
+        }
         Check::GhAuthStore => {
             observe::gh_auth_store(&world::run(&words(&["gh", "auth", "status"]), None))
         }
@@ -401,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn the_surface_is_five_shapes_and_none_of_them_is_list() {
+    fn the_surface_is_six_shapes_and_none_of_them_is_list() {
         // A bare status that resolves to one Run is Grind selecting, and the repair
         // "pick the one in flight" would pick a zombie.
         assert!(!USAGE.contains("grind list"));
@@ -409,6 +460,7 @@ mod tests {
         for shape in [
             "grind run <issue>",
             "grind resume <run-id>",
+            "grind resume --all",
             "grind status [run-id]",
             "grind doctor",
             "grind --version",
@@ -416,6 +468,10 @@ mod tests {
             assert!(USAGE.contains(shape), "the surface must name {shape}");
         }
         assert!(USAGE.contains("roster when bare"));
+        // Not a boot verb — that names a command after its caller. Not a bare `resume` either:
+        // a typo would mutate every branch on the host.
+        assert!(!USAGE.contains("grind boot"));
+        assert!(!USAGE.contains("grind resume\n"));
     }
 
     #[test]

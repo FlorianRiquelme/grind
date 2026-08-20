@@ -11,9 +11,11 @@
 //! that both readers parse the same bytes — not the compiler, which is blind to it precisely
 //! because the wall is working.
 
-use crate::attempt::Attempt;
+use crate::attempt::{self, Attempt};
+use crate::decide::{self, Stage, Verdict, VerifyContract, VerifyCoverage};
 use crate::job::{self, Job};
 use crate::observe::{self, Observation, Observed, Reason};
+use crate::policy;
 use crate::world;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -45,10 +47,11 @@ pub struct RunView {
 }
 
 impl RunView {
-    /// *attempt N of M*, with **M from the record**. Re-entering under a different environment
-    /// cannot make this misreport a Run's own budget.
+    /// *attempt N of M*, with **M from the record** and N counting **working Attempts only**.
+    /// Re-entering under a different environment cannot make this misreport a Run's own budget,
+    /// and a Run that spent six Attempts probing a wall is not six Attempts into its budget.
     pub fn attempt_counter(&self) -> (usize, usize) {
-        (self.attempts.len(), self.attempt_budget)
+        (attempt::working(&self.attempts), self.attempt_budget)
     }
 
     pub fn total_spend(&self) -> f64 {
@@ -61,6 +64,72 @@ impl RunView {
             .map(|a| a.permission_denials.len())
             .sum()
     }
+}
+
+/// Everything a terminal Run is reported from, **owned and built once**.
+///
+/// The Handback and the Job-issue comment differ only in where they send the human to look — a
+/// terminal wants fixed width, markdown wants a table. Two independently-chosen lists would
+/// drift *invisibly*, because nobody ever sees both renderings of one Run. So there is one fact
+/// set and two renderers over it, and this is the fact set.
+///
+/// It lives here rather than in `render` because gathering it reads the world, and `render` is
+/// pure — every function there returns a `String`.
+pub struct Facts {
+    pub found: RunView,
+    pub observation: Observation,
+    /// The **fresh** verdict, never the recorded state. The two are produced moments apart, and
+    /// Run 2's Handback printed `[exhausted]` over an open, green, twelve-commit PR.
+    pub verdict: Verdict,
+    pub contract: VerifyContract,
+    pub coverage: Observed<VerifyCoverage>,
+    pub furthest: Stage,
+    /// What must be cleared, when the Run stopped for a human. The recorded state is consulted
+    /// for this one fact — no fresh verdict can carry it — and never printed as a verdict.
+    pub blocker: Option<String>,
+    pub run_state: PathBuf,
+}
+
+/// Gather them. **One construction**, reached from `cli`'s Handback and from the supervisor's
+/// terminal comment alike, so the two renderings cannot be fed different lists.
+pub fn gather(home: &Path, run_id: &str) -> Option<Facts> {
+    let Lookup::Here(found) = load(home, run_id) else {
+        return None;
+    };
+    let found = *found;
+    let observation = observe_fresh(
+        Path::new(&found.worktree),
+        &found.job.handoff_sha,
+        world::now_iso(),
+    );
+    let signals = decide::signals_of(&observation);
+    let promised = found.attempts.last().is_some_and(|a| a.done_promise);
+    let verdict = decide::verdict(&signals, promised);
+    let contract = verify_contract_of(&found.worktree);
+    let coverage = decide::verify_coverage(&contract, &observation.changed_files);
+    let furthest = decide::furthest_stage(&observation);
+    let blocker = (found.state == "blocked")
+        .then(|| policy::what_must_be_cleared(&found.attempts))
+        .flatten();
+    Some(Facts {
+        run_state: record_path(home, run_id),
+        found,
+        observation,
+        verdict,
+        contract,
+        coverage,
+        furthest,
+        blocker,
+    })
+}
+
+/// Which contracted steps the target repo declares, read off its worktree. A justfile may
+/// legitimately delegate to npm scripts, so `package.json`'s scripts count as evidence.
+pub fn verify_contract_of(worktree: &str) -> VerifyContract {
+    let worktree = Path::new(worktree);
+    let justfile = world::read_to_string(&worktree.join("justfile")).ok();
+    let package = world::read_to_string(&worktree.join("package.json")).ok();
+    decide::verify_contract(justfile.as_deref(), package.as_deref())
 }
 
 /// The answer to *is this Run here*. **An unknown run id is `NotHere`, never an error** — a Run
@@ -116,7 +185,9 @@ pub fn roster(home: &Path) -> Vec<RosterRow> {
             rows.push(RosterRow {
                 supervisor_here: supervisor_here(
                     found.supervisor_identity.as_deref(),
-                    world::process_start_stamp(found.supervisor_pid).as_deref(),
+                    &crate::observe::process_start_stamp(&world::ps_start_stamp(
+                        found.supervisor_pid,
+                    )),
                 ),
                 run_id: found.run_id.clone(),
                 recorded_state: found.state.clone(),
@@ -133,16 +204,20 @@ pub fn roster(home: &Path) -> Vec<RosterRow> {
 ///
 /// **Pid *and* identity.** A pid alone is reused, and a reused pid reporting a dead Run as
 /// alive is exactly the reassurance that sends an operator back to sleep.
-pub fn supervisor_here(recorded: Option<&str>, live: Option<&str>) -> Observed<bool> {
+pub fn supervisor_here(recorded: Option<&str>, live: &Observed<String>) -> Observed<bool> {
     match (recorded, live) {
+        // **`ps` could not be asked, which is not the supervisor being gone.** This arm used to
+        // read `None` and answer `Present(false)`, and `resume --all` acts on that answer: on a
+        // host whose `ps` cannot spawn, every Run read as cut off and every Run was re-entered.
+        (_, Observed::Unobservable(reason)) => Observed::Unobservable(reason.clone()),
         // Nothing is running under that pid at all.
-        (_, None) => Observed::Present(false),
+        (_, Observed::Absent) => Observed::Present(false),
         // The pid is alive but nothing was recorded to compare it against, so this is a
         // question Grind cannot answer rather than a yes.
-        (None, Some(_)) => Observed::Unobservable(Reason::saying(
+        (None, Observed::Present(_)) => Observed::Unobservable(Reason::saying(
             "no supervisor identity was recorded at dispatch",
         )),
-        (Some(was), Some(now)) => Observed::Present(was.trim() == now.trim()),
+        (Some(was), Observed::Present(now)) => Observed::Present(was.trim() == now.trim()),
     }
 }
 
@@ -198,7 +273,7 @@ pub fn live(transcript: &Path, now_epoch: u64) -> Live {
             None => vec![String::new(); 3],
         },
         fanout: match &text {
-            Some(body) => Observed::Present(fanout(body)),
+            Some(body) => fanout(body),
             None => Observed::Unobservable(Reason::saying("the transcript could not be read")),
         },
         freshness: match newest {
@@ -251,9 +326,7 @@ fn seconds_since(at: SystemTime, now_epoch: u64) -> u64 {
 /// costs its own values and nothing else.
 pub fn now_skill(text: &str) -> Observed<String> {
     let mut last: Option<String> = None;
-    let mut lines = 0usize;
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        lines += 1;
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
@@ -263,11 +336,56 @@ pub fn now_skill(text: &str) -> Observed<String> {
             last = Some(skill.to_string());
         }
     }
-    match (last, lines) {
-        (Some(skill), _) => Observed::Present(skill),
-        (None, 0) => Observed::Absent,
-        (None, _) => Observed::Absent,
+    match last {
+        Some(skill) => Observed::Present(skill),
+        // The same *nothing recognised* rule the fan-out matcher carries. This field is not
+        // currently broken; the rule is what keeps it from breaking silently the way the
+        // fan-out one did.
+        None => nothing_recognised(text, "attributionSkill"),
     }
+}
+
+/// The tool a fan-out spawn names. The CLI calls it `Agent`; `Task` is the former spelling, and
+/// matching only that one printed `none` on every Run that fanned out — **203 spawns to 0**
+/// across sixty transcripts. The fixture that should have caught it is authored, so it asserted
+/// the matcher against itself and caught nothing.
+pub const FANOUT_TOOLS: [&str; 2] = ["Agent", "Task"];
+
+/// Every tool-use block in a transcript, whatever it named.
+///
+/// This is what separates *nothing recognised* from *nothing there*. A transcript full of tool
+/// calls and no recognised spawn is a matcher that has gone stale, and reading it as `Absent`
+/// is indistinguishable from a Run that genuinely fanned out to nobody.
+pub fn tool_calls(text: &str) -> usize {
+    let mut calls = 0usize;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(serde_json::Value::Array(parts)) =
+            value.get("message").and_then(|m| m.get("content"))
+        else {
+            continue;
+        };
+        calls += parts
+            .iter()
+            .filter(|part| part.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+            .count();
+    }
+    calls
+}
+
+/// *Could not observe*, with the tool-call count in the reason — or `Absent` where there was
+/// nothing in the transcript to recognise in the first place.
+fn nothing_recognised<T>(text: &str, what: &str) -> Observed<T> {
+    let calls = tool_calls(text);
+    if calls == 0 {
+        return Observed::Absent;
+    }
+    Observed::Unobservable(Reason::saying(&format!(
+        "{calls} tool call{} in the transcript and no recognised `{what}`",
+        if calls == 1 { "" } else { "s" }
+    )))
 }
 
 /// The last-words block, fixed at exactly `wanted` lines so `watch -n 30` never jitters.
@@ -312,7 +430,11 @@ fn one_line(text: &str) -> String {
 
 /// Fan-out as a count with descriptions — *blocked on five agents, newest wrote forty seconds
 /// ago* has to be an available answer.
-pub fn fanout(text: &str) -> Vec<Fanout> {
+///
+/// Both spellings are recognised (`FANOUT_TOOLS`), and a transcript carrying tool-use blocks
+/// with **zero** recognised spawns reads *could not observe* rather than `Absent`. Widening the
+/// matcher alone would leave the next rename exactly as silent as this one was.
+pub fn fanout(text: &str) -> Observed<Vec<Fanout>> {
     let mut found = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -330,7 +452,11 @@ pub fn fanout(text: &str) -> Vec<Fanout> {
             continue;
         };
         for part in parts {
-            if part.get("name").and_then(|n| n.as_str()) == Some("Task")
+            let named = part
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default();
+            if FANOUT_TOOLS.contains(&named)
                 && let Some(description) = part
                     .get("input")
                     .and_then(|i| i.get("description"))
@@ -342,21 +468,88 @@ pub fn fanout(text: &str) -> Vec<Fanout> {
             }
         }
     }
-    found
+    if found.is_empty() {
+        return nothing_recognised(text, "fan-out spawn");
+    }
+    Observed::Present(found)
+}
+
+/// The fan-out in **the lines appended since** `already_written`, which is what *per Attempt*
+/// means here (R51).
+///
+/// A Run's transcript is one append-only file for the Run's whole life: the session id is fixed
+/// at dispatch and every later Attempt resumes that session. So counting the whole file on
+/// Attempt N counts Attempts 1..N, and since `render` sums the per-Attempt pairs, a Run fanning
+/// out to 2 agents on each of 3 attempts reported 12 spawned. The suffix is the fix, and it is a
+/// suffix by line because the transcript is line-delimited JSON.
+pub fn fanout_since(text: &str, already_written: usize) -> Observed<(u64, u64)> {
+    fanout_counts(
+        &text
+            .lines()
+            .skip(already_written)
+            .collect::<Vec<&str>>()
+            .join("\n"),
+    )
+}
+
+/// **Spawned and returned, both read from the parent transcript** (KTD8). Spawns are the
+/// tool-use blocks naming the fan-out tool; returns are the `tool_result` blocks that pair to
+/// them by id. The subagent files on disk are the third source and are deliberately unused:
+/// they have zero observed disagreements with these counts, so they add reading and no
+/// information.
+///
+/// **No summary, boolean or health word sits over the two integers.** A count of processes must
+/// never become an assertion about a review, and whether a returned subagent errored is
+/// unproven across 203 observations and is not modelled.
+///
+/// The `tool_use` → `tool_result` pairing is **assumed**, not verified. Where a spawn carries no
+/// id it cannot be paired, so it counts as spawned and never as returned — which reads low
+/// rather than high, the safe direction for a number nobody should fold into a verdict.
+pub fn fanout_counts(text: &str) -> Observed<(u64, u64)> {
+    let mut spawned: Vec<String> = Vec::new();
+    let mut unidentified = 0u64;
+    let mut returned = 0u64;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(serde_json::Value::Array(parts)) =
+            value.get("message").and_then(|m| m.get("content"))
+        else {
+            continue;
+        };
+        for part in parts {
+            let named = part
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default();
+            if FANOUT_TOOLS.contains(&named) {
+                match part.get("id").and_then(|i| i.as_str()) {
+                    Some(id) => spawned.push(id.to_string()),
+                    None => unidentified += 1,
+                }
+                continue;
+            }
+            if part.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                && let Some(paired) = part.get("tool_use_id").and_then(|i| i.as_str())
+                && spawned.iter().any(|id| id == paired)
+            {
+                returned += 1;
+            }
+        }
+    }
+    let total = spawned.len() as u64 + unidentified;
+    if total == 0 {
+        return nothing_recognised(text, "fan-out spawn");
+    }
+    Observed::Present((total, returned))
 }
 
 /// Observe a Run's durable artifacts fresh. **Reads and never writes** — this path observes and
 /// persists nothing, which is the whole difference from the script's `cmd_status`.
 pub fn observe_fresh(worktree: &Path, handoff_sha: &str, at: String) -> Observation {
-    let readable = world::is_dir(worktree);
     let mut run = |argv: &[String]| world::run(argv, Some(worktree));
-    let mut list = |relative: &str| {
-        world::list_with_extension(&worktree.join(relative), "md")
-            .into_iter()
-            .map(|p| p.strip_prefix(worktree).unwrap_or(&p).display().to_string())
-            .collect::<Vec<String>>()
-    };
-    observe::observe_run(at, handoff_sha, readable, &mut run, &mut list)
+    observe::observe_run(at, handoff_sha, &mut run)
 }
 
 #[cfg(test)]
@@ -370,12 +563,18 @@ mod tests {
     const FANOUT_PARENT: &str = include_str!(
         "../tests/fixtures/transcript/fanout/8f2c1a70-4b3d-4e51-9c02-6a7d5e8b1f43.jsonl"
     );
+    const FANOUT_AGENT: &str =
+        include_str!("../tests/fixtures/transcript/fanout/spelling-agent.jsonl");
+    const FANOUT_UNRECOGNISED: &str =
+        include_str!("../tests/fixtures/transcript/fanout/no-recognised-spawn.jsonl");
 
     #[test]
     fn the_read_only_reader_parses_the_same_fixture_the_writer_does() {
         let found: RunView = serde_json::from_str(DAY_ONE).expect("the base's record shape");
         assert_eq!(found.run_id, "20260806-122620-snapper-28");
-        assert_eq!(found.attempt_counter(), (4, 8));
+        // Four Attempts, of which one — attempt 3, $0 and one turn — did no work.
+        assert_eq!(found.attempt_counter(), (3, 8));
+        assert_eq!(found.attempts.len(), 4);
         assert_eq!(found.denied_tools.len(), 7);
         assert_eq!(found.denial_count(), 1);
         assert!(
@@ -409,14 +608,18 @@ mod tests {
         value["attempt_budget"] = serde_json::json!(3);
         let found: RunView = serde_json::from_value(value).unwrap();
         // The environment has no say: there is no override to read, and M is a record field.
-        assert_eq!(found.attempt_counter(), (4, 3));
+        assert_eq!(found.attempt_counter(), (3, 3));
+    }
+
+    fn stamp(said: &str) -> Observed<String> {
+        Observed::Present(said.to_string())
     }
 
     #[test]
     fn a_dead_supervisor_reads_as_gone_however_it_died() {
         // Nothing is running under that pid.
         assert_eq!(
-            supervisor_here(Some("Thu Aug  6 12:26:20 2026"), None),
+            supervisor_here(Some("Thu Aug  6 12:26:20 2026"), &Observed::Absent),
             Observed::Present(false)
         );
         // The pid exists but belongs to something else — a reused pid must not report a dead
@@ -424,7 +627,7 @@ mod tests {
         assert_eq!(
             supervisor_here(
                 Some("Thu Aug  6 12:26:20 2026"),
-                Some("Thu Aug  6 18:02:11 2026")
+                &stamp("Thu Aug  6 18:02:11 2026")
             ),
             Observed::Present(false)
         );
@@ -432,7 +635,7 @@ mod tests {
         assert_eq!(
             supervisor_here(
                 Some("Thu Aug  6 12:26:20 2026"),
-                Some("Thu Aug  6 12:26:20 2026")
+                &stamp("Thu Aug  6 12:26:20 2026")
             ),
             Observed::Present(true)
         );
@@ -440,8 +643,28 @@ mod tests {
 
     #[test]
     fn an_unrecorded_identity_is_a_question_grind_cannot_answer() {
-        let found = supervisor_here(None, Some("Thu Aug  6 12:26:20 2026"));
+        let found = supervisor_here(None, &stamp("Thu Aug  6 12:26:20 2026"));
         assert!(matches!(found, Observed::Unobservable(_)), "{found:?}");
+    }
+
+    #[test]
+    fn a_ps_that_could_not_answer_is_never_a_supervisor_that_is_gone() {
+        // The input `resume --all` acts on. `ps -p <pid> -o lstart=` is a procps/BSD spelling
+        // busybox does not implement, and Grind ships as a musl static binary aimed at exactly
+        // those hosts — so *could not ask* reaches this function on an ordinary box.
+        let blind = crate::observe::process_start_stamp(&crate::world::Completed {
+            stdout: String::new(),
+            stderr: "ps: unrecognized option: p\n".to_string(),
+            code: Some(127),
+        });
+        assert!(matches!(blind, Observed::Unobservable(_)), "{blind:?}");
+        for recorded in [None, Some("Thu Aug  6 12:26:20 2026")] {
+            let found = supervisor_here(recorded, &blind);
+            assert!(
+                matches!(found, Observed::Unobservable(_)),
+                "a blind reading must not collapse into `gone`: {found:?}"
+            );
+        }
     }
 
     #[test]
@@ -470,10 +693,159 @@ mod tests {
     }
 
     #[test]
-    fn fan_out_reads_as_a_count_with_descriptions() {
-        let found = fanout(FANOUT_PARENT);
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].description, "review the diff for regressions");
+    fn fan_out_reads_as_a_count_with_descriptions_under_either_tool_name() {
+        // Support, not proof: both of these are authored, so they assert the matcher against
+        // itself. The load-bearing assertion is the negative-recognition test below.
+        let Observed::Present(former) = fanout(FANOUT_PARENT) else {
+            panic!("the former spelling is still recognised");
+        };
+        assert_eq!(former.len(), 1);
+        assert_eq!(former[0].description, "review the diff for regressions");
+
+        let Observed::Present(current) = fanout(FANOUT_AGENT) else {
+            panic!("the current spelling is recognised");
+        };
+        assert_eq!(current.len(), 2);
+        assert_eq!(current[0].description, "review the diff for regressions");
+    }
+
+    #[test]
+    fn tool_calls_with_no_recognised_spawn_are_could_not_observe_and_never_absent() {
+        // The one authoring cannot fake. Widening the matcher alone would leave the next rename
+        // exactly as silent as this one was: 203 spawns to 0 across sixty transcripts, printed
+        // as `none` every time.
+        let found = fanout(FANOUT_UNRECOGNISED);
+        let Observed::Unobservable(reason) = &found else {
+            panic!("a transcript full of tool calls is not a Run that fanned out to nobody");
+        };
+        assert!(
+            reason.to_string().contains('3'),
+            "the tool-call count is in the reason: {reason}"
+        );
+        assert_ne!(found, Observed::Absent);
+    }
+
+    #[test]
+    fn an_empty_transcript_is_absent_and_stays_distinguishable_from_a_stale_matcher() {
+        assert_eq!(fanout(EMPTY), Observed::Absent);
+        assert_eq!(
+            fanout("{\"message\":{\"content\":\"just prose\"}}"),
+            Observed::Absent
+        );
+        assert_ne!(fanout(EMPTY), fanout(FANOUT_UNRECOGNISED));
+    }
+
+    // --- fan-out, per Attempt, as two integers -------------------------------------------------
+
+    /// A parent transcript spawning `spawns` and returning the first `returns` of them.
+    fn spawning(spawns: usize, returns: usize) -> String {
+        let mut lines = Vec::new();
+        for n in 0..spawns {
+            lines.push(format!(
+                r#"{{"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_{n}","name":"Agent","input":{{"description":"do the thing"}}}}]}}}}"#
+            ));
+        }
+        for n in 0..returns {
+            lines.push(format!(
+                r#"{{"message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_{n}","content":"done"}}]}}}}"#
+            ));
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn each_attempt_of_one_run_counts_only_the_lines_it_appended() {
+        // One Run's transcript is one append-only file: the session id is fixed at dispatch and
+        // every later Attempt resumes that session. Counting the whole file on Attempt N counted
+        // Attempts 1..N — and `render` sums the per-Attempt pairs, so a Run that fanned out to
+        // two agents on each of three attempts published *12 spawned, 12 returned* (R51 says
+        // per Attempt).
+        let mut transcript = String::new();
+        let mut recorded = Vec::new();
+        for _ in 0..3 {
+            let already_written = transcript.lines().count();
+            if !transcript.is_empty() {
+                transcript.push('\n');
+            }
+            // Distinct ids per Attempt, because the real transcript never reuses one.
+            transcript
+                .push_str(&spawning(2, 2).replace("toolu_", &format!("toolu_{}_", recorded.len())));
+            recorded.push(fanout_since(&transcript, already_written));
+        }
+        assert_eq!(
+            recorded,
+            vec![
+                Observed::Present((2, 2)),
+                Observed::Present((2, 2)),
+                Observed::Present((2, 2))
+            ],
+            "the whole-file count would read (2,2), (4,4), (6,6) and sum to 12"
+        );
+        // And the suffix of an Attempt that appended nothing is absent, never a stale repeat of
+        // the Attempt before it.
+        let all = transcript.lines().count();
+        assert_eq!(fanout_since(&transcript, all), Observed::Absent);
+        // A zero offset is the whole file, which is what the Run's first Attempt reads.
+        assert_eq!(fanout_since(&transcript, 0), Observed::Present((6, 6)));
+    }
+
+    #[test]
+    fn an_attempt_that_spawned_three_and_saw_three_return_records_both_integers() {
+        assert_eq!(fanout_counts(&spawning(3, 3)), Observed::Present((3, 3)));
+    }
+
+    #[test]
+    fn an_attempt_that_spawned_three_and_saw_two_return_says_so_and_nothing_else() {
+        // A count of processes must never become an assertion about a review.
+        let found = fanout_counts(&spawning(3, 2));
+        assert_eq!(found, Observed::Present((3, 2)));
+        let rendered = format!("{found:?}").to_lowercase();
+        for banned in ["health", "degraded", "ok", "complete", "true", "false"] {
+            assert!(!rendered.contains(banned), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn an_attempt_with_no_transcript_records_could_not_observe_rather_than_zero_zero() {
+        // `(0, 0)` claims the Run fanned out to nobody. Nothing was read.
+        let unread: Observed<(u64, u64)> =
+            Observed::Unobservable(Reason::saying("the transcript could not be read"));
+        assert_ne!(unread, Observed::Present((0, 0)));
+        // And a transcript full of tool calls naming something else is the same kind of silence.
+        assert!(matches!(
+            fanout_counts(FANOUT_UNRECOGNISED),
+            Observed::Unobservable(_)
+        ));
+        assert_eq!(fanout_counts(EMPTY), Observed::Absent);
+    }
+
+    #[test]
+    fn the_record_round_trips_both_integers_through_the_reader() {
+        // One shared `Attempt` type, so there is no reader mirror to drift — and the
+        // `deny_unknown_fields` parity test binds only the record's top-level fields, so a
+        // duplicate attempt type inside `view` would not be caught by it.
+        let found: RunView = serde_json::from_str(DAY_ONE).expect("the day-one record");
+        assert_eq!(found.attempts[0].fanout, Observed::Present((3, 3)));
+        assert!(matches!(
+            found.attempts[1].fanout,
+            Observed::Unobservable(_)
+        ));
+        assert_eq!(found.attempts[2].fanout, Observed::Absent);
+        let written = serde_json::to_string(&found.attempts[0]).expect("serialise");
+        let read: crate::attempt::Attempt = serde_json::from_str(&written).expect("deserialise");
+        assert_eq!(read.fanout, found.attempts[0].fanout);
+    }
+
+    #[test]
+    fn the_live_stage_carries_the_same_nothing_recognised_rule() {
+        // Not currently broken. The rule is what keeps it from breaking silently the way the
+        // fan-out matcher did.
+        let found = now_skill(FANOUT_UNRECOGNISED);
+        assert!(matches!(found, Observed::Unobservable(_)), "{found:?}");
+        assert_eq!(
+            now_skill(FANOUT_AGENT),
+            Observed::Present("compound-engineering:ce-code-review".to_string())
+        );
     }
 
     #[test]

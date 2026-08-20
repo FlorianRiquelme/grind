@@ -45,6 +45,108 @@ pub struct VerifyContract {
     pub missing: Vec<String>,
 }
 
+/// What each contracted step **plausibly** covers, by file extension and directory prefix.
+///
+/// New data, not a refactor: `VERIFY_CONTRACT` carries tool-invocation substrings and knows
+/// nothing about paths. A coarse heuristic, authored only for the ecosystems the contract
+/// already names, and keyed to the same seven step names so a step that goes missing takes its
+/// coverage with it.
+///
+/// **There is no source of truth behind this.** The contract knows which recipes exist, not
+/// which paths they read, and a reader who treats the number below as a measurement has read
+/// it wrong.
+const STEP_COVERAGE: [(&str, &[&str]); 7] = [
+    ("rust-fmt", &[".rs"]),
+    ("rust-clippy", &[".rs"]),
+    ("rust-test", &[".rs"]),
+    ("ts-typecheck", &[".ts", ".tsx", ".d.ts"]),
+    ("ts-lint", &[".ts", ".tsx", ".js", ".jsx"]),
+    ("ts-test", &[".ts", ".tsx", ".js", ".jsx"]),
+    ("build-assertion", &[".rs", ".ts", ".tsx", "src-tauri/"]),
+];
+
+/// How much of the Run's own diff sits outside **every** contracted step that is present.
+///
+/// **A rough, explicitly-estimated statement, and the list is the primary value.** A bare
+/// number is the shape ADR-0006's sixth and seventh entries warn about; naming the paths is
+/// what makes the estimate checkable rather than authoritative-looking.
+///
+/// It carries no boolean and gates nothing. ADR-0006 already prohibits a summary flag on the
+/// verify contract, and this is the same shape one field over.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifyCoverage {
+    /// The changed paths no present step plausibly covers.
+    pub uncovered: Vec<String>,
+    /// How many paths the Run changed in all, so the proportion is the reader's to form.
+    pub changed: usize,
+}
+
+impl std::fmt::Display for VerifyCoverage {
+    /// Deliberately says **roughly** and **estimate**: a precise-looking number derived from a
+    /// guess is worse than an obviously rough one.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.uncovered.is_empty() {
+            return write!(
+                f,
+                "an estimated 0 of {} changed paths sit outside every contracted step",
+                self.changed
+            );
+        }
+        write!(
+            f,
+            "roughly {} of {} changed paths sit outside every contracted step (estimate): {}",
+            self.uncovered.len(),
+            self.changed,
+            self.uncovered.join(", ")
+        )
+    }
+}
+
+/// The estimate, over the Run's own diff and the steps the target repo actually declares.
+pub fn verify_coverage(
+    contract: &VerifyContract,
+    changed_files: &Observed<Vec<String>>,
+) -> Observed<VerifyCoverage> {
+    let changed = match changed_files {
+        Observed::Present(files) => files,
+        Observed::Absent => {
+            return Observed::Present(VerifyCoverage {
+                uncovered: Vec::new(),
+                changed: 0,
+            });
+        }
+        Observed::Unobservable(reason) => return Observed::Unobservable(reason.clone()),
+    };
+    // Only the steps that are **present** cover anything. A contract with `ts-test` missing does
+    // not get to claim its extensions.
+    let covering: Vec<&[&str]> = STEP_COVERAGE
+        .iter()
+        .filter(|(name, _)| contract.present.iter().any(|present| present == name))
+        .map(|(_, patterns)| *patterns)
+        .collect();
+    let uncovered: Vec<String> = changed
+        .iter()
+        .filter(|path| {
+            !covering
+                .iter()
+                .any(|patterns| patterns.iter().any(|pattern| covers(pattern, path)))
+        })
+        .cloned()
+        .collect();
+    Observed::Present(VerifyCoverage {
+        uncovered,
+        changed: changed.len(),
+    })
+}
+
+/// A pattern is either an extension (`.rs`) or a directory prefix (`src-tauri/`).
+fn covers(pattern: &str, path: &str) -> bool {
+    if pattern.ends_with('/') {
+        return path.starts_with(pattern) || path.contains(&format!("/{pattern}"));
+    }
+    path.ends_with(pattern)
+}
+
 /// The four observations completion is ANDed from.
 ///
 /// A named struct rather than loose arguments so a new signal is `E0063` at every construction
@@ -105,8 +207,14 @@ impl std::fmt::Display for Stage {
 /// signal's three-valuedness through untouched.
 pub fn signals_of(observation: &Observation) -> RawSignals {
     RawSignals {
+        // **A PR that was found is not a PR that is open.** The head-commit lookup asks with
+        // `--state all` deliberately — a closed PR still belongs in the Handback's PR row, and
+        // deleting it from the search would answer a different question. But the signal
+        // completion is ANDed from is *`pr_open`*, and Grind's contract is *stops at an open
+        // PR*: a Run whose PR a human closed was otherwise four-for-four and reported
+        // `Completed`, printing the closed PR's URL as its result on the Job issue.
         pr_open: match &observation.pr {
-            Observed::Present(_) => Observed::Present(true),
+            Observed::Present(found) => Observed::Present(found.state.eq_ignore_ascii_case("OPEN")),
             Observed::Absent => Observed::Present(false),
             Observed::Unobservable(reason) => Observed::Unobservable(reason.clone()),
         },
@@ -245,6 +353,12 @@ mod tests {
                 "docs/residual-review-findings/a.md".to_string(),
             ]),
             ledger_entries: Observed::Absent,
+            changed_files: Observed::Present(vec![
+                "docs/plans/a.md".to_string(),
+                "docs/residual-review-findings/a.md".to_string(),
+                "src/lib.rs".to_string(),
+            ]),
+            base_drift: Observed::Unobservable(Reason::saying("not measured in this fixture")),
         }
     }
 
@@ -444,5 +558,149 @@ mod tests {
         // blind.
         seen.checks_pending = Observed::Absent;
         assert_eq!(verdict(&signals_of(&seen), false), Verdict::Completed);
+    }
+
+    #[test]
+    fn a_closed_or_merged_pr_is_not_an_open_one_and_does_not_complete_the_run() {
+        // The head-commit lookup asks with `--state all`, so a PR a human closed is still
+        // `Observed::Present` — and every other completion signal on such a Run is satisfied.
+        // Grind's contract is *stops at an open PR*; the closed one must hold it incomplete.
+        for state in ["CLOSED", "MERGED", "closed", "merged"] {
+            let mut seen = observation();
+            let Observed::Present(pr) = &mut seen.pr else {
+                panic!("the fixture holds a PR");
+            };
+            pr.state = state.to_string();
+            assert!(
+                matches!(verdict(&signals_of(&seen), false), Verdict::Incomplete(unmet)
+                    if unmet.contains(&"PR open".to_string())),
+                "a {state} PR must not read as open"
+            );
+            // The promise does not rescue it either: DONE over a closed PR is uncorroborated.
+            assert!(matches!(
+                verdict(&signals_of(&seen), true),
+                Verdict::Uncorroborated(_)
+            ));
+            // And the PR itself stays observed, so the Handback's row still names it.
+            assert!(matches!(seen.pr, Observed::Present(_)));
+        }
+        // The spelling `gh` actually returns still completes the Run.
+        assert_eq!(
+            verdict(&signals_of(&observation()), false),
+            Verdict::Completed
+        );
+    }
+
+    // --- the verify-coverage estimate ------------------------------------------------------
+
+    fn rust_only() -> VerifyContract {
+        VerifyContract {
+            present: vec!["rust-fmt".into(), "rust-clippy".into(), "rust-test".into()],
+            missing: vec![
+                "ts-typecheck".into(),
+                "ts-lint".into(),
+                "ts-test".into(),
+                "build-assertion".into(),
+            ],
+        }
+    }
+
+    fn changed(paths: &[&str]) -> Observed<Vec<String>> {
+        Observed::Present(paths.iter().map(|p| p.to_string()).collect())
+    }
+
+    #[test]
+    fn a_diff_entirely_inside_a_present_steps_coverage_estimates_zero_uncovered() {
+        let found = verify_coverage(&rust_only(), &changed(&["src/lib.rs", "src/observe.rs"]));
+        let Observed::Present(estimate) = found else {
+            panic!("the diff was readable");
+        };
+        assert!(estimate.uncovered.is_empty());
+        assert_eq!(estimate.changed, 2);
+        assert!(estimate.to_string().contains("estimated 0 of 2"));
+    }
+
+    #[test]
+    fn a_diff_touching_an_extension_no_present_step_covers_names_the_paths() {
+        let found = verify_coverage(
+            &rust_only(),
+            &changed(&["src/lib.rs", "docs/adr/0013.md", "web/app.tsx"]),
+        );
+        let Observed::Present(estimate) = found else {
+            panic!("the diff was readable");
+        };
+        assert_eq!(estimate.uncovered, vec!["docs/adr/0013.md", "web/app.tsx"]);
+        assert_eq!(estimate.changed, 3);
+        let said = estimate.to_string();
+        assert!(said.contains("estimate"), "{said}");
+        assert!(said.contains("web/app.tsx"), "{said}");
+    }
+
+    #[test]
+    fn a_contract_with_a_step_missing_does_not_count_that_steps_extensions_as_covered() {
+        // `rust-only` above declares no TypeScript step, so `.tsx` is uncovered. Add them and
+        // the same path becomes covered — the estimate reads the contract, not the ecosystem.
+        let with_ts = VerifyContract {
+            present: vec!["rust-test".into(), "ts-lint".into()],
+            missing: vec!["rust-fmt".into()],
+        };
+        let found = verify_coverage(&with_ts, &changed(&["web/app.tsx"]));
+        assert_eq!(
+            found,
+            Observed::Present(VerifyCoverage {
+                uncovered: vec![],
+                changed: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn an_empty_diff_estimates_zero_and_says_so_without_a_boolean() {
+        let found = verify_coverage(&rust_only(), &Observed::Absent);
+        assert_eq!(
+            found,
+            Observed::Present(VerifyCoverage {
+                uncovered: vec![],
+                changed: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn a_diff_that_could_not_be_read_leaves_the_estimate_unobserved() {
+        let found = verify_coverage(
+            &rust_only(),
+            &Observed::Unobservable(Reason::saying("git diff --name-only: exit 128")),
+        );
+        assert!(matches!(found, Observed::Unobservable(_)), "{found:?}");
+    }
+
+    #[test]
+    fn no_type_in_the_estimate_carries_an_ok_a_health_word_or_a_summary_flag() {
+        let shape = format!(
+            "{:?}",
+            VerifyCoverage {
+                uncovered: vec!["docs/adr/0013.md".to_string()],
+                changed: 3,
+            }
+        )
+        .to_lowercase();
+        for banned in ["ok", "healthy", "passed", "true", "false", "sufficient"] {
+            assert!(!shape.contains(banned), "{shape}");
+        }
+        // And the estimate never gates: nothing in this module branches on it.
+        assert!(!include_str!("policy.rs").contains("verify_coverage"));
+        assert!(!include_str!("supervisor.rs").contains("verify_coverage"));
+    }
+
+    #[test]
+    fn every_contracted_step_has_a_coverage_entry_and_the_two_lists_cannot_drift() {
+        assert_eq!(STEP_COVERAGE.len(), VERIFY_CONTRACT.len());
+        for (name, _) in VERIFY_CONTRACT {
+            assert!(
+                STEP_COVERAGE.iter().any(|(covered, _)| *covered == name),
+                "`{name}` is contracted and covers nothing"
+            );
+        }
     }
 }

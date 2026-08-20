@@ -1,17 +1,48 @@
 #!/bin/sh
 # The fake `gh`, reached from a replaced `PATH` so no real `gh` is reachable at all.
 #
-# Dispatch removes a label and comments on the Job issue, so a fall-through here would mutate a
-# real GitHub issue from a routine `just verify`. **Anything unimplemented fails loudly.**
+# Grind comments on the Job issue, so a fall-through here would mutate a real GitHub issue from
+# a routine `just verify`. **Anything unimplemented fails loudly.**
+#
+# The `issue edit` arm stays after ADR-0012 deleted the label removal: an accidental
+# reintroduction has to be caught by an assertion on the log below rather than escape.
 F="${HOME:?}/.fake/gh"
 COUNT=$(cat "${HOME}/.fake/counter" 2>/dev/null || echo 0)
+
+# Every invocation, one argument per line. The assertion on what Grind writes has to be on what
+# was actually posted, not on the absence of an error — an `issue edit` that reappears is caught
+# here rather than escaping.
+{
+  printf -- '--- gh\n'
+  for a in "$@"; do printf '%s\n' "$a"; done
+} >> "${HOME}/.fake/gh.log"
 
 case "$1 $2" in
   "issue view")    cat "$F/issue.json"; exit 0 ;;
   "issue edit")    printf 'label removed\n'; exit 0 ;;
-  "issue comment") printf 'comment posted\n'; exit 0 ;;
+  "issue comment")
+      printf 'comment posted\n'
+      exit "$(cat "$F/comment.code" 2>/dev/null || echo 0)"
+      ;;
   "auth status")   printf 'github.com: Logged in to github.com account tester (oauth_token)\n'; exit 0 ;;
   "ssh-key list")  printf '2026-08-01\ttester\tauthentication\n2026-08-01\ttester\tsigning\n'; exit 0 ;;
+  "pr list")
+      # The head-commit lookup. `gh pr list` answers with an array and exits 0 when nothing
+      # matched, so *no PR yet* is an answer here rather than a failure — and the same
+      # appears-gate applies, because the world moves underneath a Run.
+      APPEARS=$(cat "$F/pr_from" 2>/dev/null || echo 1)
+      if [ ! -f "$F/pr.code" ] && [ "$COUNT" -lt "$APPEARS" ]; then
+        printf '[]\n'
+        exit 0
+      fi
+      [ -f "$F/pr.stderr" ] && cat "$F/pr.stderr" >&2
+      if [ -f "$F/pr.stdout" ]; then
+        printf '['
+        cat "$F/pr.stdout"
+        printf ']\n'
+      fi
+      exit "$(cat "$F/pr.code" 2>/dev/null || echo 0)"
+      ;;
   "pr view")
       KIND=pr
       for a in "$@"; do

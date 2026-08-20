@@ -5,7 +5,7 @@
 //! neither cleanly pure nor cleanly I/O (ADR-0007).
 
 use crate::job::Job;
-use crate::observe::Reason;
+use crate::observe::{Observed, Reason};
 use crate::world;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -22,7 +22,7 @@ use std::path::Path;
 /// Weakening the list is **intent**, and no carrier defends against intent. What is typeable is
 /// the narrower, omission-shaped property below: every invocation carries them. The contents
 /// stay prose, in `CLAUDE.md`, where they already are.
-pub const DENIED_TOOLS: [&str; 12] = [
+pub const DENIED_TOOLS: [&str; 23] = [
     "Bash(gh pr merge*)",
     "Bash(git push --force*)",
     "Bash(git push -f*)",
@@ -43,6 +43,36 @@ pub const DENIED_TOOLS: [&str; 12] = [
     "Bash(git switch main*)",
     // Merge through the API rather than `gh pr merge`.
     "Bash(gh api*merge*)",
+    // --- the same operations with the flag off the front ---------------------------------
+    //
+    // Every glob above anchors its flag immediately after the verb, and **git accepts the flag
+    // anywhere**: `git push origin --force`, `git push -u origin main --force`,
+    // `git reset HEAD~3 --hard` and `git branch --delete --force feat/x` are the forms people
+    // and agents most often type, and all four were allowed. These eleven are the same
+    // operations, position-independent.
+    "Bash(git push*--force*)",
+    "Bash(git push*--delete*)",
+    // `git push origin :feat/x` deletes a branch through the refspec. Also refuses a push
+    // naming an explicit `user@host:path` remote, which is not the shape a Run pushes in —
+    // it pushes to the `origin` its worktree already has.
+    "Bash(git push*:*)",
+    // `-f` as its own argument, in the two positions it can take. Deliberately **not**
+    // `git push*-f*`: a branch named `fix/PROJ-1 -form` is unlikely, but `-f` as a bare
+    // substring appears inside ordinary branch names and that glob would refuse the push.
+    "Bash(git push* -f)",
+    "Bash(git push* -f *)",
+    "Bash(git reset*--hard*)",
+    "Bash(git branch* -D*)",
+    "Bash(git branch*--delete*)",
+    // Force-push under its safest-sounding spelling. It is still a force-push, and
+    // `--force-with-lease` reads like a concession a stuck Run would reach for.
+    "Bash(git*--force-with-lease*)",
+    // The lowercase sibling of `Bash(git -C*)`. `git -c x rebase` moves the verb off the front
+    // exactly as `-C` does, and glob matching is byte-exact, so the uppercase glob never saw it.
+    "Bash(git -c*)",
+    // Branch deletion and history rewriting one layer below the porcelain:
+    // `git update-ref -d refs/heads/x` deletes, `git update-ref refs/heads/main <sha>` rewrites.
+    "Bash(git*update-ref*)",
 ];
 
 /// Re-entry rides Claude Code's own session resume, not an `lfg` return value: `lfg` exposes no
@@ -106,7 +136,6 @@ pub struct Conditions<'a> {
     pub session_id: &'a str,
     pub plugin_dir: &'a str,
     pub model: Option<&'a str>,
-    pub spend_cap: Option<&'a str>,
 }
 
 /// A built invocation. **Private fields, and `build` is the only constructor** — so an argv
@@ -175,27 +204,37 @@ fn build(conditions: &Conditions, mode: Mode, prompt: String) -> Invocation {
     }
     argv.push("--plugin-dir".to_string());
     argv.push(conditions.plugin_dir.to_string());
-    if let Some(cap) = conditions.spend_cap {
-        argv.push("--max-budget-usd".to_string());
-        argv.push(cap.to_string());
-    }
+    // No `--max-budget-usd`. ADR-0010: spend is recorded, never bounded — a number someone
+    // guessed at Enqueue must not kill a Run mid-work for being larger than the guess.
     // The last thing appended, on every path, from the one builder.
     argv.push("--disallowedTools".to_string());
     argv.extend(DENIED_TOOLS.iter().map(|glob| glob.to_string()));
     Invocation { argv, prompt, mode }
 }
 
+/// The Run is told only what Grind can know.
+///
+/// Two constants went out of it. *No human present* invited the Run to ask a question and wait
+/// for an answer; *unsupervised* says the same thing about attention without implying anyone is
+/// there to be addressed. And *this slice is transcription, not design* is false of any Job
+/// wider than a rewrite — the half that is true of every Job, **do not re-open decisions the
+/// Anchor records**, survives the half that is not.
+///
+/// Nothing reads the narrative or the closing keyword back. They are asked for because the
+/// human reads them, and a Grind that keyed a verdict on either would be grading prose.
 fn dispatch_prompt(job: &Job) -> String {
     format!(
-        "You are a Grind Run, executing unattended with no human present.
+        "You are a Grind Run, executing unattended and unsupervised. Nobody is watching this
+session and no question you ask will be answered, so decide and proceed.
 
 Job:            {url}
 Branch:         {branch}
 Handoff SHA:    {handoff}
 Anchor artifact: {anchor}
-
-Everything behind the Handoff SHA is context the human prepared for you — read it.
-Everything you add in front of it is reviewable output.
+{intent}
+The Handoff SHA bounds your **output**, not your **reading**. Everything you add sits in
+front of it and is what gets reviewed; read as far around it as you need, including work
+that landed after it.
 
 Invoke the `lfg` skill against the Anchor artifact, resolving the skill name against the
 available-skills list (it may be namespaced, e.g. `compound-engineering:lfg`):
@@ -203,8 +242,12 @@ available-skills list (it may be namespaced, e.g. `compound-engineering:lfg`):
     {anchor}
 
 The Anchor artifact is the requirements you must satisfy. Everything else you need is
-discoverable from this branch. Its contents are already decided — this slice is
-transcription, not design. Do not re-open decisions it records.
+discoverable from this branch. Do not re-open decisions it records.
+
+Before you create a file in a shared sequential namespace — a numbered ADR, a migration, a
+changelog entry — read the current state of that namespace. Read it again on each attempt
+rather than trusting a view you took earlier: other work lands while you run, and two files
+claiming one number is a collision a human has to unpick by hand.
 
 Definition of done: `just verify` passes.
 
@@ -212,12 +255,31 @@ If a step of `just verify` cannot be made green, say so plainly in the PR body a
 the step intact. Never weaken, trim, skip or remove a step of the verify entrypoint to
 make it pass — a gutted gate is worse than one that fails honestly.
 
+Put a narrative in the PR body: the decisions you took, whatever was non-obvious, and
+anything that surprised you. Those are categories and not a template — no headings, no
+order, no required sections, and nothing at all where there is nothing to say.
+
+Put `Closes #{issue}` in the PR body where this PR delivers the whole Job. Where the Job is
+wider than the code, reference it without the keyword instead.
+
 Stop at an open PR. Do not merge it.",
         url = job.url,
         branch = job.branch,
         handoff = job.handoff_sha,
         anchor = job.anchor,
+        issue = job.issue,
+        intent = intent_line(job.intent.as_deref()),
     )
+}
+
+/// **Default is silence.** The first `Option`-gated line in the prompt: saying nothing about
+/// the work's nature is honest, and a wrong constant is not — which is exactly what *this slice
+/// is transcription, not design* was.
+fn intent_line(intent: Option<&str>) -> String {
+    match intent {
+        Some(said) => format!("Intent:         {said}\n"),
+        None => String::new(),
+    }
 }
 
 /// What a child left behind, **after** it landed on disk.
@@ -289,6 +351,60 @@ pub struct Attempt {
     pub done_promise: bool,
     pub rate_limited: bool,
     pub result_tail: String,
+    /// **Spawned and returned, per Attempt.** A fan-out degrading on attempt 3 of a Run that
+    /// finishes on attempt 8 leaves something durable.
+    ///
+    /// Three-valued, because two bare `Option<u64>` fields would collapse *no fan-out* and
+    /// *could not read the transcript*. **No summary, boolean or health word sits over the two
+    /// integers**: a count of processes must never become an assertion about a review
+    /// (ADR-0006's sixth prohibited shape).
+    pub fanout: Observed<(u64, u64)>,
+}
+
+impl Attempt {
+    /// **A Wait is an Attempt that did no work**, and it is keyed on work done rather than on
+    /// cause — this predicate never reads `rate_limited`. Six of Run 2's eight Attempts cost $0
+    /// and ran one turn each, probing a wall, and spent the same budget as the three that built
+    /// twelve commits.
+    ///
+    /// Derived, never persisted: the three fields it reads are already on the record, so there
+    /// is no migration and no reader mirror to keep in step.
+    ///
+    /// **An Attempt whose stdout did not parse is never a Wait, and that clause is
+    /// load-bearing.** A child that dies before emitting parseable JSON leaves both the cost and
+    /// the turn count absent, so a predicate reading absence as *did no work* would make every
+    /// crash loop free: no budget spent, no rate-limit match, immediate re-entry, forever, with
+    /// `attempt N of M` reporting the Run as barely started. Absence of evidence is not evidence
+    /// of no work, and `parse_ok` is the field that already separates the two.
+    /// The fan-out arithmetic, gathered before the Attempt is pushed — `RunRecord.attempts` is
+    /// append-only with no mutating accessor, so it cannot be filled in afterwards (KTD9).
+    pub fn with_fanout(mut self, fanout: Observed<(u64, u64)>) -> Self {
+        self.fanout = fanout;
+        self
+    }
+
+    pub fn is_wait(&self) -> bool {
+        self.parse_ok
+            && self.total_cost_usd.unwrap_or(0.0) <= 0.0
+            && self.num_turns.unwrap_or(0) <= 1
+    }
+}
+
+/// How many of these Attempts did work. **The attempt budget counts these and no others**, on
+/// every surface that prints *attempt N of M*.
+pub fn working(attempts: &[Attempt]) -> usize {
+    attempts.iter().filter(|a| !a.is_wait()).count()
+}
+
+/// The run of Waits at the end of the list — the only bound on a Run that never does work,
+/// since Waits by design spend no attempt budget.
+///
+/// Counted from the **recorded** list rather than held loop-local, because the bound has to
+/// survive a restart: `resume --all` re-enters rate-limited and died Runs at boot, so a
+/// loop-local count would hand a permanently-walled Run a fresh allowance at every reboot and
+/// never terminate.
+pub fn trailing_waits(attempts: &[Attempt]) -> usize {
+    attempts.iter().rev().take_while(|a| a.is_wait()).count()
 }
 
 /// The pure classifier over a raw triple.
@@ -368,6 +484,10 @@ pub fn classify(
             },
             1500,
         ),
+        // Could not observe until somebody reads the transcript, which is `supervisor`'s job
+        // before it pushes the Attempt. A path that forgets records *could not observe* rather
+        // than `(0, 0)`, which is the honest direction for an omission.
+        fanout: Observed::Unobservable(Reason::saying("the transcript was not read")),
     }
 }
 
@@ -459,21 +579,27 @@ mod tests {
             branch: "feat/28-slice-1b".to_string(),
             handoff_sha: "9d1f4c7a".to_string(),
             anchor: "docs/plans/a.md".to_string(),
-            budget: Some("$12.50".to_string()),
+            intent: None,
             model: None,
             plugin: PluginPin::parse("compound-engineering@compound-engineering-plugin 3.21.3")
                 .unwrap(),
         }
     }
 
-    fn conditions<'a>(model: Option<&'a str>, cap: Option<&'a str>) -> Conditions<'a> {
+    fn conditions(model: Option<&str>) -> Conditions<'_> {
         Conditions {
             claude_bin: "/home/op/.grind/bin/claude",
             session_id: "d51b4c39-ce1d-449b-8366-04b9b1aa6573",
             plugin_dir: "/home/op/.claude/plugins/cache/m/n/3.21.3",
             model,
-            spend_cap: cap,
         }
+    }
+
+    /// Every prompt change is asserted against the **built** prompt string, never against the
+    /// constant it came from.
+    fn built_dispatch_prompt() -> String {
+        let built = dispatch(&conditions(None), &job());
+        built.prompt().to_string()
     }
 
     fn denials_of(invocation: &Invocation) -> Vec<String> {
@@ -487,7 +613,7 @@ mod tests {
 
     #[test]
     fn every_built_argv_carries_all_twelve_globs_on_all_three_paths() {
-        let conditions = conditions(None, None);
+        let conditions = conditions(None);
         for invocation in [
             dispatch(&conditions, &job()),
             resume(&conditions),
@@ -545,31 +671,103 @@ mod tests {
 
     #[test]
     fn each_forbidden_operation_has_a_glob_that_refuses_it_under_the_documented_matcher() {
-        // Table of forbidden operation -> a candidate command string that performs it. This is
-        // the coverage the membership test above cannot give: the globs were present all along
-        // for the seven original spellings, and still missed the five spellings below.
-        let table: [(&str, &str); 12] = [
-            ("merge via gh pr merge", "gh pr merge 123 --squash"),
-            ("force push with --force", "git push --force origin feat/x"),
-            ("force push with -f", "git push -f"),
-            ("hard reset", "git reset --hard HEAD~3"),
-            ("rebase", "git rebase main"),
-            ("checkout main", "git checkout main"),
-            ("branch delete with -D", "git branch -D feat/x"),
-            ("branch delete via push", "git push --delete origin feat/x"),
-            ("the +refspec force", "git push origin +main"),
+        // Table of forbidden operation -> **every spelling that performs it**, flag-first and
+        // flag-last. This is the coverage the membership test above cannot give, and one
+        // spelling per row is what let the whole list read complete while
+        // `git push origin --force` went straight through: git accepts the flag anywhere, and
+        // a table that only ever types it in one position never asks.
+        let table: [(&str, &[&str]); 15] = [
+            (
+                "merge via gh pr merge",
+                &["gh pr merge 123 --squash", "gh pr merge --squash 123"],
+            ),
+            (
+                "force push with --force",
+                &[
+                    "git push --force origin feat/x",
+                    "git push origin --force",
+                    "git push origin main --force",
+                    "git push -u origin main --force",
+                ],
+            ),
+            ("force push with -f", &["git push -f", "git push origin -f"]),
+            (
+                "force push with --force-with-lease",
+                &[
+                    "git push --force-with-lease origin feat/x",
+                    "git push origin --force-with-lease",
+                ],
+            ),
+            (
+                "hard reset",
+                &["git reset --hard HEAD~3", "git reset HEAD~3 --hard"],
+            ),
+            (
+                "rebase",
+                &["git rebase main", "git rebase --onto main feat/x"],
+            ),
+            (
+                "checkout main",
+                &["git checkout main", "git checkout main --force"],
+            ),
+            (
+                "branch delete",
+                &[
+                    "git branch -D feat/x",
+                    "git branch feat/x -D",
+                    "git branch --delete --force feat/x",
+                    "git branch --force --delete feat/x",
+                ],
+            ),
+            (
+                "branch delete via push",
+                &[
+                    "git push --delete origin feat/x",
+                    "git push origin --delete feat/x",
+                    "git push origin :feat/x",
+                ],
+            ),
+            (
+                "the +refspec force",
+                &[
+                    "git push origin +main",
+                    "git push origin +refs/heads/main:refs/heads/main",
+                ],
+            ),
             (
                 "the -C prefix moving the verb off the front",
-                "git -C /tmp/other push --force",
+                &[
+                    "git -C /tmp/other push --force",
+                    "git -C /tmp/other rebase main",
+                ],
             ),
-            ("switch onto main", "git switch main"),
+            (
+                "the -c prefix moving the verb off the front",
+                &["git -c core.pager=cat rebase main", "git -c x push --force"],
+            ),
+            (
+                "switch onto main",
+                &["git switch main", "git switch main --force"],
+            ),
             (
                 "merge through the api",
-                "gh api repos/o/r/pulls/12/merge -X PUT",
+                &[
+                    "gh api repos/o/r/pulls/12/merge -X PUT",
+                    "gh api --method PUT repos/o/r/pulls/12/merge",
+                ],
+            ),
+            (
+                "branch delete and history rewrite through update-ref",
+                &[
+                    "git update-ref -d refs/heads/feat/x",
+                    "git update-ref refs/heads/main abc123",
+                ],
             ),
         ];
-        for (name, candidate) in table {
-            assert!(is_denied(candidate), "{name}: {candidate:?} must be denied");
+        for (name, spellings) in table {
+            for candidate in spellings {
+                assert!(is_denied(candidate), "{name}: {candidate:?} must be denied");
+            }
         }
         // Denials are per-subcommand after splitting on shell operators, so a prefix like `cd`
         // ahead of the forbidden verb must not let it through.
@@ -580,10 +778,18 @@ mod tests {
     fn ordinary_operations_the_barrier_must_not_catch_are_not_denied() {
         for allowed in [
             "git push origin feat/x",
+            "git push -u origin feat/x",
+            // A branch name carrying `-f` or `-D` as a substring is ordinary, and the
+            // position-independent globs are written to leave it alone.
+            "git push -u origin fix/PROJ-1-form-fields",
+            "git push -u origin feat/PROJ-2-Dashboard",
             "git status",
             "git branch -d feat/x",
             "gh pr view 12",
+            "gh pr create --fill",
             "git checkout feat/x",
+            "git fetch origin",
+            "git log --oneline",
         ] {
             assert!(!is_denied(allowed), "{allowed:?} must not be denied");
         }
@@ -591,7 +797,7 @@ mod tests {
 
     #[test]
     fn the_first_attempt_opens_a_session_and_every_later_one_resumes_it() {
-        let conditions = conditions(None, None);
+        let conditions = conditions(None);
         let first = dispatch(&conditions, &job());
         assert!(first.argv().contains(&"--session-id".to_string()));
         assert!(!first.argv().contains(&"--resume".to_string()));
@@ -606,7 +812,7 @@ mod tests {
 
     #[test]
     fn the_argv_shape_is_the_one_two_runs_actually_used() {
-        let invocation = dispatch(&conditions(Some("claude-opus-5"), Some("12.50")), &job());
+        let invocation = dispatch(&conditions(Some("claude-opus-5")), &job());
         let argv = invocation.argv();
         assert_eq!(argv[0], "/home/op/.grind/bin/claude");
         assert_eq!(
@@ -621,23 +827,36 @@ mod tests {
             argv.windows(2)
                 .any(|w| w[0] == "--model" && w[1] == "claude-opus-5")
         );
-        assert!(
-            argv.windows(2)
-                .any(|w| w[0] == "--max-budget-usd" && w[1] == "12.50")
-        );
         assert!(argv.windows(2).any(|w| w[0] == "--plugin-dir"));
     }
 
     #[test]
-    fn no_budget_ceiling_and_no_model_mean_no_flags_for_them() {
-        let invocation = dispatch(&conditions(None, None), &job());
-        assert!(!invocation.argv().contains(&"--max-budget-usd".to_string()));
+    fn no_built_argv_on_any_of_the_three_paths_carries_a_spend_ceiling() {
+        // ADR-0010: spend is recorded, never bounded. A number someone guessed at Enqueue must
+        // not kill a Run mid-work for being larger than the guess.
+        let conditions = conditions(Some("claude-opus-5"));
+        for invocation in [
+            dispatch(&conditions, &job()),
+            resume(&conditions),
+            ci_babysit(&conditions),
+        ] {
+            assert!(
+                !invocation.argv().contains(&"--max-budget-usd".to_string()),
+                "{:?}",
+                invocation.mode()
+            );
+        }
+    }
+
+    #[test]
+    fn no_model_means_no_flag_for_it() {
+        let invocation = dispatch(&conditions(None), &job());
         assert!(!invocation.argv().contains(&"--model".to_string()));
     }
 
     #[test]
     fn the_dispatch_prompt_carries_the_jobs_own_four_facts() {
-        let invocation = dispatch(&conditions(None, None), &job());
+        let invocation = dispatch(&conditions(None), &job());
         for fact in [
             "issues/28",
             "feat/28-slice-1b",
@@ -651,6 +870,121 @@ mod tests {
                 .prompt()
                 .contains("Stop at an open PR. Do not merge it.")
         );
+    }
+
+    #[test]
+    fn the_dispatch_prompt_says_unsupervised_rather_than_alone() {
+        // *No human present* invited the Run to ask a question and wait for an answer.
+        let prompt = built_dispatch_prompt();
+        assert!(prompt.contains("unsupervised"), "{prompt}");
+        assert!(!prompt.contains("no human present"), "{prompt}");
+        assert!(
+            prompt.contains("executing unattended"),
+            "the phrase that was right stays: {prompt}"
+        );
+    }
+
+    #[test]
+    fn the_dispatch_prompt_stops_calling_the_work_transcription() {
+        // False of any Job wider than a rewrite, and this one is a slice with design left in it.
+        let prompt = built_dispatch_prompt();
+        assert!(!prompt.contains("transcription"), "{prompt}");
+        assert!(
+            prompt.contains("Do not re-open decisions it records"),
+            "the half that is true of every Job survives: {prompt}"
+        );
+    }
+
+    #[test]
+    fn the_dispatch_prompt_bounds_output_rather_than_reading() {
+        let prompt = built_dispatch_prompt();
+        let at = prompt
+            .find("Handoff SHA bounds")
+            .expect("the Handoff SHA paragraph");
+        let paragraph = &prompt[at..at + 200.min(prompt.len() - at)];
+        assert!(paragraph.contains("output"), "{paragraph}");
+        assert!(paragraph.contains("reading"), "{paragraph}");
+    }
+
+    #[test]
+    fn the_dispatch_prompt_asks_for_a_narrative_by_category_and_not_by_template() {
+        // Naming a structure is how a narrative Grind promised not to parse becomes one it
+        // parses.
+        let prompt = built_dispatch_prompt();
+        for category in ["decisions you took", "non-obvious", "surprised you"] {
+            assert!(prompt.contains(category), "missing {category}: {prompt}");
+        }
+        assert!(prompt.contains("no headings"), "{prompt}");
+        assert!(prompt.contains("no required sections"), "{prompt}");
+    }
+
+    #[test]
+    fn the_dispatch_prompt_asks_for_the_closing_keyword_and_licenses_declining_it() {
+        let prompt = built_dispatch_prompt();
+        assert!(prompt.contains("Closes #28"), "{prompt}");
+        assert!(
+            prompt.contains("without the keyword"),
+            "a Job wider than its code closes nothing: {prompt}"
+        );
+    }
+
+    #[test]
+    fn the_dispatch_prompt_names_the_shared_sequential_namespaces() {
+        let prompt = built_dispatch_prompt();
+        for named in ["numbered ADR", "migration", "changelog entry"] {
+            assert!(prompt.contains(named), "missing {named}: {prompt}");
+        }
+        assert!(
+            prompt.contains("on each attempt"),
+            "a per-Attempt read, not a pinned view: {prompt}"
+        );
+    }
+
+    #[test]
+    fn a_job_with_an_intent_row_puts_that_line_in_the_built_prompt() {
+        let stated = Job {
+            intent: Some("A settled plan transcribed into one module.".to_string()),
+            ..job()
+        };
+        let prompt = dispatch(&conditions(None), &stated).prompt().to_string();
+        assert!(
+            prompt.contains("Intent:         A settled plan transcribed into one module."),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn a_job_with_no_intent_row_puts_no_characterisation_of_the_work_in_the_prompt() {
+        // Default is silence. Saying nothing about the work's nature is honest; a wrong
+        // constant is not, which is exactly what *this slice is transcription, not design* was.
+        let prompt = built_dispatch_prompt();
+        assert!(!prompt.contains("Intent"), "{prompt}");
+        for characterisation in [
+            "transcription",
+            "mechanical",
+            "straightforward",
+            "exploratory",
+            "greenfield",
+        ] {
+            assert!(!prompt.contains(characterisation), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn nothing_observes_the_narrative_or_the_closing_keyword() {
+        // Asserted as an absence, over the two modules that could grow a reader for either.
+        // `include_str!` rather than the filesystem: reading a file at run time from inside
+        // `src/` is what `tests/topology.rs` forbids everywhere but `world`.
+        const OBSERVE: &str = include_str!("observe.rs");
+        const DECIDE: &str = include_str!("decide.rs");
+        for (name, source) in [("observe", OBSERVE), ("decide", DECIDE)] {
+            for reader in ["narrative", "Closes #", "closes #", "surprised"] {
+                assert!(
+                    !source.contains(reader),
+                    "`{name}` must not read the Run's prose back; it names `{reader}`"
+                );
+            }
+        }
     }
 
     #[test]
@@ -845,6 +1179,73 @@ mod tests {
         assert!(CI_BABYSIT_PROMPT.contains("one invocation"));
         assert!(CI_BABYSIT_PROMPT.contains("do not open a second PR"));
         assert!(CI_BABYSIT_PROMPT.contains("Never weaken, trim or skip a step of `just verify`"));
+    }
+
+    // --- the Wait predicate -------------------------------------------------------------------
+
+    fn shaped(parse_ok: bool, cost: Option<f64>, turns: Option<u64>, limited: bool) -> Attempt {
+        Attempt {
+            n: 1,
+            mode: Mode::Resume,
+            started_at: "s".to_string(),
+            ended_at: "e".to_string(),
+            exit_code: Some(1),
+            is_error: true,
+            parse_ok,
+            subtype: None,
+            stop_reason: None,
+            api_error_status: None,
+            terminal_reason: None,
+            num_turns: turns,
+            total_cost_usd: cost,
+            usage: None,
+            permission_denials: vec![],
+            done_promise: false,
+            rate_limited: limited,
+            result_tail: String::new(),
+            fanout: Observed::Absent,
+        }
+    }
+
+    #[test]
+    fn an_attempt_with_real_cost_and_many_turns_is_never_a_wait() {
+        // Keyed on work done, never on cause: the flag says rate-limited and the Attempt still
+        // did work, so it still spends the budget.
+        assert!(!shaped(true, Some(37.04), Some(187), true).is_wait());
+        assert!(!shaped(true, Some(37.04), Some(187), false).is_wait());
+    }
+
+    #[test]
+    fn an_attempt_that_parsed_with_no_cost_and_no_turns_is_a_wait() {
+        assert!(shaped(true, Some(0.0), Some(1), true).is_wait());
+        assert!(shaped(true, None, None, false).is_wait());
+        assert!(
+            shaped(true, Some(0.0), Some(1), false).is_wait(),
+            "a Wait is never keyed on the rate-limit flag"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_attempt_is_never_a_wait_even_with_both_fields_absent() {
+        // The load-bearing clause. A child that dies before emitting parseable JSON leaves both
+        // fields absent, and reading that as *did no work* makes every crash loop free.
+        assert!(!shaped(false, None, None, false).is_wait());
+        assert!(!shaped(false, None, None, true).is_wait());
+    }
+
+    #[test]
+    fn the_wait_arithmetic_reads_the_attempt_list_and_nothing_else() {
+        let list = [
+            shaped(true, Some(3.0), Some(40), false),
+            shaped(true, Some(0.0), Some(1), true),
+            shaped(false, None, None, false),
+            shaped(true, None, None, true),
+            shaped(true, Some(0.0), Some(0), true),
+        ];
+        assert_eq!(working(&list), 2);
+        assert_eq!(trailing_waits(&list), 2);
+        assert_eq!(trailing_waits(&[]), 0);
+        assert_eq!(working(&[]), 0);
     }
 
     #[test]
