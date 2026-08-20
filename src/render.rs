@@ -358,7 +358,7 @@ pub fn job_comment(view: &Facts) -> String {
     line(&mut out, "");
     line(
         &mut out,
-        &handback_verdict(verdict, observation, found, blocker.as_deref()),
+        &handback_verdict(&off_host(verdict), observation, found, blocker.as_deref()),
     );
     line(&mut out, "");
     line(&mut out, "| | |");
@@ -400,6 +400,30 @@ pub fn job_comment(view: &Facts) -> String {
     cell("verify coverage", &marked(coverage));
     cell("run state", &format!("`{}`", run_state.display()));
     out
+}
+
+/// The verdict, reduced to what the surface that leaves the host is allowed to carry.
+///
+/// The table cells honour *the mark and never the `Reason`* through [`marked`]; the verdict line
+/// above them is composed by `decide::verdict`, which spells an `Unobserved` entry
+/// `format!("{name}: {reason}")` — and a `Reason::of` is `<call site>: exit N: <first stderr
+/// line>`, so its tail is raw child stderr. Taking the text before the first `:` leaves the
+/// signal name, which is the whole of what a reader off-host can act on. `Completed`,
+/// `Uncorroborated` and `Incomplete` carry signal names only, and pass through untouched.
+///
+/// A transform on the verdict rather than a second renderer, so the comment and the Handback
+/// cannot drift into two shapes for one Run — which is the same reason `job_comment` takes
+/// [`Facts`] rather than composing its own.
+fn off_host(verdict: &Verdict) -> Verdict {
+    match verdict {
+        Verdict::Unobserved(blind) => Verdict::Unobserved(
+            blind
+                .iter()
+                .map(|said| said.split(':').next().unwrap_or(said).trim().to_string())
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 /// The mark, and never the reason behind it.
@@ -1159,54 +1183,9 @@ mod tests {
         assert!(markdown.contains("snapper.local"), "{markdown}");
     }
 
-    #[test]
-    fn the_comment_renders_at_every_one_of_the_five_terminal_states() {
-        // completed, uncorroborated, unobserved, exhausted and blocked. Exhaustion reads as an
-        // incomplete verdict over a Run whose budget ran out, and a Blocker rides the same line.
-        let mut absent = observation();
-        absent.pr = Observed::Absent;
-        let each: [(&str, String); 5] = [
-            ("completed", commented(&observation(), &Verdict::Completed)),
-            (
-                "uncorroborated",
-                commented(&absent, &Verdict::Uncorroborated(vec!["PR open".into()])),
-            ),
-            (
-                "unobserved",
-                commented(&absent, &Verdict::Unobserved(vec!["PR open: reset".into()])),
-            ),
-            (
-                "exhausted",
-                commented(&absent, &Verdict::Incomplete(vec!["PR open".into()])),
-            ),
-            (
-                "blocked",
-                job_comment(&facts_of(
-                    found(),
-                    absent.clone(),
-                    Verdict::Incomplete(vec!["PR open".into()]),
-                    coverage(),
-                    Some("git push --force-with-lease"),
-                )),
-            ),
-        ];
-        for (state, markdown) in each {
-            assert!(
-                markdown.contains("**Run `20260806-122620-snapper-28`"),
-                "the {state} comment names the Run:\n{markdown}"
-            );
-            assert!(
-                markdown.contains("| run state |"),
-                "the {state} comment carries the table:\n{markdown}"
-            );
-        }
-    }
-
-    #[test]
-    fn no_rendered_comment_contains_a_reason_built_by_reason_of() {
-        // `Reason::of` composes `<call site>: exit N: <first stderr line>`, so a reason is raw
-        // child stderr — and a misprovisioned host is exactly where an HTTPS `origin` embeds a
-        // token. An observation that could not be made shows its mark and nothing else.
+    /// An observation that could not be made, carrying a `Reason` built the way the real one is:
+    /// `Reason::of` over a failed child, whose stderr is an HTTPS `origin` with a token in it.
+    fn could_not_look() -> Observation {
         let mut blind = observation();
         blind.pr = Observed::Unobservable(Reason::of(
             "gh pr view",
@@ -1217,8 +1196,109 @@ mod tests {
                 code: Some(128),
             },
         ));
+        blind
+    }
+
+    /// The comment with its verdict **composed the way `view::gather` composes it** — through
+    /// `decide`, from the same observation. An authored verdict literal is a sanitised input,
+    /// and a guard that authors its own input cannot see what the composition path puts on the
+    /// line.
+    fn commented_from(observation: &Observation) -> String {
+        commented(
+            observation,
+            &crate::decide::verdict(&crate::decide::signals_of(observation), false),
+        )
+    }
+
+    #[test]
+    fn the_comment_renders_at_every_one_of_the_five_terminal_states() {
+        // completed, uncorroborated, unobserved, exhausted and blocked. Exhaustion reads as an
+        // incomplete verdict over a Run whose budget ran out, and a Blocker rides the same line.
+        //
+        // **Each case asserts what only that state says.** The Run name and the table header are
+        // state-invariant, so a guard built from those two passes on all five even when the one
+        // line that tells them apart has gone — and `exhausted` and `blocked` are the same
+        // verdict, differing only by the parenthetical.
+        let mut absent = observation();
+        absent.pr = Observed::Absent;
+        let each: [(&str, String, &[&str], &[&str]); 5] = [
+            (
+                "completed",
+                commented(&observation(), &Verdict::Completed),
+                &["completed"],
+                &["uncorroborated", "unobserved", "incomplete", "a Blocker"],
+            ),
+            (
+                "uncorroborated",
+                commented(&absent, &Verdict::Uncorroborated(vec!["PR open".into()])),
+                &["uncorroborated — DONE promised, PR open disagrees"],
+                &["a Blocker"],
+            ),
+            (
+                "unobserved",
+                commented_from(&could_not_look()),
+                &["unobserved — PR open"],
+                &["ghp_secret", "exit 128", "a Blocker"],
+            ),
+            (
+                "exhausted",
+                commented(&absent, &Verdict::Incomplete(vec!["PR open".into()])),
+                &["incomplete — PR open"],
+                &["a Blocker"],
+            ),
+            (
+                "blocked",
+                job_comment(&facts_of(
+                    found(),
+                    absent.clone(),
+                    Verdict::Incomplete(vec!["PR open".into()]),
+                    coverage(),
+                    Some("git push --force-with-lease"),
+                )),
+                &[
+                    "incomplete — PR open",
+                    "a Blocker: git push --force-with-lease must be cleared",
+                ],
+                &[],
+            ),
+        ];
+        for (state, markdown, said, unsaid) in each {
+            assert!(
+                markdown.contains("**Run `20260806-122620-snapper-28`"),
+                "the {state} comment names the Run:\n{markdown}"
+            );
+            assert!(
+                markdown.contains("| run state |"),
+                "the {state} comment carries the table:\n{markdown}"
+            );
+            for claim in said {
+                assert!(
+                    markdown.contains(claim),
+                    "the {state} comment drops `{claim}`:\n{markdown}"
+                );
+            }
+            for banned in unsaid {
+                assert!(
+                    !markdown.contains(banned),
+                    "the {state} comment carries `{banned}`:\n{markdown}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_rendered_comment_contains_a_reason_built_by_reason_of() {
+        // `Reason::of` composes `<call site>: exit N: <first stderr line>`, so a reason is raw
+        // child stderr — and a misprovisioned host is exactly where an HTTPS `origin` embeds a
+        // token. An observation that could not be made shows its mark and nothing else.
+        //
+        // **The verdict is composed, never authored.** The earlier shape of this test hand-wrote
+        // its blind vector as `vec!["PR open: x"]`, which is a sanitised input: the leak was on
+        // the verdict line, built by `decide::verdict` out of the very `Reason` this test
+        // constructs, and a guard holding a literal cannot reach it.
+        let mut blind = could_not_look();
         blind.base_drift = Observed::Unobservable(Reason::saying("git symbolic-ref: exit 1"));
-        let markdown = commented(&blind, &Verdict::Unobserved(vec!["PR open: x".into()]));
+        let markdown = commented_from(&blind);
         assert!(!markdown.contains("ghp_secret"), "{markdown}");
         assert!(!markdown.contains("exit 128"), "{markdown}");
         assert!(!markdown.contains("symbolic-ref"), "{markdown}");
@@ -1226,6 +1306,14 @@ mod tests {
             markdown.contains(UNOBSERVABLE_MARK),
             "the mark still shows:\n{markdown}"
         );
+        // The signal name survives — the reader off-host is told *which* observation is missing.
+        assert!(markdown.contains("unobserved — PR open"), "{markdown}");
+        // And the Handback, on the host where the human already has them, still prints reasons.
+        let on_host = handed_back(
+            &blind,
+            &crate::decide::verdict(&crate::decide::signals_of(&blind), false),
+        );
+        assert!(on_host.contains("ghp_secret"), "{on_host}");
     }
 
     #[test]
