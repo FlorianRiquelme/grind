@@ -113,13 +113,21 @@ fn environment_access_is_named_in_exactly_one_module_and_it_is_world() {
 #[test]
 fn no_path_in_src_classifies_an_issue() {
     let sources = sources();
+    // Both spellings of each namespace: `gh issue edit` takes `--add-`/`--remove-` and
+    // `gh issue create` takes the bare flag. `files_naming` is a plain substring match, so
+    // `"--add-project".contains("--project")` is **false** — the bare flag alone let the edit
+    // spelling through, and it was the only namespace here missing its pair.
     for classifying in [
         "--add-label",
         "--remove-label",
+        "--label",
         "--add-assignee",
         "--remove-assignee",
-        "--milestone",
+        "--assignee",
+        "--add-project",
+        "--remove-project",
         "--project",
+        "--milestone",
     ] {
         let offenders = files_naming(&sources, classifying);
         assert!(
