@@ -419,7 +419,7 @@ fn sandbox(name: &str) -> Sandbox {
     // the real `git` need. No real `gh` is reachable at all.
     let toolbox = home.join(".fake/toolbox");
     fs::create_dir_all(&toolbox).expect("a toolbox");
-    for tool in ["git", "sh", "cat", "sed", "dirname", "uname", "ps"] {
+    for tool in ["git", "sh", "cat", "sed", "dirname", "uname", "ps", "mkdir"] {
         let real = which(tool);
         let _ = std::os::unix::fs::symlink(&real, toolbox.join(tool));
     }
@@ -868,6 +868,42 @@ fn a_skipped_run_does_not_stop_the_others_from_re_entering() {
     assert_eq!(code, Some(0), "never a panic:\n{out}\n{err}");
     assert!(out.contains("re-entered r-good"), "{out}");
     assert!(out.contains("skipped    r-ancient"), "{out}");
+}
+
+#[test]
+fn fan_out_is_recorded_per_attempt_and_never_cumulatively() {
+    // Three Attempts of one Run, each fanning out to two subagents that both return. The Run's
+    // transcript is **one append-only file** — the session id is fixed at dispatch and every
+    // later Attempt resumes it — so reading the whole file on Attempt N counted Attempts 1..N,
+    // and `render::fanout_totals` then summed those pairs: (2,2), (4,4), (6,6) published as
+    // *12 spawned, 12 returned* for a Run that spawned six. R51 says per Attempt.
+    let box_ = sandbox("fanout-per-attempt");
+    box_.scenario(&["fanout", "fanout", "fanout", "success_done"])
+        .pr_appears_at(4);
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+
+    let record = box_.record();
+    let attempts = record["attempts"].as_array().expect("attempts");
+    let fanouts: Vec<&serde_json::Value> = attempts.iter().take(3).map(|a| &a["fanout"]).collect();
+    for (n, fanout) in fanouts.iter().enumerate() {
+        assert_eq!(
+            fanout["present"],
+            serde_json::json!([2, 2]),
+            "attempt {} recorded {fanout} rather than its own two: a cumulative read would give \
+             (2,2), (4,4), (6,6)",
+            n + 1
+        );
+    }
+    // And the Handback, which sums those pairs, says six rather than twelve — as does the
+    // comment posted on the Job issue, which is where a wrong number leaves the host.
+    assert!(
+        out.contains("6 spawned, 6 returned"),
+        "the Handback:\n{out}"
+    );
+    let posted = comments_on_the_job_issue(&box_);
+    let terminal = posted.last().expect("a terminal comment");
+    assert!(terminal.contains("6 spawned, 6 returned"), "{terminal}");
 }
 
 #[test]

@@ -702,6 +702,15 @@ fn run_one_attempt(
     let started_at = world::now_iso();
     say(run_dir, &format!("  [{started_at}] attempt {n} ({mode}) …"));
 
+    // **Taken before the child spawns, and this is what makes the pair belong to this Attempt.**
+    // The transcript is keyed on `record.session_id`, which `fresh_session_id` fixes for the
+    // Run's life, and every attempt after the first resumes that session and appends to the same
+    // `.jsonl`. Counting the whole file on Attempt N therefore counted Attempts 1..N — and
+    // `render::fanout_totals` sums those pairs, so a Run fanning out to 2 agents on each of 3
+    // attempts recorded (2,2), (4,4), (6,6) and published *12 spawned, 12 returned*. R51 says
+    // per Attempt; the suffix is what says it.
+    let already_written = transcript_lines(record);
+
     let raw = attempt::run(
         &invocation,
         worktree,
@@ -716,19 +725,36 @@ fn run_one_attempt(
     // runs in the direction the topology already allows.
     let classified = raw
         .classify(n, mode, &started_at, &world::now_iso())
-        .with_fanout(fanout_of(record));
+        .with_fanout(fanout_of(record, already_written));
     record.push_attempt(classified);
     Ok(())
 }
 
-/// The Attempt's fan-out arithmetic. `world` reads the file; a pure counter reads the text.
-fn fanout_of(record: &RunRecord) -> Observed<(u64, u64)> {
+/// How much of the Run's transcript exists right now, in lines. A transcript that is not there
+/// yet is zero rather than a refusal: the first Attempt of a Run has nothing to skip, and that
+/// is the same answer.
+///
+/// Read while the child is not running, so the file is quiescent and the last line is whole.
+fn transcript_lines(record: &RunRecord) -> usize {
+    let Some(home) = world::home() else {
+        return 0;
+    };
+    let transcript = crate::view::transcript_path(&home, &record.worktree, &record.session_id);
+    match world::read_to_string(&transcript) {
+        Ok(text) => text.lines().count(),
+        Err(_) => 0,
+    }
+}
+
+/// The Attempt's fan-out arithmetic, over **the lines this Attempt appended** and no earlier
+/// ones. `world` reads the file; a pure counter reads the text.
+fn fanout_of(record: &RunRecord, already_written: usize) -> Observed<(u64, u64)> {
     let Some(home) = world::home() else {
         return Observed::Unobservable(Reason::saying("$HOME is unset"));
     };
     let transcript = crate::view::transcript_path(&home, &record.worktree, &record.session_id);
     match world::read_to_string(&transcript) {
-        Ok(text) => crate::view::fanout_counts(&text),
+        Ok(text) => crate::view::fanout_since(&text, already_written),
         Err(said) => Observed::Unobservable(Reason::saying(&format!(
             "the transcript could not be read: {said}"
         ))),

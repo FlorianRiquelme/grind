@@ -474,6 +474,24 @@ pub fn fanout(text: &str) -> Observed<Vec<Fanout>> {
     Observed::Present(found)
 }
 
+/// The fan-out in **the lines appended since** `already_written`, which is what *per Attempt*
+/// means here (R51).
+///
+/// A Run's transcript is one append-only file for the Run's whole life: the session id is fixed
+/// at dispatch and every later Attempt resumes that session. So counting the whole file on
+/// Attempt N counts Attempts 1..N, and since `render` sums the per-Attempt pairs, a Run fanning
+/// out to 2 agents on each of 3 attempts reported 12 spawned. The suffix is the fix, and it is a
+/// suffix by line because the transcript is line-delimited JSON.
+pub fn fanout_since(text: &str, already_written: usize) -> Observed<(u64, u64)> {
+    fanout_counts(
+        &text
+            .lines()
+            .skip(already_written)
+            .collect::<Vec<&str>>()
+            .join("\n"),
+    )
+}
+
 /// **Spawned and returned, both read from the parent transcript** (KTD8). Spawns are the
 /// tool-use blocks naming the fan-out tool; returns are the `tool_result` blocks that pair to
 /// them by id. The subagent files on disk are the third source and are deliberately unused:
@@ -733,6 +751,42 @@ mod tests {
             ));
         }
         lines.join("\n")
+    }
+
+    #[test]
+    fn each_attempt_of_one_run_counts_only_the_lines_it_appended() {
+        // One Run's transcript is one append-only file: the session id is fixed at dispatch and
+        // every later Attempt resumes that session. Counting the whole file on Attempt N counted
+        // Attempts 1..N — and `render` sums the per-Attempt pairs, so a Run that fanned out to
+        // two agents on each of three attempts published *12 spawned, 12 returned* (R51 says
+        // per Attempt).
+        let mut transcript = String::new();
+        let mut recorded = Vec::new();
+        for _ in 0..3 {
+            let already_written = transcript.lines().count();
+            if !transcript.is_empty() {
+                transcript.push('\n');
+            }
+            // Distinct ids per Attempt, because the real transcript never reuses one.
+            transcript
+                .push_str(&spawning(2, 2).replace("toolu_", &format!("toolu_{}_", recorded.len())));
+            recorded.push(fanout_since(&transcript, already_written));
+        }
+        assert_eq!(
+            recorded,
+            vec![
+                Observed::Present((2, 2)),
+                Observed::Present((2, 2)),
+                Observed::Present((2, 2))
+            ],
+            "the whole-file count would read (2,2), (4,4), (6,6) and sum to 12"
+        );
+        // And the suffix of an Attempt that appended nothing is absent, never a stale repeat of
+        // the Attempt before it.
+        let all = transcript.lines().count();
+        assert_eq!(fanout_since(&transcript, all), Observed::Absent);
+        // A zero offset is the whole file, which is what the Run's first Attempt reads.
+        assert_eq!(fanout_since(&transcript, 0), Observed::Present((6, 6)));
     }
 
     #[test]
