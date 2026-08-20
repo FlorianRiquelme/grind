@@ -207,8 +207,14 @@ impl std::fmt::Display for Stage {
 /// signal's three-valuedness through untouched.
 pub fn signals_of(observation: &Observation) -> RawSignals {
     RawSignals {
+        // **A PR that was found is not a PR that is open.** The head-commit lookup asks with
+        // `--state all` deliberately — a closed PR still belongs in the Handback's PR row, and
+        // deleting it from the search would answer a different question. But the signal
+        // completion is ANDed from is *`pr_open`*, and Grind's contract is *stops at an open
+        // PR*: a Run whose PR a human closed was otherwise four-for-four and reported
+        // `Completed`, printing the closed PR's URL as its result on the Job issue.
         pr_open: match &observation.pr {
-            Observed::Present(_) => Observed::Present(true),
+            Observed::Present(found) => Observed::Present(found.state.eq_ignore_ascii_case("OPEN")),
             Observed::Absent => Observed::Present(false),
             Observed::Unobservable(reason) => Observed::Unobservable(reason.clone()),
         },
@@ -552,6 +558,37 @@ mod tests {
         // blind.
         seen.checks_pending = Observed::Absent;
         assert_eq!(verdict(&signals_of(&seen), false), Verdict::Completed);
+    }
+
+    #[test]
+    fn a_closed_or_merged_pr_is_not_an_open_one_and_does_not_complete_the_run() {
+        // The head-commit lookup asks with `--state all`, so a PR a human closed is still
+        // `Observed::Present` — and every other completion signal on such a Run is satisfied.
+        // Grind's contract is *stops at an open PR*; the closed one must hold it incomplete.
+        for state in ["CLOSED", "MERGED", "closed", "merged"] {
+            let mut seen = observation();
+            let Observed::Present(pr) = &mut seen.pr else {
+                panic!("the fixture holds a PR");
+            };
+            pr.state = state.to_string();
+            assert!(
+                matches!(verdict(&signals_of(&seen), false), Verdict::Incomplete(unmet)
+                    if unmet.contains(&"PR open".to_string())),
+                "a {state} PR must not read as open"
+            );
+            // The promise does not rescue it either: DONE over a closed PR is uncorroborated.
+            assert!(matches!(
+                verdict(&signals_of(&seen), true),
+                Verdict::Uncorroborated(_)
+            ));
+            // And the PR itself stays observed, so the Handback's row still names it.
+            assert!(matches!(seen.pr, Observed::Present(_)));
+        }
+        // The spelling `gh` actually returns still completes the Run.
+        assert_eq!(
+            verdict(&signals_of(&observation()), false),
+            Verdict::Completed
+        );
     }
 
     // --- the verify-coverage estimate ------------------------------------------------------
