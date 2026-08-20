@@ -471,6 +471,12 @@ pub fn host_items() -> &'static [HostItem] {
             doc_anchor: "`just` on `PATH`.",
         },
         HostItem {
+            name: "ps on PATH",
+            depth: Depth::Dispatch,
+            check: Check::OnPath("ps"),
+            doc_anchor: "`ps` on `PATH`.",
+        },
+        HostItem {
             name: "lfg plugin installed",
             depth: Depth::Dispatch,
             check: Check::PluginInstalled,

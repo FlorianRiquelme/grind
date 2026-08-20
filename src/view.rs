@@ -185,7 +185,9 @@ pub fn roster(home: &Path) -> Vec<RosterRow> {
             rows.push(RosterRow {
                 supervisor_here: supervisor_here(
                     found.supervisor_identity.as_deref(),
-                    world::process_start_stamp(found.supervisor_pid).as_deref(),
+                    &crate::observe::process_start_stamp(&world::ps_start_stamp(
+                        found.supervisor_pid,
+                    )),
                 ),
                 run_id: found.run_id.clone(),
                 recorded_state: found.state.clone(),
@@ -202,16 +204,20 @@ pub fn roster(home: &Path) -> Vec<RosterRow> {
 ///
 /// **Pid *and* identity.** A pid alone is reused, and a reused pid reporting a dead Run as
 /// alive is exactly the reassurance that sends an operator back to sleep.
-pub fn supervisor_here(recorded: Option<&str>, live: Option<&str>) -> Observed<bool> {
+pub fn supervisor_here(recorded: Option<&str>, live: &Observed<String>) -> Observed<bool> {
     match (recorded, live) {
+        // **`ps` could not be asked, which is not the supervisor being gone.** This arm used to
+        // read `None` and answer `Present(false)`, and `resume --all` acts on that answer: on a
+        // host whose `ps` cannot spawn, every Run read as cut off and every Run was re-entered.
+        (_, Observed::Unobservable(reason)) => Observed::Unobservable(reason.clone()),
         // Nothing is running under that pid at all.
-        (_, None) => Observed::Present(false),
+        (_, Observed::Absent) => Observed::Present(false),
         // The pid is alive but nothing was recorded to compare it against, so this is a
         // question Grind cannot answer rather than a yes.
-        (None, Some(_)) => Observed::Unobservable(Reason::saying(
+        (None, Observed::Present(_)) => Observed::Unobservable(Reason::saying(
             "no supervisor identity was recorded at dispatch",
         )),
-        (Some(was), Some(now)) => Observed::Present(was.trim() == now.trim()),
+        (Some(was), Observed::Present(now)) => Observed::Present(was.trim() == now.trim()),
     }
 }
 
@@ -587,11 +593,15 @@ mod tests {
         assert_eq!(found.attempt_counter(), (3, 3));
     }
 
+    fn stamp(said: &str) -> Observed<String> {
+        Observed::Present(said.to_string())
+    }
+
     #[test]
     fn a_dead_supervisor_reads_as_gone_however_it_died() {
         // Nothing is running under that pid.
         assert_eq!(
-            supervisor_here(Some("Thu Aug  6 12:26:20 2026"), None),
+            supervisor_here(Some("Thu Aug  6 12:26:20 2026"), &Observed::Absent),
             Observed::Present(false)
         );
         // The pid exists but belongs to something else — a reused pid must not report a dead
@@ -599,7 +609,7 @@ mod tests {
         assert_eq!(
             supervisor_here(
                 Some("Thu Aug  6 12:26:20 2026"),
-                Some("Thu Aug  6 18:02:11 2026")
+                &stamp("Thu Aug  6 18:02:11 2026")
             ),
             Observed::Present(false)
         );
@@ -607,7 +617,7 @@ mod tests {
         assert_eq!(
             supervisor_here(
                 Some("Thu Aug  6 12:26:20 2026"),
-                Some("Thu Aug  6 12:26:20 2026")
+                &stamp("Thu Aug  6 12:26:20 2026")
             ),
             Observed::Present(true)
         );
@@ -615,8 +625,28 @@ mod tests {
 
     #[test]
     fn an_unrecorded_identity_is_a_question_grind_cannot_answer() {
-        let found = supervisor_here(None, Some("Thu Aug  6 12:26:20 2026"));
+        let found = supervisor_here(None, &stamp("Thu Aug  6 12:26:20 2026"));
         assert!(matches!(found, Observed::Unobservable(_)), "{found:?}");
+    }
+
+    #[test]
+    fn a_ps_that_could_not_answer_is_never_a_supervisor_that_is_gone() {
+        // The input `resume --all` acts on. `ps -p <pid> -o lstart=` is a procps/BSD spelling
+        // busybox does not implement, and Grind ships as a musl static binary aimed at exactly
+        // those hosts — so *could not ask* reaches this function on an ordinary box.
+        let blind = crate::observe::process_start_stamp(&crate::world::Completed {
+            stdout: String::new(),
+            stderr: "ps: unrecognized option: p\n".to_string(),
+            code: Some(127),
+        });
+        assert!(matches!(blind, Observed::Unobservable(_)), "{blind:?}");
+        for recorded in [None, Some("Thu Aug  6 12:26:20 2026")] {
+            let found = supervisor_here(recorded, &blind);
+            assert!(
+                matches!(found, Observed::Unobservable(_)),
+                "a blind reading must not collapse into `gone`: {found:?}"
+            );
+        }
     }
 
     #[test]

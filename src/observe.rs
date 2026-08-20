@@ -639,6 +639,26 @@ pub fn boot_one_shot(completed: &Completed) -> Observed<Outcome> {
     }
 }
 
+/// When the process under a pid started, as `ps` answered.
+///
+/// **Three-valued, because a `ps` that could not run is not a process that is gone.** Grind
+/// ships as a musl static binary aimed at minimal Linux hosts, and `-p <pid> -o lstart=` is a
+/// procps/BSD spelling busybox `ps` does not implement — so *could not ask* is an ordinary
+/// reading here rather than a theoretical one. It is also the reading `resume --all` **acts**
+/// on: folding it into *gone* re-enters every Run on the host at boot, which is the opposite of
+/// the direction that path's own doc calls safe.
+///
+/// `ps` exits 1 with nothing on stdout when no process matches, which is a fact about the
+/// world; every other failure is a fact about the check.
+pub fn process_start_stamp(completed: &Completed) -> Observed<String> {
+    let stamp = completed.stdout.trim().to_string();
+    match completed.code {
+        Some(0) | Some(1) if !stamp.is_empty() => Observed::Present(stamp),
+        Some(0) | Some(1) => Observed::Absent,
+        _ => Observed::Unobservable(Reason::of("ps -p <pid> -o lstart=", completed)),
+    }
+}
+
 /// `~/.grind/repos/<owner>/<name>` exists, and — at doctor's depth — its `origin` names the
 /// target repo. `origin` is `None` at dispatch depth, which is what makes the dispatch subset a
 /// shallower run of the same item rather than a second item.
@@ -913,6 +933,33 @@ mod tests {
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
             code,
+        }
+    }
+
+    #[test]
+    fn a_ps_that_could_not_run_is_could_not_observe_and_never_a_process_that_is_gone() {
+        // Three string literals instead of a process, which is the whole point of classifying
+        // away from the spawn. `resume --all` acts on this reading: folding *could not ask*
+        // into *gone* re-enters every Run on the host at boot.
+        assert_eq!(
+            process_start_stamp(&completed("Thu Aug  6 12:26:20 2026\n", "", Some(0))),
+            Observed::Present("Thu Aug  6 12:26:20 2026".to_string())
+        );
+        // `ps` answered, and the answer is that no process matches — a fact about the world.
+        for gone in [completed("", "", Some(1)), completed("\n", "", Some(0))] {
+            assert_eq!(process_start_stamp(&gone), Observed::Absent, "{gone:?}");
+        }
+        // Every other failure is a fact about the check. `-p <pid> -o lstart=` is a procps/BSD
+        // spelling busybox does not implement, and Grind ships aimed at those hosts.
+        for blind in [
+            completed("", "ps: unrecognized option: p\n", Some(127)),
+            completed("", "No such file or directory (os error 2)", None),
+            completed("", "ps: bad -o argument\n", Some(2)),
+        ] {
+            assert!(
+                matches!(process_start_stamp(&blind), Observed::Unobservable(_)),
+                "{blind:?}"
+            );
         }
     }
 

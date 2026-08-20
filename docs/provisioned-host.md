@@ -82,6 +82,13 @@ resolves.
   the dispatch prompt makes `just verify` the Run's definition of done, so a host without it fails
   every Run at the last step, in the target repo, with nothing in Grind's own output naming the
   cause. *doctor* rather than *dispatch* because the failure is the Run's, not the Dispatch's.
+- **`ps` on `PATH`.** — *dispatch* — Supervisor liveness is a pid **plus** the start stamp
+  `ps -p <pid> -o lstart=` prints, because a pid alone is reused. `resume --all` acts on that
+  reading at boot, so a `ps` that cannot answer is a Run's re-entry decision made blind — and
+  `-p <pid> -o lstart=` is a procps/BSD spelling **busybox `ps` does not implement**, which a
+  minimal Linux host is quite likely to be. Presence only: a busybox `ps` is on `PATH` and still
+  cannot answer, so this item catches the absent one and `observe::process_start_stamp` catches
+  the rest by reading three-valued.
 - **The `lfg` plugin is installed.** — *dispatch* — The Job names the plugin, the host names the
   version (ADR-0002 as amended). Resolution picks the installed version, records the resolved path,
   and every attempt and every `--resume` reads the record — so a Run's plugin version is fixed for

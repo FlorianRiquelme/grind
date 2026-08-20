@@ -193,7 +193,7 @@ fn status_one(run_id: &str) -> i32 {
             );
             let here = view::supervisor_here(
                 found.supervisor_identity.as_deref(),
-                world::process_start_stamp(found.supervisor_pid).as_deref(),
+                &observe::process_start_stamp(&world::ps_start_stamp(found.supervisor_pid)),
             );
             print(&render::run_view(&SingleRun {
                 found: &found,

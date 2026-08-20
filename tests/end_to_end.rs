@@ -156,6 +156,23 @@ impl Sandbox {
 
     /// Rewrite one Run's recorded state word, leaving its attempt list alone. The shape a
     /// resume guard keyed on the word cannot tell apart from the one it means to allow.
+    /// Replace the toolbox's `ps` with one that cannot answer — busybox does not implement
+    /// `-p <pid> -o lstart=`, and Grind ships as a musl static binary aimed at hosts that run
+    /// it. A shape, not a mock: the binary sees a real exec with a real non-zero exit.
+    fn ps_cannot_answer(&self) -> &Self {
+        let ps = self.home.join(".fake/toolbox/ps");
+        let _ = fs::remove_file(&ps);
+        fs::write(
+            &ps,
+            "#!/bin/sh\necho 'ps: unrecognized option: p' >&2\nexit 127\n",
+        )
+        .expect("write a refusing ps");
+        let mut mode = fs::metadata(&ps).expect("stat").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+        fs::set_permissions(&ps, mode).expect("make it executable");
+        self
+    }
+
     fn state_becomes(&self, run_id: &str, state: &str) {
         let path = self.home.join(".grind/runs").join(run_id).join("run.json");
         let raw = fs::read_to_string(&path).expect("a record");
@@ -840,6 +857,33 @@ fn a_skipped_run_does_not_stop_the_others_from_re_entering() {
     assert_eq!(code, Some(0), "never a panic:\n{out}\n{err}");
     assert!(out.contains("re-entered r-good"), "{out}");
     assert!(out.contains("skipped    r-ancient"), "{out}");
+}
+
+#[test]
+fn resume_all_re_enters_nothing_on_a_host_whose_ps_cannot_answer() {
+    // The reading `resume --all` acts on. A `ps` that cannot spawn used to yield no stamp, and
+    // *no stamp* collapsed into *the supervisor is gone* — so every Run on the host read as cut
+    // off and every Run was re-entered at boot, with nobody watching. The safe direction is to
+    // decline, and to say so rather than skip in silence.
+    let box_ = sandbox("resume-all-blind-ps");
+    let template = a_real_record(&box_);
+    box_.stage(&template, "r-dispatched", "dispatched", GONE);
+    box_.stage(&template, "r-died", "died", GONE);
+    box_.ps_cannot_answer();
+
+    let (out, err, code) = box_.run(&["resume", "--all"]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    for run_id in ["r-dispatched", "r-died"] {
+        assert!(
+            !out.contains(&format!("re-entered {run_id}")),
+            "a blind reading must not re-enter {run_id}:\n{out}"
+        );
+        assert!(
+            out.contains(run_id),
+            "and the skip is reported rather than silent:\n{out}"
+        );
+    }
+    assert!(out.contains("could not be read"), "{out}");
 }
 
 #[test]

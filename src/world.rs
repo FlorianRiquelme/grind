@@ -260,10 +260,15 @@ pub fn pid() -> u32 {
     std::process::id()
 }
 
-/// The supervisor's identity beside its pid: a pid alone is reused, and a reused pid reporting
-/// a dead Run as alive is the thing the split exists to stop.
-pub fn process_start_stamp(pid: u32) -> Option<String> {
-    let out = run(
+/// Ask `ps` when the process under this pid started — the supervisor's identity beside its pid,
+/// because a pid alone is reused and a reused pid reporting a dead Run as alive is the thing the
+/// split exists to stop.
+///
+/// **The raw triple, classified by `observe::process_start_stamp`.** The collapse this used to
+/// perform here — `code == Some(0) && !stamp.is_empty()` folded into an `Option` — read a `ps`
+/// that could not run as *no such process*, which `resume --all` then acts on.
+pub fn ps_start_stamp(pid: u32) -> Completed {
+    run(
         &[
             "ps".to_string(),
             "-p".to_string(),
@@ -272,9 +277,7 @@ pub fn process_start_stamp(pid: u32) -> Option<String> {
             "lstart=".to_string(),
         ],
         None,
-    );
-    let stamp = out.stdout.trim().to_string();
-    (out.code == Some(0) && !stamp.is_empty()).then_some(stamp)
+    )
 }
 
 /// Here rather than in `cli` because `std::env` is named in one module, and `cli` parses argv

@@ -318,7 +318,7 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         attempt_budget: ATTEMPT_BUDGET,
         limit_sleep_seconds: LIMIT_SLEEP_SECONDS,
         supervisor_pid: pid,
-        supervisor_identity: world::process_start_stamp(pid),
+        supervisor_identity: recorded_identity(pid),
         attempts: Vec::new(),
         job,
     };
@@ -346,6 +346,17 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
     say(&run_dir, &format!("  run {run_id}"));
 
     supervise(&mut record, &run_dir)
+}
+
+/// The identity to record beside a pid. `Absent` and `Unobservable` are the same fact at *this*
+/// end — nothing was read that a later reading could be compared against — and `supervisor_here`
+/// already says so out loud when it meets the `None`. Written out rather than collapsed by an
+/// `ok()`, because the collapse at the *reading* end is what #14 was.
+fn recorded_identity(pid: u32) -> Option<String> {
+    match crate::observe::process_start_stamp(&world::ps_start_stamp(pid)) {
+        Observed::Present(stamp) => Some(stamp),
+        Observed::Absent | Observed::Unobservable(_) => None,
+    }
 }
 
 /// Re-enter a Run that died, **reading every condition from the record** rather than the
@@ -398,7 +409,7 @@ pub fn resume(run_id: &str) -> Result<Outcome, Refusal> {
 
     let pid = world::pid();
     record.supervisor_pid = pid;
-    record.supervisor_identity = world::process_start_stamp(pid);
+    record.supervisor_identity = recorded_identity(pid);
     record.save(&path)?;
 
     supervise(&mut record, &run_dir)
@@ -457,10 +468,31 @@ pub fn resume_all() -> Result<Reentry, Refusal> {
         }
         let supervisor = crate::view::supervisor_here(
             record.supervisor_identity.as_deref(),
-            world::process_start_stamp(record.supervisor_pid).as_deref(),
+            &crate::observe::process_start_stamp(&world::ps_start_stamp(record.supervisor_pid)),
         );
-        if !matches!(supervisor, Observed::Present(false)) {
-            continue;
+        match supervisor {
+            // The one reading that means *a restart cut this Run off*.
+            Observed::Present(false) => {}
+            // Still running under the recorded identity: not cut off, and not this path's
+            // business.
+            Observed::Present(true) => continue,
+            // **Could not tell.** `ps -p <pid> -o lstart=` is a procps/BSD spelling busybox does
+            // not implement, and this is the one path that *acts* on the reading rather than
+            // printing it. Skipping is the safe direction, and it is reported rather than
+            // silent: a host where every reading is blind would otherwise re-enter nothing and
+            // say nothing about why.
+            other => {
+                let why = format!(
+                    "whether its supervisor is still running could not be read ({})",
+                    other
+                        .reason()
+                        .map(|r| r.to_string())
+                        .unwrap_or_else(|| "no reason".to_string())
+                );
+                say(&run_dir, &format!("  skipped at boot: {why}"));
+                report.skipped.push((run_id.to_string(), why));
+                continue;
+            }
         }
         // `resume` runs no precondition checks and the new refusals live in `dispatch`, so boot
         // re-entry inherits none of them. A machine that just rebooted is exactly where someone
