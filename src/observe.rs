@@ -210,15 +210,25 @@ fn says_no_pr(stderr: &str) -> bool {
     said.contains("no pull requests found") || said.contains("no open pull requests")
 }
 
-/// `gh pr list --search <head-sha> --state all --json number,url,state,isDraft`.
+/// `gh pr list --search <head-sha> --state all --json number,url,state,isDraft,headRefOid`.
 ///
 /// **A Run's identity on GitHub is the commit it pushed, not the branch its Job named.** Run 2
 /// pushed to `…-run` while its Job named `…-seam`, so the branch lookup answered truthfully
 /// about the wrong question and the Handback said `PR —` over an open, green, twelve-commit PR.
 ///
-/// An empty array is `Absent` — the search ran and matched nothing. Anything unreadable is
-/// could-not-observe, the direction that withholds a verdict rather than inventing one.
-pub fn pr_by_head(completed: &Completed) -> Observed<Pr> {
+/// **The search index cannot be trusted to answer that identity question either** (#84):
+/// against the live repo, `gh pr list --search <sha>` returned *empty* for an open PR whose
+/// head was exactly that sha — GitHub's search lags or skips head SHAs of open PRs, which is
+/// precisely the population Grind observes. So the query only narrows candidates and the match
+/// is made here, over `headRefOid`, comparing case-insensitively because hex case is a
+/// rendering choice (`git` prints lowercase, the API has answered mixed). A response whose
+/// entries carry a different OID reads as `Absent`, which is what sends [`observe_run`] down
+/// the branch fallback rather than what declares the PR gone.
+///
+/// An empty array — or no entry whose head OID equals the Run's — is `Absent`: the search ran
+/// and matched nothing. Anything unreadable is could-not-observe, the direction that withholds
+/// a verdict rather than inventing one.
+pub fn pr_by_head(head_sha: &str, completed: &Completed) -> Observed<Pr> {
     if completed.code != Some(0) {
         return Observed::Unobservable(Reason::of("gh pr list --search", completed));
     }
@@ -227,10 +237,15 @@ pub fn pr_by_head(completed: &Completed) -> Observed<Pr> {
     else {
         return Observed::Unobservable(Reason::saying("gh pr list --search: unreadable JSON"));
     };
-    let Some(first) = matched.first() else {
+    let Some(first) = matched.into_iter().find(|candidate| {
+        candidate
+            .get("headRefOid")
+            .and_then(|oid| oid.as_str())
+            .is_some_and(|oid| oid.eq_ignore_ascii_case(head_sha))
+    }) else {
         return Observed::Absent;
     };
-    match parse_pr_value(first) {
+    match parse_pr_value(&first) {
         Some(found) => Observed::Present(found),
         None => Observed::Unobservable(Reason::saying("gh pr list --search: unreadable JSON")),
     }
@@ -299,9 +314,12 @@ pub fn checks(completed: &Completed) -> (Observed<bool>, Observed<bool>) {
         {
             pending = true;
         }
+        // STARTUP_FAILURE means the required check's job never ran its steps, and STALE means
+        // GitHub retired the result — neither is pending, so without naming them red,
+        // completion could proceed over a required check that never produced a verdict.
         if matches!(
             conclusion.as_str(),
-            "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED"
+            "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE" | "STALE"
         ) || matches!(state.as_str(), "FAILURE" | "ERROR")
         {
             red = true;
@@ -509,30 +527,33 @@ pub fn observe_run(
             &changed,
         ),
     };
-
     // The head commit first, the Job's branch as a fallback. Both stay pure parses over raw
     // output, and the existing three-valued classification was never wrong here — it was the
     // question that was wrong.
     let head = run(&argv(&["git", "rev-parse", "HEAD"]));
     let by_head = if head.code == Some(0) && !head.stdout.trim().is_empty() {
-        pr_by_head(&run(&argv(&[
-            "gh",
-            "pr",
-            "list",
-            "--search",
+        pr_by_head(
             head.stdout.trim(),
-            "--state",
-            "all",
-            "--json",
-            "number,url,state,isDraft",
-        ])))
+            &run(&argv(&[
+                "gh",
+                "pr",
+                "list",
+                "--search",
+                head.stdout.trim(),
+                "--state",
+                "all",
+                "--json",
+                "number,url,state,isDraft,headRefOid",
+            ])),
+        )
     } else {
         Observed::Unobservable(Reason::of("git rev-parse HEAD", &head))
     };
     let found = match by_head {
         Observed::Present(found) => Observed::Present(found),
-        // Nothing matched the commit, so ask the branch — which is still the right question on
-        // a Run that pushed where its Job said it would.
+        // Nothing matched the commit — including a response whose entries all carry a
+        // different head OID — so ask the branch, which is still the right question on a Run
+        // that pushed where its Job said it would.
         Observed::Absent => pr(&run(&argv(&[
             "gh",
             "pr",
@@ -1028,8 +1049,11 @@ mod tests {
 
     // --- the PR is found by head commit ------------------------------------------------------
 
-    const PR_JSON: &str =
-        r#"{"number":30,"url":"https://github.com/o/n/pull/30","state":"OPEN","isDraft":false}"#;
+    // The head OID rides every fixture because the lookup now matches on it client-side
+    // (#84): `3333…` is what the fake `git rev-parse HEAD` answers in `observing`.
+    const PR_JSON: &str = r#"{"number":30,"url":"https://github.com/o/n/pull/30","state":"OPEN","isDraft":false,"headRefOid":"3333333333333333333333333333333333333333"}"#;
+
+    const HEAD_SHA: &str = "3333333333333333333333333333333333333333";
 
     /// One whole observation from literals: the head-commit lookup, the branch fallback, and
     /// the rollup, plus every argv the sequence actually built.
@@ -1135,6 +1159,44 @@ mod tests {
     }
 
     #[test]
+    fn a_search_response_that_never_indexed_the_sha_is_found_through_its_head_oid() {
+        // #84, live: GitHub's search returns the PR but its index carries no trace of the
+        // head SHA, so matching has to happen over `headRefOid` — and hex case is a rendering
+        // choice, so the comparison is case-insensitive on purpose.
+        let found = pr_by_head(
+            "8d30e44919bd8f372efb27a8971d2f5823680454",
+            &completed(
+                r#"[{"number":84,"url":"https://github.com/o/n/pull/84","state":"OPEN","isDraft":false,"headRefOid":"8D30E44919BD8F372EFB27A8971D2F5823680454"}]"#,
+                "",
+                Some(0),
+            ),
+        );
+        let Observed::Present(pr) = found else {
+            panic!("the head OID identifies the PR: {found:?}");
+        };
+        assert_eq!(pr.number, 84);
+    }
+
+    #[test]
+    fn a_search_response_of_different_head_oids_falls_through_to_the_branch_fallback() {
+        // The search answered, but about somebody else's commit — that is *nothing matched*,
+        // not *no PR*, so the branch still gets asked.
+        let (observation, _) = observing(
+            completed(
+                r#"[{"number":99,"url":"https://github.com/o/n/pull/99","state":"MERGED","isDraft":false,"headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]"#,
+                "",
+                Some(0),
+            ),
+            completed(PR_JSON, "", Some(0)),
+            completed(r#"{"statusCheckRollup":[]}"#, "", Some(0)),
+        );
+        let Observed::Present(found) = &observation.pr else {
+            panic!("the branch fallback still finds it: {:?}", observation.pr);
+        };
+        assert_eq!(found.number, 30);
+    }
+
+    #[test]
     fn a_gh_auth_failure_is_could_not_observe_on_both_paths_and_never_absent() {
         let code: i32 = GH_AUTH_CODE.trim().parse().expect("the recorded exit code");
         let broken = completed(GH_AUTH_STDOUT, GH_AUTH_STDERR, Some(code));
@@ -1154,11 +1216,20 @@ mod tests {
     #[test]
     fn unreadable_json_from_either_lookup_is_could_not_observe() {
         assert!(matches!(
-            pr_by_head(&completed("not json at all", "", Some(0))),
+            pr_by_head(HEAD_SHA, &completed("not json at all", "", Some(0))),
             Observed::Unobservable(_)
         ));
+        // An entry whose head OID *does* match but which cannot be parsed as a PR is still
+        // could-not-observe — the OID filter must not turn an unreadable answer into Absent.
         assert!(matches!(
-            pr_by_head(&completed(r#"[{"url":"x"}]"#, "", Some(0))),
+            pr_by_head(
+                HEAD_SHA,
+                &completed(
+                    r#"[{"headRefOid":"3333333333333333333333333333333333333333","url":"x"}]"#,
+                    "",
+                    Some(0)
+                )
+            ),
             Observed::Unobservable(_)
         ));
         let (observation, _) = observing(
@@ -1425,6 +1496,21 @@ mod tests {
         let (pending, red) = checks(&completed(failing, "", Some(0)));
         assert_eq!(pending, Observed::Present(false));
         assert_eq!(red, Observed::Present(true));
+    }
+
+    #[test]
+    fn a_check_that_never_ran_or_was_retired_reads_red_rather_than_completable() {
+        // STARTUP_FAILURE: the required check's job never ran its steps. STALE: GitHub retired
+        // the result. Neither is pending, so if neither were red, completion could proceed
+        // over a required check that never produced a verdict.
+        for conclusion in ["STARTUP_FAILURE", "STALE"] {
+            let rollup = format!(
+                r#"{{"statusCheckRollup":[{{"status":"COMPLETED","conclusion":"{conclusion}"}}]}}"#
+            );
+            let (pending, red) = checks(&completed(&rollup, "", Some(0)));
+            assert_eq!(pending, Observed::Present(false), "{conclusion}");
+            assert_eq!(red, Observed::Present(true), "{conclusion}");
+        }
     }
 
     #[test]
