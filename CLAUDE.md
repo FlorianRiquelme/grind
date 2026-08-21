@@ -216,6 +216,10 @@ Issues live as GitHub issues in `FlorianRiquelme/grind`, driven via the `gh` CLI
 
 The five canonical triage roles, using their default label strings. See `docs/agents/triage-labels.md`.
 
+### Observing a Run
+
+Answering *what is the Run doing* is `grind status <run-id>`, not a transcript dig. See `docs/agents/run-observation.md`.
+
 ### Domain docs
 
 Single-context: `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.

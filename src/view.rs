@@ -365,19 +365,25 @@ pub fn now_skill(text: &str) -> Observed<String> {
 }
 
 /// The last assistant message, flattened to one line: the live answer to *what is it doing
-/// right now* while the Run is still going (#82). It reads only `type: "assistant"` lines —
-/// unlike `last_words`, which takes every message — because the operator asking *what is it
-/// doing* means what Claude said, not what was said to it. Like everything in this view it
-/// describes what happened and is never a verdict input (ADR-0003).
+/// right now* while the Run is still going (#82). It reads only assistant lines — unlike
+/// `last_words`, which takes every message — because the operator asking *what is it doing*
+/// means what Claude said, not what was said to it. Both role spellings are recognised, the
+/// top-level `type` and `message.role`, because the real file carries the role inconsistently
+/// between its own lines and a matcher over one spelling is the next silent-stale one. Like
+/// everything in this view it describes what happened and is never a verdict input (ADR-0003).
 pub fn assistant_now(text: &str) -> Observed<String> {
     let mut last: Option<String> = None;
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if value.get("type").and_then(|t| t.as_str()) == Some("assistant")
-            && let Some(said) = first_text(&value)
-        {
+        let is_assistant = value.get("type").and_then(|t| t.as_str()) == Some("assistant")
+            || value
+                .get("message")
+                .and_then(|m| m.get("role"))
+                .and_then(|r| r.as_str())
+                == Some("assistant");
+        if is_assistant && let Some(said) = first_text(&value) {
             last = Some(one_line(&said));
         }
     }
@@ -1004,6 +1010,26 @@ mod tests {
         assert_eq!(
             assistant_now(transcript),
             Observed::Present("second answer".to_string())
+        );
+    }
+
+    #[test]
+    fn an_assistant_message_carrying_only_the_inner_role_spelling_is_still_one() {
+        // The real file carries the role inconsistently between its own lines: some lines
+        // name it only as `message.role`. A matcher over the top-level `type` alone is the
+        // next silent-stale one, so both spellings count (#82).
+        let transcript = concat!(
+            "{\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"inner role\"}]}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"top level\"}]}}\n",
+        );
+        assert_eq!(
+            assistant_now(transcript),
+            Observed::Present("top level".to_string())
+        );
+        let only_inner = "{\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"inner role\"}]}}\n";
+        assert_eq!(
+            assistant_now(only_inner),
+            Observed::Present("inner role".to_string())
         );
     }
 
