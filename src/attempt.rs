@@ -22,7 +22,7 @@ use std::path::Path;
 /// Weakening the list is **intent**, and no carrier defends against intent. What is typeable is
 /// the narrower, omission-shaped property below: every invocation carries them. The contents
 /// stay prose, in `CLAUDE.md`, where they already are.
-pub const DENIED_TOOLS: [&str; 23] = [
+pub const DENIED_TOOLS: [&str; 26] = [
     "Bash(gh pr merge*)",
     "Bash(git push --force*)",
     "Bash(git push -f*)",
@@ -73,6 +73,14 @@ pub const DENIED_TOOLS: [&str; 23] = [
     // Branch deletion and history rewriting one layer below the porcelain:
     // `git update-ref -d refs/heads/x` deletes, `git update-ref refs/heads/main <sha>` rewrites.
     "Bash(git*update-ref*)",
+    // Mirror push: force-updates (and can delete) **every** ref on the remote, not one.
+    "Bash(git push*--mirror*)",
+    // Prune push: deletes every remote ref with no local counterpart — remote branch
+    // deletion by side effect of an ordinary-looking push.
+    "Bash(git push*--prune*)",
+    // Branch deletion one door over: `gh api -X DELETE repos/o/r/git/refs/heads/x` removes a
+    // remote branch through the API the `gh pr merge`/`gh api*merge*` globs leave open.
+    "Bash(gh api*DELETE*)",
 ];
 
 /// Re-entry rides Claude Code's own session resume, not an `lfg` return value: `lfg` exposes no
@@ -290,12 +298,24 @@ fn intent_line(intent: Option<&str>) -> String {
 /// reading the file it already wrote. *Parse before write* is not a thing to remember.
 pub struct RawAttempt {
     stdout: String,
+    /// Read back from disk alongside stdout, for the same reason: a child the rate limit
+    /// killed before it emitted any JSON leaves its verdict on stderr, and classifying only
+    /// stdout would record that death as an ordinary one.
+    stderr: String,
     code: Option<i32>,
 }
 
 impl RawAttempt {
     pub fn classify(&self, n: usize, mode: Mode, started_at: &str, ended_at: &str) -> Attempt {
-        classify(&self.stdout, self.code, n, mode, started_at, ended_at)
+        classify(
+            &self.stdout,
+            &self.stderr,
+            self.code,
+            n,
+            mode,
+            started_at,
+            ended_at,
+        )
     }
 }
 
@@ -319,9 +339,15 @@ pub fn run(
         stderr_path,
     )
     .map_err(|e| Reason::saying(&format!("could not spawn `claude`: {e}")))?;
-    // Read back what is already on disk, rather than what the parent buffered.
+    // Read back what is already on disk, rather than what the parent buffered. Both streams:
+    // the classifier needs stderr to see a limit that killed the child before any JSON.
     let stdout = world::read_to_string(stdout_path).unwrap_or_default();
-    Ok(RawAttempt { stdout, code })
+    let stderr = world::read_to_string(stderr_path).unwrap_or_default();
+    Ok(RawAttempt {
+        stdout,
+        stderr,
+        code,
+    })
 }
 
 /// One attempt as the record holds it.
@@ -362,20 +388,6 @@ pub struct Attempt {
 }
 
 impl Attempt {
-    /// **A Wait is an Attempt that did no work**, and it is keyed on work done rather than on
-    /// cause — this predicate never reads `rate_limited`. Six of Run 2's eight Attempts cost $0
-    /// and ran one turn each, probing a wall, and spent the same budget as the three that built
-    /// twelve commits.
-    ///
-    /// Derived, never persisted: the three fields it reads are already on the record, so there
-    /// is no migration and no reader mirror to keep in step.
-    ///
-    /// **An Attempt whose stdout did not parse is never a Wait, and that clause is
-    /// load-bearing.** A child that dies before emitting parseable JSON leaves both the cost and
-    /// the turn count absent, so a predicate reading absence as *did no work* would make every
-    /// crash loop free: no budget spent, no rate-limit match, immediate re-entry, forever, with
-    /// `attempt N of M` reporting the Run as barely started. Absence of evidence is not evidence
-    /// of no work, and `parse_ok` is the field that already separates the two.
     /// The fan-out arithmetic, gathered before the Attempt is pushed — `RunRecord.attempts` is
     /// append-only with no mutating accessor, so it cannot be filled in afterwards (KTD9).
     pub fn with_fanout(mut self, fanout: Observed<(u64, u64)>) -> Self {
@@ -383,10 +395,30 @@ impl Attempt {
         self
     }
 
+    /// **A Wait is an Attempt that did no work**, and it is keyed on work done rather than on
+    /// cause — this predicate never reads `rate_limited`. Six of Run 2's eight Attempts cost $0
+    /// and ran one turn each, probing a wall, and spent the same budget as the three that built
+    /// twelve commits.
+    ///
+    /// **Presence, not absence, of the two fields decides.** Run 2's real Waits carry explicit
+    /// `total_cost_usd: 0.0` and `num_turns: 1`; a payload that parsed but whose cost/turn
+    /// fields were renamed away (the recorded `result-field-missing` drift) must not read as
+    /// *did no work* — that is the same failure mode the next clause guards, one level
+    /// shallower. Absence spends the budget, which is the safe direction.
+    ///
+    /// **An Attempt whose stdout did not parse is never a Wait, and that clause is
+    /// load-bearing.** A child that dies before emitting parseable JSON leaves both the cost and
+    /// the turn count absent, so a predicate reading absence as *did no work* would make every
+    /// crash loop free: no budget spent, no rate-limit match, immediate re-entry, forever, with
+    /// `attempt N of M` reporting the Run as barely started. Absence of evidence is not evidence
+    /// of no work, and `parse_ok` is the field that already separates the two.
+    ///
+    /// Derived, never persisted: the fields it reads are already on the record, so there is no
+    /// migration and no reader mirror to keep in step.
     pub fn is_wait(&self) -> bool {
         self.parse_ok
-            && self.total_cost_usd.unwrap_or(0.0) <= 0.0
-            && self.num_turns.unwrap_or(0) <= 1
+            && self.total_cost_usd.is_some_and(|cost| cost <= 0.0)
+            && self.num_turns.is_some_and(|turns| turns <= 1)
     }
 }
 
@@ -412,15 +444,26 @@ pub fn trailing_waits(attempts: &[Attempt]) -> usize {
 /// **`subtype` is not the outcome.** It read `success` on all five of Run 1's attempts including
 /// the three that died, and on all six of Run 2's rate-limited ones. `terminal_reason` and the
 /// API error status are the discriminators.
+///
+/// **The payload is recovered tolerantly, and the raw streams speak when it cannot.** Strict
+/// whole-string parsing flips `parse_ok` false over a single stray byte around the payload,
+/// and then a rate limit delivered amid noise classifies as a crash — an immediate Reenter
+/// burning attempts against an hours-long wall. So [`parse_payload`] falls back before giving
+/// up, and when the payload never rendered a verdict (`parse_ok` false) or the child exited
+/// non-zero without the payload itself carrying the 429, the same normalised needle set folds
+/// over the stdout tail and the stderr — where a limit that killed the child before any JSON
+/// leaves its verdict. A false positive sleeps instead of burning attempts: the safe
+/// direction, the same one that makes an unparseable Attempt never a Wait.
 pub fn classify(
     stdout: &str,
+    stderr: &str,
     code: Option<i32>,
     n: usize,
     mode: Mode,
     started_at: &str,
     ended_at: &str,
 ) -> Attempt {
-    let parsed: Option<serde_json::Value> = serde_json::from_str(stdout).ok();
+    let parsed = parse_payload(stdout);
     let parse_ok = parsed.is_some();
     let value = parsed.unwrap_or(serde_json::Value::Null);
 
@@ -435,6 +478,18 @@ pub fn classify(
         .get("is_error")
         .and_then(|v| v.as_bool())
         .unwrap_or(!parse_ok);
+
+    // The stdout half of the rate-limit haystack, computed once: the payload's `result` when
+    // one arrived, the raw stdout otherwise — the same slice the record keeps as its tail,
+    // so no second pass over the stream is needed.
+    let stream_tail = tail(
+        if parse_ok && result_present {
+            &result
+        } else {
+            stdout
+        },
+        1500,
+    );
 
     Attempt {
         n,
@@ -471,24 +526,51 @@ pub fn classify(
             .cloned()
             .unwrap_or_default(),
         done_promise: result.contains("<promise>DONE</promise>"),
-        rate_limited: is_rate_limited(&value),
+        // The payload's own verdict first. The raw-streams fold runs only when the payload
+        // cannot speak — it never parsed, or the child exited non-zero without the payload
+        // itself carrying the 429 — so a healthy attempt is never rate-limited by noise on
+        // its stderr. `stream_tail` is the stdout half of that fold, the same tail the
+        // record keeps for diagnosis.
+        rate_limited: is_rate_limited(&value)
+            || ((!parse_ok || code.is_some_and(|c| c != 0))
+                && mentions_limit(&normalise(&format!("{stream_tail} {stderr}")))),
         // The tail is kept whether or not the response parsed, so an unreadable child still
         // leaves something diagnosable. A missing `result` key takes the same fallback as an
         // unparseable payload, for the same reason: there is nothing under that key to show
         // either way, and the raw stdout is the only thing left to look at.
-        result_tail: tail(
-            if parse_ok && result_present {
-                &result
-            } else {
-                stdout
-            },
-            1500,
-        ),
+        result_tail: stream_tail,
         // Could not observe until somebody reads the transcript, which is `supervisor`'s job
         // before it pushes the Attempt. A path that forgets records *could not observe* rather
         // than `(0, 0)`, which is the honest direction for an omission.
         fanout: Observed::Unobservable(Reason::saying("the transcript was not read")),
     }
+}
+
+/// The payload, recovered tolerantly.
+///
+/// Strict whole-string parsing first — the shape a healthy child emits. Around it, the
+/// recorded failure mode is **noise**: a wrapper's banner, a warning line, a stray byte, and
+/// then a rate limit delivered amid that noise would classify as a crash and burn attempts
+/// against an hours-long wall. So before declaring the stream unparseable: retry on the
+/// widest `{`..`}` span (the payload with junk around it), then take the last line that
+/// parses as a JSON object (a payload after other output). Only a stream with no recoverable
+/// object at all returns `None`, which `classify` records as `unparseable-output` with the
+/// raw tail kept.
+fn parse_payload(stdout: &str) -> Option<serde_json::Value> {
+    if let Ok(value) = serde_json::from_str(stdout) {
+        return Some(value);
+    }
+    if let (Some(start), Some(end)) = (stdout.find('{'), stdout.rfind('}'))
+        && start < end
+        && let Ok(value) = serde_json::from_str(&stdout[start..=end])
+    {
+        return Some(value);
+    }
+    stdout.lines().rev().find_map(|line| {
+        serde_json::from_str(line.trim())
+            .ok()
+            .filter(serde_json::Value::is_object)
+    })
 }
 
 /// A field as text, whether the child sent a string, a number or a boolean. `api_error_status`
@@ -534,6 +616,12 @@ pub fn is_rate_limited(value: &serde_json::Value) -> bool {
         }
     }
     let normalised = normalise(&haystack);
+    mentions_limit(&normalised)
+}
+
+/// The needle set over an already-normalised haystack — shared by the payload path above and
+/// by `classify`'s fold over the raw streams, so both ask exactly one question.
+fn mentions_limit(normalised: &str) -> bool {
     const NEEDLES: [&str; 8] = [
         "ratelimit",
         "usagelimit",
@@ -676,7 +764,7 @@ mod tests {
         // spelling per row is what let the whole list read complete while
         // `git push origin --force` went straight through: git accepts the flag anywhere, and
         // a table that only ever types it in one position never asks.
-        let table: [(&str, &[&str]); 15] = [
+        let table: [(&str, &[&str]); 18] = [
             (
                 "merge via gh pr merge",
                 &["gh pr merge 123 --squash", "gh pr merge --squash 123"],
@@ -761,6 +849,21 @@ mod tests {
                 &[
                     "git update-ref -d refs/heads/feat/x",
                     "git update-ref refs/heads/main abc123",
+                ],
+            ),
+            (
+                "mirror push force-updating every ref on the remote",
+                &["git push --mirror origin", "git push origin --mirror"],
+            ),
+            (
+                "prune push deleting remote refs with no local counterpart",
+                &["git push --prune origin", "git push origin --prune"],
+            ),
+            (
+                "branch delete through the api",
+                &[
+                    "gh api -X DELETE repos/o/r/git/refs/heads/feat/x",
+                    "gh api --method DELETE repos/o/r/git/refs/heads/feat/x",
                 ],
             ),
         ];
@@ -1043,7 +1146,7 @@ mod tests {
             (2, RUN1_ATTEMPT_2),
             (3, RUN1_ATTEMPT_3),
         ] {
-            let found = classify(raw, Some(1), n, Mode::Resume, "start", "end");
+            let found = classify(raw, "", Some(1), n, Mode::Resume, "start", "end");
             assert_eq!(found.subtype.as_deref(), Some("success"), "attempt {n}");
             assert!(found.is_error, "attempt {n} really did die");
             assert!(!found.done_promise, "attempt {n} promised nothing");
@@ -1062,7 +1165,7 @@ mod tests {
         // an off-by-one or wrong-end bug in `tail` reproduce identically on both sides of the
         // assertion and pass unnoticed.
         for raw in [TRUNCATED, GARBAGE, EMPTY] {
-            let found = classify(raw, Some(1), 1, Mode::Dispatch, "start", "end");
+            let found = classify(raw, "", Some(1), 1, Mode::Dispatch, "start", "end");
             assert!(!found.parse_ok, "this fixture does not parse");
             assert_eq!(found.subtype.as_deref(), Some("unparseable-output"));
             assert!(found.is_error);
@@ -1077,7 +1180,7 @@ mod tests {
         }
         // The truncated fixture is 1998 characters, long enough to actually cross the
         // 1500-character boundary — the case that matters, where bytes arrived and then stopped.
-        let truncated = classify(TRUNCATED, Some(1), 1, Mode::Dispatch, "start", "end");
+        let truncated = classify(TRUNCATED, "", Some(1), 1, Mode::Dispatch, "start", "end");
         assert_eq!(truncated.result_tail.chars().count(), 1500);
         assert_ne!(
             truncated.result_tail, TRUNCATED,
@@ -1085,7 +1188,7 @@ mod tests {
         );
         // Both of these fixtures are under the boundary, so nothing was cut.
         for raw in [GARBAGE, EMPTY] {
-            let found = classify(raw, Some(1), 1, Mode::Dispatch, "start", "end");
+            let found = classify(raw, "", Some(1), 1, Mode::Dispatch, "start", "end");
             assert_eq!(
                 found.result_tail, raw,
                 "under the 1500-character boundary, the tail is everything there was"
@@ -1095,7 +1198,7 @@ mod tests {
 
     #[test]
     fn a_killed_childs_empty_stdout_is_recorded_rather_than_lost() {
-        let killed = classify("", None, 4, Mode::Resume, "start", "end");
+        let killed = classify("", "", None, 4, Mode::Resume, "start", "end");
         assert!(!killed.parse_ok);
         assert_eq!(killed.exit_code, None);
         assert!(
@@ -1112,7 +1215,7 @@ mod tests {
             "result": "PR is open, stopping here. <promise>DONE</promise>",
         })
         .to_string();
-        assert!(classify(&promised, Some(0), 5, Mode::Resume, "s", "e").done_promise);
+        assert!(classify(&promised, "", Some(0), 5, Mode::Resume, "s", "e").done_promise);
 
         let unpromised = serde_json::json!({
             "is_error": false,
@@ -1120,7 +1223,7 @@ mod tests {
             "result": "Made progress but the pipeline has not reached an open PR yet.",
         })
         .to_string();
-        assert!(!classify(&unpromised, Some(0), 4, Mode::Resume, "s", "e").done_promise);
+        assert!(!classify(&unpromised, "", Some(0), 4, Mode::Resume, "s", "e").done_promise);
     }
 
     #[test]
@@ -1129,7 +1232,15 @@ mod tests {
         // whose DONE text sits under `output` rather than `result`. Before this fix, that read
         // as `parse_ok: true, done_promise: false` — indistinguishable from a session that
         // genuinely said nothing.
-        let found = classify(DEGRADED_RENAMED, Some(0), 1, Mode::Dispatch, "start", "end");
+        let found = classify(
+            DEGRADED_RENAMED,
+            "",
+            Some(0),
+            1,
+            Mode::Dispatch,
+            "start",
+            "end",
+        );
         assert!(found.parse_ok, "the payload itself is well-formed JSON");
         assert_eq!(
             found.subtype.as_deref(),
@@ -1155,7 +1266,7 @@ mod tests {
             "permission_denials": [{"tool_name": "Bash", "tool_input": {"command": "git push --force"}}],
         })
         .to_string();
-        let found = classify(&denied, Some(0), 1, Mode::CiBabysit, "s", "e");
+        let found = classify(&denied, "", Some(0), 1, Mode::CiBabysit, "s", "e");
         assert_eq!(found.permission_denials.len(), 1);
         assert_eq!(found.mode, Mode::CiBabysit);
     }
@@ -1216,13 +1327,25 @@ mod tests {
     }
 
     #[test]
-    fn an_attempt_that_parsed_with_no_cost_and_no_turns_is_a_wait() {
+    fn an_attempt_with_explicit_zero_cost_and_one_turn_is_a_wait() {
+        // Run 2's real Waits carry the fields explicitly: 0.0 and 1.
         assert!(shaped(true, Some(0.0), Some(1), true).is_wait());
-        assert!(shaped(true, None, None, false).is_wait());
         assert!(
             shaped(true, Some(0.0), Some(1), false).is_wait(),
             "a Wait is never keyed on the rate-limit flag"
         );
+    }
+
+    #[test]
+    fn an_attempt_that_parsed_with_both_fields_absent_is_not_a_wait() {
+        // The bug this defends: absence read as zero, so a payload whose cost/turn fields were
+        // renamed away (the recorded `result-field-missing` drift) made every Attempt —
+        // including a $37/187-turn one — a Wait, and the budget never spent. Absence spends
+        // the budget; only explicit zero-and-one waits.
+        assert!(!shaped(true, None, None, false).is_wait());
+        assert!(!shaped(true, None, None, true).is_wait());
+        assert!(!shaped(true, Some(37.04), None, false).is_wait());
+        assert!(!shaped(true, None, Some(187), false).is_wait());
     }
 
     #[test]
@@ -1242,10 +1365,99 @@ mod tests {
             shaped(true, None, None, true),
             shaped(true, Some(0.0), Some(0), true),
         ];
-        assert_eq!(working(&list), 2);
-        assert_eq!(trailing_waits(&list), 2);
+        assert_eq!(working(&list), 3);
+        assert_eq!(trailing_waits(&list), 1);
         assert_eq!(trailing_waits(&[]), 0);
         assert_eq!(working(&[]), 0);
+    }
+
+    #[test]
+    fn a_payload_amid_stdout_noise_still_classifies() {
+        // Strict whole-string parsing would flip `parse_ok` false over the banner bytes and
+        // turn a rate limit into a crash — an immediate Reenter against an hours-long wall.
+        let payload = serde_json::json!({
+            "is_error": true,
+            "result": "You've hit your session limit · resets 5pm (Europe/Berlin)",
+            "num_turns": 3,
+            "total_cost_usd": 0.42,
+        });
+        let noisy = format!("WARNING: plugin cache stale\n{payload}\nretrying once\n");
+        let found = classify(&noisy, "", Some(1), 2, Mode::Resume, "s", "e");
+        assert!(found.parse_ok, "the payload amid noise is still a payload");
+        assert!(found.rate_limited, "the limit must survive noise around it");
+        assert_eq!(found.num_turns, Some(3));
+        assert_eq!(found.total_cost_usd, Some(0.42));
+    }
+
+    #[test]
+    fn noise_without_a_recoverable_payload_is_still_unparseable_output() {
+        // Braces alone do not make a payload: nothing parses, so the record says
+        // `unparseable-output` and keeps the raw tail exactly as before the fallback existed.
+        let found = classify(
+            "fatal: worker exited mid-write { see dump above }",
+            "",
+            Some(1),
+            1,
+            Mode::Dispatch,
+            "s",
+            "e",
+        );
+        assert!(!found.parse_ok);
+        assert_eq!(found.subtype.as_deref(), Some("unparseable-output"));
+        assert_eq!(
+            found.result_tail,
+            "fatal: worker exited mid-write { see dump above }"
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_that_killed_the_child_before_any_json_is_read_off_stderr() {
+        // The child never emitted stdout JSON, so the payload path cannot speak; the verdict
+        // sits on stderr, which `world` already wrote to disk. Sleeping beats re-entering.
+        let found = classify(
+            "",
+            "You've hit your session limit · resets 5pm (Europe/Berlin)",
+            None,
+            4,
+            Mode::Resume,
+            "s",
+            "e",
+        );
+        assert!(!found.parse_ok);
+        assert!(found.rate_limited, "a stderr-only limit must still be one");
+    }
+
+    #[test]
+    fn an_ordinary_death_on_stderr_is_not_mistaken_for_a_rate_limit() {
+        let found = classify(
+            "",
+            "thread 'main' panicked at 'out of memory', src/never.rs:3:5",
+            Some(101),
+            4,
+            Mode::Resume,
+            "s",
+            "e",
+        );
+        assert!(!found.parse_ok);
+        assert!(!found.rate_limited, "no needle in the prose, no limit");
+    }
+
+    #[test]
+    fn a_successful_attempt_is_not_rate_limited_by_noise_on_its_stderr() {
+        // The stderr fold is gated on the payload failing to speak or the exit being non-zero:
+        // a healthy attempt whose stderr mentions limits in passing stays healthy.
+        let payload = serde_json::json!({"is_error": false, "result": "done"}).to_string();
+        let found = classify(
+            &payload,
+            "note: the rate limit docs have moved",
+            Some(0),
+            5,
+            Mode::Dispatch,
+            "s",
+            "e",
+        );
+        assert!(found.parse_ok);
+        assert!(!found.rate_limited);
     }
 
     #[test]
