@@ -128,7 +128,6 @@ impl RunRecord {
 pub struct Outcome {
     pub run_id: String,
     pub state: &'static str,
-    pub attempts_made: usize,
     /// True when `resume` found a Run already at a terminal state and started nothing. The name
     /// reads narrower than the flag now is — it covers `Exhausted` as well as `Completed`, see
     /// the guard in `resume` — so nothing may render it as the word *completed*. `state` beside
@@ -398,7 +397,6 @@ pub fn resume(run_id: &str) -> Result<Outcome, Refusal> {
         return Ok(Outcome {
             run_id: record.run_id.clone(),
             state: record.state.as_str(),
-            attempts_made: record.attempts().len(),
             already_completed: true,
         });
     }
@@ -509,11 +507,14 @@ pub fn resume_all() -> Result<Reentry, Refusal> {
             report.skipped.push((run_id.to_string(), why));
             continue;
         }
-        match world::spawn_detached(&[
-            exe.display().to_string(),
-            "resume".to_string(),
-            run_id.to_string(),
-        ]) {
+        match world::spawn_detached(
+            &[
+                exe.display().to_string(),
+                "resume".to_string(),
+                run_id.to_string(),
+            ],
+            &resume_log_path(&run_dir),
+        ) {
             Ok(_) => {
                 say(&run_dir, "  re-entered at boot");
                 report.started.push(run_id.to_string());
@@ -549,12 +550,13 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
     let mut working_seen = attempt::working(record.attempts());
 
     loop {
-        // The first pass has no attempt to classify, so the loop starts by attempting.
-        let mode = if record.attempts().is_empty() {
-            Mode::Dispatch
-        } else {
-            Mode::Resume
-        };
+        // The first pass has no attempt to classify, so the loop starts by attempting. But a
+        // crash *inside* Attempt 1 leaves a record with no attempts while the session already
+        // carries transcript lines — re-dispatching there would start the Job over under the
+        // same session id and lose what the crashed session did. Dispatch therefore means an
+        // untouched Run: no attempts *and* an empty transcript. A created-but-empty session
+        // still re-dispatches, because there is nothing in it to lose.
+        let mode = entry_mode(record.attempts(), transcript_lines(record));
         run_one_attempt(record, run_dir, &worktree, mode)?;
         record.save(&path)?;
 
@@ -671,7 +673,6 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
             return Ok(Outcome {
                 run_id: record.run_id.clone(),
                 state: record.state.as_str(),
-                attempts_made: record.attempts().len(),
                 already_completed: false,
             });
         }
@@ -728,6 +729,22 @@ fn run_one_attempt(
         .with_fanout(fanout_of(record, already_written));
     record.push_attempt(classified);
     Ok(())
+}
+
+/// Dispatch or resume, from the two facts a re-entering supervisor can see: the attempt list
+/// and how much transcript the recorded session already holds.
+///
+/// `attempts.is_empty()` alone is not *fresh*: a crash inside Attempt 1 — after `claude`
+/// created the session named by `--session-id`, before any Attempt was recorded — leaves an
+/// empty list over a session that already did work. Re-dispatching there would start the Job
+/// over and lose that work, so Dispatch requires the transcript to be empty too. Absence of a
+/// transcript file reads as zero, which is the honest reading: nothing was written yet.
+fn entry_mode(attempts: &[Attempt], transcript_lines: usize) -> Mode {
+    if attempts.is_empty() && transcript_lines == 0 {
+        Mode::Dispatch
+    } else {
+        Mode::Resume
+    }
 }
 
 /// How much of the Run's transcript exists right now, in lines. A transcript that is not there
@@ -801,9 +818,12 @@ fn refuse_unless_host_ready(home: &Path, job: &Job) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// The presence half of the shared item list — local, free, no network. `cli` runs the same
-/// items at doctor's depth.
-pub fn check_presence(home: &Path, job: &Job, check: job::Check) -> Observed<ItemOutcome> {
+/// The presence half of the dispatch-depth item list — local, free, no network, run by
+/// `refuse_unless_host_ready` before a child is ever spawned. **`cli` does not share this**:
+/// doctor keeps its own mapping in its own `check`, because doctor's depth (relaxed checks,
+/// declared-clone context) differs per item, and one function serving both would drag
+/// dispatch's no-network shape into every doctor row.
+fn check_presence(home: &Path, job: &Job, check: job::Check) -> Observed<ItemOutcome> {
     use crate::observe as obs;
     match check {
         job::Check::DeclaredClone => obs::declared_clone(
@@ -974,6 +994,16 @@ fn record_path(run_dir: &Path) -> PathBuf {
 /// structurally rather than by a `.gitignore` line.
 fn log_path(run_dir: &Path) -> PathBuf {
     run_dir.join("supervisor.log")
+}
+
+/// `~/.grind/runs/<run-id>/resume.log` — where the detached boot-re-entry child's own stdout
+/// and stderr land. The child is detached, so nobody is watching its streams; without a file
+/// they are nulled and a pre-supervise refusal (`resume.log`'s whole reason to exist) — the
+/// dispatch lock's `WouldBlock`, an unreadable record — vanishes after `resume --all` already
+/// said *re-entered*. Appended, like `supervisor.log` beside it, so repeated boots keep every
+/// account.
+fn resume_log_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("resume.log")
 }
 
 /// The supervisor's narration, to stdout **and** to a file that outlives the terminal.
@@ -1266,5 +1296,55 @@ mod tests {
             world::resolve_link(&second).unwrap()
         );
         world::remove_tree(&repo);
+    }
+    /// A minimal crashed Attempt — the child never handed back anything classifiable.
+    fn a_crashed_attempt(n: usize) -> Attempt {
+        Attempt {
+            n,
+            mode: Mode::Resume,
+            started_at: "2026-08-21T00:00:00+00:00".into(),
+            ended_at: "2026-08-21T00:01:00+00:00".into(),
+            exit_code: None,
+            is_error: true,
+            parse_ok: false,
+            subtype: Some("unparseable-output".into()),
+            stop_reason: None,
+            api_error_status: None,
+            terminal_reason: None,
+            num_turns: None,
+            total_cost_usd: None,
+            usage: None,
+            permission_denials: Vec::new(),
+            done_promise: false,
+            rate_limited: false,
+            result_tail: String::new(),
+            fanout: Observed::Absent,
+        }
+    }
+
+    #[test]
+    fn a_crash_inside_attempt_one_resumes_the_session_instead_of_redispatching_it() {
+        // A crash after `claude` created the session leaves either no recorded attempts over a
+        // transcript that already has lines, or one crashed attempt over any transcript. Keying
+        // Dispatch on the empty attempt list alone re-dispatched under the same session id and
+        // lost the crashed session's work, so Dispatch now means an untouched Run: no attempts
+        // *and* no transcript. A created-but-empty session — the crash landed before Attempt 1
+        // was ever recorded — still re-dispatches, because there is nothing in it to lose.
+        let crashed = [a_crashed_attempt(1)];
+        assert_eq!(entry_mode(&[], 0), Mode::Dispatch);
+        assert_eq!(entry_mode(&crashed, 0), Mode::Resume);
+        assert_eq!(entry_mode(&crashed, 3), Mode::Resume);
+    }
+
+    #[test]
+    fn the_detached_resume_child_logs_beside_the_record_it_reenters() {
+        // The detached child's stdout and stderr land in one file directly under the run
+        // directory, next to `run.json` and `supervisor.log` — the one place a boot re-entry's
+        // pre-supervise refusal can still be read after the parent has exited.
+        let path = resume_log_path(Path::new("/home/op/.grind/runs/20260821-000000-snapper-90"));
+        assert_eq!(
+            path,
+            Path::new("/home/op/.grind/runs/20260821-000000-snapper-90/resume.log")
+        );
     }
 }
