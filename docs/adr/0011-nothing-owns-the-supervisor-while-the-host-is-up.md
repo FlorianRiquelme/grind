@@ -109,6 +109,10 @@ failure is *declining to re-enter*, which is the safe direction.
   `every_item_carries_the_mark_the_document_gives_it` and this item has no `Check` behind it yet.
   The decision is made; the carrier and the check land together, or neither does.
 
+> **Landed 2026-08-21.** The paragraph above is superseded: the item carries its *doctor* mark
+> in `docs/provisioned-host.md`, `job::host_items()` carries the entry, and `Check::BootOneShot`
+> is implemented in `cli.rs`. Carrier and check landed together, as this section required.
+
 ## Explicitly out of scope
 
 **A supervisor killed on a host that stays up** — OOM, a stray `kill`, a crash. Neither the current

@@ -17,6 +17,11 @@ comment holds the full derivation.
 
 Nothing here is built yet: there is no Rust crate in this repo, so a recipe running `cargo fmt`
 would reference nothing. This ADR is the target the base arrives with.
+> **Superseded 2026-08-21 by the Rust base (ADR-0005).** Every absence the opening below
+> asserts has since inverted: Grind is a compiled Rust crate with a `justfile` whose `just
+> verify` is the recipe this ADR specified, a `.github/` workflow running that recipe and
+> nothing else, and no `tests/test_grind.py`. The paragraphs stand as written because the
+> decision was made against the state they describe.
 
 ## The premise that deflated: `just` is not a host dependency
 
