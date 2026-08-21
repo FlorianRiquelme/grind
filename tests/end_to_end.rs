@@ -554,6 +554,9 @@ fn scenario_a_a_real_run_shape_with_the_literal_argv_of_every_attempt() {
                 "Bash(git*--force-with-lease*)",
                 "Bash(git -c*)",
                 "Bash(git*update-ref*)",
+                "Bash(git push*--mirror*)",
+                "Bash(git push*--prune*)",
+                "Bash(gh api*DELETE*)",
             ]
         );
         // No spend ceiling on any of them, and the Job issue still carries the row (ADR-0010).
