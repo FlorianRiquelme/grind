@@ -9,7 +9,7 @@
 
 use crate::decide::{Stage, Verdict, VerifyContract};
 use crate::observe::{Observation, Observed, Outcome, UNOBSERVABLE_MARK};
-use crate::view::{Facts, Live, RosterRow, RunView};
+use crate::view::{Facts, Live, RosterRow, RunView, one_line};
 use std::path::Path;
 
 /// One item of doctor's report, as `cli` hands it over: the name and the depth mark alongside
@@ -53,9 +53,13 @@ pub fn run_view(view: &SingleRun) -> String {
     let furthest = *furthest;
     let (made, budget) = found.attempt_counter();
     let mut out = String::new();
+    // The recorded state, **labelled as recorded**: printed bare above the fresh verdict it
+    // asks the human to adjudicate between two things Grind produced — the exact shape the
+    // Handback refuses (the test below). The word stays, because it names the record on disk;
+    // the label is what stops it reading as a fresh claim.
     line(
         &mut out,
-        &format!("Run     {}  [{}]", found.run_id, found.state),
+        &format!("Run     {}  recorded [{}]", found.run_id, found.state),
     );
     line(
         &mut out,
@@ -84,6 +88,11 @@ pub fn run_view(view: &SingleRun) -> String {
     // Two separate stage lines. *How far it got* and *what it is doing* are never conflated.
     line(&mut out, &format!("  furthest stage    {furthest}"));
     line(&mut out, &format!("  now               {}", live.now_skill));
+    // *What it is doing right now* — the last assistant message, distinct from how far it got.
+    line(
+        &mut out,
+        &format!("  doing             {}", live.assistant_now),
+    );
     line(
         &mut out,
         &format!("  progress          {}", freshness_line(&live.freshness)),
@@ -392,8 +401,16 @@ pub fn job_comment(view: &Facts) -> String {
         &format!("${:.2} (API pricing)", found.total_spend()),
     );
     cell("tool denials", &found.denial_count().to_string());
-    // The four completion observations, each with its mark and nothing else.
-    cell("PR", &marked(&observation.pr));
+    // The four completion observations, each with its mark and nothing else. The draft flag
+    // travels with the URL: the Handback renders it as its own row, but that rendering never
+    // leaves the host, and this comment is all the off-host triage gets.
+    cell(
+        "PR",
+        &match &observation.pr {
+            Observed::Present(pr) if pr.is_draft => format!("{} (draft)", pr),
+            other => marked(other),
+        },
+    );
     cell("tree clean", &marked(&observation.tree_clean));
     cell("commits ahead", &marked(&observation.commits_ahead));
     cell("checks pending", &marked(&observation.checks_pending));
@@ -683,9 +700,11 @@ fn freshness_line(freshness: &Observed<u64>) -> String {
 
 fn fanout_line(live: &Live) -> String {
     match &live.fanout {
-        Observed::Present(agents) if agents.is_empty() => "none".to_string(),
         Observed::Present(agents) => {
-            let described: Vec<&str> = agents.iter().map(|a| a.description.as_str()).collect();
+            // Each description through the same one-line discipline as `last_words`: five long
+            // Agent descriptions wrapping differently on every `watch` refresh is exactly the
+            // jitter the fixed view shape exists to prevent.
+            let described: Vec<String> = agents.iter().map(|a| one_line(&a.description)).collect();
             format!(
                 "{} agent{}: {}  ({})",
                 agents.len(),
@@ -694,6 +713,10 @@ fn fanout_line(live: &Live) -> String {
                 freshness_line(&live.freshness)
             )
         }
+        // `Absent` — nothing running — and *could not observe* keep the shared marks. The old
+        // `Present(agents) if agents.is_empty() => "none"` arm was unreachable: `fanout`
+        // returns `Absent` once every spawn has paired with a `tool_result`, and reads *could
+        // not observe* rather than an empty list where nothing was recognised.
         other => negative_mark(other).to_string(),
     }
 }
@@ -776,6 +799,9 @@ mod tests {
                     }
                 })
                 .collect(),
+            assistant_now: Observed::Present(
+                "running the rust test suite for the auth module".to_string(),
+            ),
             fanout: Observed::Present(vec![Fanout {
                 description: "review the diff for regressions".to_string(),
             }]),
@@ -809,6 +835,46 @@ mod tests {
             .map(|l| l.trim().split("  ").next().unwrap_or_default().to_string())
             .filter(|l| !l.is_empty())
             .collect()
+    }
+
+    #[test]
+    fn the_recorded_state_is_labelled_so_a_stale_word_cannot_read_as_a_fresh_claim() {
+        // The Handback refuses to print the recorded state beside the fresh verdict at all;
+        // the single-Run view keeps the word — it names the record on disk — but labels it,
+        // so a stale `exhausted` above a fresh `completed` verdict cannot adjudicate itself.
+        let mut record = found();
+        record.state = "exhausted".to_string();
+        let text = run_view(&SingleRun {
+            found: &record,
+            observation: &observation(),
+            live: &live(3),
+            verdict: &Verdict::Completed,
+            contract: &contract(),
+            furthest: Stage::PrOpen,
+            supervisor_here: &Observed::Present(true),
+            run_state: Path::new("/home/op/.grind/runs/20260806-122620-snapper-28/run.json"),
+        });
+        assert!(text.contains("recorded [exhausted]"), "{text}");
+    }
+
+    #[test]
+    fn a_long_agent_description_is_capped_like_the_last_words_block() {
+        // Five long descriptions wrapping differently on every refresh is the jitter the fixed
+        // view shape exists to prevent; the freshness suffix is deliberate and stays.
+        let mut watching = live(3);
+        watching.fanout = Observed::Present(vec![Fanout {
+            description: "word ".repeat(40),
+        }]);
+        let text = rendered(&observation(), &watching, &Verdict::Completed);
+        let said = text
+            .lines()
+            .find(|l| l.contains(" 1 agent: "))
+            .expect("the fan-out line");
+        assert!(said.contains('…'), "{said}");
+        assert!(
+            said.ends_with(")"),
+            "one line, freshness suffix intact: {said}"
+        );
     }
 
     #[test]
@@ -900,6 +966,7 @@ mod tests {
         let text = rendered(&observation(), &live(3), &Verdict::Completed);
         assert!(text.contains("furthest stage    pr-open"));
         assert!(text.contains("now               compound-engineering:ce-work"));
+        assert!(text.contains("doing             running the rust test suite"));
     }
 
     #[test]
@@ -1453,6 +1520,25 @@ mod tests {
             assert!(markdown.contains(named), "the comment drops `{named}`");
         }
         assert!(markdown.contains("4 spawned, 4 returned"), "{markdown}");
+        // The draft flag travels with the URL: the Handback's `draft` row never leaves the
+        // host, and this comment is all the off-host triage gets.
+        let mut draft = observation();
+        draft.pr = Observed::Present(Pr {
+            number: 30,
+            url: "https://github.com/FlorianRiquelme/snapper/pull/30".to_string(),
+            state: "OPEN".to_string(),
+            is_draft: true,
+        });
+        let marked_up = commented(&draft, &Verdict::Completed);
+        assert!(
+            marked_up
+                .contains("| PR | https://github.com/FlorianRiquelme/snapper/pull/30 (draft) |"),
+            "{marked_up}"
+        );
+        assert!(
+            !markdown.contains("(draft)"),
+            "a ready PR does not read as a draft:\n{markdown}"
+        );
     }
 
     #[test]

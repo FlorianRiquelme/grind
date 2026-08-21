@@ -309,7 +309,12 @@ pub fn verify_contract(justfile: Option<&str>, package_json: Option<&str>) -> Ve
                 .collect(),
         };
     };
-    let mut haystack = justfile.to_string();
+    // A step trimmed to green but left behind as a comment (`# cargo clippy -- -D warnings`) must
+    // not read as present: the contract exists to catch exactly that trim (#82). Strip
+    // `#`-to-end-of-line segments line-wise before matching — a noisy missing report is always
+    // safer than a false green (ADR-0003), and package.json scripts carry no comments so that
+    // path is left untouched.
+    let mut haystack = strip_comments(justfile);
     if let Some(scripts) = package_json.and_then(npm_scripts) {
         haystack.push_str(&scripts);
     }
@@ -328,6 +333,21 @@ pub fn verify_contract(justfile: Option<&str>, package_json: Option<&str>) -> Ve
 fn npm_scripts(package_json: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(package_json).ok()?;
     Some(value.get("scripts")?.to_string())
+}
+
+/// Removes `#`-to-end-of-line comment segments from a justfile. A `#` inside a recipe line's
+/// string argument would also be stripped, but that only ever risks a false "missing" report,
+/// never a false green, and no contracted token contains `#`.
+fn strip_comments(justfile: &str) -> String {
+    let mut stripped = String::with_capacity(justfile.len());
+    for line in justfile.lines() {
+        match line.find('#') {
+            Some(at) => stripped.push_str(&line[..at]),
+            None => stripped.push_str(line),
+        }
+        stripped.push('\n');
+    }
+    stripped
 }
 
 #[cfg(test)]
@@ -514,6 +534,41 @@ mod tests {
             Some(r#"{"scripts":{"test":"vitest run"}}"#),
         );
         assert_eq!(contract.missing, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_step_left_behind_only_as_a_comment_is_reported_missing() {
+        // The exact failure the contract exists to catch: a step trimmed until it goes green,
+        // with the invocation surviving as a comment. The commented mention must not count.
+        let commented = INTACT.replace(
+            "    cargo clippy -- -D warnings",
+            "    # cargo clippy -- -D warnings",
+        );
+        let contract = verify_contract(Some(&commented), None);
+        assert_eq!(contract.missing, vec!["rust-clippy".to_string()]);
+    }
+
+    #[test]
+    fn a_live_recipe_line_still_matches_after_comment_stripping() {
+        let with_comments = format!(
+            "# verify: fmt clippy test typecheck lint fe-test build\n{INTACT}# trailing note\n"
+        );
+        assert_eq!(
+            verify_contract(Some(&with_comments), None).missing,
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn an_inline_trailing_comment_does_not_break_a_real_invocation() {
+        let inline = INTACT.replace(
+            "    cargo clippy -- -D warnings",
+            "    cargo clippy -- -D warnings # deny warnings on purpose",
+        );
+        assert_eq!(
+            verify_contract(Some(&inline), None).missing,
+            Vec::<String>::new()
+        );
     }
 
     #[test]

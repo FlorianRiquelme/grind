@@ -8,13 +8,15 @@ is not present for, and stops at an open PR.
 - **`CONTEXT.md`** — the glossary. Job, Enqueue, Dispatch, Run, Handoff SHA, Anchor
   artifact, Handback and the rest are defined terms with explicit `_Avoid_` lists. Use them;
   don't drift to the synonyms they rule out.
-- **`docs/adr/`** — eleven accepted decisions that constrain almost every change here.
+- **`docs/adr/`** — twelve accepted decisions that constrain almost every change here.
 - **`docs/provisioned-host.md`** — what a host must guarantee before a Dispatch succeeds on
   it: the `~/.grind/` layout, the executables, the six credential steps, and which items are
   checked at dispatch, by `grind doctor`, or not at all. Read it before provisioning anything.
 - **`STRATEGY.md`** — the target problem and the four metrics a change should serve.
-- **`docs/findings/`** — what actual Runs measured. `0001-first-run.md` is the only real
-  data the metrics have; it also corrects two things `BRAINSTORM.md` got wrong.
+- **`docs/findings/`** — what actual Runs measured. `0001`, `0002` and `0003` hold the only
+  real data the metrics have, and Run 2's is load-bearing: ADR-0002 and ADR-0004 argue from it,
+  the policy tests replay it, and its transcripts are checked-in fixtures (`tests/fixtures/run2`).
+  `0001` also corrects two things `BRAINSTORM.md` got wrong.
 - **`BRAINSTORM.md`** — the design record. Historical, and wrong in the places
   `docs/findings/0001` says it is.
 
@@ -104,13 +106,16 @@ change carries a safety property, not for coverage's sake.
   `tests/topology.rs` carries the absence of every classifying flag.
 - **Grind is a scheduler, not a pipeline** (ADR-0001). Everything between plan and open PR
   belongs to `lfg`. Don't reimplement stages it already runs.
-- **The plugin version is pinned per Job and frozen per Run** (ADR-0002 as amended by #42 and
-  re-amended by #50). The Job names both the plugin and the version, and a reference without a
-  literal `x.y.z` is refused at parse time — that shape is what makes `Latest` unspellable.
+- **The plugin version is pinned per Job and frozen per Run** (ADR-0002 as amended by #42,
+  re-amended by #50, and amended a third time by #69). The Job names both the plugin and the
+  version, and a reference without a literal `x.y.z` is refused at parse time — that shape is
+  what makes `Latest` unspellable.
   `job::plugin_dir()` then runs **once**, at dispatch, and the resolved path goes into the record —
   every attempt and every `--resume` reads the record. Never re-resolve per attempt: an 8-attempt
-  Run spans hours of rate-limit sleeps, and a version changing mid-Run is silent. Advancing the
-  pin in a Job is the act of promotion, which keeps promotion reviewable.
+  Run spans hours of rate-limit sleeps, and a version changing mid-Run is silent. Nobody advances
+  the pin: Enqueue resolves the newest installed version when it drafts the Job and writes that
+  literal, so a pin moves because the local cache updated — the freeze is the whole of what the
+  pin is for.
 - **Headless deliberately lags local** (ADR-0002). New capabilities get proven in supervised
   sessions first. Grind is not where we experiment.
 - **`DENIED_TOOLS` in `src/attempt.rs` is a safety property, and the list lives here.** A Run
@@ -140,6 +145,9 @@ change carries a safety property, not for coverage's sake.
   Bash(git*--force-with-lease*)
   Bash(git -c*)
   Bash(git*update-ref*)
+  Bash(git push*--mirror*)
+  Bash(git push*--prune*)
+  Bash(gh api*DELETE*)
   ```
 
   They rely on two documented matcher facts: a `*` may appear anywhere in the pattern, not only
@@ -151,16 +159,21 @@ change carries a safety property, not for coverage's sake.
   `git push origin --delete feat/x`, `git push origin :feat/x`,
   `git branch --delete --force feat/x`, `git reset HEAD~3 --hard`, `git branch feat/x -D`,
   `git -c x rebase` and `git update-ref -d refs/heads/x` were **all allowed** — and those are the
-  forms people and agents most often type. The eleven position-independent globs below the
+  forms people and agents most often type. The fourteen position-independent globs below the
   twelve close them.
 
-  Four are deliberately broad. `Bash(git -C*)` and `Bash(git -c*)` refuse **every** `git -C` and
+  Seven are deliberately broad. `Bash(git -C*)` and `Bash(git -c*)` refuse **every** `git -C` and
   `git -c`, because a Run works inside its own worktree via cwd, so a prefix pointing anywhere is
   outside the shape it should have — and enumerating the prefix × each forbidden verb is
   whack-a-mole. `Bash(git push*+*)` catches the `+refspec` force and will also refuse a push to a
   branch with a literal `+` in its name. `Bash(git push*:*)` catches the `:branch` delete refspec
   and will also refuse a push naming an explicit `user@host:path` remote, which is not the shape
-  a Run pushes in. Both are acceptable false refusals for a barrier of this kind.
+  a Run pushes in. `Bash(git push*--mirror*)` and `Bash(git push*--prune*)` refuse pushes that
+  touch refs beyond the one a Run owns — mirror rewrites every ref on the remote and prune drops
+  the deleted ones — which a single-branch Run never issues. `Bash(gh api*DELETE*)` refuses any
+  `gh api` DELETE, which a Run has no reason to issue; branch deletion is already covered by the
+  git globs, so this closes the API door rather than a git one. All are acceptable false refusals
+  for a barrier of this kind.
 
   `-f` is spelled ` -f` and ` -f ` rather than `-f`, because `-f` as a bare substring appears
   inside ordinary branch names and the broad glob would refuse the push. `-D` is not: it is
