@@ -1,6 +1,6 @@
 ---
 name: Grind
-last_updated: 2026-08-03
+last_updated: 2026-08-21
 ---
 
 # Grind Strategy
@@ -20,6 +20,11 @@ supervised local use until it stops needing correction, and a Run stops at an op
 without ever asserting the work is ready — so the gate stays downstream of Grind, where it
 already was: an agent-run review, and the human's merge decision over the PR's record.
 
+Leg 1 exists. The four things shipped as one accumulating build on the Rust base — #76
+spec'd it, PR #79 landed it 2026-08-20 — with the review sweep (#86) and the transcript
+live-view fix (#82) on top. Run 3, Grind dispatched at itself (`docs/findings/0003`), scored
+handback fidelity 5 of 5 with the record true on every claim.
+
 ## Who it's for
 
 **Primary:** The author, at the seam — holding a branch they have already enriched and
@@ -36,8 +41,9 @@ is affordable precisely because the shell over `lfg` is thin.
   four observations that decide it: PR open, tree clean, commits ahead, no check pending), how
   many the human had to check for themselves before they could act. The primary metric;
   minimise it. Hand-counted from the Handback beside the PR, and nothing instruments it. Run 1
-  scored 0 of 5, Run 2 scored 3 of 5 — and Run 2's morning cost was disbelief rather than
-  decisions, which is the cost the metric below could not see. Distinct from *self-diagnosable
+  scored 0 of 5, Run 2 scored 3 of 5 — and Run 3, against Grind itself, 5 of 5 — and Run 2's
+  morning cost was disbelief rather than decisions, which is the cost the metric below could
+  not see. Distinct from *self-diagnosable
   failures*: that one is about explaining a death, this one about trusting a terminal fact.
 - **Morning decisions per run** — count of findings and open questions that require a decision
   from the human before work can continue. Secondary, and minimised only alongside fidelity:
@@ -46,6 +52,8 @@ is affordable precisely because the shell over `lfg` is thin.
   carries no findings and depends on the narrative for nothing.
 - **Unattended completion rate** — share of dispatched Runs reaching an open PR with no
   mid-run intervention. Measured from run state.
+  Standing after three Runs: 3 of 3 reached an open PR, and the record says 3 of 3
+  (`docs/findings/0003`).
 - **Weekly-limit cost per run** — session and weekly-limit consumption a Run spends. Kept as
   the instrument that would show the limit becoming binding, not because it already is: the
   scarce input is refined plans, and they arrive slower than the limit refills. Measured from
@@ -63,6 +71,9 @@ artifact, the decomposability admission check, the pinned plugin version. Enqueu
 where the Dispatch is offered — the trigger is a push closing this step, never a watcher
 observing anything (ADR-0012).
 
+It ships as `skills/enqueue/`, a globally-loaded skill invoked from the session that prepared
+the branch (#69); its Job table is a parser contract, tested by `tests/enqueue_template.rs`.
+
 _Why it serves the approach:_ Enqueue is the last moment a human is present, so it is the
 only place a badly shaped job can be caught before it fails unattended and expensively.
 
@@ -70,7 +81,11 @@ only place a badly shaped job can be caught before it fails unattended and expen
 
 Run-now before any schedule, re-entry at the stage that died, limit handling by sleeping and
 re-entering rather than pre-flight quota checks, and run state on gitignored local disk that
+
 is structured enough for a day session to read.
+
+A reboot re-enters what was cut off through a boot-time one-shot calling `grind resume
+--all` (ADR-0011); nothing owns the supervisor while the host is up.
 
 _Why it serves the approach:_ It is the resilience layer, so it is **not an agent** — a
 supervisor built from the thing that gets rate-limited loses its state exactly when that

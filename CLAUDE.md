@@ -12,7 +12,7 @@ is not present for, and stops at an open PR.
 - **`docs/provisioned-host.md`** — what a host must guarantee before a Dispatch succeeds on
   it: the `~/.grind/` layout, the executables, the six credential steps, and which items are
   checked at dispatch, by `grind doctor`, or not at all. Read it before provisioning anything.
-- **`STRATEGY.md`** — the target problem and the four metrics a change should serve.
+- **`STRATEGY.md`** — the target problem and the five metrics a change should serve.
 - **`docs/findings/`** — what actual Runs measured. `0001`, `0002` and `0003` hold the only
   real data the metrics have, and Run 2's is load-bearing: ADR-0002 and ADR-0004 argue from it,
   the policy tests replay it, and its transcripts are checked-in fixtures (`tests/fixtures/run2`).
