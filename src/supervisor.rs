@@ -848,16 +848,33 @@ fn adopt_or_create_worktree(repo_path: &Path, branch: &str) -> Result<PathBuf, R
         return Ok(adopted);
     }
     let wanted = job::worktree_to_create(repo_path, branch);
-    let made = world::run(
-        &[
-            "git".to_string(),
-            "worktree".to_string(),
-            "add".to_string(),
-            wanted.display().to_string(),
-            branch.to_string(),
-        ],
+    // A Job's declared branch is normally created *by* its Run, so at dispatch it usually
+    // exists nowhere yet: plain `add` demanded an existing ref and refused every
+    // fresh-branch Job (`invalid reference`, issue #81). `-b` makes the create path
+    // create-the-branch-and-its-worktree; when the ref already exists but holds no
+    // worktree, plain `add` checks it out exactly as before.
+    let ref_exists = world::run(
+        &words(&[
+            "git",
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ]),
         Some(repo_path),
     );
+    let mut argv = vec!["git".to_string(), "worktree".to_string(), "add".to_string()];
+    // `-b` binds to the next argument, so the two forms order differently:
+    // `add -b <branch> <path>` against `add <path> <branch>`.
+    if ref_exists.code != Some(0) {
+        argv.push("-b".to_string());
+        argv.push(branch.to_string());
+        argv.push(wanted.display().to_string());
+    } else {
+        argv.push(wanted.display().to_string());
+        argv.push(branch.to_string());
+    }
+    let made = world::run(&argv, Some(repo_path));
     if made.code != Some(0) {
         return Err(Refusal::saying(format!(
             "could not create a worktree for {branch}: {}",
@@ -1162,5 +1179,92 @@ mod tests {
         let last = record.attempts().last().unwrap().clone();
         record.push_attempt(last);
         assert_eq!(record.attempts().len(), before + 1);
+    }
+    /// A throwaway clone with one commit on `main`, so `worktree add -b` has a HEAD to
+    /// branch from. Removed by the caller; a leftover harms nothing but tidiness. Every
+    /// effect goes through `world`, which is where `tests/topology.rs` insists they live.
+    fn a_clone_with_one_commit(tag: &str) -> PathBuf {
+        let repo = world::temp_dir(tag);
+        let git = |args: &[&str]| {
+            let mut argv = vec!["git"];
+            argv.extend_from_slice(args);
+            let out = world::run(&words(&argv), Some(&repo));
+            assert!(
+                out.code == Some(0),
+                "git {args:?}: {}",
+                out.stderr.lines().next().unwrap_or("no output")
+            );
+        };
+        git(&["init", "-b", "main", "."]);
+        world::write(&repo.join("seed"), "seed").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=grind-81",
+            "-c",
+            "user.email=grind-81@example.invalid",
+            "commit",
+            "-m",
+            "seed",
+        ]);
+        repo
+    }
+
+    fn rev_parse(repo: &Path, what: &str) -> Option<String> {
+        let out = world::run(&words(&["git", "rev-parse", what]), Some(repo));
+        (out.code == Some(0)).then(|| out.stdout.trim().to_string())
+    }
+
+    #[test]
+    fn a_branch_that_exists_nowhere_dispatches_a_worktree() {
+        // Issue #81: the create path ran `git worktree add <path> <branch>` with no `-b`,
+        // so a Job declaring a brand-new branch — the normal case, since the Run creates
+        // the branch — was refused with `fatal: invalid reference`. Pinned at the seam
+        // itself, against a real clone.
+        let repo = a_clone_with_one_commit("fresh");
+        let branch = "feat/81-brand-new";
+        let worktree = adopt_or_create_worktree(&repo, branch).expect("a fresh branch dispatches");
+        assert_eq!(worktree, job::worktree_to_create(&repo, branch));
+        assert!(
+            rev_parse(&repo, &format!("refs/heads/{branch}")).is_some(),
+            "the create path must create the declared branch"
+        );
+        let listed = world::run(
+            &words(&["git", "worktree", "list", "--porcelain"]),
+            Some(&repo),
+        );
+        assert!(
+            job::adopt_worktree(&listed.stdout, branch).is_some(),
+            "the worktree just made must be adoptable on the next dispatch"
+        );
+        world::remove_tree(&repo);
+    }
+
+    #[test]
+    fn a_ref_that_exists_but_holds_no_worktree_is_checked_out_not_recreated() {
+        // The other half of the seam: `-b` is reached for only when the ref is missing.
+        // Recreating an existing branch would refuse (`already exists`) or, worse, reset it.
+        let repo = a_clone_with_one_commit("existing");
+        let sha = rev_parse(&repo, "HEAD").unwrap();
+        let branched = world::run(&words(&["git", "branch", "side"]), Some(&repo));
+        assert_eq!(branched.code, Some(0));
+        let worktree = adopt_or_create_worktree(&repo, "side").expect("an existing ref dispatches");
+        assert_eq!(rev_parse(&worktree, "HEAD").as_deref(), Some(sha.as_str()));
+        world::remove_tree(&repo);
+    }
+
+    #[test]
+    fn the_worktree_adopted_is_the_one_the_branch_already_holds() {
+        let repo = a_clone_with_one_commit("adopted");
+        // Adopt stays read-only: no `-b`, no move, just the worktree the porcelain named.
+        let first = adopt_or_create_worktree(&repo, "feat/81-twice").unwrap();
+        let second = adopt_or_create_worktree(&repo, "feat/81-twice").unwrap();
+        // git reports worktree paths canonicalised, and on macOS /var is a symlink to
+        // /private/var — so compare through the filesystem, not through the strings.
+        assert_eq!(
+            world::resolve_link(&first).unwrap(),
+            world::resolve_link(&second).unwrap()
+        );
+        world::remove_tree(&repo);
     }
 }
