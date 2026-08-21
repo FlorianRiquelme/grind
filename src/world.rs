@@ -403,3 +403,26 @@ fn civil(epoch: u64) -> (u64, u64, u64, u64, u64, u64) {
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60)
 }
+
+/// A unique scratch directory under the system temporary directory. Test scaffolding —
+/// `tests/topology.rs` keeps `std::fs` and `std::env` out of every other module, so the
+/// tests that need a throwaway clone ask here. The caller removes what it creates.
+#[cfg(test)]
+pub fn temp_dir(tag: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "grind-test-{tag}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&path).expect("a scratch directory");
+    path
+}
+
+/// The inverse of [`temp_dir`]: best-effort removal of a scratch tree.
+#[cfg(test)]
+pub fn remove_tree(path: &Path) {
+    let _ = fs::remove_dir_all(path);
+}
