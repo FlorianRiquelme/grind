@@ -11,7 +11,7 @@
 //! that both readers parse the same bytes — not the compiler, which is blind to it precisely
 //! because the wall is working.
 
-use crate::attempt::{self, Attempt};
+use crate::attempt::{self, Attempt, Clearance};
 use crate::decide::{self, Stage, Verdict, VerifyContract, VerifyCoverage};
 use crate::job::{self, Job};
 use crate::observe::{self, Observation, Observed, Reason};
@@ -44,6 +44,10 @@ pub struct RunView {
     pub supervisor_pid: u32,
     pub supervisor_identity: Option<String>,
     pub attempts: Vec<Attempt>,
+    /// Absent in records written before the `cleared` verb existed, which is the same fact
+    /// as empty — see the writer's field for why that default is honest.
+    #[serde(default)]
+    pub clearances: Vec<Clearance>,
 }
 
 impl RunView {
@@ -87,6 +91,10 @@ pub struct Facts {
     /// What must be cleared, when the Run stopped for a human. The recorded state is consulted
     /// for this one fact — no fresh verdict can carry it — and never printed as a verdict.
     pub blocker: Option<String>,
+    /// The latest clearance, when the human has recorded one. Read unconditionally rather
+    /// than only on a blocked record: a fact about the world does not expire, so it rides
+    /// every later surface (R3) — and it decides nothing, appearing only when it exists.
+    pub cleared: Option<Clearance>,
     pub run_state: PathBuf,
 }
 
@@ -111,6 +119,7 @@ pub fn gather(home: &Path, run_id: &str) -> Option<Facts> {
     let blocker = (found.state == "blocked")
         .then(|| policy::what_must_be_cleared(&found.attempts))
         .flatten();
+    let cleared = found.clearances.last().cloned();
     Some(Facts {
         run_state: record_path(home, run_id),
         found,
@@ -120,6 +129,7 @@ pub fn gather(home: &Path, run_id: &str) -> Option<Facts> {
         coverage,
         furthest,
         blocker,
+        cleared,
     })
 }
 
@@ -657,6 +667,10 @@ mod tests {
         assert_eq!(found.attempts.len(), 4);
         assert_eq!(found.denied_tools.len(), 7);
         assert_eq!(found.denial_count(), 1);
+        assert!(
+            found.clearances.is_empty(),
+            "a record written before the `cleared` verb reads as empty, not as unreadable"
+        );
         assert!(
             (found.total_spend() - 26.69).abs() < 0.001,
             "{}",

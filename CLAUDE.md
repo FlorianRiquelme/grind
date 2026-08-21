@@ -38,6 +38,7 @@ a `String` — so every decision is testable from literals with no network.
 grind run <issue>       dispatch a Job now (issue number or URL)
 grind resume <run-id>   re-enter a Run that died
 grind resume --all      re-enter every Run on this host a restart cut off
+grind cleared <run-id> <note>   record what changed on a Run a Blocker stopped
 grind status [run-id]   roster when bare; one Run's live view when named
 grind doctor            check the provisioned-host list
 grind --version         which copy of the binary is this

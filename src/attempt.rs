@@ -136,6 +136,18 @@ impl std::fmt::Display for Mode {
     }
 }
 
+/// One clearance the human recorded on a Blocked Run: when, and what changed in the world.
+///
+/// It lives here beside [`Attempt`] because this module is already the shared vocabulary
+/// between the record's private writer and its read-only reader — and because the re-entry
+/// composition consumes the note here. A shared-noun module for it would pull the writer and
+/// the readers back under one roof, which `tests/topology.rs` exists to refuse.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Clearance {
+    pub cleared_at: String,
+    pub note: String,
+}
+
 /// Everything an invocation is built from, all of it read from the record rather than the
 /// environment — so re-entering an in-flight Run never changes its conditions mid-pipeline.
 #[derive(Debug, Clone, Copy)]
@@ -176,9 +188,26 @@ pub fn dispatch(conditions: &Conditions, job: &Job) -> Invocation {
     build(conditions, Mode::Dispatch, dispatch_prompt(job))
 }
 
-/// Every later attempt, resuming the same session id.
-pub fn resume(conditions: &Conditions) -> Invocation {
-    build(conditions, Mode::Resume, REENTRY_PROMPT.to_string())
+/// Every later attempt, resuming the same session id. The latest clearance note rides this
+/// prompt and only this one: Dispatch has no stop behind it, and CiBabysit bounds itself to
+/// one reaction and must not grow a second subject (R2).
+pub fn resume(conditions: &Conditions, cleared: Option<&str>) -> Invocation {
+    build(conditions, Mode::Resume, reentry_prompt(cleared))
+}
+
+/// `REENTRY_PROMPT`, with the human's clearance note composed after it when one exists.
+/// **Default is silence**, the same rule as `intent_line`: with no note the prompt is the
+/// constant, exactly — nothing is rendered where nothing was recorded.
+fn reentry_prompt(cleared: Option<&str>) -> String {
+    match cleared {
+        Some(note) => format!(
+            "{REENTRY_PROMPT}\n\nSince you stopped, the human reports: {note}\n\nThat is \
+             what changed in the world since your last observation. Trust it over what you \
+             last saw of the obstacle, and do not spend turns re-probing what it says is \
+             cleared."
+        ),
+        None => REENTRY_PROMPT.to_string(),
+    }
 }
 
 /// The one bounded invocation a decided-and-failing CI buys. **The same builder** — there is no
@@ -704,7 +733,8 @@ mod tests {
         let conditions = conditions(None);
         for invocation in [
             dispatch(&conditions, &job()),
-            resume(&conditions),
+            resume(&conditions, None),
+            resume(&conditions, Some("the wall moved")),
             ci_babysit(&conditions),
         ] {
             assert_eq!(
@@ -905,7 +935,7 @@ mod tests {
         assert!(first.argv().contains(&"--session-id".to_string()));
         assert!(!first.argv().contains(&"--resume".to_string()));
 
-        for later in [resume(&conditions), ci_babysit(&conditions)] {
+        for later in [resume(&conditions, None), ci_babysit(&conditions)] {
             assert!(later.argv().contains(&"--resume".to_string()));
             assert!(!later.argv().contains(&"--session-id".to_string()));
             let at = later.argv().iter().position(|a| a == "--resume").unwrap();
@@ -940,7 +970,7 @@ mod tests {
         let conditions = conditions(Some("claude-opus-5"));
         for invocation in [
             dispatch(&conditions, &job()),
-            resume(&conditions),
+            resume(&conditions, None),
             ci_babysit(&conditions),
         ] {
             assert!(
@@ -1290,6 +1320,49 @@ mod tests {
         assert!(CI_BABYSIT_PROMPT.contains("one invocation"));
         assert!(CI_BABYSIT_PROMPT.contains("do not open a second PR"));
         assert!(CI_BABYSIT_PROMPT.contains("Never weaken, trim or skip a step of `just verify`"));
+    }
+
+    // --- the clearance note rides Resume and nothing else --------------------------------------
+
+    #[test]
+    fn a_clearance_note_rides_the_resume_prompt_and_never_dispatch_or_ci_babysit() {
+        // The safety property R6 names: the composed prompt reaches Resume invocations only.
+        // Asserted against the **built** invocations, in the spirit of the argv tests above.
+        let conditions = conditions(None);
+        let note = "the deploy key was rotated; the push will go through now";
+        let resumed = resume(&conditions, Some(note));
+        assert!(
+            resumed.prompt().starts_with(REENTRY_PROMPT),
+            "the note composes after the re-entry text, never instead of it:\n{}",
+            resumed.prompt()
+        );
+        assert!(
+            resumed
+                .prompt()
+                .contains("Since you stopped, the human reports:"),
+            "{}",
+            resumed.prompt()
+        );
+        assert!(resumed.prompt().contains(note), "{}", resumed.prompt());
+        for other in [dispatch(&conditions, &job()), ci_babysit(&conditions)] {
+            assert!(
+                !other.prompt().contains(note),
+                "{:?} must not carry the note",
+                other.mode()
+            );
+            assert!(
+                !other.prompt().contains("the human reports"),
+                "{:?} must not grow a clearance paragraph",
+                other.mode()
+            );
+        }
+    }
+
+    #[test]
+    fn no_note_composes_the_reentry_prompt_exactly() {
+        // Render nothing when no note exists — the prompt is the constant, byte for byte,
+        // so a Run that was never blocked re-enters exactly as it always has.
+        assert_eq!(resume(&conditions(None), None).prompt(), REENTRY_PROMPT);
     }
 
     // --- the Wait predicate -------------------------------------------------------------------

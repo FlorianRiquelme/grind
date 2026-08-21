@@ -10,7 +10,7 @@
 //! can erase `attempts[]`, which nothing can rebuild — and it erases it while the human is
 //! watching the dashboard to be reassured.
 
-use crate::attempt::{self, Attempt, Conditions, DENIED_TOOLS, Invocation, Mode};
+use crate::attempt::{self, Attempt, Clearance, Conditions, DENIED_TOOLS, Invocation, Mode};
 use crate::decide::{self, Verdict};
 use crate::job::{self, Job, Refusal};
 use crate::observe::{Observation, Observed, Outcome as ItemOutcome, Reason};
@@ -99,6 +99,13 @@ struct RunRecord {
     /// `set_attempts` and no `&mut Vec<_>` getter, so *load a stale copy, then overwrite the
     /// whole list* is not expressible even from in here.
     attempts: Vec<Attempt>,
+    /// What the human cleared while this Run stood at a Blocker, newest last. The same
+    /// privacy-and-append shape as `attempts`. `serde(default)` because absent genuinely is
+    /// empty — a record written before the `cleared` verb existed recorded none, and the
+    /// Blocked Run already on disk is exactly the one the verb targets — unlike the forced
+    /// dispatch-time conditions, where absence means a different environment.
+    #[serde(default)]
+    clearances: Vec<Clearance>,
 }
 
 impl RunRecord {
@@ -108,6 +115,14 @@ impl RunRecord {
 
     fn push_attempt(&mut self, attempt: Attempt) {
         self.attempts.push(attempt);
+    }
+
+    fn clearances(&self) -> &[Clearance] {
+        &self.clearances
+    }
+
+    fn push_clearance(&mut self, clearance: Clearance) {
+        self.clearances.push(clearance);
     }
 
     fn load(path: &Path) -> Result<Self, Refusal> {
@@ -319,6 +334,7 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         supervisor_pid: pid,
         supervisor_identity: recorded_identity(pid),
         attempts: Vec::new(),
+        clearances: Vec::new(),
         job,
     };
     let run_dir = job::runs_dir(&home).join(&run_id);
@@ -411,6 +427,57 @@ pub fn resume(run_id: &str) -> Result<Outcome, Refusal> {
     record.save(&path)?;
 
     supervise(&mut record, &run_dir)
+}
+
+/// Record what the human cleared on a Blocked Run. **A one-shot supervisor process** — the
+/// writer ruling holds because this verb *is* the supervisor, exactly as `resume` is — and it
+/// records only; `resume` is the separate act that spends. Nothing here changes `state`,
+/// posts a comment, or starts anything.
+///
+/// The order is **load-for-key → lock → re-load → validate → append → save**. The first load
+/// exists only to learn the lock key (the target repo and branch live on the record); the
+/// copy that reaches `save` is read under the lock, because `save` writes the whole record —
+/// a copy read while a resumed supervisor was still running could hand back a list missing
+/// that supervisor's appended Attempts, which nothing can rebuild.
+pub fn cleared(run_id: &str, note: &str) -> Result<(), Refusal> {
+    let home = world::home().ok_or_else(|| Refusal::saying("$HOME is unset"))?;
+    let run_dir = job::runs_dir(&home).join(run_id);
+    let path = record_path(&run_dir);
+    if !world::exists(&path) {
+        return Err(Refusal::saying(format!("no Run `{run_id}` on this host")));
+    }
+    let keyed = RunRecord::load(&path)?;
+    let _lock = take_lock(&home, &keyed.job.target_repo, &keyed.job.branch)?;
+    let mut record = RunRecord::load(&path)?;
+    record_clearance(&mut record, note, world::now_iso())?;
+    record.save(&path)?;
+    say(&run_dir, &format!("  clearance recorded: {}", note.trim()));
+    Ok(())
+}
+
+/// The pure half of `cleared`: the refusals and the append, over an already-loaded record.
+/// Refusing leaves in the incoherent-input register — naming the actual state is a fact
+/// about coherence, never a health verdict (ADR-0003).
+fn record_clearance(record: &mut RunRecord, note: &str, at: String) -> Result<(), Refusal> {
+    let note = note.trim();
+    if note.is_empty() {
+        return Err(Refusal::saying(
+            "an empty note clears nothing — say what changed",
+        ));
+    }
+    if record.state != State::Blocked {
+        return Err(Refusal::saying(format!(
+            "Run `{}` is {}, not blocked — a clearance records what changed for a Run a \
+             Blocker stopped",
+            record.run_id,
+            record.state.as_str()
+        )));
+    }
+    record.push_clearance(Clearance {
+        cleared_at: at,
+        note: note.to_string(),
+    });
+    Ok(())
 }
 
 /// What `resume --all` started, and what it declined to. **Never what any Run concluded**:
@@ -659,13 +726,15 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
                 }
             }
             // Resumable, because it never spent the budget: the world changed, not the number.
+            // The repair is two verbs in order: `cleared` records what changed, `resume`
+            // spends — Grind never chooses to spend an Attempt, so the acts stay separate.
             if let Stop::Blocked(what) = &stop {
                 say(
                     run_dir,
                     &format!(
                         "    stopped for a human — {what} was refused twice with no progress; \
-                     `grind resume {}` once it is cleared",
-                        record.run_id
+                     `grind cleared {id} \"<what changed>\"`, then `grind resume {id}`",
+                        id = record.run_id
                     ),
                 );
             }
@@ -696,7 +765,12 @@ fn run_one_attempt(
     };
     let invocation: Invocation = match mode {
         Mode::Dispatch => attempt::dispatch(&conditions, &record.job),
-        Mode::Resume => attempt::resume(&conditions),
+        // The latest clearance rides every Resume re-entry — a fact about the world does
+        // not expire — and only Resume: CiBabysit bounds itself to one reaction.
+        Mode::Resume => attempt::resume(
+            &conditions,
+            record.clearances().last().map(|c| c.note.as_str()),
+        ),
         Mode::CiBabysit => attempt::ci_babysit(&conditions),
     };
 
@@ -1142,6 +1216,9 @@ mod tests {
         assert_eq!(record.denied_tools.len(), 7);
         assert_eq!(record.state, State::Completed);
         assert!(record.attempts().iter().any(|a| a.mode == Mode::CiBabysit));
+        // The fixture predates the `cleared` verb, and absence reads as the same fact as
+        // empty — that is the whole of what `serde(default)` is for here.
+        assert!(record.clearances().is_empty());
     }
 
     #[test]
@@ -1173,7 +1250,11 @@ mod tests {
         // is a failure — a fixture-only check cannot see that, because a field the reader never
         // declares is not a shared field and serde drops it silently.
         const DAY_ONE: &str = include_str!("../tests/fixtures/record/day-one.json");
-        let written: RunRecord = serde_json::from_str(DAY_ONE).expect("the writer's shape");
+        let mut written: RunRecord = serde_json::from_str(DAY_ONE).expect("the writer's shape");
+        written.push_clearance(Clearance {
+            cleared_at: "2026-08-21T19:00:00+00:00".to_string(),
+            note: "the deploy key was rotated".to_string(),
+        });
         let bytes = serde_json::to_string(&written).expect("serialise");
         let read: crate::view::RunView = serde_json::from_str(&bytes)
             .expect("the reader must accept every field the writer emits");
@@ -1185,6 +1266,7 @@ mod tests {
         assert_eq!(read.supervisor_pid, written.supervisor_pid);
         assert_eq!(read.state, written.state.as_str());
         assert_eq!(read.denied_tools, written.denied_tools);
+        assert_eq!(read.clearances, written.clearances());
     }
 
     #[test]
@@ -1210,6 +1292,89 @@ mod tests {
         record.push_attempt(last);
         assert_eq!(record.attempts().len(), before + 1);
     }
+    // --- a clearance records what changed, and only on a Blocked Run ---------------------------
+
+    fn day_one() -> RunRecord {
+        serde_json::from_str(include_str!("../tests/fixtures/record/day-one.json"))
+            .expect("the day-one record")
+    }
+
+    #[test]
+    fn a_clearance_on_a_run_that_is_not_blocked_is_refused_naming_the_actual_state() {
+        // The same register as `resume` refusing to overspend: incoherent input, never a
+        // health verdict. The day-one record is completed, so there is nothing to clear.
+        let mut record = day_one();
+        let refused = record_clearance(
+            &mut record,
+            "the wall moved",
+            "2026-08-21T19:00:00+00:00".to_string(),
+        );
+        let said = refused
+            .expect_err("a completed Run has no Blocker to clear")
+            .to_string();
+        assert!(said.contains("completed"), "{said}");
+        assert!(said.contains(&record.run_id), "{said}");
+        assert!(record.clearances().is_empty(), "nothing may be appended");
+    }
+
+    #[test]
+    fn a_clearance_on_a_blocked_run_appends_a_dated_row_and_the_state_stays_blocked() {
+        // `cleared` records, `resume` spends: the state word is `resume`'s to change, so a
+        // cleared-but-not-resumed Run still reads blocked and stays out of `resume --all`.
+        let mut record = day_one();
+        record.state = State::Blocked;
+        record_clearance(
+            &mut record,
+            "  the deploy key was rotated  ",
+            "2026-08-21T19:00:00+00:00".to_string(),
+        )
+        .expect("a Blocked Run takes the row");
+        assert_eq!(record.clearances().len(), 1);
+        assert_eq!(record.clearances()[0].note, "the deploy key was rotated");
+        assert_eq!(
+            record.clearances()[0].cleared_at,
+            "2026-08-21T19:00:00+00:00"
+        );
+        assert_eq!(record.state, State::Blocked);
+    }
+
+    #[test]
+    fn an_empty_or_whitespace_note_is_refused_and_nothing_is_appended() {
+        let mut record = day_one();
+        record.state = State::Blocked;
+        for empty in ["", "   ", "\n\t"] {
+            let refused = record_clearance(&mut record, empty, "2026-08-21T19:00:00+00:00".into());
+            assert!(refused.is_err(), "{empty:?} clears nothing");
+        }
+        assert!(record.clearances().is_empty());
+    }
+
+    #[test]
+    fn clearances_accumulate_and_the_latest_is_last() {
+        // Re-block after a clearance: clear, resume, blocked again, clear again — the
+        // latest note wins on every surface, and every row survives in the record (R3).
+        let mut record = day_one();
+        record.state = State::Blocked;
+        record_clearance(
+            &mut record,
+            "first wall cleared",
+            "2026-08-21T19:00:00+00:00".into(),
+        )
+        .expect("the first row");
+        record_clearance(
+            &mut record,
+            "second wall cleared",
+            "2026-08-21T21:00:00+00:00".into(),
+        )
+        .expect("the second row");
+        assert_eq!(record.clearances().len(), 2);
+        assert_eq!(
+            record.clearances().last().unwrap().note,
+            "second wall cleared"
+        );
+        assert_eq!(record.clearances()[0].note, "first wall cleared");
+    }
+
     /// A throwaway clone with one commit on `main`, so `worktree add -b` has a HEAD to
     /// branch from. Removed by the caller; a leftover harms nothing but tidiness. Every
     /// effect goes through `world`, which is where `tests/topology.rs` insists they live.

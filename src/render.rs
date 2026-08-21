@@ -7,6 +7,7 @@
 //! **Verdict language describes what happened, never quality** (ADR-0003). Check every string
 //! this module emits against that rule; there is a test at the bottom that does.
 
+use crate::attempt::Clearance;
 use crate::decide::{Stage, Verdict, VerifyContract};
 use crate::observe::{Observation, Observed, Outcome, UNOBSERVABLE_MARK};
 use crate::view::{Facts, Live, RosterRow, RunView, one_line};
@@ -31,6 +32,8 @@ pub struct SingleRun<'a> {
     pub contract: &'a VerifyContract,
     pub furthest: Stage,
     pub supervisor_here: &'a Observed<bool>,
+    /// The latest clearance, shown only when one exists (#16 — it decides nothing).
+    pub cleared: Option<&'a Clearance>,
     pub run_state: &'a Path,
 }
 
@@ -48,6 +51,7 @@ pub fn run_view(view: &SingleRun) -> String {
         contract,
         furthest,
         supervisor_here,
+        cleared,
         run_state,
     } = view;
     let furthest = *furthest;
@@ -85,6 +89,14 @@ pub fn run_view(view: &SingleRun) -> String {
         &mut out,
         &format!("  verdict           {}", verdict_line(verdict, observation)),
     );
+    // Only when one exists: a clearance decides nothing (#16), and the note goes through
+    // the same one-line discipline as everything else on this fixed-shape view.
+    if let Some(clearance) = cleared {
+        line(
+            &mut out,
+            &format!("  cleared           {}", one_line(&clearance.note)),
+        );
+    }
     // Two separate stage lines. *How far it got* and *what it is doing* are never conflated.
     line(&mut out, &format!("  furthest stage    {furthest}"));
     line(&mut out, &format!("  now               {}", live.now_skill));
@@ -206,6 +218,7 @@ pub fn handback(view: &Facts) -> String {
         coverage,
         furthest,
         blocker,
+        cleared,
         run_state,
     } = view;
     let furthest = *furthest;
@@ -261,6 +274,15 @@ pub fn handback(view: &Facts) -> String {
         rows.push(Row {
             label: "denied",
             value: denied_invocations(found).join("; "),
+            unobserved: false,
+        });
+    }
+    // The latest clearance, only when one exists: it decides nothing, and a Run nobody
+    // cleared prints nothing. On the host the human's own words come back verbatim.
+    if let Some(clearance) = cleared {
+        rows.push(Row {
+            label: "cleared",
+            value: format!("{} ({})", clearance.note, clearance.cleared_at),
             unobserved: false,
         });
     }
@@ -375,6 +397,7 @@ pub fn job_comment(view: &Facts) -> String {
         coverage,
         furthest,
         blocker,
+        cleared,
         run_state,
     } = view;
     let (made, budget) = found.attempt_counter();
@@ -415,6 +438,19 @@ pub fn job_comment(view: &Facts) -> String {
     cell("commits ahead", &marked(&observation.commits_ahead));
     cell("checks pending", &marked(&observation.checks_pending));
     cell("base drift", &marked(&observation.base_drift));
+    // Only when one exists (#16). The human typed the note for the Run, so it travels —
+    // flattened to one line with pipes escaped, because a markdown table cell is the one
+    // surface its own shape can break.
+    if let Some(clearance) = cleared {
+        cell(
+            "cleared",
+            &format!(
+                "{} ({})",
+                one_line(&clearance.note).replace('|', "\\|"),
+                clearance.cleared_at
+            ),
+        );
+    }
     // The same two facts, with the mark and **never the `Reason`** — the rule the verdict line
     // above learned the hard way.
     cell(
@@ -508,8 +544,14 @@ fn handback_verdict(
     if matches!(observation.checks_red, Observed::Present(true)) {
         said = format!("{said} — ${:.2} of repair spent", repair_spend(found));
     }
+    // The repair is two verbs, named in order beside what must be cleared: `cleared`
+    // records what changed, `resume` spends. Describing the way back is not a gate.
     if let Some(what) = blocker {
-        said = format!("{said}  (a Blocker: {what} must be cleared)");
+        said = format!(
+            "{said}  (a Blocker: {what} must be cleared — `grind cleared {id} \"<what \
+             changed>\"`, then `grind resume {id}`)",
+            id = found.run_id
+        );
     }
     said
 }
@@ -817,14 +859,24 @@ mod tests {
     }
 
     fn rendered(observation: &Observation, live: &Live, verdict: &Verdict) -> String {
+        rendered_of(&found(), observation, live, verdict)
+    }
+
+    fn rendered_of(
+        found: &RunView,
+        observation: &Observation,
+        live: &Live,
+        verdict: &Verdict,
+    ) -> String {
         run_view(&SingleRun {
-            found: &found(),
+            found,
             observation,
             live,
             verdict,
             contract: &contract(),
             furthest: Stage::PrOpen,
             supervisor_here: &Observed::Present(true),
+            cleared: found.clearances.last(),
             run_state: Path::new("/home/op/.grind/runs/20260806-122620-snapper-28/run.json"),
         })
     }
@@ -844,16 +896,7 @@ mod tests {
         // so a stale `exhausted` above a fresh `completed` verdict cannot adjudicate itself.
         let mut record = found();
         record.state = "exhausted".to_string();
-        let text = run_view(&SingleRun {
-            found: &record,
-            observation: &observation(),
-            live: &live(3),
-            verdict: &Verdict::Completed,
-            contract: &contract(),
-            furthest: Stage::PrOpen,
-            supervisor_here: &Observed::Present(true),
-            run_state: Path::new("/home/op/.grind/runs/20260806-122620-snapper-28/run.json"),
-        });
+        let text = rendered_of(&record, &observation(), &live(3), &Verdict::Completed);
         assert!(text.contains("recorded [exhausted]"), "{text}");
     }
 
@@ -1012,6 +1055,7 @@ mod tests {
         coverage: Observed<VerifyCoverage>,
         blocker: Option<&str>,
     ) -> Facts {
+        let cleared = found.clearances.last().cloned();
         Facts {
             found,
             observation,
@@ -1020,6 +1064,7 @@ mod tests {
             coverage,
             furthest: Stage::PrOpen,
             blocker: blocker.map(str::to_string),
+            cleared,
             run_state: PathBuf::from("/home/op/.grind/runs/20260806-122620-snapper-28/run.json"),
         }
     }
@@ -1318,6 +1363,103 @@ mod tests {
         assert!(said.contains("a Blocker"), "{said}");
         assert!(said.contains("git push --force-with-lease"), "{said}");
         assert!(said.contains("must be cleared"), "{said}");
+        // The two-step repair, named in order: `cleared` records, `resume` spends.
+        assert!(
+            said.contains("grind cleared 20260806-122620-snapper-28"),
+            "{said}"
+        );
+        assert!(
+            said.contains("grind resume 20260806-122620-snapper-28"),
+            "{said}"
+        );
+        let record_first = said.find("grind cleared").expect("the recording verb");
+        let spend_second = said.find("grind resume").expect("the spending verb");
+        assert!(record_first < spend_second, "{said}");
+    }
+
+    // --- the latest clearance, only when one exists ---------------------------------------------
+
+    /// The day-one record with two clearances recorded, newest last.
+    fn cleared_twice() -> RunView {
+        let mut record = found();
+        record.clearances = vec![
+            Clearance {
+                cleared_at: "2026-08-21T19:00:00+00:00".to_string(),
+                note: "first wall cleared".to_string(),
+            },
+            Clearance {
+                cleared_at: "2026-08-21T21:00:00+00:00".to_string(),
+                note: "the deploy key was rotated".to_string(),
+            },
+        ];
+        record
+    }
+
+    #[test]
+    fn no_surface_prints_a_cleared_row_when_no_clearance_exists() {
+        // Render nothing when no note exists (R6): a permanent negative never prints.
+        for text in [
+            handed_back(&observation(), &Verdict::Completed),
+            commented(&observation(), &Verdict::Completed),
+            rendered(&observation(), &live(3), &Verdict::Completed),
+        ] {
+            assert!(!text.contains("cleared"), "{text}");
+        }
+    }
+
+    #[test]
+    fn every_surface_shows_the_latest_note_and_every_row_stays_in_the_record() {
+        // R3 and R4: the latest note rides all three surfaces; the older row survives in
+        // the record but is not what a reader is shown.
+        let record = cleared_twice();
+        let facts = facts_of(
+            record.clone(),
+            observation(),
+            Verdict::Completed,
+            coverage(),
+            None,
+        );
+        let on_host = handback(&facts);
+        let markdown = job_comment(&facts);
+        let watching = rendered_of(&record, &observation(), &live(3), &Verdict::Completed);
+        for (surface, text) in [
+            ("handback", &on_host),
+            ("comment", &markdown),
+            ("status", &watching),
+        ] {
+            assert!(
+                text.contains("the deploy key was rotated"),
+                "{surface} drops the latest note:\n{text}"
+            );
+            assert!(
+                !text.contains("first wall cleared"),
+                "{surface} shows a superseded note:\n{text}"
+            );
+        }
+        assert_eq!(record.clearances.len(), 2, "both rows stay in the record");
+        // The comment is the surface that leaves the host, so the date travels with it.
+        assert!(markdown.contains("2026-08-21T21:00:00+00:00"), "{markdown}");
+    }
+
+    #[test]
+    fn a_note_that_would_break_the_comment_table_is_flattened_in_the_cell_only() {
+        // A markdown table cell is the one surface the note's own shape can break: `|`
+        // splits the row and a newline ends it. The Handback keeps the human's words
+        // verbatim — on the host, where they typed them.
+        let mut record = found();
+        record.clearances = vec![Clearance {
+            cleared_at: "2026-08-21T19:00:00+00:00".to_string(),
+            note: "ran a | b\nthen pushed".to_string(),
+        }];
+        let facts = facts_of(record, observation(), Verdict::Completed, coverage(), None);
+        let markdown = job_comment(&facts);
+        let cell = markdown
+            .lines()
+            .find(|l| l.contains("| cleared |"))
+            .expect("the cleared cell");
+        assert!(cell.contains("ran a \\| b then pushed"), "{cell}");
+        let on_host = handback(&facts);
+        assert!(on_host.contains("ran a | b\nthen pushed"), "{on_host}");
     }
 
     #[test]

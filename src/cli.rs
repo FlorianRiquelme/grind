@@ -59,6 +59,9 @@ pub fn run() -> i32 {
         // otherwise bind `run_id = "--all"` and dispatch it as a run id.
         ["resume", "--all"] => resume_all(),
         ["resume", run_id] => finish(supervisor::resume(run_id)),
+        // The rest of argv joined is the note, so an unquoted multi-word note works. An
+        // empty rest still matches and refuses in `supervisor`, where the state check lives.
+        ["cleared", run_id, note @ ..] => cleared(run_id, &note.join(" ")),
         ["status"] => status_roster(),
         ["status", run_id] => status_one(run_id),
         ["doctor"] => doctor(),
@@ -80,6 +83,7 @@ const USAGE: &str = "grind — dispatch and supervise headless `lfg` Runs agains
     grind run <issue>       dispatch a Job now (issue number or URL)
     grind resume <run-id>   re-enter a Run that died
     grind resume --all      re-enter every Run on this host a restart cut off
+    grind cleared <run-id> <note>   record what changed on a Run a Blocker stopped
     grind status [run-id]   roster when bare; one Run's live view when named
     grind doctor            check the provisioned-host list
     grind --version         which copy of the binary is this
@@ -118,6 +122,24 @@ fn finish(outcome: Result<supervisor::Outcome, Refusal>) -> i32 {
         Observability::CouldNotAnswer.code()
     } else {
         Observability::Answered.code()
+    }
+}
+
+/// Record a clearance on a Blocked Run. Recording only: `resume` is the separate act that
+/// spends, so success points at it rather than performing it — Grind never chooses to
+/// spend an Attempt.
+fn cleared(run_id: &str, note: &str) -> i32 {
+    match supervisor::cleared(run_id, note) {
+        Ok(()) => {
+            print(&format!(
+                "clearance recorded for {run_id} — re-enter with `grind resume {run_id}`"
+            ));
+            0
+        }
+        Err(refusal) => {
+            print_err(&render::refusal(&refusal.to_string()));
+            INCOHERENT_INPUT
+        }
     }
 }
 
@@ -203,6 +225,7 @@ fn status_one(run_id: &str) -> i32 {
                 contract: &view::verify_contract_of(&found.worktree),
                 furthest: decide::furthest_stage(&observation),
                 supervisor_here: &here,
+                cleared: found.clearances.last(),
                 run_state: &view::record_path(&home, run_id),
             }));
             // Derived from what could be observed. There is no path from the verdict to here.
@@ -452,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn the_surface_is_six_shapes_and_none_of_them_is_list() {
+    fn the_surface_is_seven_shapes_and_none_of_them_is_list() {
         // A bare status that resolves to one Run is Grind selecting, and the repair
         // "pick the one in flight" would pick a zombie.
         assert!(!USAGE.contains("grind list"));
@@ -461,6 +484,7 @@ mod tests {
             "grind run <issue>",
             "grind resume <run-id>",
             "grind resume --all",
+            "grind cleared <run-id> <note>",
             "grind status [run-id]",
             "grind doctor",
             "grind --version",

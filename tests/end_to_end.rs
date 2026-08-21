@@ -759,6 +759,42 @@ fn scenario_g_a_repeated_denial_with_no_progress_stops_for_a_human_and_resumes()
     );
 
     let run_id = record["run_id"].as_str().expect("a run id").to_string();
+
+    // The stop names the two-step repair in order: `cleared` records, `resume` spends.
+    assert!(out.contains(&format!("grind cleared {run_id}")), "{out}");
+    assert!(out.contains(&format!("grind resume {run_id}")), "{out}");
+
+    // An unknown run id and an empty note both leave in the incoherent-input register.
+    let (_, err, code) = box_.run(&["cleared", "nope", "the wall moved"]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("no Run `nope` on this host"), "{err}");
+    let (_, err, code) = box_.run(&["cleared", &run_id]);
+    assert_eq!(code, Some(2), "an empty note clears nothing:\n{err}");
+    assert_eq!(
+        box_.record()["state"],
+        "blocked",
+        "a refusal records nothing"
+    );
+
+    // The clearance: a multi-word unquoted note, joined from the rest of argv. It records
+    // and does not spend — the state stays blocked until the hand re-enters.
+    let (out, err, code) =
+        box_.run(&["cleared", &run_id, "the", "deploy", "key", "was", "rotated"]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert!(out.contains(&format!("grind resume {run_id}")), "{out}");
+    let record = box_.record();
+    assert_eq!(record["state"], "blocked");
+    assert_eq!(
+        record["clearances"][0]["note"],
+        "the deploy key was rotated"
+    );
+    assert!(
+        record["clearances"][0]["cleared_at"]
+            .as_str()
+            .is_some_and(|at| !at.is_empty()),
+        "the row is dated"
+    );
+
     let (out, err, code) = box_.run(&["resume", &run_id]);
     assert_eq!(code, Some(0), "{out}\n{err}");
     assert!(
@@ -766,6 +802,41 @@ fn scenario_g_a_repeated_denial_with_no_progress_stops_for_a_human_and_resumes()
         "a Blocked Run re-enters rather than short-circuiting:\n{out}"
     );
     assert_eq!(box_.record()["state"], "completed");
+
+    // The note rode the resumed Attempt's prompt — and only Resume-mode prompts: the
+    // dispatch prompt on disk stays exactly what it was (R6's safety property, pinned on
+    // the files the supervisor wrote rather than on the builder alone).
+    let resumed_prompt = fs::read_to_string(box_.run_dir().join("attempt-4.prompt.txt"))
+        .expect("the resumed attempt's prompt");
+    assert!(
+        resumed_prompt.contains("Since you stopped, the human reports:"),
+        "{resumed_prompt}"
+    );
+    assert!(
+        resumed_prompt.contains("the deploy key was rotated"),
+        "{resumed_prompt}"
+    );
+    let dispatch_prompt = fs::read_to_string(box_.run_dir().join("attempt-1.prompt.txt"))
+        .expect("the dispatch prompt");
+    assert!(
+        !dispatch_prompt.contains("the deploy key was rotated"),
+        "{dispatch_prompt}"
+    );
+
+    // The note reaches the Handback and the terminal comment — the Record carries what was
+    // cleared, not merely that something was.
+    assert!(out.contains("the deploy key was rotated"), "{out}");
+    let comments = comments_on_the_job_issue(&box_);
+    let terminal = comments.last().expect("a terminal comment");
+    assert!(
+        terminal.contains("the deploy key was rotated"),
+        "{terminal}"
+    );
+
+    // A Run that finished has no Blocker to clear anymore: the actual state is named.
+    let (_, err, code) = box_.run(&["cleared", &run_id, "again"]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("completed"), "{err}");
 }
 
 // --- surviving a reboot -------------------------------------------------------------------------
