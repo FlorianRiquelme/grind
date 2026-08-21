@@ -17,9 +17,9 @@ echo "$N" > "$F/counter"
   printf -- '--- attempt %s\n' "$N"
 } >> "$F/argv.log"
 # The transcript Claude Code would write for this session, so a shape can append to it the way
-# a real fan-out does. Derived from the record rather than from `$PWD`, because a shell resolves
-# symlinks and the recorded worktree is what `view::transcript_path` slugs — on macOS those are
-# `/private/var/...` and `/var/...` for the same directory.
+# a real fan-out does. Derived from the record rather than from `$PWD`, and resolved through
+# symlinks before slugging — exactly what `view::transcript_path` now does (#82), because
+# Claude slugs the path the OS resolves cwd to, not the declared string.
 # `PATH` is replaced, so this uses shell globbing and `sed` and nothing else.
 RUN_JSON=""
 for candidate in "$HOME"/.grind/runs/*/run.json; do
@@ -28,7 +28,8 @@ done
 if [ -n "$RUN_JSON" ]; then
   WORKTREE=$(sed -n 's/.*"worktree": *"\([^"]*\)".*/\1/p;' "$RUN_JSON" | sed -n '1p')
   SESSION=$(sed -n 's/.*"session_id": *"\([^"]*\)".*/\1/p;' "$RUN_JSON" | sed -n '1p')
-  SLUG=$(printf '%s' "$WORKTREE" | sed 's/[^A-Za-z0-9]/-/g')
+  RESOLVED=$(cd "$WORKTREE" 2>/dev/null && pwd -P)
+  SLUG=$(printf '%s' "${RESOLVED:-$WORKTREE}" | sed 's/[^A-Za-z0-9]/-/g')
   printf '%s\n' "$HOME/.claude/projects/$SLUG/$SESSION.jsonl" > "$F/transcript"
 fi
 
