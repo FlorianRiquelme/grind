@@ -21,12 +21,12 @@ The observation block, top to bottom, is the answer to *how is it going*:
   verdict           unobserved — …        # what happened, never quality (ADR-0003)
   furthest stage    dispatched
   now               compound-engineering:ce-work
-  live              Coherence review returned clean — zero findings. Waiting on…
+  doing             Coherence review returned clean — zero findings. Waiting on…
   progress          newest write 28s ago
   fan-out           1 agent: feasibility reviewer  (newest write 28s ago)
 ```
 
-- **`live`** is the transcript's last assistant message, one line — the direct answer to
+- **`doing`** is the transcript's last assistant message, one line — the direct answer to
   *what is it doing right now*. Read fresh from the session transcript on every call;
   mid-attempt, this is the field that moves.
 - **`progress`** is seconds since the newest write across the parent transcript **and every

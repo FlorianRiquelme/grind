@@ -128,7 +128,6 @@ impl RunRecord {
 pub struct Outcome {
     pub run_id: String,
     pub state: &'static str,
-    pub attempts_made: usize,
     /// True when `resume` found a Run already at a terminal state and started nothing. The name
     /// reads narrower than the flag now is — it covers `Exhausted` as well as `Completed`, see
     /// the guard in `resume` — so nothing may render it as the word *completed*. `state` beside
@@ -398,7 +397,6 @@ pub fn resume(run_id: &str) -> Result<Outcome, Refusal> {
         return Ok(Outcome {
             run_id: record.run_id.clone(),
             state: record.state.as_str(),
-            attempts_made: record.attempts().len(),
             already_completed: true,
         });
     }
@@ -509,11 +507,14 @@ pub fn resume_all() -> Result<Reentry, Refusal> {
             report.skipped.push((run_id.to_string(), why));
             continue;
         }
-        match world::spawn_detached(&[
-            exe.display().to_string(),
-            "resume".to_string(),
-            run_id.to_string(),
-        ]) {
+        match world::spawn_detached(
+            &[
+                exe.display().to_string(),
+                "resume".to_string(),
+                run_id.to_string(),
+            ],
+            &resume_log_path(&run_dir),
+        ) {
             Ok(_) => {
                 say(&run_dir, "  re-entered at boot");
                 report.started.push(run_id.to_string());
@@ -549,12 +550,13 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
     let mut working_seen = attempt::working(record.attempts());
 
     loop {
-        // The first pass has no attempt to classify, so the loop starts by attempting.
-        let mode = if record.attempts().is_empty() {
-            Mode::Dispatch
-        } else {
-            Mode::Resume
-        };
+        // The first pass has no attempt to classify, so the loop starts by attempting. But a
+        // crash *inside* Attempt 1 leaves a record with no attempts while the session already
+        // carries transcript lines — re-dispatching there would start the Job over under the
+        // same session id and lose what the crashed session did. Dispatch therefore means an
+        // untouched Run: no attempts *and* an empty transcript. A created-but-empty session
+        // still re-dispatches, because there is nothing in it to lose.
+        let mode = entry_mode(record.attempts(), transcript_lines(record));
         run_one_attempt(record, run_dir, &worktree, mode)?;
         record.save(&path)?;
 
@@ -671,7 +673,6 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
             return Ok(Outcome {
                 run_id: record.run_id.clone(),
                 state: record.state.as_str(),
-                attempts_made: record.attempts().len(),
                 already_completed: false,
             });
         }
@@ -728,6 +729,22 @@ fn run_one_attempt(
         .with_fanout(fanout_of(record, already_written));
     record.push_attempt(classified);
     Ok(())
+}
+
+/// Dispatch or resume, from the two facts a re-entering supervisor can see: the attempt list
+/// and how much transcript the recorded session already holds.
+///
+/// `attempts.is_empty()` alone is not *fresh*: a crash inside Attempt 1 — after `claude`
+/// created the session named by `--session-id`, before any Attempt was recorded — leaves an
+/// empty list over a session that already did work. Re-dispatching there would start the Job
+/// over and lose that work, so Dispatch requires the transcript to be empty too. Absence of a
+/// transcript file reads as zero, which is the honest reading: nothing was written yet.
+fn entry_mode(attempts: &[Attempt], transcript_lines: usize) -> Mode {
+    if attempts.is_empty() && transcript_lines == 0 {
+        Mode::Dispatch
+    } else {
+        Mode::Resume
+    }
 }
 
 /// How much of the Run's transcript exists right now, in lines. A transcript that is not there
@@ -801,9 +818,12 @@ fn refuse_unless_host_ready(home: &Path, job: &Job) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// The presence half of the shared item list — local, free, no network. `cli` runs the same
-/// items at doctor's depth.
-pub fn check_presence(home: &Path, job: &Job, check: job::Check) -> Observed<ItemOutcome> {
+/// The presence half of the dispatch-depth item list — local, free, no network, run by
+/// `refuse_unless_host_ready` before a child is ever spawned. **`cli` does not share this**:
+/// doctor keeps its own mapping in its own `check`, because doctor's depth (relaxed checks,
+/// declared-clone context) differs per item, and one function serving both would drag
+/// dispatch's no-network shape into every doctor row.
+fn check_presence(home: &Path, job: &Job, check: job::Check) -> Observed<ItemOutcome> {
     use crate::observe as obs;
     match check {
         job::Check::DeclaredClone => obs::declared_clone(
@@ -848,16 +868,33 @@ fn adopt_or_create_worktree(repo_path: &Path, branch: &str) -> Result<PathBuf, R
         return Ok(adopted);
     }
     let wanted = job::worktree_to_create(repo_path, branch);
-    let made = world::run(
-        &[
-            "git".to_string(),
-            "worktree".to_string(),
-            "add".to_string(),
-            wanted.display().to_string(),
-            branch.to_string(),
-        ],
+    // A Job's declared branch is normally created *by* its Run, so at dispatch it usually
+    // exists nowhere yet: plain `add` demanded an existing ref and refused every
+    // fresh-branch Job (`invalid reference`, issue #81). `-b` makes the create path
+    // create-the-branch-and-its-worktree; when the ref already exists but holds no
+    // worktree, plain `add` checks it out exactly as before.
+    let ref_exists = world::run(
+        &words(&[
+            "git",
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ]),
         Some(repo_path),
     );
+    let mut argv = vec!["git".to_string(), "worktree".to_string(), "add".to_string()];
+    // `-b` binds to the next argument, so the two forms order differently:
+    // `add -b <branch> <path>` against `add <path> <branch>`.
+    if ref_exists.code != Some(0) {
+        argv.push("-b".to_string());
+        argv.push(branch.to_string());
+        argv.push(wanted.display().to_string());
+    } else {
+        argv.push(wanted.display().to_string());
+        argv.push(branch.to_string());
+    }
+    let made = world::run(&argv, Some(repo_path));
     if made.code != Some(0) {
         return Err(Refusal::saying(format!(
             "could not create a worktree for {branch}: {}",
@@ -957,6 +994,16 @@ fn record_path(run_dir: &Path) -> PathBuf {
 /// structurally rather than by a `.gitignore` line.
 fn log_path(run_dir: &Path) -> PathBuf {
     run_dir.join("supervisor.log")
+}
+
+/// `~/.grind/runs/<run-id>/resume.log` — where the detached boot-re-entry child's own stdout
+/// and stderr land. The child is detached, so nobody is watching its streams; without a file
+/// they are nulled and a pre-supervise refusal (`resume.log`'s whole reason to exist) — the
+/// dispatch lock's `WouldBlock`, an unreadable record — vanishes after `resume --all` already
+/// said *re-entered*. Appended, like `supervisor.log` beside it, so repeated boots keep every
+/// account.
+fn resume_log_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("resume.log")
 }
 
 /// The supervisor's narration, to stdout **and** to a file that outlives the terminal.
@@ -1162,5 +1209,142 @@ mod tests {
         let last = record.attempts().last().unwrap().clone();
         record.push_attempt(last);
         assert_eq!(record.attempts().len(), before + 1);
+    }
+    /// A throwaway clone with one commit on `main`, so `worktree add -b` has a HEAD to
+    /// branch from. Removed by the caller; a leftover harms nothing but tidiness. Every
+    /// effect goes through `world`, which is where `tests/topology.rs` insists they live.
+    fn a_clone_with_one_commit(tag: &str) -> PathBuf {
+        let repo = world::temp_dir(tag);
+        let git = |args: &[&str]| {
+            let mut argv = vec!["git"];
+            argv.extend_from_slice(args);
+            let out = world::run(&words(&argv), Some(&repo));
+            assert!(
+                out.code == Some(0),
+                "git {args:?}: {}",
+                out.stderr.lines().next().unwrap_or("no output")
+            );
+        };
+        git(&["init", "-b", "main", "."]);
+        world::write(&repo.join("seed"), "seed").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=grind-81",
+            "-c",
+            "user.email=grind-81@example.invalid",
+            "commit",
+            "-m",
+            "seed",
+        ]);
+        repo
+    }
+
+    fn rev_parse(repo: &Path, what: &str) -> Option<String> {
+        let out = world::run(&words(&["git", "rev-parse", what]), Some(repo));
+        (out.code == Some(0)).then(|| out.stdout.trim().to_string())
+    }
+
+    #[test]
+    fn a_branch_that_exists_nowhere_dispatches_a_worktree() {
+        // Issue #81: the create path ran `git worktree add <path> <branch>` with no `-b`,
+        // so a Job declaring a brand-new branch — the normal case, since the Run creates
+        // the branch — was refused with `fatal: invalid reference`. Pinned at the seam
+        // itself, against a real clone.
+        let repo = a_clone_with_one_commit("fresh");
+        let branch = "feat/81-brand-new";
+        let worktree = adopt_or_create_worktree(&repo, branch).expect("a fresh branch dispatches");
+        assert_eq!(worktree, job::worktree_to_create(&repo, branch));
+        assert!(
+            rev_parse(&repo, &format!("refs/heads/{branch}")).is_some(),
+            "the create path must create the declared branch"
+        );
+        let listed = world::run(
+            &words(&["git", "worktree", "list", "--porcelain"]),
+            Some(&repo),
+        );
+        assert!(
+            job::adopt_worktree(&listed.stdout, branch).is_some(),
+            "the worktree just made must be adoptable on the next dispatch"
+        );
+        world::remove_tree(&repo);
+    }
+
+    #[test]
+    fn a_ref_that_exists_but_holds_no_worktree_is_checked_out_not_recreated() {
+        // The other half of the seam: `-b` is reached for only when the ref is missing.
+        // Recreating an existing branch would refuse (`already exists`) or, worse, reset it.
+        let repo = a_clone_with_one_commit("existing");
+        let sha = rev_parse(&repo, "HEAD").unwrap();
+        let branched = world::run(&words(&["git", "branch", "side"]), Some(&repo));
+        assert_eq!(branched.code, Some(0));
+        let worktree = adopt_or_create_worktree(&repo, "side").expect("an existing ref dispatches");
+        assert_eq!(rev_parse(&worktree, "HEAD").as_deref(), Some(sha.as_str()));
+        world::remove_tree(&repo);
+    }
+
+    #[test]
+    fn the_worktree_adopted_is_the_one_the_branch_already_holds() {
+        let repo = a_clone_with_one_commit("adopted");
+        // Adopt stays read-only: no `-b`, no move, just the worktree the porcelain named.
+        let first = adopt_or_create_worktree(&repo, "feat/81-twice").unwrap();
+        let second = adopt_or_create_worktree(&repo, "feat/81-twice").unwrap();
+        // git reports worktree paths canonicalised, and on macOS /var is a symlink to
+        // /private/var — so compare through the filesystem, not through the strings.
+        assert_eq!(
+            world::resolve_link(&first).unwrap(),
+            world::resolve_link(&second).unwrap()
+        );
+        world::remove_tree(&repo);
+    }
+    /// A minimal crashed Attempt — the child never handed back anything classifiable.
+    fn a_crashed_attempt(n: usize) -> Attempt {
+        Attempt {
+            n,
+            mode: Mode::Resume,
+            started_at: "2026-08-21T00:00:00+00:00".into(),
+            ended_at: "2026-08-21T00:01:00+00:00".into(),
+            exit_code: None,
+            is_error: true,
+            parse_ok: false,
+            subtype: Some("unparseable-output".into()),
+            stop_reason: None,
+            api_error_status: None,
+            terminal_reason: None,
+            num_turns: None,
+            total_cost_usd: None,
+            usage: None,
+            permission_denials: Vec::new(),
+            done_promise: false,
+            rate_limited: false,
+            result_tail: String::new(),
+            fanout: Observed::Absent,
+        }
+    }
+
+    #[test]
+    fn a_crash_inside_attempt_one_resumes_the_session_instead_of_redispatching_it() {
+        // A crash after `claude` created the session leaves either no recorded attempts over a
+        // transcript that already has lines, or one crashed attempt over any transcript. Keying
+        // Dispatch on the empty attempt list alone re-dispatched under the same session id and
+        // lost the crashed session's work, so Dispatch now means an untouched Run: no attempts
+        // *and* no transcript. A created-but-empty session — the crash landed before Attempt 1
+        // was ever recorded — still re-dispatches, because there is nothing in it to lose.
+        let crashed = [a_crashed_attempt(1)];
+        assert_eq!(entry_mode(&[], 0), Mode::Dispatch);
+        assert_eq!(entry_mode(&crashed, 0), Mode::Resume);
+        assert_eq!(entry_mode(&crashed, 3), Mode::Resume);
+    }
+
+    #[test]
+    fn the_detached_resume_child_logs_beside_the_record_it_reenters() {
+        // The detached child's stdout and stderr land in one file directly under the run
+        // directory, next to `run.json` and `supervisor.log` — the one place a boot re-entry's
+        // pre-supervise refusal can still be read after the parent has exited.
+        let path = resume_log_path(Path::new("/home/op/.grind/runs/20260821-000000-snapper-90"));
+        assert_eq!(
+            path,
+            Path::new("/home/op/.grind/runs/20260821-000000-snapper-90/resume.log")
+        );
     }
 }

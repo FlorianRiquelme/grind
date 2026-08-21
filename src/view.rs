@@ -281,15 +281,15 @@ pub fn live(transcript: &Path, now_epoch: u64) -> Live {
             Some(body) => now_skill(body),
             None => Observed::Unobservable(Reason::saying("the transcript could not be read")),
         },
+        assistant_now: match &text {
+            Some(body) => assistant_now(body),
+            None => Observed::Unobservable(Reason::saying("the transcript could not be read")),
+        },
         last_words: match &text {
             Some(body) => last_words(body, 3),
             // Still exactly three lines: the block's height is fixed so `watch` never jitters,
             // and an unreadable transcript must not change the shape of the view.
             None => vec![String::new(); 3],
-        },
-        assistant_now: match &text {
-            Some(body) => assistant_now(body),
-            None => Observed::Unobservable(Reason::saying("the transcript could not be read")),
         },
         fanout: match &text {
             Some(body) => fanout(body),
@@ -364,6 +364,35 @@ pub fn now_skill(text: &str) -> Observed<String> {
     }
 }
 
+/// The last assistant message, flattened to one line: the live answer to *what is it doing
+/// right now* while the Run is still going (#82). It reads only assistant lines — unlike
+/// `last_words`, which takes every message — because the operator asking *what is it doing*
+/// means what Claude said, not what was said to it. Both role spellings are recognised, the
+/// top-level `type` and `message.role`, because the real file carries the role inconsistently
+/// between its own lines and a matcher over one spelling is the next silent-stale one. Like
+/// everything in this view it describes what happened and is never a verdict input (ADR-0003).
+pub fn assistant_now(text: &str) -> Observed<String> {
+    let mut last: Option<String> = None;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let is_assistant = value.get("type").and_then(|t| t.as_str()) == Some("assistant")
+            || value
+                .get("message")
+                .and_then(|m| m.get("role"))
+                .and_then(|r| r.as_str())
+                == Some("assistant");
+        if is_assistant && let Some(said) = first_text(&value) {
+            last = Some(one_line(&said));
+        }
+    }
+    match last {
+        Some(said) => Observed::Present(said),
+        None => nothing_recognised(text, "assistant message"),
+    }
+}
+
 /// The tool a fan-out spawn names. The CLI calls it `Agent`; `Task` is the former spelling, and
 /// matching only that one printed `none` on every Run that fanned out — **203 spawns to 0**
 /// across sixty transcripts. The fixture that should have caught it is authored, so it asserted
@@ -426,40 +455,6 @@ pub fn last_words(text: &str, wanted: usize) -> Vec<String> {
     block
 }
 
-/// The last assistant message, flattened to one line — the live answer to *what is it doing
-/// right now*, observed from the transcript and never a verdict input (ADR-0003 caps this at
-/// describing what happened; issue #82).
-///
-/// Either spelling of the role is recognised — `type` at the top level or `message.role`,
-/// which the real file uses inconsistently between its own lines. A line carrying text but
-/// neither spelling costs only itself, and an assistant line with no text (a bare tool call)
-/// leaves the previous message standing. No assistant text at all degrades by the same
-/// nothing-recognised rule the fan-out matcher carries.
-pub fn assistant_now(text: &str) -> Observed<String> {
-    let mut last: Option<String> = None;
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let is_assistant = value.get("type").and_then(|t| t.as_str()) == Some("assistant")
-            || value
-                .get("message")
-                .and_then(|m| m.get("role"))
-                .and_then(|r| r.as_str())
-                == Some("assistant");
-        if !is_assistant {
-            continue;
-        }
-        if let Some(text) = first_text(&value) {
-            last = Some(one_line(&text));
-        }
-    }
-    match last {
-        Some(said) => Observed::Present(said),
-        None => nothing_recognised(text, "assistant message"),
-    }
-}
-
 fn first_text(value: &serde_json::Value) -> Option<String> {
     let content = value.get("message")?.get("content")?;
     match content {
@@ -472,7 +467,11 @@ fn first_text(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn one_line(text: &str) -> String {
+/// One line, capped: whitespace flattened and at most 100 characters, so a long value renders
+/// at a fixed width. `render` reuses this for fan-out descriptions — five long Agent
+/// descriptions wrapping differently on every `watch` refresh is the jitter the fixed view
+/// shape exists to prevent.
+pub(crate) fn one_line(text: &str) -> String {
     let flattened: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if flattened.chars().count() > 100 {
         flattened.chars().take(99).collect::<String>() + "…"
@@ -487,18 +486,28 @@ fn one_line(text: &str) -> String {
 /// Both spellings are recognised (`FANOUT_TOOLS`), and a transcript carrying tool-use blocks
 /// with **zero** recognised spawns reads *could not observe* rather than `Absent`. Widening the
 /// matcher alone would leave the next rename exactly as silent as this one was.
+///
+/// **A spawn paired to a `tool_result` anywhere in the same text is not running.** This is the
+/// same `tool_use` → `tool_result` pairing [`fanout_counts`] assumes, and the same transcript:
+/// the live view reads the whole append-only file, so listing every spawn listed finished work
+/// as currently-running forever — attempt 1's three agents all returned, and `grind status`
+/// kept saying *3 agents*. A spawn carrying no id cannot be paired, so it stays listed, the
+/// same assumed-not-returned direction `fanout_counts` reads. When every spawn has paired
+/// there is nothing running to observe, which is `Absent` — never `Present(vec![])`, an empty
+/// list whose only consumer rendered as a word and whose non-empty case is the whole point.
+///
+/// A bare top-level `description` field is **not** a spawn. That field belongs to subagent
+/// side-chain lines (`isSidechain: true` in `<session>/subagents/*.jsonl`), files this view
+/// reads only for freshness ([`newest_write`]) — the parent transcript this function reads
+/// never carries one, and matching it counted unrelated lines as spawns that could never pair
+/// away.
 pub fn fanout(text: &str) -> Observed<Vec<Fanout>> {
-    let mut found = Vec::new();
+    let mut spawned: Vec<(Option<String>, Fanout)> = Vec::new();
+    let mut returned: Vec<String> = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if let Some(description) = value.get("description").and_then(|d| d.as_str()) {
-            found.push(Fanout {
-                description: description.to_string(),
-            });
-            continue;
-        }
         let Some(serde_json::Value::Array(parts)) =
             value.get("message").and_then(|m| m.get("content"))
         else {
@@ -509,22 +518,40 @@ pub fn fanout(text: &str) -> Observed<Vec<Fanout>> {
                 .get("name")
                 .and_then(|n| n.as_str())
                 .unwrap_or_default();
-            if FANOUT_TOOLS.contains(&named)
-                && let Some(description) = part
-                    .get("input")
-                    .and_then(|i| i.get("description"))
-                    .and_then(|d| d.as_str())
+            if FANOUT_TOOLS.contains(&named) {
+                spawned.push((
+                    part.get("id").and_then(|i| i.as_str()).map(str::to_string),
+                    Fanout {
+                        description: part
+                            .get("input")
+                            .and_then(|i| i.get("description"))
+                            .and_then(|d| d.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    },
+                ));
+            } else if part.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                && let Some(paired) = part.get("tool_use_id").and_then(|i| i.as_str())
             {
-                found.push(Fanout {
-                    description: description.to_string(),
-                });
+                returned.push(paired.to_string());
             }
         }
     }
-    if found.is_empty() {
+    if spawned.is_empty() {
         return nothing_recognised(text, "fan-out spawn");
     }
-    Observed::Present(found)
+    let running: Vec<Fanout> = spawned
+        .iter()
+        .filter(|(id, _)| match id {
+            Some(id) => !returned.iter().any(|seen| seen == id),
+            None => true,
+        })
+        .map(|(_, fanout)| fanout.clone())
+        .collect();
+    if running.is_empty() {
+        return Observed::Absent;
+    }
+    Observed::Present(running)
 }
 
 /// The fan-out in **the lines appended since** `already_written`, which is what *per Attempt*
@@ -732,6 +759,63 @@ mod tests {
     }
 
     #[test]
+    fn a_transcript_that_spawned_three_and_saw_three_return_has_nothing_running() {
+        // The live view reads the whole append-only transcript: without pairing against
+        // `tool_result`, attempt 1's three agents read as *3 agents* forever after they all
+        // returned — finished work presented as currently-running.
+        assert_eq!(fanout(&spawning(3, 3)), Observed::Absent);
+    }
+
+    #[test]
+    fn the_spawn_without_a_paired_result_is_the_one_still_listed_as_running() {
+        let found = fanout(&spawning(3, 2));
+        let Observed::Present(running) = found else {
+            panic!("the unpaired spawn is still running: {found:?}");
+        };
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].description, "do the thing 2");
+    }
+
+    #[test]
+    fn a_spawn_without_an_id_cannot_pair_and_stays_listed() {
+        // The same assumed pairing `fanout_counts` states: where a spawn carries no id it
+        // counts as spawned and never returned, so the live view keeps it listed.
+        let transcript = r#"{"message":{"content":[{"type":"tool_use","name":"Agent","input":{"description":"idless"}}]}}"#;
+        let found = fanout(transcript);
+        assert_eq!(
+            found,
+            Observed::Present(vec![Fanout {
+                description: "idless".to_string()
+            }])
+        );
+    }
+
+    #[test]
+    fn a_bare_top_level_description_line_is_not_a_spawn() {
+        // The top-level `description` field belongs to subagent side-chain lines in
+        // `<session>/subagents/*.jsonl` — files this view reads only for freshness. The parent
+        // transcript never carries one, so matching it counted unrelated lines as spawns that
+        // could never pair away.
+        let transcript = concat!(
+            r#"{"description":"unrelated prose","message":{"role":"user"}}"#,
+            "\n",
+            r#"{"message":{"content":[{"type":"tool_use","id":"t1","name":"Agent","input":{"description":"real spawn"}}]}}"#,
+        );
+        let found = fanout(transcript);
+        assert_eq!(
+            found,
+            Observed::Present(vec![Fanout {
+                description: "real spawn".to_string()
+            }])
+        );
+        // And alone, such a line is no recognised spawn at all — the empty-transcript rule.
+        assert_eq!(
+            fanout(r#"{"description":"unrelated prose"}"#),
+            Observed::Absent
+        );
+    }
+
+    #[test]
     fn a_field_that_changed_name_or_type_costs_its_own_line_and_nothing_else() {
         // The same real file changes field names and field types between its own lines, which
         // is why this is read tolerantly and the child's stdout is read strictly.
@@ -795,7 +879,7 @@ mod tests {
         let mut lines = Vec::new();
         for n in 0..spawns {
             lines.push(format!(
-                r#"{{"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_{n}","name":"Agent","input":{{"description":"do the thing"}}}}]}}}}"#
+                r#"{{"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_{n}","name":"Agent","input":{{"description":"do the thing {n}"}}}}]}}}}"#
             ));
         }
         for n in 0..returns {
@@ -914,89 +998,53 @@ mod tests {
         assert_eq!(block, vec!["line 7", "line 8", "line 9"]);
     }
 
-    /// An assistant line under both role spellings at once, saying `said`.
-    fn assistant_line(said: &str) -> String {
-        format!(
-            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"{said}"}}]}}}}"#
-        )
-    }
-
     #[test]
-    fn the_last_assistant_message_is_what_it_is_doing_now() {
-        // The newest thing said is the live answer; everything earlier is history.
-        let transcript = format!(
-            "{}\n{}\n",
-            assistant_line("checking the failing test"),
-            assistant_line("fixing the failing test")
+    fn the_last_assistant_message_is_the_one_shown_and_user_lines_never_win() {
+        // `assistant_now` answers *what is it doing right now*, which is what Claude last
+        // said — not what was last said to it.
+        let transcript = concat!(
+            "{\"type\":\"user\",\"message\":{\"content\":\"the operator asked\"}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"first answer\"}]}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"second answer\"}]}}\n",
         );
         assert_eq!(
-            assistant_now(&transcript),
-            Observed::Present("fixing the failing test".to_string())
+            assistant_now(transcript),
+            Observed::Present("second answer".to_string())
         );
     }
 
     #[test]
-    fn a_user_line_is_never_what_it_is_doing() {
-        // Tool results ride in under the `user` role and carry text; reading them as the
-        // assistant's words would quote the transcript back at itself.
-        let transcript = format!(
-            "{}\n{}\n",
-            assistant_line("running the tests"),
-            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"tool output pasted back"}]}}"#
+    fn an_assistant_message_carrying_only_the_inner_role_spelling_is_still_one() {
+        // The real file carries the role inconsistently between its own lines: some lines
+        // name it only as `message.role`. A matcher over the top-level `type` alone is the
+        // next silent-stale one, so both spellings count (#82).
+        let transcript = concat!(
+            "{\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"inner role\"}]}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"top level\"}]}}\n",
         );
         assert_eq!(
-            assistant_now(&transcript),
-            Observed::Present("running the tests".to_string())
+            assistant_now(transcript),
+            Observed::Present("top level".to_string())
+        );
+        let only_inner = "{\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"inner role\"}]}}\n";
+        assert_eq!(
+            assistant_now(only_inner),
+            Observed::Present("inner role".to_string())
         );
     }
 
     #[test]
-    fn assistant_now_recognises_either_spelling_of_the_role() {
-        // The real file uses both between its own lines, so matching one would silently
-        // drop the other — the fan-out matcher's lesson (203 spawns to 0).
-        let by_type = r#"{"type":"assistant","message":{"content":"said by type"}}"#;
-        let by_role = r#"{"message":{"role":"assistant","content":"said by role"}}"#;
-        assert_eq!(
-            assistant_now(by_type),
-            Observed::Present("said by type".to_string())
+    fn an_assistant_line_that_never_parses_follows_the_nothing_recognised_rule() {
+        // Tool calls in the transcript but no readable assistant line: could-not-observe,
+        // never absent — the same stale-matcher distinction the fan-out matcher carries.
+        let damaged = concat!(
+            "{\"type\":\"assistant\",\"message\":{ oops\n",
+            "{\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\"}]}}\n",
         );
-        assert_eq!(
-            assistant_now(by_role),
-            Observed::Present("said by role".to_string())
-        );
-    }
-
-    #[test]
-    fn a_damaged_line_costs_assistant_now_only_itself() {
-        let transcript = format!(
-            "{}\nnot json at all\n{}\n",
-            assistant_line("before the damage"),
-            assistant_line("after the damage")
-        );
-        assert_eq!(
-            assistant_now(&transcript),
-            Observed::Present("after the damage".to_string())
-        );
-    }
-
-    #[test]
-    fn an_empty_transcript_has_no_assistant_message_to_show() {
+        let found = assistant_now(damaged);
+        assert!(matches!(found, Observed::Unobservable(_)), "{found:?}");
+        // Nothing in the transcript at all: absent, and distinguishable from a stale matcher.
         assert_eq!(assistant_now(EMPTY), Observed::Absent);
-    }
-
-    #[test]
-    fn activity_without_any_assistant_text_is_could_not_observe_never_absent() {
-        // The same nothing-recognised rule as the fan-out matcher: a transcript full of tool
-        // calls and no readable assistant text is a matcher gone stale, not a quiet Run.
-        let found = assistant_now(FANOUT_UNRECOGNISED);
-        let Observed::Unobservable(reason) = &found else {
-            panic!("tool calls with no recognised assistant text are not a quiet Run");
-        };
-        assert!(
-            reason.to_string().contains('3'),
-            "the tool-call count is in the reason: {reason}"
-        );
-        assert_ne!(found, Observed::Absent);
     }
 
     #[test]
@@ -1004,9 +1052,9 @@ mod tests {
         let nowhere = Path::new("/nowhere/that/exists/none.jsonl");
         let found = live(nowhere, 1_785_000_000);
         assert!(matches!(found.now_skill, Observed::Unobservable(_)));
-        assert!(matches!(found.assistant_now, Observed::Unobservable(_)));
         assert!(matches!(found.fanout, Observed::Unobservable(_)));
         assert!(matches!(found.freshness, Observed::Unobservable(_)));
+        assert!(matches!(found.assistant_now, Observed::Unobservable(_)));
         assert_eq!(found.last_words.len(), 3);
         assert_eq!(found.transcript, nowhere);
     }

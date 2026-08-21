@@ -158,9 +158,21 @@ pub fn write(path: &Path, contents: &str) -> Result<(), String> {
 /// Write via a temporary file in the same directory, then rename over the target. A crash
 /// between the two leaves the **old** `run.json` intact, because the temp file is the only
 /// thing that can be half-written. A plain write truncates the real file instead.
+///
+/// The scratch file is **fsynced before the rename**. Rename is atomic against process death
+/// on its own, but not against power loss: without the flush, the directory entry can be
+/// renamed while its data still sits in the page cache, and a cut then leaves a `run.json`
+/// that is the right length and full of zeros — or truncated. The record is the sole account
+/// of attempts that cost real money, so *old intact or new complete* has to hold across the
+/// power cutting too, which is what `sync_all` buys.
 pub fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     let scratch = path.with_extension("tmp");
-    fs::write(&scratch, contents).map_err(|e| format!("{}: {e}", scratch.display()))?;
+    let mut file = File::create(&scratch).map_err(|e| format!("{}: {e}", scratch.display()))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|e| format!("{}: {e}", scratch.display()))?;
+    file.sync_all()
+        .map_err(|e| format!("{}: {e}", scratch.display()))?;
+    drop(file);
     fs::rename(&scratch, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -300,19 +312,30 @@ pub fn current_exe() -> Option<PathBuf> {
 /// from taking the supervisors with it; the systemd unit's own `KillMode` is the other half, and
 /// it lives in `dist/`.
 ///
-/// Nothing is waited on and nothing is piped — the child owns its own stdio and writes its own
-/// `supervisor.log`.
-pub fn spawn_detached(argv: &[String]) -> Result<u32, String> {
+/// Nothing is waited on and nothing is piped. The child's stdout and stderr are redirected to
+/// `log` — appended, like the supervisor log beside the record — because nobody is watching a
+/// detached child's streams: nulled, they swallow exactly the refusals the re-entering child can
+/// hit before it ever reaches `supervise` (the dispatch lock's `WouldBlock`, an unreadable
+/// record) at the moment `resume --all` has already reported *re-entered*. A log that cannot be
+/// opened fails the spawn rather than starting a child whose first refusal would be invisible.
+pub fn spawn_detached(argv: &[String], log: &Path) -> Result<u32, String> {
     use std::os::unix::process::CommandExt;
     let Some((program, rest)) = argv.split_first() else {
         return Err("empty argv".to_string());
     };
+    let log_file = File::options()
+        .create(true)
+        .append(true)
+        .open(log)
+        .map_err(|e| format!("{}: {e}", log.display()))?;
     Command::new(program)
         .args(rest)
         .process_group(0)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(
+            log_file.try_clone().map_err(|e| e.to_string())?,
+        ))
+        .stderr(Stdio::from(log_file))
         .spawn()
         .map(|child| child.id())
         .map_err(|e| e.to_string())
@@ -402,4 +425,27 @@ fn civil(epoch: u64) -> (u64, u64, u64, u64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+
+/// A unique scratch directory under the system temporary directory. Test scaffolding —
+/// `tests/topology.rs` keeps `std::fs` and `std::env` out of every other module, so the
+/// tests that need a throwaway clone ask here. The caller removes what it creates.
+#[cfg(test)]
+pub fn temp_dir(tag: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "grind-test-{tag}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&path).expect("a scratch directory");
+    path
+}
+
+/// The inverse of [`temp_dir`]: best-effort removal of a scratch tree.
+#[cfg(test)]
+pub fn remove_tree(path: &Path) {
+    let _ = fs::remove_dir_all(path);
 }

@@ -136,17 +136,22 @@ pub fn parse_reference(input: &str) -> Result<Reference, Refusal> {
 /// Reads a Job out of `gh issue view --json number,title,body,url,labels,state`.
 ///
 /// A missing required row refuses and names the row, at dispatch rather than three hours into
-/// a Run. `target repo` becomes a filesystem path and `branch` becomes a lock filename, so both
-/// are validated as segments before they leave this module — a Job is a private-repo artifact
-/// today, but a value that reaches a path deserves a shape either way.
+/// a Run. The same holds for the JSON's own `number` and `url`: both render into every later
+/// message, so an absent one is refused here rather than printed blank. `target repo` becomes
+/// a filesystem path and `branch` becomes a lock filename, so both are validated as segments
+/// before they leave this module — a Job is a private-repo artifact today, but a value that
+/// reaches a path deserves a shape either way.
 pub fn from_issue_json(raw: &str) -> Result<Job, Refusal> {
     let value: serde_json::Value = serde_json::from_str(raw)
         .map_err(|e| Refusal::saying(format!("`gh issue view` returned unreadable JSON: {e}")))?;
 
+    // `url` refuses like `number`: every downstream message renders it (`Job {url} has no
+    // usable …`), and an absent one rendered as `Job  has no usable …`, blank in the prompt.
     let url = value
         .get("url")
         .and_then(|v| v.as_str())
-        .unwrap_or_default()
+        .filter(|u| !u.trim().is_empty())
+        .ok_or_else(|| Refusal::saying("`gh issue view` returned no issue url".to_string()))?
         .to_string();
     let issue = value
         .get("number")
@@ -227,15 +232,18 @@ fn field_table(body: &str) -> Vec<(String, String)> {
     let mut rows = Vec::new();
     for line in body.lines() {
         let line = line.trim();
+        // Split on the first interior `|` only. A value may itself carry a pipe — escaped
+        // `\|` or bare — and splitting on every one turned such a row into three cells that
+        // were dropped silently, so dispatch later refused on a row that was there. The
+        // trailing `|` is already stripped, so the value runs to line end.
         if !line.starts_with('|') || !line.ends_with('|') || line.len() < 3 {
             continue;
         }
-        let cells: Vec<&str> = line[1..line.len() - 1].split('|').collect();
-        if cells.len() != 2 {
+        let Some((key_cell, value_cell)) = line[1..line.len() - 1].split_once('|') else {
             continue;
-        }
-        let key = clean(cells[0]).to_lowercase();
-        let value = clean(cells[1]);
+        };
+        let key = clean(key_cell).to_lowercase();
+        let value = clean(value_cell);
         if key.is_empty() || key == "field" || key == "value" || is_separator(&key) {
             continue;
         }
@@ -924,6 +932,52 @@ mod tests {
         // Absent is the ordinary case, and the ordinary case is silence.
         let bare = from_issue_json(&issue_json(FULL_ROWS)).expect("a complete Job");
         assert_eq!(bare.intent, None);
+    }
+
+    #[test]
+    fn a_target_repo_row_whose_value_carries_a_pipe_parses_as_one_row() {
+        // Splitting on every `|` turned such a row into three cells that were dropped
+        // silently, and dispatch then refused on a row that was there. Escaped or bare, the
+        // value runs from the first interior `|` to the line's last.
+        let table = field_table(&body(
+            "| Target repo | FlorianRiquelme/snapper \\| mirrored at #12 |",
+        ));
+        assert_eq!(
+            table,
+            vec![(
+                "target repo".to_string(),
+                "FlorianRiquelme/snapper \\| mirrored at #12".to_string()
+            )]
+        );
+        // The bare pipe reads the same way.
+        let bare = field_table(&body(
+            "| Target repo | FlorianRiquelme/snapper | see docs |",
+        ));
+        assert_eq!(
+            bare,
+            vec![(
+                "target repo".to_string(),
+                "FlorianRiquelme/snapper | see docs".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn an_issue_json_without_a_usable_url_refuses_and_names_the_field() {
+        // Every refusal downstream renders the url (`Job {url} has no usable …`), so an
+        // absent one used to print `Job  has no usable …` and land blank in the prompt.
+        for url in [None, Some("")] {
+            let mut raw = serde_json::json!({
+                "number": 28,
+                "title": "Slice 1b",
+                "body": body(FULL_ROWS),
+            });
+            if let Some(u) = url {
+                raw["url"] = serde_json::json!(u);
+            }
+            let refusal = from_issue_json(&raw.to_string()).expect_err("must refuse");
+            assert!(refusal.to_string().contains("url"), "{refusal}");
+        }
     }
 
     #[test]

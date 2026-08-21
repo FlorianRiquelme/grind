@@ -89,10 +89,12 @@ resolves.
   minimal Linux host is quite likely to be. Presence only: a busybox `ps` is on `PATH` and still
   cannot answer, so this item catches the absent one and `observe::process_start_stamp` catches
   the rest by reading three-valued.
-- **The `lfg` plugin is installed.** — *dispatch* — The Job names the plugin, the host names the
-  version (ADR-0002 as amended). Resolution picks the installed version, records the resolved path,
-  and every attempt and every `--resume` reads the record — so a Run's plugin version is fixed for
-  the Run's whole life even though it was never pinned.
+- **The `lfg` plugin is installed.** — *dispatch* — The Job names both the plugin and a literal
+  `x.y.z` version, which Enqueue wrote when it drafted the Job (ADR-0002, #50, #69). Nothing on
+  the host resolves anything: `job::plugin_dir()` builds the path from that literal, records it,
+  and every attempt and every `--resume` reads the record — the version is pinned per Job and
+  frozen for the Run's whole life. The host owes an installed plugin, which is all this check
+  looks for; which version matters is the Job's literal, never the host's.
 
 ## Lifetime
 

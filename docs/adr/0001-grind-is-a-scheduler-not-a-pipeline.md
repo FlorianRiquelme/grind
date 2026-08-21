@@ -28,6 +28,8 @@ autonomous residual handoff that files durable records without prompting.
   mid-experiment and invalidate comparison across runs.
 - Grind owns no shared state: it reads issues, writes run state to gitignored local
   disk, comments on the Job issue at dispatch and at every terminal state, and opens PRs.
+  *(Superseded 2026-08-06 by ADR-0008: run state lives at `~/.grind/runs/`, outside any
+  checkout, so it is never committed structurally rather than by a `.gitignore` line.)*
 - If `lfg` turns out to be too opinionated, composing later is a mechanical decomposition
   of a known-good sequence rather than a redesign — and by then we will know which of its
   opinions actually cost us something.
