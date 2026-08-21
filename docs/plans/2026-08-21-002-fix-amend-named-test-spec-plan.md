@@ -1,5 +1,5 @@
 ---
-title: Amend #76's named Run 2 replay test to the claim it supports - Plan
+title: "Amend #76's named Run 2 replay test to the claim it supports - Plan"
 type: fix
 date: 2026-08-21
 origin: docs/plans/2026-08-21-001-amend-leg-1-named-test.md
