@@ -229,13 +229,17 @@ pub struct Fanout {
     pub description: String,
 }
 
-/// What the transcript can say. Four values, each degrading on its own — an unreadable
+/// What the transcript can say. Five values, each degrading on its own — an unreadable
 /// transcript costs these their values and never the whole command.
 #[derive(Debug)]
 pub struct Live {
     pub transcript: PathBuf,
     pub now_skill: Observed<String>,
     pub last_words: Vec<String>,
+    /// The last assistant message, flattened to one line: the live answer to *what is it
+    /// doing right now*, observed from the transcript. Never a verdict input — ADR-0003
+    /// caps this field at describing what happened (issue #82).
+    pub assistant_now: Observed<String>,
     pub fanout: Observed<Vec<Fanout>>,
     /// Seconds since the newest write across the parent transcript **and every subagent
     /// transcript**. The quietest healthy phase of a pipeline must not read as stuck.
@@ -243,10 +247,21 @@ pub struct Live {
 }
 
 /// Claude Code writes a session's transcript under a slug of the directory it ran in.
+///
+/// The record's worktree is the **declared** clone — on this host a symlink under
+/// `~/.grind/repos/<owner>/<name>` — and the OS resolves a cwd through it, so Claude slugs the
+/// **resolved** path (`/private/var/...` where the record says `/var/...`) and the pointer
+/// named a file that was not there (#82). Resolving at read time matches what Claude records,
+/// and heals records written before the fix with no migration: the slug is recomputed from the
+/// same directory every read. A worktree that is gone cannot be canonicalised, and slugging
+/// the raw string is then the only answer there is — the old behaviour, kept for that case.
 pub fn transcript_path(home: &Path, worktree: &str, session_id: &str) -> PathBuf {
+    let resolved = world::resolve_link(Path::new(worktree))
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| worktree.to_string());
     home.join(".claude")
         .join("projects")
-        .join(project_slug(worktree))
+        .join(project_slug(&resolved))
         .join(format!("{session_id}.jsonl"))
 }
 
@@ -271,6 +286,10 @@ pub fn live(transcript: &Path, now_epoch: u64) -> Live {
             // Still exactly three lines: the block's height is fixed so `watch` never jitters,
             // and an unreadable transcript must not change the shape of the view.
             None => vec![String::new(); 3],
+        },
+        assistant_now: match &text {
+            Some(body) => assistant_now(body),
+            None => Observed::Unobservable(Reason::saying("the transcript could not be read")),
         },
         fanout: match &text {
             Some(body) => fanout(body),
@@ -405,6 +424,40 @@ pub fn last_words(text: &str, wanted: usize) -> Vec<String> {
         block.push(String::new());
     }
     block
+}
+
+/// The last assistant message, flattened to one line — the live answer to *what is it doing
+/// right now*, observed from the transcript and never a verdict input (ADR-0003 caps this at
+/// describing what happened; issue #82).
+///
+/// Either spelling of the role is recognised — `type` at the top level or `message.role`,
+/// which the real file uses inconsistently between its own lines. A line carrying text but
+/// neither spelling costs only itself, and an assistant line with no text (a bare tool call)
+/// leaves the previous message standing. No assistant text at all degrades by the same
+/// nothing-recognised rule the fan-out matcher carries.
+pub fn assistant_now(text: &str) -> Observed<String> {
+    let mut last: Option<String> = None;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let is_assistant = value.get("type").and_then(|t| t.as_str()) == Some("assistant")
+            || value
+                .get("message")
+                .and_then(|m| m.get("role"))
+                .and_then(|r| r.as_str())
+                == Some("assistant");
+        if !is_assistant {
+            continue;
+        }
+        if let Some(text) = first_text(&value) {
+            last = Some(one_line(&text));
+        }
+    }
+    match last {
+        Some(said) => Observed::Present(said),
+        None => nothing_recognised(text, "assistant message"),
+    }
 }
 
 fn first_text(value: &serde_json::Value) -> Option<String> {
@@ -861,11 +914,97 @@ mod tests {
         assert_eq!(block, vec!["line 7", "line 8", "line 9"]);
     }
 
+    /// An assistant line under both role spellings at once, saying `said`.
+    fn assistant_line(said: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"{said}"}}]}}}}"#
+        )
+    }
+
     #[test]
-    fn a_transcript_that_cannot_be_read_at_all_costs_four_values_and_not_the_command() {
+    fn the_last_assistant_message_is_what_it_is_doing_now() {
+        // The newest thing said is the live answer; everything earlier is history.
+        let transcript = format!(
+            "{}\n{}\n",
+            assistant_line("checking the failing test"),
+            assistant_line("fixing the failing test")
+        );
+        assert_eq!(
+            assistant_now(&transcript),
+            Observed::Present("fixing the failing test".to_string())
+        );
+    }
+
+    #[test]
+    fn a_user_line_is_never_what_it_is_doing() {
+        // Tool results ride in under the `user` role and carry text; reading them as the
+        // assistant's words would quote the transcript back at itself.
+        let transcript = format!(
+            "{}\n{}\n",
+            assistant_line("running the tests"),
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"tool output pasted back"}]}}"#
+        );
+        assert_eq!(
+            assistant_now(&transcript),
+            Observed::Present("running the tests".to_string())
+        );
+    }
+
+    #[test]
+    fn assistant_now_recognises_either_spelling_of_the_role() {
+        // The real file uses both between its own lines, so matching one would silently
+        // drop the other — the fan-out matcher's lesson (203 spawns to 0).
+        let by_type = r#"{"type":"assistant","message":{"content":"said by type"}}"#;
+        let by_role = r#"{"message":{"role":"assistant","content":"said by role"}}"#;
+        assert_eq!(
+            assistant_now(by_type),
+            Observed::Present("said by type".to_string())
+        );
+        assert_eq!(
+            assistant_now(by_role),
+            Observed::Present("said by role".to_string())
+        );
+    }
+
+    #[test]
+    fn a_damaged_line_costs_assistant_now_only_itself() {
+        let transcript = format!(
+            "{}\nnot json at all\n{}\n",
+            assistant_line("before the damage"),
+            assistant_line("after the damage")
+        );
+        assert_eq!(
+            assistant_now(&transcript),
+            Observed::Present("after the damage".to_string())
+        );
+    }
+
+    #[test]
+    fn an_empty_transcript_has_no_assistant_message_to_show() {
+        assert_eq!(assistant_now(EMPTY), Observed::Absent);
+    }
+
+    #[test]
+    fn activity_without_any_assistant_text_is_could_not_observe_never_absent() {
+        // The same nothing-recognised rule as the fan-out matcher: a transcript full of tool
+        // calls and no readable assistant text is a matcher gone stale, not a quiet Run.
+        let found = assistant_now(FANOUT_UNRECOGNISED);
+        let Observed::Unobservable(reason) = &found else {
+            panic!("tool calls with no recognised assistant text are not a quiet Run");
+        };
+        assert!(
+            reason.to_string().contains('3'),
+            "the tool-call count is in the reason: {reason}"
+        );
+        assert_ne!(found, Observed::Absent);
+    }
+
+    #[test]
+    fn a_transcript_that_cannot_be_read_at_all_costs_five_values_and_not_the_command() {
         let nowhere = Path::new("/nowhere/that/exists/none.jsonl");
         let found = live(nowhere, 1_785_000_000);
         assert!(matches!(found.now_skill, Observed::Unobservable(_)));
+        assert!(matches!(found.assistant_now, Observed::Unobservable(_)));
         assert!(matches!(found.fanout, Observed::Unobservable(_)));
         assert!(matches!(found.freshness, Observed::Unobservable(_)));
         assert_eq!(found.last_words.len(), 3);

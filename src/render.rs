@@ -84,6 +84,13 @@ pub fn run_view(view: &SingleRun) -> String {
     // Two separate stage lines. *How far it got* and *what it is doing* are never conflated.
     line(&mut out, &format!("  furthest stage    {furthest}"));
     line(&mut out, &format!("  now               {}", live.now_skill));
+    // Observed live from the session transcript, not from the attempt record — the #82 fix.
+    // Like Base drift below, it is observed, never a verdict input: what the attempt is doing
+    // right now is a fact about the moment, not a judgement on the work.
+    line(
+        &mut out,
+        &format!("  live              {}", live.assistant_now),
+    );
     line(
         &mut out,
         &format!("  progress          {}", freshness_line(&live.freshness)),
@@ -776,6 +783,11 @@ mod tests {
                     }
                 })
                 .collect(),
+            assistant_now: Observed::Present(
+                "Coherence review returned clean — zero findings. Waiting on the feasibility \
+                 reviewer."
+                    .to_string(),
+            ),
             fanout: Observed::Present(vec![Fanout {
                 description: "review the diff for regressions".to_string(),
             }]),
@@ -900,6 +912,37 @@ mod tests {
         let text = rendered(&observation(), &live(3), &Verdict::Completed);
         assert!(text.contains("furthest stage    pr-open"));
         assert!(text.contains("now               compound-engineering:ce-work"));
+    }
+
+    #[test]
+    fn the_live_row_sits_between_now_and_progress() {
+        // The fixed line order is the whole contract of `run_view`: a new live row joins the
+        // observation block, it does not reorder it (#82).
+        let order = label_order(&rendered(&observation(), &live(3), &Verdict::Completed));
+        let now = order.iter().position(|l| l == "now").expect("a now row");
+        let live = order.iter().position(|l| l == "live").expect("a live row");
+        let progress = order
+            .iter()
+            .position(|l| l == "progress")
+            .expect("a progress row");
+        assert!(now < live && live < progress, "{order:?}");
+    }
+
+    #[test]
+    fn a_blind_transcript_still_renders_the_live_row() {
+        // Degrades, never disappears: the row is part of the fixed shape, so an unreadable
+        // transcript prints the unobservable mark rather than dropping the line (#82).
+        let mut blind = live(3);
+        blind.assistant_now = Observed::Unobservable(Reason::saying(
+            "view::transcript_path: transcript missing under the resolved path",
+        ));
+        let text = rendered(&observation(), &blind, &Verdict::Completed);
+        let line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("live "))
+            .expect("the live row must render even when the transcript is unreadable");
+        assert!(line.contains(UNOBSERVABLE_MARK), "{line}");
+        assert!(!line.contains(crate::observe::ABSENT_MARK), "{line}");
     }
 
     #[test]

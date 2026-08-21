@@ -5,7 +5,7 @@
 //! inside `src/` would trip `tests/topology.rs`. Git carries no mtimes either, so the fixture's
 //! times are set at run time — which is the honest way to test a freshness reading anyway.
 
-use grind::view::newest_write;
+use grind::view::{newest_write, transcript_path};
 use std::fs::{self, FileTimes};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -113,4 +113,34 @@ fn a_transcript_that_is_not_there_yields_no_time_rather_than_a_zero() {
     // Zero would render as *written in 1970*, which reads as a fact. Nothing is the honest
     // answer, and the view spells it as could-not-observe.
     assert!(newest_write(Path::new("/nowhere/that/exists/none.jsonl")).is_none());
+}
+
+#[test]
+fn the_transcript_slug_follows_the_symlink_the_way_claude_records_it() {
+    // #82: the declared clone `~/.grind/repos/<owner>/<name>` is a symlink, and Claude slugs
+    // the **resolved** path — on macOS the same directory is `/private/var/...` and
+    // `/var/...` — so a pointer slugged from the raw string named a file that was not there.
+    let real = std::env::temp_dir().join(format!("grind-slug-real-{}", std::process::id()));
+    let link = std::env::temp_dir().join(format!("grind-slug-link-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&real);
+    let _ = fs::remove_file(&link);
+    fs::create_dir_all(&real).expect("a real directory to stand in for the resolved clone");
+    std::os::unix::fs::symlink(&real, &link).expect("a symlink standing in for the clone");
+    let home = Path::new("/home/op");
+    let session = "d51b4c39-ce1d-449b-8366-04b9b1aa6573";
+    let via_link = transcript_path(home, link.to_str().unwrap(), session);
+    let direct = transcript_path(home, real.to_str().unwrap(), session);
+    assert_eq!(via_link, direct);
+    // A worktree that is gone cannot be canonicalised, and slugging the raw string is the old
+    // behaviour that keeps such a record's transcript path computable at all.
+    let gone = transcript_path(home, "/nowhere/that/exists/snapper", session);
+    assert_eq!(
+        gone,
+        home.join(".claude")
+            .join("projects")
+            .join("-nowhere-that-exists-snapper")
+            .join(format!("{session}.jsonl"))
+    );
+    let _ = fs::remove_dir_all(&real);
+    let _ = fs::remove_file(&link);
 }
