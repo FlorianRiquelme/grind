@@ -921,7 +921,8 @@ fn supervise_ladder(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, R
             let mut this_budget = budget;
             if let Some(last) = record.attempts().last()
                 && last.rate_limited
-                && let Some(finer) = policy::reset_time_sleep(&last.result_tail, now_hour_minute())
+                && let Some(finer) =
+                    policy::reset_time_sleep(&last.result_tail, world::now_local_hour_minute())
             {
                 this_budget.limit_sleep = finer;
             }
@@ -998,16 +999,6 @@ fn supervise_ladder(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, R
             record.save(&path)?;
         }
     }
-}
-
-/// The current wall-clock hour and minute, UTC, for `policy::reset_time_sleep` — the one
-/// impure edge the pure parse needs, kept to this one call site.
-fn now_hour_minute() -> (u32, u32) {
-    let iso = world::now_iso();
-    let hm = iso.split('T').nth(1).unwrap_or("");
-    let hour = hm.get(0..2).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let minute = hm.get(3..5).and_then(|s| s.parse().ok()).unwrap_or(0);
-    (hour, minute)
 }
 
 /// Every stage's return, read fresh off disk. A malformed or absent file reads as `None` per
