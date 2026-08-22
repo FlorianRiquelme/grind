@@ -431,6 +431,48 @@ fn civil(epoch: u64) -> (u64, u64, u64, u64, u64, u64) {
     (y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60)
 }
 
+/// Pure parse of `date +%H:%M`'s output. Tolerates a trailing newline; rejects anything
+/// out of range or unparseable rather than guessing.
+fn parse_hour_minute(s: &str) -> Option<(u32, u32)> {
+    let trimmed = s.trim();
+    let (h, m) = trimmed.split_once(':')?;
+    let hour: u32 = h.parse().ok()?;
+    let minute: u32 = m.parse().ok()?;
+    (hour <= 23 && minute <= 59).then_some((hour, minute))
+}
+
+/// Shells out to the POSIX-guaranteed `date +%H:%M`, the only place `std`'s missing timezone
+/// database gets filled in. `tz` sets the child's `TZ` when given; `None` leaves the child to
+/// inherit the host's own zone. Any failure — spawn, exit status, or unparseable stdout —
+/// comes back as `None` rather than a guess.
+fn local_hour_minute(tz: Option<&str>) -> Option<(u32, u32)> {
+    let mut command = Command::new("date");
+    command.arg("+%H:%M");
+    if let Some(value) = tz {
+        command.env("TZ", value);
+    }
+    let out = command.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_hour_minute(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The pure fallback seam: `reading` when the spawn succeeded, otherwise the UTC hour/minute
+/// this process already knows from [`civil`]. Callable directly with a literal `None`, so the
+/// fallback path is unit-testable without forcing `date` itself to fail.
+fn local_or_utc(reading: Option<(u32, u32)>) -> (u32, u32) {
+    reading.unwrap_or_else(|| {
+        let (_, _, _, h, mi, _) = civil(now_epoch());
+        (h as u32, mi as u32)
+    })
+}
+
+/// The host-local `(hour, minute)`, falling back to UTC when `date` cannot be read.
+pub fn now_local_hour_minute() -> (u32, u32) {
+    local_or_utc(local_hour_minute(None))
+}
+
 /// A unique scratch directory under the system temporary directory. Test scaffolding —
 /// `tests/topology.rs` keeps `std::fs` and `std::env` out of every other module, so the
 /// tests that need a throwaway clone ask here. The caller removes what it creates.
@@ -475,5 +517,62 @@ mod tests {
             panic!("a missing file is an Err");
         };
         assert!(said.contains("/nowhere/that/exists/evidence.bin"), "{said}");
+    }
+
+    #[test]
+    fn parse_hour_minute_tolerates_a_trailing_newline_and_rejects_garbage() {
+        assert_eq!(parse_hour_minute("07:05\n"), Some((7, 5)));
+        assert_eq!(parse_hour_minute("24:00"), None);
+        assert_eq!(parse_hour_minute(""), None);
+        assert_eq!(parse_hour_minute("resets 5pm"), None);
+    }
+
+    fn shifted(epoch: u64, offset_minutes: i64) -> (u32, u32) {
+        let (_, _, _, h, mi, _) = civil(epoch);
+        let total = ((h as i64) * 60 + mi as i64 + offset_minutes).rem_euclid(1440);
+        ((total / 60) as u32, (total % 60) as u32)
+    }
+
+    #[test]
+    fn local_hour_minute_reads_the_injected_zone_not_utc() {
+        let e1 = now_epoch();
+        let Some(got) = local_hour_minute(Some("GRD-3")) else {
+            return;
+        };
+        let e2 = now_epoch();
+        assert!(
+            got == shifted(e1, 180) || got == shifted(e2, 180),
+            "{got:?} vs e1={:?} e2={:?}",
+            shifted(e1, 180),
+            shifted(e2, 180)
+        );
+    }
+
+    #[test]
+    fn local_hour_minute_at_zero_offset_pins_only_the_zone_moving() {
+        let e1 = now_epoch();
+        let Some(got) = local_hour_minute(Some("UTC0")) else {
+            return;
+        };
+        let e2 = now_epoch();
+        assert!(
+            got == shifted(e1, 0) || got == shifted(e2, 0),
+            "{got:?} vs e1={:?} e2={:?}",
+            shifted(e1, 0),
+            shifted(e2, 0)
+        );
+    }
+
+    #[test]
+    fn local_or_utc_falls_back_to_the_civil_utc_reading() {
+        let e1 = now_epoch();
+        let got = local_or_utc(None);
+        let e2 = now_epoch();
+        assert!(
+            got == shifted(e1, 0) || got == shifted(e2, 0),
+            "{got:?} vs e1={:?} e2={:?}",
+            shifted(e1, 0),
+            shifted(e2, 0)
+        );
     }
 }
