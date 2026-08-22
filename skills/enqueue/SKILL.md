@@ -15,6 +15,18 @@ parses the template's own example table through that parser — so a required ro
 side turns `just verify` red. A change to either still belongs in the same diff: the test catches
 a rename, not a meaning that drifted.
 
+## 0. A drafted Job from the proposal queue fills the table first
+
+Reflect drafts follow-up Jobs from a finished Run's residuals as complete issue bodies —
+template rows filled, done predicate stated, Handoff SHA proposed — parked under that Run's
+`stages/reflect/jobs/` and surfaced on the serve roster. When the human points at one ("enqueue
+the drafted Job", a pasted draft path), read the draft and let it pre-fill every row the steps
+below would derive or ask for; each step then only *verifies* its row against the current world
+(the proposed Handoff SHA may have aged, the branch may since exist). Nothing changes about
+authority: the human still reads the full body before anything is filed, and nothing dispatches
+on its own — the draft lowers the cost of the next unit of work to reading it, which is all it
+is for.
+
 ## 1. Derive everything you can
 
 ```sh
