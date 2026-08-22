@@ -65,16 +65,13 @@ pub fn run() -> i32 {
         ["status"] => status_roster(),
         ["status", run_id] => status_one(run_id),
         ["doctor"] => doctor(),
+        // **Before** the generic fallthrough, for the same reason `resume --all` is: slice
+        // patterns match by position, so unparsed flags would otherwise be read as tokens of
+        // an unknown command instead of parsed.
+        ["serve", rest @ ..] => serve_dashboard(rest),
         // No `list`. A bare status that resolves to one Run is Grind selecting, and the repair
         // *"pick the one in flight"* would pick a zombie.
-        other => {
-            print_err(&render::refusal(&format!(
-                "unknown command: {}",
-                other.join(" ")
-            )));
-            print(USAGE);
-            INCOHERENT_INPUT
-        }
+        other => refuse(&format!("unknown command: {}", other.join(" "))),
     }
 }
 
@@ -86,6 +83,7 @@ const USAGE: &str = "grind — dispatch and supervise headless `lfg` Runs agains
     grind cleared <run-id> <note>   record what changed on a Run a Blocker stopped
     grind status [run-id]   roster when bare; one Run's live view when named
     grind doctor            check the provisioned-host list
+    grind serve [--bind <addr>] [--port <n>]   serve the dashboard — pull-only; writes nothing
     grind --version         which copy of the binary is this
 ";
 
@@ -244,6 +242,61 @@ fn observe_for(found: &view::RunView) -> observe::Observation {
         &found.job.handoff_sha,
         world::now_iso(),
     )
+}
+
+// --- serve -------------------------------------------------------------------------------------
+
+/// Serve the dashboard. The kernel prints its own startup line; `Ok` here only means it
+/// answered until the operator stopped it, and a bind failure leaves in the could-not-answer
+/// register — never a verdict about any Run.
+fn serve_dashboard(rest: &[&str]) -> i32 {
+    let (host, port) = match serve_flags(rest) {
+        Ok(parsed) => parsed,
+        Err(said) => return refuse(&said),
+    };
+    let Some(home) = world::home() else {
+        print_err(&render::refusal("$HOME is unset"));
+        return INCOHERENT_INPUT;
+    };
+    match crate::serve::serve(&home, &host, port) {
+        Ok(()) => Observability::Answered.code(),
+        Err(said) => {
+            print_err(&said);
+            Observability::CouldNotAnswer.code()
+        }
+    }
+}
+
+/// Parse `--bind <addr>` and `--port <n>` in any order, each taking one value. Anything else
+/// is incoherent input, and the refusal names what was incoherent.
+fn serve_flags(rest: &[&str]) -> Result<(String, u16), String> {
+    let mut host = "127.0.0.1".to_string();
+    let mut port: u16 = 7800;
+    let mut flags = rest.iter();
+    while let Some(flag) = flags.next() {
+        match *flag {
+            "--bind" => match flags.next() {
+                Some(addr) => host = (*addr).to_string(),
+                None => return Err("--bind needs an address".to_string()),
+            },
+            "--port" => match flags.next() {
+                Some(value) => match value.parse::<u16>() {
+                    Ok(parsed) => port = parsed,
+                    Err(_) => return Err(format!("--port must be a port number, not `{value}`")),
+                },
+                None => return Err("--port needs a port number".to_string()),
+            },
+            other => return Err(format!("unknown flag: {other}")),
+        }
+    }
+    Ok((host, port))
+}
+
+/// The shared refusal path: stderr, USAGE, exit 2.
+fn refuse(said: &str) -> i32 {
+    print_err(&render::refusal(said));
+    print(USAGE);
+    INCOHERENT_INPUT
 }
 
 // --- doctor -------------------------------------------------------------------------------------
@@ -475,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn the_surface_is_seven_shapes_and_none_of_them_is_list() {
+    fn the_surface_is_eight_shapes_and_none_of_them_is_list() {
         // A bare status that resolves to one Run is Grind selecting, and the repair
         // "pick the one in flight" would pick a zombie.
         assert!(!USAGE.contains("grind list"));
@@ -486,16 +539,56 @@ mod tests {
             "grind resume --all",
             "grind cleared <run-id> <note>",
             "grind status [run-id]",
+            "grind serve [--bind <addr>] [--port <n>]",
             "grind doctor",
             "grind --version",
         ] {
             assert!(USAGE.contains(shape), "the surface must name {shape}");
         }
         assert!(USAGE.contains("roster when bare"));
+        assert!(USAGE.contains("pull-only"));
         // Not a boot verb — that names a command after its caller. Not a bare `resume` either:
         // a typo would mutate every branch on the host.
         assert!(!USAGE.contains("grind boot"));
         assert!(!USAGE.contains("grind resume\n"));
+    }
+
+    #[test]
+    fn serve_flags_default_to_loopback_and_7800() {
+        assert_eq!(serve_flags(&[]), Ok(("127.0.0.1".to_string(), 7800)));
+    }
+
+    #[test]
+    fn serve_flags_parse_in_any_order() {
+        assert_eq!(
+            serve_flags(&["--port", "8000"]),
+            Ok(("127.0.0.1".to_string(), 8000))
+        );
+        assert_eq!(
+            serve_flags(&["--bind", "0.0.0.0"]),
+            Ok(("0.0.0.0".to_string(), 7800))
+        );
+        assert_eq!(
+            serve_flags(&["--port", "8000", "--bind", "0.0.0.0"]),
+            Ok(("0.0.0.0".to_string(), 8000))
+        );
+        assert_eq!(
+            serve_flags(&["--bind", "0.0.0.0", "--port", "8000"]),
+            Ok(("0.0.0.0".to_string(), 8000))
+        );
+    }
+
+    #[test]
+    fn serve_flags_refuse_the_incoherent_and_name_the_flag() {
+        assert!(serve_flags(&["--verbose"]).is_err());
+        assert!(serve_flags(&["runs.json"]).is_err());
+        let said = serve_flags(&["--port", "not-a-port"]).unwrap_err();
+        assert!(
+            said.contains("--port"),
+            "the refusal must name the flag: {said}"
+        );
+        assert!(serve_flags(&["--port"]).is_err());
+        assert!(serve_flags(&["--bind"]).is_err());
     }
 
     #[test]

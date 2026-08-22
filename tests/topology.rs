@@ -105,6 +105,50 @@ fn environment_access_is_named_in_exactly_one_module_and_it_is_world() {
     );
 }
 
+/// Sockets join the named-here-only list as an amendment, not an exception: the listener is
+/// `serve`'s essence (KTD3), and wrapping it in `world` would drag stream I/O through ceremony
+/// without making anything testable (ADR-0014).
+#[test]
+fn socket_access_is_named_in_serve_only() {
+    let offenders = files_naming(&sources(), "std::net");
+    assert_eq!(
+        offenders,
+        vec!["serve.rs".to_string()],
+        "`std::net` must be named in src/serve.rs only; found it in {offenders:?}"
+    );
+}
+
+/// The UI never writes (ADR-0013; #23): the served surface — kernel, pages, and embedded
+/// assets alike — may not name the record's write side, so a mutation route cannot arrive by
+/// import and a save cannot hide inside a string constant.
+#[test]
+fn the_server_never_names_the_write_side() {
+    let sources = sources();
+    for banned in [
+        "RunRecord",
+        "push_attempt",
+        "push_clearance",
+        "::save",
+        "dispatch(",
+    ] {
+        let offenders: Vec<String> = ["serve.rs", "page.rs", "style.rs", "script.rs"]
+            .iter()
+            .filter(|name| {
+                sources
+                    .iter()
+                    .find(|(n, _)| n == *name)
+                    .is_some_and(|(_, contents)| code_only(contents).contains(banned))
+            })
+            .map(|name| name.to_string())
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "`{banned}` is the write side; the served surface must never name it — \
+             found in {offenders:?}"
+        );
+    }
+}
+
 /// **Grind adds, never classifies** (ADR-0012). A comment is additive and ungoverned; a label,
 /// an assignee, a project and a milestone are shared namespaces the target repo's owner
 /// governs. `QUEUE_LABEL` erased a triage fact — `ready-for-agent`, one of the five canonical
