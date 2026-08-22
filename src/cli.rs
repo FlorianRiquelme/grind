@@ -76,7 +76,7 @@ pub fn run() -> i32 {
     }
 }
 
-const USAGE: &str = "grind — dispatch and supervise headless `lfg` Runs against a Job.
+const USAGE: &str = "grind — dispatch and supervise headless Runs against a Job.
 
     grind run <issue>       dispatch a Job now (issue number or URL)
     grind resume <run-id>   re-enter a Run that died

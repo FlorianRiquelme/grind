@@ -4,13 +4,23 @@ Round 4, after grilling. Round 3 designed a pipeline. The pipeline already exist
 almost all of round 3 was superseded by reading `lfg`. What is left is smaller, better
 defined, and unbuilt by anyone.
 
+*(Superseded 2026-08-22: ADR-0015 retired the plugin and superseded ADR-0001 — the
+pipeline-consumption premise ended, and Grind owns a ten-stage ladder of its own, resolving
+[#92](https://github.com/FlorianRiquelme/grind/issues/92) and landed as PR #98.)*
+
 See [`STRATEGY.md`](./STRATEGY.md) for who this is for and what it optimises,
 [`CONTEXT.md`](./CONTEXT.md) for vocabulary, and [`docs/adr/`](./docs/adr/) for the twelve
 accepted decisions that carry lock-in.
 
+*(Corrected 2026-08-22: fifteen accepted decisions — ADR-0013 through ADR-0015 landed since
+that count was written.)*
+
 ## What this is
 
 **A queue, unattended dispatch, a supervisor, and a record around headless `lfg` runs.**
+
+*(Corrected 2026-08-22 by ADR-0015: a queue, a supervisor and a record around headless runs of
+Grind's **own stage ladder** — not headless `lfg` runs, which retired with the plugin.)*
 
 It exists to make progress on work the human cannot sit with — meetings, travel, sleep,
 anything. The input is a plan good enough to act on, which their day sessions already
@@ -19,6 +29,10 @@ produce. The output is an open PR and a room to talk about it in.
 ## What this is not
 
 - **Not a pipeline.** `lfg` is the pipeline. See ADR-0001.
+  *(Inverted 2026-08-22 by ADR-0015, resolving
+  [#92](https://github.com/FlorianRiquelme/grind/issues/92): Grind owns the pipeline — its own
+  ten-rung ladder — and this bullet has read backwards since. The never-gate ruling survives it
+  unchanged; see ADR-0003.)*
 - **Not a quality gate.** It hands off at an open PR and never asserts readiness. See
   ADR-0003.
 - **Not nocturnal.** "Night" is one possible dispatch trigger. Nothing in the design is
@@ -80,6 +94,14 @@ the only moment someone is there to notice.
 if the resilience layer is built from the thing that gets rate-limited, it loses its own
 state exactly when that matters. Agent orchestration happens *inside* `lfg` stages, where a
 death costs one stage rather than the job.
+
+*(Corrected 2026-08-22 by ADR-0015, resolving
+[#92](https://github.com/FlorianRiquelme/grind/issues/92): nothing invokes `lfg` any more. A Run
+executes Grind's own ladder — ten stages, Plan through Ship, one Attempt per stage session with
+its own authored skill text. Completion is supervisor observation of durable return files
+(`stages/<name>.return.json`); advancement is the total pure function `rung::next`; a death
+re-enters only the stage that died. Triage and DiffTriage are zero-token Rust passes that size
+later stages into tiers T0–T3, escalation-only and fail-closed to T2.)*
 
 What the supervisor owns:
 
@@ -158,6 +180,10 @@ does not.
 | Co-designing with `svo-engineering-guidelines` | Both are PoCs. Coupling two PoCs slows both. It plugs in when it is ready, on its own schedule |
 | Per-night digest, cockpit, HTML rendering | Channels do the surfacing |
 
+*(Corrected 2026-08-22: the first three rows cut against a pipeline Grind refused to build
+because `lfg` already owned it. It arrived anyway as its own ladder once lfg's shape cost proved
+real ([docs/findings/0004](./docs/findings/0004-fourth-run.md)); the rows stand as written.)*
+
 ## Still open
 
 1. **Learnings across runs.** Correctly deferred — it is downstream of having runs to read.
@@ -189,3 +215,10 @@ specified* patches on [#5](https://github.com/FlorianRiquelme/grind/issues/5) ea
 their named revisit condition, and the next evidence comes from real Jobs — with the
 provisioned remote host ([docs/provisioned-host.md](./docs/provisioned-host.md)) the
 least-exercised surface left.
+
+**Where this stands, 2026-08-22.** Four dogfood Runs are recorded under
+[docs/findings/](./docs/findings/) — Run 4 measured the `lfg` mega-session shape cost ($132.98,
+spent to that shape rather than to its own work), and ADR-0015 is the answer: the cutover to
+Grind's own ten-stage ladder, resolving
+[#92](https://github.com/FlorianRiquelme/grind/issues/92) via PR #98. The leg-1 framing above
+predates the cutover.
