@@ -407,6 +407,8 @@ fn sandbox(name: &str) -> Sandbox {
             "url": format!("https://github.com/{OWNER}/{NAME}/pull/30"),
             "state": "OPEN",
             "isDraft": false,
+            "headRefName": BRANCH,
+            "baseRefName": "main",
         })
         .to_string(),
     )

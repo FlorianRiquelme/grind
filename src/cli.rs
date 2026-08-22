@@ -240,6 +240,8 @@ fn observe_for(found: &view::RunView) -> observe::Observation {
     view::observe_fresh(
         Path::new(&found.worktree),
         &found.job.handoff_sha,
+        &found.job.branch,
+        &found.job.base_branch,
         world::now_iso(),
     )
 }

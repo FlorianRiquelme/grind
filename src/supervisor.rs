@@ -643,8 +643,13 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
         record.save(&path)?;
 
         let stop = loop {
-            let observation =
-                crate::view::observe_fresh(&worktree, &record.job.handoff_sha, world::now_iso());
+            let observation = crate::view::observe_fresh(
+                &worktree,
+                &record.job.handoff_sha,
+                &record.job.branch,
+                &record.job.base_branch,
+                world::now_iso(),
+            );
             // The progress window advances once per working Attempt, and only ever forward.
             let working_now = attempt::working(record.attempts());
             if working_now > working_seen {

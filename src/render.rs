@@ -817,6 +817,8 @@ mod tests {
                 url: "https://github.com/FlorianRiquelme/snapper/pull/30".to_string(),
                 state: "OPEN".to_string(),
                 is_draft: false,
+                head_ref: "feat/x".to_string(),
+                base_ref: "main".to_string(),
             }),
             checks_pending: Observed::Present(false),
             checks_red: Observed::Present(false),
@@ -831,6 +833,8 @@ mod tests {
                 commits: 0,
                 overlapping: vec![],
             }),
+            pr_head_matches_job_branch: Observed::Present(true),
+            pr_base_matches_declared: Observed::Present(true),
         }
     }
 
@@ -1208,6 +1212,8 @@ mod tests {
             url: "https://github.com/o/n/pull/30".to_string(),
             state: "OPEN".to_string(),
             is_draft: true,
+            head_ref: "feat/x".to_string(),
+            base_ref: "main".to_string(),
         });
         assert!(handed_back(&draft, &Verdict::Completed).contains("draft"));
     }
@@ -1676,6 +1682,8 @@ mod tests {
             url: "https://github.com/FlorianRiquelme/snapper/pull/30".to_string(),
             state: "OPEN".to_string(),
             is_draft: true,
+            head_ref: "feat/x".to_string(),
+            base_ref: "main".to_string(),
         });
         let marked_up = commented(&draft, &Verdict::Completed);
         assert!(

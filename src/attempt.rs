@@ -6,6 +6,7 @@
 
 use crate::job::Job;
 use crate::observe::{Observed, Reason};
+use crate::rung;
 use crate::world;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -82,6 +83,252 @@ pub const DENIED_TOOLS: [&str; 26] = [
     // remote branch through the API the `gh pr merge`/`gh api*merge*` globs leave open.
     "Bash(gh api*DELETE*)",
 ];
+
+/// Write-capable Bash forms denied on the two fan-out panels (`Review`, `Validate`) and on
+/// Reflect: none of the three ever touches a worktree, and denying `Write`/`Edit` alone does not
+/// reach a shell command that mutates one the same way. `git push*` is denied outright — a panel
+/// or Reflect never pushes.
+const PANEL_BASH_FORMS: [&str; 10] = [
+    "Bash(git commit*)",
+    "Bash(git add*)",
+    "Bash(git apply*)",
+    "Bash(git stash*)",
+    "Bash(mv *)",
+    "Bash(cp *)",
+    "Bash(rm *)",
+    "Bash(tee *)",
+    "Bash(sed -i*)",
+    "Bash(git push*)",
+];
+
+/// The denial set for one of the ten ladder stages. **The base list always, verbatim, never
+/// filtered** — widening only, never narrowing. Report-only stages (`PlanReview`, `Review`,
+/// `Validate`) additionally deny `Write` and `Edit`; the two fan-out panels (`Review`,
+/// `Validate`) further deny the write-capable Bash forms above, since a panel session's sandbox
+/// — not its prompt — is what makes "touches nothing" true. `Plan`, `Triage`, `Work`,
+/// `Simplify`, `DiffTriage`, `Fixes` and `Ship` carry the base list only: they are the stages
+/// that write the worktree (or, for the two in-process `[R]` passes, write nothing at all).
+pub fn denied_for(stage: rung::Stage) -> Vec<String> {
+    use rung::Stage::{PlanReview, Review, Validate};
+    let mut denials: Vec<String> = DENIED_TOOLS.iter().map(|s| s.to_string()).collect();
+    if matches!(stage, PlanReview | Review | Validate) {
+        denials.push("Write".to_string());
+        denials.push("Edit".to_string());
+    }
+    if matches!(stage, Review | Validate) {
+        denials.extend(PANEL_BASH_FORMS.iter().map(|s| s.to_string()));
+    }
+    denials
+}
+
+/// Reflect is not a rung on the ladder — [`rung::Stage`] has no variant for it — and it is
+/// report-only like the two panels, but it must still write its own artifacts under
+/// `<stages-dir>/reflect/`, which a `Write`/`Edit` denial would block. Its worktree protection is
+/// instead the write-capable Bash-form denials above (plus `git push*` outright), backed by
+/// dispatching it with the *run* directory as cwd rather than the *worktree* (unit C's job, noted
+/// here since this is where the sandbox story is decided) — so there is no repo tree under this
+/// session for `Write`/`Edit` to touch in the first place.
+pub fn denied_for_reflect() -> Vec<String> {
+    let mut denials: Vec<String> = DENIED_TOOLS.iter().map(|s| s.to_string()).collect();
+    denials.extend(PANEL_BASH_FORMS.iter().map(|s| s.to_string()));
+    denials
+}
+
+/// `<run>-<stage>`, the session id a stage's own Attempt dispatches or resumes. Re-entry resumes
+/// the dying *stage's* session, never the Run's old mega-session.
+pub fn stage_session_id(run_id: &str, stage: rung::Stage) -> String {
+    format!("{run_id}-{stage}")
+}
+
+/// What a stage invocation needs beyond a session id and a binary path: the stage itself, its
+/// skill text (read by the caller through `world` and handed in as `&str`, so this stays pure),
+/// where its returns and artifacts go, the worktree it runs in, the Job rows it is dispatched
+/// against, and the model this Run's tier resolved for it. `notes` is Plan-only injected
+/// notes/lessons text; every other stage leaves it `None` and it is never rendered.
+#[derive(Debug, Clone, Copy)]
+pub struct StageContext<'a> {
+    pub stage: rung::Stage,
+    pub skill_text: &'a str,
+    pub stages_dir: &'a str,
+    pub worktree: &'a str,
+    pub job: &'a Job,
+    pub model: Option<&'a str>,
+    pub notes: Option<&'a str>,
+}
+
+/// The two facts a stage invocation needs that [`Conditions`] does not carry the right shape
+/// for: a stage invocation names no plugin (ADR-0015 retires the pin the moment nothing left
+/// invokes it), so this is not `Conditions` with a field ignored — it is the narrower thing a
+/// stage argv actually is.
+#[derive(Debug, Clone, Copy)]
+pub struct StageConditions<'a> {
+    pub claude_bin: &'a str,
+    pub run_id: &'a str,
+}
+
+/// Resumed mid-stage, told to pick up its own return rather than the Run's — the stage-level
+/// sibling of [`REENTRY_PROMPT`]. Each stage owns its own session, so "the pipeline" of the old
+/// prompt narrows to "this stage".
+pub const STAGE_REENTRY_PROMPT: &str = "You were interrupted mid-stage and have just been resumed.
+
+Re-read this stage's own return file and the working tree to establish what you had already
+done, then continue this stage from where it left off. Do not restart work this stage already
+completed, and do not redo a stage the ladder has already advanced past.
+
+Everything in the original instruction still applies — especially: never weaken, trim or
+skip a step of `just verify` to make it pass.";
+
+/// The first Attempt for a stage, opening that stage's own session.
+pub fn stage_dispatch(conditions: &StageConditions, ctx: &StageContext) -> Invocation {
+    build_stage(conditions, ctx, Mode::Dispatch, stage_dispatch_prompt(ctx))
+}
+
+/// A later Attempt for a stage, resuming that stage's own session — never the Run's.
+pub fn stage_resume(
+    conditions: &StageConditions,
+    ctx: &StageContext,
+    cleared: Option<&Clearance>,
+) -> Invocation {
+    build_stage(
+        conditions,
+        ctx,
+        Mode::Resume,
+        stage_resume_prompt(ctx, cleared),
+    )
+}
+
+/// The composition unit C's loop calls once it has decided a stage's next Attempt is Dispatch or
+/// Resume. `Mode::CiBabysit` never routes here: Ship's babysit round continues `<run>-ship`'s own
+/// session through the existing [`ci_babysit`] builder, not a fresh stage composition — there is
+/// no stage-shaped babysit prompt to build.
+pub fn stage_invocation(
+    conditions: &StageConditions,
+    ctx: &StageContext,
+    mode: Mode,
+    cleared: Option<&Clearance>,
+) -> Invocation {
+    match mode {
+        Mode::Dispatch => stage_dispatch(conditions, ctx),
+        Mode::Resume => stage_resume(conditions, ctx, cleared),
+        Mode::CiBabysit => {
+            unreachable!("babysit continues Ship's session via `ci_babysit`, never a fresh stage")
+        }
+    }
+}
+
+fn build_stage(
+    conditions: &StageConditions,
+    ctx: &StageContext,
+    mode: Mode,
+    prompt: String,
+) -> Invocation {
+    let session_id = stage_session_id(conditions.run_id, ctx.stage);
+    let mut argv = vec![
+        conditions.claude_bin.to_string(),
+        "-p".to_string(),
+        "--output-format".to_string(),
+        "json".to_string(),
+        "--permission-mode".to_string(),
+        "bypassPermissions".to_string(),
+    ];
+    if let Some(model) = ctx.model {
+        argv.push("--model".to_string());
+        argv.push(model.to_string());
+    }
+    match mode {
+        Mode::Dispatch => {
+            argv.push("--session-id".to_string());
+            argv.push(session_id);
+        }
+        Mode::Resume | Mode::CiBabysit => {
+            argv.push("--resume".to_string());
+            argv.push(session_id);
+        }
+    }
+    // No `--plugin-dir`: a stage invocation names no plugin.
+    // No `--max-budget-usd`, same reason as the mega-session builder: ADR-0010.
+    argv.push("--disallowedTools".to_string());
+    argv.extend(denied_for(ctx.stage));
+    Invocation { argv, prompt, mode }
+}
+
+/// The skill text verbatim, then a bounded context block naming what the skill's own prose
+/// cannot know until dispatch: where this Run's returns and artifacts go, which worktree it
+/// runs in, and the Job rows the skill leans on (branch, base branch, verify entrypoint, done
+/// predicate, Anchor). Plan alone also carries injected notes/lessons.
+fn stage_dispatch_prompt(ctx: &StageContext) -> String {
+    format!(
+        "{skill}\n\n---\n\n{context}{notes}",
+        skill = ctx.skill_text,
+        context = stage_context_block(ctx),
+        notes = plan_notes_block(ctx),
+    )
+}
+
+/// The same bundle, with the stage-level re-entry paragraph (and, when one was recorded, the
+/// latest clearance note) composed after the context block.
+fn stage_resume_prompt(ctx: &StageContext, cleared: Option<&Clearance>) -> String {
+    format!(
+        "{skill}\n\n---\n\n{context}\n\n{reentry}{clearance}{notes}",
+        skill = ctx.skill_text,
+        context = stage_context_block(ctx),
+        reentry = STAGE_REENTRY_PROMPT,
+        clearance = stage_clearance_paragraph(cleared),
+        notes = plan_notes_block(ctx),
+    )
+}
+
+/// **Default is silence**, the same rule the mega-session's `reentry_prompt` follows: with no
+/// note the paragraph renders as nothing, and the latest clearance is framed as an account to
+/// check against what the stage now observes, never as current fact to trust blind.
+fn stage_clearance_paragraph(cleared: Option<&Clearance>) -> String {
+    match cleared {
+        Some(clearance) => format!(
+            "\n\nSince you stopped, the human reports (recorded {at}): {note}\n\nThat is their \
+             account of what changed in the world, from the moment it was recorded. Check it \
+             against what you now observe: do not spend turns re-probing an obstacle the note \
+             says is cleared and the world confirms — but where the world in front of you \
+             contradicts the note, trust what you observe and say so plainly.",
+            at = clearance.cleared_at,
+            note = clearance.note,
+        ),
+        None => String::new(),
+    }
+}
+
+fn stage_context_block(ctx: &StageContext) -> String {
+    format!(
+        "Stage:             {stage}
+Stages directory:  {stages_dir}
+Worktree:          {worktree}
+Job branch:        {branch}
+Job base branch:   {base_branch}
+Verify entrypoint: {verify}
+Done predicate:    {done}
+Anchor artifact:   {anchor}
+
+Every return and artifact this stage writes belongs under the stages directory named above,
+never elsewhere.",
+        stage = ctx.stage,
+        stages_dir = ctx.stages_dir,
+        worktree = ctx.worktree,
+        branch = ctx.job.branch,
+        base_branch = ctx.job.base_branch,
+        verify = ctx.job.verify_entrypoint,
+        done = ctx.job.done_predicate,
+        anchor = ctx.job.anchor,
+    )
+}
+
+/// **Default is silence**, Plan-only: every other stage leaves `notes` `None` and this renders
+/// nothing for it regardless of what is passed, since only Plan's dispatch prompt injects notes
+/// and lessons the caller gathered ahead of composition.
+fn plan_notes_block(ctx: &StageContext) -> String {
+    match (ctx.stage, ctx.notes) {
+        (rung::Stage::Plan, Some(notes)) => format!("\n\nNotes and lessons for this Run:\n{notes}"),
+        _ => String::new(),
+    }
+}
 
 /// Re-entry rides Claude Code's own session resume, not an `lfg` return value: `lfg` exposes no
 /// structured return to its caller. Resuming the session restores which stage it was on; this
@@ -1583,5 +1830,269 @@ mod tests {
             serde_json::to_string(&Mode::CiBabysit).unwrap(),
             "\"ci-babysit\""
         );
+    }
+
+    // --- stage invocations ---------------------------------------------------------------------
+
+    const ALL_STAGES: [rung::Stage; 10] = [
+        rung::Stage::Plan,
+        rung::Stage::Triage,
+        rung::Stage::PlanReview,
+        rung::Stage::Work,
+        rung::Stage::Simplify,
+        rung::Stage::DiffTriage,
+        rung::Stage::Review,
+        rung::Stage::Validate,
+        rung::Stage::Fixes,
+        rung::Stage::Ship,
+    ];
+
+    fn stage_conditions() -> StageConditions<'static> {
+        StageConditions {
+            claude_bin: "/home/op/.grind/bin/claude",
+            run_id: "run-20260822-001",
+        }
+    }
+
+    fn stage_ctx<'a>(
+        stage: rung::Stage,
+        job: &'a Job,
+        model: Option<&'a str>,
+        notes: Option<&'a str>,
+    ) -> StageContext<'a> {
+        StageContext {
+            stage,
+            skill_text: "# Work\n\nDo the work and write the return.",
+            stages_dir: "/home/op/.grind/runs/run-20260822-001/stages",
+            worktree: "/home/op/.grind/runs/run-20260822-001/worktree",
+            job,
+            model,
+            notes,
+        }
+    }
+
+    #[test]
+    fn stage_session_ids_are_run_id_dash_stage_for_all_ten_stages() {
+        for stage in ALL_STAGES {
+            assert_eq!(
+                stage_session_id("run-1", stage),
+                format!("run-1-{stage}"),
+                "{stage}"
+            );
+        }
+        assert_eq!(stage_session_id("run-1", rung::Stage::Work), "run-1-work");
+    }
+
+    #[test]
+    fn a_stage_dispatch_opens_that_stages_own_session_with_no_plugin_flag() {
+        let job = job();
+        let ctx = stage_ctx(rung::Stage::Work, &job, None, None);
+        let invocation = stage_dispatch(&stage_conditions(), &ctx);
+        let argv = invocation.argv();
+        assert!(argv.contains(&"--session-id".to_string()));
+        let at = argv.iter().position(|a| a == "--session-id").unwrap();
+        assert_eq!(argv[at + 1], "run-20260822-001-work");
+        assert!(!argv.contains(&"--resume".to_string()));
+        assert!(!argv.contains(&"--plugin-dir".to_string()));
+    }
+
+    #[test]
+    fn a_stage_resume_resumes_that_stages_own_session_with_no_plugin_flag() {
+        let job = job();
+        let ctx = stage_ctx(rung::Stage::Review, &job, None, None);
+        let invocation = stage_resume(&stage_conditions(), &ctx, None);
+        let argv = invocation.argv();
+        assert!(argv.contains(&"--resume".to_string()));
+        let at = argv.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(argv[at + 1], "run-20260822-001-review");
+        assert!(!argv.contains(&"--session-id".to_string()));
+        assert!(!argv.contains(&"--plugin-dir".to_string()));
+    }
+
+    #[test]
+    fn a_stage_model_puts_the_model_flag_on_the_argv_and_absence_omits_it() {
+        let job = job();
+        let with_model = stage_ctx(rung::Stage::Ship, &job, Some("claude-opus-5"), None);
+        let invocation = stage_dispatch(&stage_conditions(), &with_model);
+        assert!(
+            invocation
+                .argv()
+                .windows(2)
+                .any(|w| w[0] == "--model" && w[1] == "claude-opus-5")
+        );
+
+        let without_model = stage_ctx(rung::Stage::Ship, &job, None, None);
+        let invocation = stage_dispatch(&stage_conditions(), &without_model);
+        assert!(!invocation.argv().contains(&"--model".to_string()));
+    }
+
+    #[test]
+    fn stage_invocation_routes_dispatch_and_resume_and_refuses_ci_babysit() {
+        let job = job();
+        let ctx = stage_ctx(rung::Stage::Fixes, &job, None, None);
+        let dispatched = stage_invocation(&stage_conditions(), &ctx, Mode::Dispatch, None);
+        assert_eq!(dispatched.mode(), Mode::Dispatch);
+        let resumed = stage_invocation(&stage_conditions(), &ctx, Mode::Resume, None);
+        assert_eq!(resumed.mode(), Mode::Resume);
+    }
+
+    #[test]
+    #[should_panic(expected = "babysit continues Ship's session")]
+    fn stage_invocation_panics_on_ci_babysit() {
+        let job = job();
+        let ctx = stage_ctx(rung::Stage::Ship, &job, None, None);
+        let _ = stage_invocation(&stage_conditions(), &ctx, Mode::CiBabysit, None);
+    }
+
+    #[test]
+    fn a_stage_prompt_carries_the_skill_text_verbatim_and_the_bounded_context() {
+        let job = job();
+        let ctx = stage_ctx(rung::Stage::Work, &job, None, None);
+        let prompt = stage_dispatch(&stage_conditions(), &ctx)
+            .prompt()
+            .to_string();
+        assert!(prompt.contains(ctx.skill_text));
+        assert!(prompt.contains(ctx.stages_dir));
+        assert!(prompt.contains(ctx.worktree));
+        assert!(prompt.contains(&job.branch));
+        assert!(prompt.contains(&job.base_branch));
+        assert!(prompt.contains(&job.verify_entrypoint));
+        assert!(prompt.contains(&job.done_predicate));
+        assert!(prompt.contains(&job.anchor));
+    }
+
+    #[test]
+    fn a_stage_resume_prompt_carries_the_stage_reentry_paragraph_and_no_dispatch_does() {
+        let job = job();
+        let ctx = stage_ctx(rung::Stage::Work, &job, None, None);
+        let resumed = stage_resume(&stage_conditions(), &ctx, None)
+            .prompt()
+            .to_string();
+        assert!(resumed.contains("Re-read this stage's own return file"));
+
+        let dispatched = stage_dispatch(&stage_conditions(), &ctx)
+            .prompt()
+            .to_string();
+        assert!(!dispatched.contains("Re-read this stage's own return file"));
+    }
+
+    #[test]
+    fn a_stage_resume_prompt_carries_the_latest_clearance_when_given_and_nothing_otherwise() {
+        let job = job();
+        let ctx = stage_ctx(rung::Stage::Fixes, &job, None, None);
+        let note = "the CI runner was fixed";
+        let cleared = a_clearance(note);
+        let with_note = stage_resume(&stage_conditions(), &ctx, Some(&cleared))
+            .prompt()
+            .to_string();
+        assert!(with_note.contains("Since you stopped, the human reports"));
+        assert!(with_note.contains(note));
+
+        let without_note = stage_resume(&stage_conditions(), &ctx, None)
+            .prompt()
+            .to_string();
+        assert!(!without_note.contains("Since you stopped, the human reports"));
+    }
+
+    #[test]
+    fn plan_alone_injects_notes_and_lessons_into_its_dispatch_prompt() {
+        let job = job();
+        let notes = "the last Run mistook a Wait for a crash; watch for that.";
+        let plan_ctx = stage_ctx(rung::Stage::Plan, &job, None, Some(notes));
+        let plan_prompt = stage_dispatch(&stage_conditions(), &plan_ctx)
+            .prompt()
+            .to_string();
+        assert!(plan_prompt.contains(notes));
+
+        // The same notes text, offered to a non-Plan stage, is never rendered — only Plan reads
+        // `ctx.notes` at all.
+        let work_ctx = stage_ctx(rung::Stage::Work, &job, None, Some(notes));
+        let work_prompt = stage_dispatch(&stage_conditions(), &work_ctx)
+            .prompt()
+            .to_string();
+        assert!(!work_prompt.contains(notes));
+    }
+
+    #[test]
+    fn every_stage_denial_set_carries_the_full_base_list_verbatim() {
+        for stage in ALL_STAGES {
+            let denied = denied_for(stage);
+            for glob in DENIED_TOOLS {
+                assert!(
+                    denied.iter().any(|g| g == glob),
+                    "{stage} must carry {glob}"
+                );
+            }
+        }
+        let reflect = denied_for_reflect();
+        for glob in DENIED_TOOLS {
+            assert!(
+                reflect.iter().any(|g| g == glob),
+                "reflect must carry {glob}"
+            );
+        }
+    }
+
+    #[test]
+    fn report_only_stages_deny_write_and_edit_and_the_writing_stages_do_not() {
+        for stage in [
+            rung::Stage::PlanReview,
+            rung::Stage::Review,
+            rung::Stage::Validate,
+        ] {
+            let denied = denied_for(stage);
+            assert!(denied.contains(&"Write".to_string()), "{stage}");
+            assert!(denied.contains(&"Edit".to_string()), "{stage}");
+        }
+        for stage in [rung::Stage::Work, rung::Stage::Fixes, rung::Stage::Ship] {
+            let denied = denied_for(stage);
+            assert!(!denied.contains(&"Write".to_string()), "{stage}");
+            assert!(!denied.contains(&"Edit".to_string()), "{stage}");
+        }
+    }
+
+    #[test]
+    fn only_the_two_fan_out_panels_carry_the_write_capable_bash_forms() {
+        for stage in [rung::Stage::Review, rung::Stage::Validate] {
+            let denied = denied_for(stage);
+            for glob in PANEL_BASH_FORMS {
+                assert!(
+                    denied.iter().any(|g| g == glob),
+                    "{stage} must carry {glob}"
+                );
+            }
+        }
+        for stage in [
+            rung::Stage::Plan,
+            rung::Stage::Triage,
+            rung::Stage::PlanReview,
+            rung::Stage::Work,
+            rung::Stage::Simplify,
+            rung::Stage::DiffTriage,
+            rung::Stage::Fixes,
+            rung::Stage::Ship,
+        ] {
+            let denied = denied_for(stage);
+            assert!(
+                !denied.iter().any(|g| *g == "Bash(git commit*)"),
+                "{stage} must not carry a panel-only Bash form"
+            );
+        }
+    }
+
+    #[test]
+    fn reflect_carries_the_write_capable_bash_forms_but_not_write_or_edit() {
+        let reflect = denied_for_reflect();
+        for glob in PANEL_BASH_FORMS {
+            assert!(
+                reflect.iter().any(|g| g == glob),
+                "reflect must carry {glob}"
+            );
+        }
+        assert!(
+            !reflect.contains(&"Write".to_string()),
+            "reflect must still write its own artifacts"
+        );
+        assert!(!reflect.contains(&"Edit".to_string()));
     }
 }

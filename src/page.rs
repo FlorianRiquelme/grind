@@ -852,6 +852,8 @@ mod tests {
                 ledger_entries: Observed::Absent,
                 changed_files: Observed::Absent,
                 base_drift: Observed::Absent,
+                pr_head_matches_job_branch: Observed::Absent,
+                pr_base_matches_declared: Observed::Absent,
             },
             verdict: Verdict::Incomplete(Vec::new()),
             contract: VerifyContract {

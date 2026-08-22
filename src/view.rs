@@ -108,6 +108,8 @@ pub fn gather(home: &Path, run_id: &str) -> Option<Facts> {
     let observation = observe_fresh(
         Path::new(&found.worktree),
         &found.job.handoff_sha,
+        &found.job.branch,
+        &found.job.base_branch,
         world::now_iso(),
     );
     let signals = decide::signals_of(&observation);
@@ -659,9 +661,15 @@ pub fn fanout_counts(text: &str) -> Observed<(u64, u64)> {
 
 /// Observe a Run's durable artifacts fresh. **Reads and never writes** — this path observes and
 /// persists nothing, which is the whole difference from the script's `cmd_status`.
-pub fn observe_fresh(worktree: &Path, handoff_sha: &str, at: String) -> Observation {
+pub fn observe_fresh(
+    worktree: &Path,
+    handoff_sha: &str,
+    job_branch: &str,
+    declared_base: &str,
+    at: String,
+) -> Observation {
     let mut run = |argv: &[String]| world::run(argv, Some(worktree));
-    observe::observe_run(at, handoff_sha, &mut run)
+    observe::observe_run(at, handoff_sha, job_branch, declared_base, &mut run)
 }
 
 #[cfg(test)]

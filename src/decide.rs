@@ -1,7 +1,7 @@
-//! Which signals corroborate what — the furthest stage, and the four ANDed observations that
+//! Which signals corroborate what — the furthest stage, and the six ANDed observations that
 //! decide completion.
 //!
-//! **A fifth completion signal cannot be added and forgotten.** `RawSignals` is a named struct,
+//! **A seventh completion signal cannot be added and forgotten.** `RawSignals` is a named struct,
 //! so a new field is `E0063` at every constructor; the fold destructures it with no `..` and no
 //! `field: _`, so a new field is `E0027` there, and the binding it forces is then unused —
 //! which is an error under `cargo clippy -- -D warnings`. Two forced sites, neither needing a
@@ -149,7 +149,7 @@ fn covers(pattern: &str, path: &str) -> bool {
     path.ends_with(pattern)
 }
 
-/// The four observations completion is ANDed from.
+/// The six observations completion is ANDed from.
 ///
 /// A named struct rather than loose arguments so a new signal is `E0063` at every construction
 /// site. The verify contract is deliberately **not** among them: a precondition must not
@@ -160,6 +160,10 @@ pub struct RawSignals {
     pub tree_clean: Observed<bool>,
     pub commits_ahead: Observed<bool>,
     pub no_check_pending: Observed<bool>,
+    /// The found PR's head ref against the Job's `branch` row (Run 2's fix).
+    pub pr_head_matches_job_branch: Observed<bool>,
+    /// The found PR's base ref against the Job's `base_branch` row.
+    pub pr_base_matches_declared: Observed<bool>,
 }
 
 /// What happened. **Every variant describes what happened, never how good it was** — there is
@@ -231,6 +235,10 @@ pub fn signals_of(observation: &Observation) -> RawSignals {
             Observed::Absent => Observed::Present(true),
             Observed::Unobservable(reason) => Observed::Unobservable(reason.clone()),
         },
+        // Both already carry `observation.pr`'s own fold — no PR yet reads as `Present(false)`,
+        // never blind, mirroring `pr_open` above.
+        pr_head_matches_job_branch: observation.pr_head_matches_job_branch.clone(),
+        pr_base_matches_declared: observation.pr_base_matches_declared.clone(),
     }
 }
 
@@ -246,13 +254,17 @@ pub fn verdict(signals: &RawSignals, done_promise: bool) -> Verdict {
         tree_clean,
         commits_ahead,
         no_check_pending,
+        pr_head_matches_job_branch,
+        pr_base_matches_declared,
     } = signals;
 
-    let named: [(&str, &Observed<bool>); 4] = [
+    let named: [(&str, &Observed<bool>); 6] = [
         ("PR open", pr_open),
         ("tree clean", tree_clean),
         ("commits ahead", commits_ahead),
         ("no check pending", no_check_pending),
+        ("PR head matches Job branch", pr_head_matches_job_branch),
+        ("PR base matches declared branch", pr_base_matches_declared),
     ];
 
     let mut blind = Vec::new();
@@ -367,6 +379,8 @@ mod tests {
                 url: "https://github.com/o/n/pull/30".to_string(),
                 state: "OPEN".to_string(),
                 is_draft: false,
+                head_ref: "feat/x".to_string(),
+                base_ref: "main".to_string(),
             }),
             checks_pending: Observed::Present(false),
             checks_red: Observed::Present(false),
@@ -381,6 +395,8 @@ mod tests {
                 "src/lib.rs".to_string(),
             ]),
             base_drift: Observed::Unobservable(Reason::saying("not measured in this fixture")),
+            pr_head_matches_job_branch: Observed::Present(true),
+            pr_base_matches_declared: Observed::Present(true),
         }
     }
 
@@ -390,11 +406,13 @@ mod tests {
             tree_clean: Observed::Present(true),
             commits_ahead: Observed::Present(true),
             no_check_pending: Observed::Present(true),
+            pr_head_matches_job_branch: Observed::Present(true),
+            pr_base_matches_declared: Observed::Present(true),
         }
     }
 
     #[test]
-    fn four_present_and_true_signals_are_completed() {
+    fn six_present_and_true_signals_are_completed() {
         assert_eq!(verdict(&all_true(), false), Verdict::Completed);
         assert_eq!(verdict(&all_true(), true), Verdict::Completed);
     }
@@ -422,16 +440,18 @@ mod tests {
 
     #[test]
     fn a_could_not_observe_signal_never_contributes_a_true() {
-        // Every arrangement with a blind signal withholds the verdict, even when the three
+        // Every arrangement with a blind signal withholds the verdict, even when the other five
         // signals Grind *could* ask all looked satisfied.
-        for blind in 0..4 {
+        for blind in 0..6 {
             let mut signals = all_true();
             let reason = Observed::Unobservable(Reason::saying("connection reset"));
             match blind {
                 0 => signals.pr_open = reason,
                 1 => signals.tree_clean = reason,
                 2 => signals.commits_ahead = reason,
-                _ => signals.no_check_pending = reason,
+                3 => signals.no_check_pending = reason,
+                4 => signals.pr_head_matches_job_branch = reason,
+                _ => signals.pr_base_matches_declared = reason,
             }
             for promised in [false, true] {
                 assert!(
@@ -440,6 +460,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_false_fifth_or_sixth_signal_withholds_completion_like_the_original_four() {
+        let mut head_mismatch = all_true();
+        head_mismatch.pr_head_matches_job_branch = Observed::Present(false);
+        assert!(matches!(
+            verdict(&head_mismatch, false),
+            Verdict::Incomplete(unmet) if unmet == vec!["PR head matches Job branch".to_string()]
+        ));
+
+        let mut base_mismatch = all_true();
+        base_mismatch.pr_base_matches_declared = Observed::Present(false);
+        assert!(matches!(
+            verdict(&base_mismatch, true),
+            Verdict::Uncorroborated(unmet)
+                if unmet == vec!["PR base matches declared branch".to_string()]
+        ));
+    }
+
+    #[test]
+    fn a_pre_cutover_run_with_no_pr_yet_reads_the_new_signals_as_absent_not_blind() {
+        // Mirrors `pr_open`'s own fold: no PR yet is a Run's normal early state. `signals_of`
+        // just carries `Observation`'s own fold through, so this is the same fixture shape as
+        // `observation()` with the PR-derived fields turned to what a PR-less Run produces.
+        let mut seen = observation();
+        seen.pr = Observed::Absent;
+        seen.pr_head_matches_job_branch = Observed::Present(false);
+        seen.pr_base_matches_declared = Observed::Present(false);
+        assert!(matches!(
+            verdict(&signals_of(&seen), false),
+            Verdict::Incomplete(_)
+        ));
+        assert!(!matches!(
+            verdict(&signals_of(&seen), false),
+            Verdict::Unobserved(_)
+        ));
     }
 
     #[test]
@@ -778,6 +835,7 @@ mod tests {
 /// Diff-triage floor it binds both read as plain `Ord` rather than a hand-rolled ranking an
 /// agent could get backwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Tier {
     T0,
     T1,
@@ -800,6 +858,7 @@ impl std::fmt::Display for Tier {
 /// The nine-persona review library (ADR-0015's design, issue #92). Every persona exists whether
 /// or not it fires; `panel` decides who fires for a given diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Persona {
     Correctness,
     Security,
@@ -1417,6 +1476,29 @@ mod tier_tests {
         let tiers = tiers_from_toml(text);
         assert_eq!(tiers.loc_t1, 80);
         assert_eq!(tiers, Tiers::default());
+    }
+
+    #[test]
+    fn tier_and_persona_serialize_kebab_case_matching_the_skills_vocabulary() {
+        // `decision.json` is read by prompt text the skills author, so `Tier::T0` must land on
+        // disk as `"t0"` — kebab-case of a bare digit suffix, not `"T0"` or `"t-0"`.
+        for (tier, word) in [
+            (Tier::T0, "\"t0\""),
+            (Tier::T1, "\"t1\""),
+            (Tier::T2, "\"t2\""),
+            (Tier::T3, "\"t3\""),
+        ] {
+            assert_eq!(serde_json::to_string(&tier).unwrap(), word);
+            assert_eq!(serde_json::from_str::<Tier>(word).unwrap(), tier);
+        }
+        assert_eq!(
+            serde_json::to_string(&Persona::Correctness).unwrap(),
+            "\"correctness\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Persona::Consistency).unwrap(),
+            "\"consistency\""
+        );
     }
 
     #[test]
