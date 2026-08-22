@@ -9,3 +9,6 @@
 
 # Cargo build output
 /target
+
+# Working plans — session-local, never repo history
+docs/plans/
