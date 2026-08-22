@@ -224,6 +224,26 @@ fn no_module_is_named_for_a_noun_two_others_share() {
     }
 }
 
+/// The reset-sleep reading must come from the local-time seam, not a re-derived UTC path.
+/// Reverting the supervisor's call-site edit alone — reintroducing `now_hour_minute` and
+/// un-swapping the argument — must turn this test red; that falsifiability is the point.
+#[test]
+fn the_reset_sleep_reads_the_local_time_seam_rather_than_a_utc_path() {
+    let supervisor =
+        fs::read_to_string(src_dir().join("supervisor.rs")).expect("read src/supervisor.rs");
+    let code = code_only(&supervisor);
+    assert!(
+        code.contains("world::now_local_hour_minute"),
+        "supervisor.rs must feed `policy::reset_time_sleep` from `world::now_local_hour_minute`; \
+         it does not"
+    );
+    assert!(
+        !code.contains("fn now_hour_minute"),
+        "the UTC-deriving `now_hour_minute` helper must be gone entirely, not shadowed or \
+         renamed with the same body elsewhere"
+    );
+}
+
 // --- the same rules, checked against literals ------------------------------------------
 
 fn main_is_only_a_delegation(main: &str) -> bool {
