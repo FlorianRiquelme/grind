@@ -305,6 +305,25 @@ fn sandbox(name: &str) -> Sandbox {
             .join(VERSION),
     )
     .expect("the pinned plugin");
+    // The ten stage skill directories (ADR-0015) — `refuse_unless_host_ready` now checks their
+    // presence at every Dispatch, legacy path and ladder alike. Presence only: empty directories
+    // are enough for the check, and the mega-session scenarios below never read their contents.
+    for stage in [
+        "plan",
+        "plan-review",
+        "work",
+        "simplify",
+        "review",
+        "validate",
+        "fixes",
+        "ship",
+        "babysit",
+        "reflect",
+    ] {
+        let dir = home.join(".grind/skills/run").join(stage);
+        fs::create_dir_all(&dir).expect("a stage skill dir");
+        fs::write(dir.join("SKILL.md"), format!("# {stage}\n")).expect("a stage skill file");
+    }
 
     // The fakes are checked in executable. A copy that loses the bit fails as *could not
     // observe* rather than as a test failure, which is the confusing shape to avoid.
@@ -503,8 +522,16 @@ fn scenario_a_a_real_run_shape_with_the_literal_argv_of_every_attempt() {
     let attempts = record["attempts"].as_array().expect("attempts");
     assert_eq!(attempts.len(), 5, "five attempts, as Run 1 took");
 
-    let argvs = box_.argvs();
-    assert_eq!(argvs.len(), 5, "the fake saw every attempt");
+    let all_argvs = box_.argvs();
+    // Six: the five real Attempts plus the one Reflect session a Completed terminal
+    // observation now dispatches (idempotent, budget-exempt — it lands no `Attempt` row, but
+    // the fake still logs the invocation it received).
+    assert_eq!(
+        all_argvs.len(),
+        6,
+        "the fake saw every attempt plus reflect"
+    );
+    let (argvs, reflect) = all_argvs.split_at(5);
     let session = &record["session_id"]
         .as_str()
         .expect("a session id")
@@ -567,11 +594,22 @@ fn scenario_a_a_real_run_shape_with_the_literal_argv_of_every_attempt() {
         // No spend ceiling on any of them, and the Job issue still carries the row (ADR-0010).
         assert!(!argv.contains(&"--max-budget-usd".to_string()));
         assert!(argv.contains(&"bypassPermissions".to_string()));
-        assert!(
-            argv.windows(2)
-                .any(|w| w[0] == "--plugin-dir" && w[1].ends_with(VERSION))
-        );
+        // A fresh Dispatch walks the ladder (ADR-0015), and a stage invocation names no
+        // plugin — the pin retires the moment nothing left invokes it (unit D deletes the
+        // record field and the resolution; this Run still carries both, unread by any argv).
+        assert!(!argv.contains(&"--plugin-dir".to_string()));
     }
+
+    // Reflect's own session, never the Run's: a fresh `--session-id`, no `--plugin-dir` (a
+    // stage-shaped invocation never names one), and the base denials still ride it.
+    assert_eq!(reflect.len(), 1);
+    assert!(reflect[0].contains(&"--session-id".to_string()));
+    assert!(!reflect[0].contains(&"--plugin-dir".to_string()));
+    assert!(
+        reflect[0].iter().any(|a| a.ends_with("-reflect")),
+        "{:?}",
+        reflect[0]
+    );
 
     // Every attempt's raw landed on disk, including the ones that died and the silent one.
     for n in 1..=5 {
@@ -667,12 +705,21 @@ fn scenario_d_a_rate_limit_announces_the_recorded_sleep_rather_than_burning_the_
     box_.scenario(&["rate_limited"]).pr_appears_at(99);
 
     let mut child = box_.spawn(&["run", ISSUE]);
-    // The assertion is on the **announced** duration: nothing can shorten a recorded 1800s
-    // from outside, because `$HOME` is the only variable and the field table has no row for it.
+    // The fixture's own prose names a stated reset time (`resets 5pm (Europe/Berlin)`), so
+    // decision 5's parse fires and the announced duration is no longer the fixed 1800s — it is
+    // whatever hour is 5pm from wherever the test happens to run, capped at 12h. The property
+    // this scenario still pins is that *something* bounded is announced and slept on, not a
+    // literal figure that would make the assertion depend on the wall clock at test time.
     let seen = wait_for_line(&mut child, "rate limited", Duration::from_secs(30));
+    let seconds: u64 = seen
+        .split("sleeping ")
+        .nth(1)
+        .and_then(|s| s.split('s').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no announced sleep duration:\n{seen}"));
     assert!(
-        seen.contains("sleeping 1800s"),
-        "the recorded limit sleep:\n{seen}"
+        seconds > 0 && seconds <= 12 * 3600,
+        "the announced sleep must be bounded: {seconds}s\n{seen}"
     );
     child.kill().expect("stop the supervisor mid-sleep");
     let _ = child.wait();
@@ -704,8 +751,9 @@ fn scenario_e_attempts_exhausted_is_its_own_outcome_and_not_a_death() {
 
     let record = box_.record();
     assert_eq!(record["state"], "exhausted", "distinct from `died`");
-    assert_eq!(record["attempts"].as_array().expect("attempts").len(), 8);
-    assert_eq!(record["attempt_budget"], 8);
+    // Grit's arithmetic (the ten-Attempt fullest walk plus four re-entries of headroom).
+    assert_eq!(record["attempts"].as_array().expect("attempts").len(), 14);
+    assert_eq!(record["attempt_budget"], 14);
 }
 
 #[test]
@@ -842,6 +890,105 @@ fn scenario_g_a_repeated_denial_with_no_progress_stops_for_a_human_and_resumes()
     let (_, err, code) = box_.run(&["cleared", &run_id, "again"]);
     assert_eq!(code, Some(2), "{err}");
     assert!(err.contains("completed"), "{err}");
+}
+
+#[test]
+fn scenario_h_a_ladder_walk_completes_plan_then_triage_before_plan_review_ever_dispatches() {
+    // A full ten-rung fake is disproportionate (per the plan's own escape valve): this walks
+    // the first two rungs honestly — Plan, an [S] session, and Triage, a zero-token [R] pass —
+    // then lets PlanReview's own stage session re-enter itself under `rung::next`'s earliest-
+    // absent-return contract until the budget is spent, which this asserts deterministically
+    // (no killed-mid-flight race, unlike the sleep-blocked scenarios above: nothing here
+    // blocks between one rung and the next). `plan_writes_return.sh` plays Plan honestly: it
+    // writes `plan-facts.json` and its own return under the stages directory the context block
+    // names, exactly what a real stage session's structured return would do; every attempt
+    // after it — PlanReview's, since its own shape never writes back — replays it too, which
+    // is harmless (Plan's return already exists) and lets the same one shape drive the whole
+    // scenario.
+    let box_ = sandbox("h-ladder-walk");
+    box_.scenario(&["plan_writes_return"]).pr_appears_at(99);
+
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+
+    let record = box_.record();
+    let run_id = record["run_id"].as_str().expect("a run id").to_string();
+    assert_eq!(
+        record["state"], "exhausted",
+        "plan-review never writes back, so the budget is spent re-entering it:\n{out}\n{err}"
+    );
+    assert_eq!(record["attempts"].as_array().expect("attempts").len(), 14);
+
+    let stages = record["stages"].as_array().expect("stages");
+    assert_eq!(stages[0]["name"], "plan");
+    assert_eq!(stages[0]["status"], "complete");
+    assert_eq!(
+        stages[0]["session_id"], record["session_id"],
+        "a new record's Run-level session_id is the Plan stage's own (decision 4)"
+    );
+    assert_eq!(
+        stages[0]["session_id"].as_str().unwrap(),
+        format!("{run_id}-plan")
+    );
+
+    // Triage: zero-token, no session, costing none of Plan's or plan-review's attempts.
+    assert_eq!(stages[1]["name"], "triage");
+    assert_eq!(stages[1]["session_id"], "[R]");
+    assert_eq!(stages[1]["status"], "complete");
+    assert_eq!(stages[1]["cost_usd"], 0.0);
+    assert_eq!(stages[1]["turns"], 0);
+
+    // Every remaining row is PlanReview, re-entering **its own** session — never Plan's again,
+    // the earliest-absent-return contract `rung::next` states.
+    let plan_review_rows = &stages[2..];
+    assert_eq!(plan_review_rows.len(), 13, "14 attempts minus Plan's one");
+    for row in plan_review_rows {
+        assert_eq!(row["name"], "plan-review");
+        assert_eq!(
+            row["session_id"].as_str().unwrap(),
+            format!("{run_id}-plan-review")
+        );
+    }
+
+    // Triage's own decision landed on disk.
+    let decision = fs::read_to_string(
+        box_.run_dir()
+            .join("stages")
+            .join("triage")
+            .join("decision.json"),
+    )
+    .expect("triage's decision.json");
+    assert!(decision.contains("\"tier\""), "{decision}");
+
+    // The argv shape: Plan's session opens fresh, and every plan-review attempt after the
+    // first resumes the same one rather than re-opening it.
+    let argvs = box_.argvs();
+    assert_eq!(
+        argvs.len(),
+        14,
+        "one per real Attempt — the [R] pass logged none"
+    );
+    assert!(argvs[0].contains(&"--session-id".to_string()));
+    let first_review_at = argvs[1]
+        .iter()
+        .position(|a| a == "--session-id" || a == "--resume")
+        .expect("a session flag");
+    assert_eq!(argvs[1][first_review_at], "--session-id");
+    assert_eq!(
+        argvs[1][first_review_at + 1],
+        format!("{run_id}-plan-review")
+    );
+    for argv in &argvs[2..] {
+        let at = argv
+            .iter()
+            .position(|a| a == "--session-id" || a == "--resume")
+            .expect("a session flag");
+        assert_eq!(
+            argv[at], "--resume",
+            "plan-review re-enters, never re-opens"
+        );
+        assert_eq!(argv[at + 1], format!("{run_id}-plan-review"));
+    }
 }
 
 // --- surviving a reboot -------------------------------------------------------------------------
@@ -1143,7 +1290,7 @@ fn status_reads_and_never_writes() {
     let after = fs::read_to_string(&record).expect("the record");
     assert_eq!(before, after, "status must leave the record byte-identical");
     let parsed: serde_json::Value = serde_json::from_str(&after).unwrap();
-    assert_eq!(parsed["attempts"].as_array().expect("attempts").len(), 8);
+    assert_eq!(parsed["attempts"].as_array().expect("attempts").len(), 14);
 }
 
 #[test]
@@ -1181,15 +1328,15 @@ fn resume_on_a_completed_run_prints_the_handback_and_starts_nothing() {
 #[test]
 fn resume_on_an_exhausted_run_prints_the_handback_and_starts_nothing() {
     // `supervise` attempts before it ever consults `policy::next`, so without this guard a
-    // resume of an exhausted Run would spend a ninth attempt against a recorded budget of
-    // eight. The Handback names the state it actually found, so an exhausted Run reads as
+    // resume of an exhausted Run would spend one more attempt against its recorded budget.
+    // The Handback names the state it actually found, so an exhausted Run reads as
     // exhausted rather than borrowing the word `completed` from its sibling short-circuit.
     let box_ = sandbox("resume-exhausted");
     let run_id = a_run_that_did_not_finish(&box_);
     let record = box_.record();
     assert_eq!(record["state"], "exhausted");
     let attempts_before = record["attempts"].as_array().expect("attempts").len();
-    assert_eq!(attempts_before, 8);
+    assert_eq!(attempts_before, 14);
 
     let (out, err, code) = box_.run(&["resume", &run_id]);
     assert_eq!(code, Some(0), "{out}\n{err}");
@@ -1204,16 +1351,16 @@ fn resume_on_an_exhausted_run_prints_the_handback_and_starts_nothing() {
             .expect("attempts")
             .len(),
         attempts_before,
-        "resuming an exhausted Run must not spend a ninth attempt against a recorded budget of eight"
+        "resuming an exhausted Run must not spend one more attempt against its recorded budget"
     );
 }
 
 #[test]
 fn resume_at_the_attempt_budget_starts_nothing_whatever_the_state_word_says() {
     // `Uncorroborated` and `Unobserved` are deliberately resumable: neither stopped because the
-    // budget ran out. But a Run can land one *at* 8 of 8 — and `supervise` runs
+    // budget ran out. But a Run can land one *at* its recorded budget — and `supervise` runs
     // `run_one_attempt` before it ever consults `policy::next`, so a guard keyed on the state
-    // word walks that Run into a ninth attempt with no policy check standing in front of it,
+    // word walks that Run into one more attempt with no policy check standing in front of it,
     // stops in the same state, and does it again on the next resume. A recorded Attempt in this
     // project costs $7–$37.
     let box_ = sandbox("resume-at-budget");
@@ -1222,7 +1369,7 @@ fn resume_at_the_attempt_budget_starts_nothing_whatever_the_state_word_says() {
         .as_array()
         .expect("attempts")
         .len();
-    assert_eq!(attempts_before, 8);
+    assert_eq!(attempts_before, 14);
 
     for state in ["uncorroborated", "unobserved"] {
         box_.state_becomes(&run_id, state);
@@ -1239,7 +1386,7 @@ fn resume_at_the_attempt_budget_starts_nothing_whatever_the_state_word_says() {
                 .expect("attempts")
                 .len(),
             attempts_before,
-            "a Run at 8 of 8 must not spend a ninth attempt because its state word is resumable"
+            "a Run at its recorded budget must not spend one more attempt because its state word is resumable"
         );
     }
 }

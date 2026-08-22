@@ -413,6 +413,15 @@ fn check(home: &Path, clones: &[(String, PathBuf)], check: Check) -> Observed<Ou
         Check::PluginInstalled => observe::plugin_installed(
             !world::list_dir(&home.join(".claude").join("plugins").join("cache")).is_empty(),
         ),
+        Check::SkillsPresent => {
+            let root = job::grind_dir(home).join("skills").join("run");
+            let names: Vec<String> = world::list_dir(&root)
+                .into_iter()
+                .filter(|p| world::is_dir(p))
+                .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+                .collect();
+            observe::skills_present(&names)
+        }
         // Spelled `cfg!` rather than `std::env::consts::OS`, which is the idiomatic runtime
         // spelling: `tests/topology.rs` string-matches the literal `std::env` and asserts only
         // `world` names it, so the idiom would turn `just verify` red on a carrier that must

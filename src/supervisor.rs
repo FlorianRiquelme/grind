@@ -10,11 +10,15 @@
 //! can erase `attempts[]`, which nothing can rebuild — and it erases it while the human is
 //! watching the dashboard to be reassured.
 
-use crate::attempt::{self, Attempt, Clearance, Conditions, DENIED_TOOLS, Invocation, Mode};
-use crate::decide::{self, Verdict};
+use crate::attempt::{
+    self, Attempt, Clearance, Conditions, DENIED_TOOLS, Invocation, Mode, StageConditions,
+    StageContext,
+};
+use crate::decide::{self, Pass, PlanFacts, Tier, Tiers, Verdict};
 use crate::job::{self, Job, Refusal};
-use crate::observe::{Observation, Observed, Outcome as ItemOutcome, Reason};
+use crate::observe::{self, Observation, Observed, Outcome as ItemOutcome, Reason};
 use crate::policy::{self, Budget, Next, Stop};
+use crate::rung::{self, ReturnStatus, Stage, StageReturn};
 use crate::world::{self, LockHandle, TryLock};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -23,7 +27,14 @@ use std::time::Duration;
 /// Compiled constants, snapshotted into the record at dispatch. There is no environment
 /// override (ADR-0008), so the record is what makes *attempt N of M with M from the record*
 /// true and what makes a re-entry under different conditions visible rather than silent.
-pub const ATTEMPT_BUDGET: usize = 8;
+/// The ten-Attempt fullest T2/T3 walk (eight [S]/[F] stages — the two [R] passes are free —
+/// plus two fix rounds) plus four re-entries of headroom: sized from the ladder's own
+/// arithmetic rather than picked. Was `8`, the mega-session's own unmapped figure.
+pub const ATTEMPT_BUDGET: usize = 14;
+/// Plan review's bounded revision round: `act-on` findings are applied once, never re-litigated.
+pub const PLAN_REVISIONS: usize = 1;
+/// Fixes' bounded rounds; exhaustion leaves residuals in the Record and the Run proceeds.
+pub const FIX_ROUNDS: usize = 2;
 pub const LIMIT_SLEEP_SECONDS: u64 = 1800;
 pub const REOBSERVATIONS: usize = 3;
 /// How long a re-observation waits before looking again. The mechanism exists for a transient
@@ -93,6 +104,13 @@ struct RunRecord {
     hostname: String,
     attempt_budget: usize,
     limit_sleep_seconds: u64,
+    /// Snapshotted at dispatch, like `attempt_budget` beside them. `serde(default)` because a
+    /// record from before Grit's ladder existed carries neither — the same pre-cutover reasoning
+    /// `job::Job::done_predicate` documents, never a blank answer.
+    #[serde(default)]
+    plan_revisions: usize,
+    #[serde(default)]
+    fix_rounds: usize,
     supervisor_pid: u32,
     supervisor_identity: Option<String>,
     /// Private even inside the private type. The only mutator appends — there is no
@@ -106,6 +124,31 @@ struct RunRecord {
     /// dispatch-time conditions, where absence means a different environment.
     #[serde(default)]
     clearances: Vec<Clearance>,
+    /// One row per stage Attempt, append-only like `attempts` — same privacy discipline, same
+    /// reason. Empty on a pre-cutover record (`serde(default)`), which is exactly the fact
+    /// `supervise`'s legacy-path gate reads.
+    #[serde(default)]
+    stages: Vec<rung::StageEntry>,
+    /// Frozen at dispatch: the grind binary version plus a hash of the host skill root, so a
+    /// skill edit or a binary upgrade mid-Run is visible rather than silent. `None` on a
+    /// pre-cutover record, which never had a skill root to hash.
+    #[serde(default)]
+    provenance: Option<Provenance>,
+    /// Whether Reflect has been dispatched for this Run's terminal observation. Set — and
+    /// saved — **before** Reflect is dispatched, not after: a supervisor that died mid-Reflect
+    /// must not dispatch it again on the next look, and a lost Reflect is a cheaper loss than a
+    /// duplicated one. `serde(default)` reads false, which is the correct answer for every
+    /// record that predates Reflect existing.
+    #[serde(default)]
+    reflected: bool,
+}
+
+/// Frozen once, at dispatch — never re-resolved, for the same reason the plugin pin never was:
+/// a Run spans hours, and provenance that changed mid-Run would be silent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Provenance {
+    binary_version: String,
+    skills_hash: String,
 }
 
 impl RunRecord {
@@ -123,6 +166,14 @@ impl RunRecord {
 
     fn push_clearance(&mut self, clearance: Clearance) {
         self.clearances.push(clearance);
+    }
+
+    fn stages(&self) -> &[rung::StageEntry] {
+        &self.stages
+    }
+
+    fn push_stage_entry(&mut self, entry: rung::StageEntry) {
+        self.stages.push(entry);
     }
 
     fn load(path: &Path) -> Result<Self, Refusal> {
@@ -327,17 +378,25 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         plugin_dir: plugin_dir.display().to_string(),
         repo_path: repo_path.display().to_string(),
         worktree: worktree.display().to_string(),
-        session_id: fresh_session_id(&run_id, pid),
+        // The Run-level `session_id` field stays for pre-cutover records; a new record leaves
+        // it as the Plan stage's own session id (decision 4) rather than a Run-wide
+        // mega-session — Plan is where the ladder always starts.
+        session_id: attempt::stage_session_id(&run_id, Stage::Plan),
         claude_bin: claude_bin.display().to_string(),
         model: job.model.clone(),
         denied_tools: DENIED_TOOLS.iter().map(|glob| glob.to_string()).collect(),
         hostname: world::hostname().unwrap_or_else(|| "unknown-host".to_string()),
         attempt_budget: ATTEMPT_BUDGET,
         limit_sleep_seconds: LIMIT_SLEEP_SECONDS,
+        plan_revisions: PLAN_REVISIONS,
+        fix_rounds: FIX_ROUNDS,
         supervisor_pid: pid,
         supervisor_identity: recorded_identity(pid),
         attempts: Vec::new(),
         clearances: Vec::new(),
+        stages: Vec::new(),
+        provenance: Some(provenance(&home)),
+        reflected: false,
         job,
     };
     let run_dir = job::runs_dir(&home).join(&run_id);
@@ -612,7 +671,45 @@ pub fn resume_all() -> Result<Reentry, Refusal> {
 
 // --- the loop ---------------------------------------------------------------------------------
 
+/// Dispatch to the ladder walk for every record born under it, and to the mega-session loop for
+/// the fallback ADR-0015 names: a record with attempts already on it, no `stages` rows and no
+/// stage return file on disk anywhere is one this binary never started — the old script's shape.
+/// A fresh record (`stages` empty **and** `attempts` empty) is not pre-cutover; it walks the
+/// ladder from Attempt 1.
 fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal> {
+    if is_pre_cutover(record, run_dir) {
+        say(
+            run_dir,
+            &format!(
+                "    pre-cutover record — resuming at {} via rung::from_furthest \
+                 (ADR-0015's stated fallback)",
+                rung::from_furthest(decide::furthest_stage(&crate::view::observe_fresh(
+                    &PathBuf::from(&record.worktree),
+                    &record.job.handoff_sha,
+                    &record.job.branch,
+                    &record.job.base_branch,
+                    world::now_iso(),
+                )))
+            ),
+        );
+        return supervise_legacy(record, run_dir);
+    }
+    supervise_ladder(record, run_dir)
+}
+
+/// See [`supervise`]. Read, never persisted — `rung::from_furthest` is logged for the operator,
+/// never consulted for control flow: the legacy loop below re-enters exactly as it always did,
+/// off the Run-level session and the attempt list alone.
+fn is_pre_cutover(record: &RunRecord, run_dir: &Path) -> bool {
+    if !record.stages().is_empty() || record.attempts().is_empty() {
+        return false;
+    }
+    rung::ALL
+        .iter()
+        .all(|stage| !world::exists(&run_dir.join("stages").join(format!("{stage}.return.json"))))
+}
+
+fn supervise_legacy(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal> {
     let path = record_path(run_dir);
     let budget = Budget {
         attempts: record.attempt_budget,
@@ -732,39 +829,624 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
         };
 
         if let Some(stop) = stop {
-            record.state = match &stop {
-                Stop::Completed => State::Completed,
-                Stop::Uncorroborated(_) => State::Uncorroborated,
-                Stop::Unobserved(_) => State::Unobserved,
-                Stop::Exhausted => State::Exhausted,
-                Stop::Blocked(_) => State::Blocked,
-            };
-            record.save(&path)?;
-            if let Stop::Unobserved(blind) = &stop {
-                for said in blind {
-                    say(run_dir, &format!("    could not observe {said}"));
-                }
-            }
-            // Resumable, because it never spent the budget: the world changed, not the number.
-            // The repair is two verbs in order: `cleared` records what changed, `resume`
-            // spends — Grind never chooses to spend an Attempt, so the acts stay separate.
-            if let Stop::Blocked(what) = &stop {
-                say(
-                    run_dir,
-                    &format!(
-                        "    stopped for a human — {what} was refused twice with no progress; {}",
-                        crate::render::repair_hint(&record.run_id)
-                    ),
-                );
-            }
-            report_to_the_job_issue(run_dir, record);
-            return Ok(Outcome {
-                run_id: record.run_id.clone(),
-                state: record.state.as_str(),
-                already_completed: false,
-            });
+            return finish_run(record, run_dir, &path, stop);
         }
     }
+}
+
+/// Shared by the legacy loop and the ladder walk: record the terminal state, dispatch Reflect
+/// once (never for a Blocker or an Exhaustion — the design's own zero-output skip), and post the
+/// account on the Job issue.
+fn finish_run(
+    record: &mut RunRecord,
+    run_dir: &Path,
+    path: &Path,
+    stop: Stop,
+) -> Result<Outcome, Refusal> {
+    record.state = match &stop {
+        Stop::Completed => State::Completed,
+        Stop::Uncorroborated(_) => State::Uncorroborated,
+        Stop::Unobserved(_) => State::Unobserved,
+        Stop::Exhausted => State::Exhausted,
+        Stop::Blocked(_) => State::Blocked,
+    };
+    record.save(path)?;
+    if let Stop::Unobserved(blind) = &stop {
+        for said in blind {
+            say(run_dir, &format!("    could not observe {said}"));
+        }
+    }
+    // Resumable, because it never spent the budget: the world changed, not the number.
+    // The repair is two verbs in order: `cleared` records what changed, `resume`
+    // spends — Grind never chooses to spend an Attempt, so the acts stay separate.
+    if let Stop::Blocked(what) = &stop {
+        say(
+            run_dir,
+            &format!(
+                "    stopped for a human — {what} was refused twice with no progress; {}",
+                crate::render::repair_hint(&record.run_id)
+            ),
+        );
+    }
+    maybe_dispatch_reflect(record, run_dir, path);
+    report_to_the_job_issue(run_dir, record);
+    Ok(Outcome {
+        run_id: record.run_id.clone(),
+        state: record.state.as_str(),
+        already_completed: false,
+    })
+}
+
+/// Dispatch Reflect once per finished Run, immediately after a terminal observation — Completed,
+/// Uncorroborated or Unobserved. **Never for `Blocked` or `Exhausted`**: the design's own
+/// zero-output skip, since neither carries a Run worth mining.
+///
+/// **Idempotent over re-runs**: `reflected` is set and saved *before* Reflect is dispatched, so a
+/// supervisor that dies mid-Reflect does not dispatch it again on the next terminal observation
+/// (there is at most one) — a lost Reflect is the cheaper failure. Bounded to one re-entry on
+/// death; a Reflect failure never changes the Run's own terminal state, which is why every path
+/// out of this function is `()`, not a `Result`.
+fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
+    if record.reflected {
+        return;
+    }
+    if !matches!(
+        record.state,
+        State::Completed | State::Uncorroborated | State::Unobserved
+    ) {
+        return;
+    }
+    record.reflected = true;
+    if record.save(path).is_err() {
+        say(
+            run_dir,
+            "    note: could not record reflect's idempotence — skipping reflect",
+        );
+        return;
+    }
+    let Some(home) = world::home() else {
+        say(run_dir, "    note: $HOME is unset — skipping reflect");
+        return;
+    };
+    let skill_path = skills_root(&home).join("reflect").join("SKILL.md");
+    let Ok(skill_text) = world::read_to_string(&skill_path) else {
+        say(
+            run_dir,
+            "    note: reflect's skill text is unavailable — skipping reflect",
+        );
+        return;
+    };
+    let conditions = StageConditions {
+        claude_bin: &record.claude_bin,
+        run_id: &record.run_id,
+    };
+    let session_id = format!("{}-reflect", record.run_id);
+    let worktree = PathBuf::from(&record.worktree);
+    // Bounded at one re-entry: a fresh dispatch, then at most one resume. Counted off the
+    // recorded `StageEntry` rows rather than the transcript alone — a died-before-writing-a-
+    // line session leaves no transcript to read, and `entry_mode`'s own comment names exactly
+    // this: absence of a transcript is not absence of an attempt.
+    let reflect_attempts = record
+        .stages()
+        .iter()
+        .filter(|entry| entry.name == "reflect")
+        .count();
+    if reflect_attempts >= 2 {
+        say(
+            run_dir,
+            "    note: reflect already re-entered once — skipping",
+        );
+        return;
+    }
+    let mode = if reflect_attempts == 0 && transcript_lines_for(&worktree, &session_id) == 0 {
+        Mode::Dispatch
+    } else {
+        Mode::Resume
+    };
+    let invocation = match mode {
+        Mode::Dispatch => attempt::reflect_dispatch(&conditions, &skill_text),
+        _ => attempt::reflect_resume(&conditions, &skill_text),
+    };
+    let n = reflect_attempts + 1;
+    say(run_dir, &format!("  [reflect] attempt {n} ({mode}) …"));
+    let raw = attempt::run(
+        &invocation,
+        // Reflect's cwd is the **run directory**, never the worktree — there is no repo tree
+        // under this session for a Write/Edit denial to matter over.
+        run_dir,
+        &run_dir.join(format!("reflect-{n}.prompt.txt")),
+        &run_dir.join(format!("reflect-{n}.stdout.json")),
+        &run_dir.join(format!("reflect-{n}.stderr.log")),
+    );
+    let Ok(raw) = raw else {
+        say(run_dir, "    note: reflect could not be spawned — skipping");
+        return;
+    };
+    let started_at = world::now_iso();
+    let classified = raw.classify(n, mode, &started_at, &world::now_iso());
+    record.push_stage_entry(rung::StageEntry {
+        name: "reflect".to_string(),
+        session_id,
+        status: if classified.done_promise || classified.parse_ok {
+            ReturnStatus::Complete
+        } else {
+            ReturnStatus::Incomplete
+        },
+        artifact_paths: Vec::new(),
+        model: None,
+        cost_usd: classified.total_cost_usd,
+        turns: classified.num_turns,
+    });
+    let _ = record.save(path);
+}
+
+// --- the ladder walk (ADR-0015) -------------------------------------------------------------
+
+/// The rung-by-rung walk. Same shape as [`supervise_legacy`]'s loop — attempt (or [R] pass),
+/// save, observe, decide — differing only in **what one Attempt executes**: one stage's own
+/// session rather than the Run's mega-session, and a zero-token in-process pass at the two [R]
+/// rungs that consumes no Attempt at all.
+fn supervise_ladder(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal> {
+    let path = record_path(run_dir);
+    let budget = Budget {
+        attempts: record.attempt_budget,
+        limit_sleep: Duration::from_secs(record.limit_sleep_seconds),
+        reobservations: REOBSERVATIONS,
+        reobserve_pause: Duration::from_secs(REOBSERVE_PAUSE_SECONDS),
+        consecutive_waits: CONSECUTIVE_WAITS,
+    };
+    let worktree = PathBuf::from(&record.worktree);
+    let mut reobservations = 0usize;
+    let mut stalls: Vec<Observed<bool>> = Vec::new();
+    let mut commits_before: Option<Observed<u64>> = None;
+    let mut working_seen = attempt::working(record.attempts());
+
+    loop {
+        let walked = match rung::next(&read_stage_returns(run_dir)) {
+            Some(stage @ (Stage::Triage | Stage::DiffTriage)) => {
+                run_r_pass(record, run_dir, &worktree, stage)?;
+                record.save(&path)?;
+                continue;
+            }
+            Some(stage) => {
+                run_ladder_attempt(record, run_dir, &worktree, stage)?;
+                record.save(&path)?;
+                false
+            }
+            // The ladder is walked: fall through to the same observe/verdict tail the legacy
+            // loop uses, which is what decides Completed vs Uncorroborated from the six signals.
+            None => true,
+        };
+
+        let stop = loop {
+            let observation = crate::view::observe_fresh(
+                &worktree,
+                &record.job.handoff_sha,
+                &record.job.branch,
+                &record.job.base_branch,
+                world::now_iso(),
+            );
+            let working_now = attempt::working(record.attempts());
+            if working_now > working_seen {
+                working_seen = working_now;
+                stalls.push(policy::stalled(
+                    commits_before.as_ref(),
+                    &observation.commits_ahead,
+                ));
+                commits_before = Some(observation.commits_ahead.clone());
+            }
+            let signals = decide::signals_of(&observation);
+            let promised = record.attempts().last().is_some_and(|a| a.done_promise);
+            let verdict = decide::verdict(&signals, promised);
+            announce(run_dir, record, &observation, &verdict);
+
+            if !matches!(verdict, Verdict::Completed)
+                && let Some(stop) = policy::blocker(record.attempts(), &stalls)
+            {
+                break Some(stop);
+            }
+
+            // Decision 5: a stated reset time reads finer than the fixed sleep, when the last
+            // Attempt's own text names one. `policy::next`'s signature stays untouched — this
+            // only ever narrows `limit_sleep` for this one call, on the one path
+            // (`SleepThenReenter`) that reads it.
+            let mut this_budget = budget;
+            if let Some(last) = record.attempts().last()
+                && last.rate_limited
+                && let Some(finer) = policy::reset_time_sleep(&last.result_tail, now_hour_minute())
+            {
+                this_budget.limit_sleep = finer;
+            }
+
+            match policy::next(
+                record.attempts(),
+                &verdict,
+                &observation.checks_red,
+                reobservations,
+                &this_budget,
+            ) {
+                Next::Reobserve(pause) => {
+                    reobservations += 1;
+                    say(
+                        run_dir,
+                        &format!(
+                            "    a signal could not be observed — sleeping {}s before looking again",
+                            pause.as_secs()
+                        ),
+                    );
+                    world::sleep(pause);
+                    continue;
+                }
+                Next::SpendCiBudget => {
+                    reobservations = 0;
+                    say(
+                        run_dir,
+                        "    decided, and a check came back red — spending the one CI budget",
+                    );
+                    run_ship_babysit_attempt(record, run_dir, &worktree)?;
+                    record.save(&path)?;
+                    continue;
+                }
+                Next::SleepThenReenter(nap) => {
+                    reobservations = 0;
+                    record.state = State::RateLimited;
+                    record.save(&path)?;
+                    say(
+                        run_dir,
+                        &format!(
+                            "    rate limited — sleeping {}s, then re-entering",
+                            nap.as_secs()
+                        ),
+                    );
+                    world::sleep(nap);
+                    break None;
+                }
+                Next::Reenter => {
+                    reobservations = 0;
+                    record.state = State::Died;
+                    record.save(&path)?;
+                    say(
+                        run_dir,
+                        "    ended without a DONE promise — re-entering at the stage that died",
+                    );
+                    break None;
+                }
+                Next::Stop(stop) => break Some(stop),
+            }
+        };
+
+        if let Some(stop) = stop {
+            return finish_run(record, run_dir, &path, stop);
+        }
+
+        // The tail asked for a re-entry. On a walked ladder there is no earliest-incomplete
+        // stage to resume — `rung::next` would come back `None` again, no attempt would run,
+        // and the loop would spin on an identical observation without ever progressing the
+        // attempt list (the legacy loop could not spin: every iteration ran an attempt). The
+        // re-entry lands on Ship's own session, the stage whose `complete` the observation is
+        // contradicting, and stays budget-bounded like every attempt.
+        if walked {
+            run_ladder_attempt(record, run_dir, &worktree, Stage::Ship)?;
+            record.save(&path)?;
+        }
+    }
+}
+
+/// The current wall-clock hour and minute, UTC, for `policy::reset_time_sleep` — the one
+/// impure edge the pure parse needs, kept to this one call site.
+fn now_hour_minute() -> (u32, u32) {
+    let iso = world::now_iso();
+    let hm = iso.split('T').nth(1).unwrap_or("");
+    let hour = hm.get(0..2).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minute = hm.get(3..5).and_then(|s| s.parse().ok()).unwrap_or(0);
+    (hour, minute)
+}
+
+/// Every stage's return, read fresh off disk. A malformed or absent file reads as `None` per
+/// stage (`rung::returns_from`'s own tolerance) — fail-closed toward re-entering that one stage.
+fn read_stage_returns(run_dir: &Path) -> rung::StageReturns {
+    let stages_dir = run_dir.join("stages");
+    let texts: Vec<Option<String>> = rung::ALL
+        .iter()
+        .map(|stage| world::read_to_string(&stages_dir.join(format!("{stage}.return.json"))).ok())
+        .collect();
+    let slots: [Option<&str>; 10] = std::array::from_fn(|i| texts[i].as_deref());
+    rung::returns_from(slots)
+}
+
+/// `docs/tiers.toml` at the worktree's `HEAD`, tolerantly parsed; absent or garbage reads as
+/// [`Tiers::default`] — the same fail-closed shape the parser itself already carries.
+fn load_tiers(worktree: &Path) -> Tiers {
+    match world::read_to_string(&worktree.join("docs/tiers.toml")) {
+        Ok(text) => decide::tiers_from_toml(&text),
+        Err(_) => Tiers::default(),
+    }
+}
+
+/// Run one of the two zero-token in-process passes: `select_tier` over durable facts, writing
+/// `decision.json` and the stage's own return. Consumes **no Attempt** — the `StageEntry` this
+/// pushes carries `cost_usd: Some(0.0)`, `turns: Some(0)`, and `session_id: "[R]"`, a literal
+/// chosen (over an empty string) so a rendered stage table reads *pure Rust, no session* rather
+/// than looking like an unresolved field.
+fn run_r_pass(
+    record: &mut RunRecord,
+    run_dir: &Path,
+    worktree: &Path,
+    stage: Stage,
+) -> Result<(), Refusal> {
+    let stages_dir = run_dir.join("stages");
+    let tiers = load_tiers(worktree);
+    let decision = match stage {
+        Stage::Triage => {
+            let plan_facts =
+                world::read_to_string(&stages_dir.join("plan").join("plan-facts.json"))
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<PlanFacts>(&text).ok());
+            // `TrackRecord` is `None` for now: `grind outcomes` (a later phase, part 2's
+            // design) is the supplier that makes it non-trivial. `select_tier` already
+            // fails closed on `None` the same way it does on a missing `PlanFacts`.
+            decide::select_tier(
+                Pass::Triage,
+                plan_facts.as_ref(),
+                None,
+                None,
+                Tier::T0,
+                &tiers,
+            )
+        }
+        Stage::DiffTriage => {
+            let range = format!("{}..HEAD", record.job.handoff_sha);
+            let numstat = world::run(
+                &words(&["git", "diff", "--numstat", &range]),
+                Some(worktree),
+            );
+            let name_only = world::run(
+                &words(&["git", "diff", "--name-only", &range]),
+                Some(worktree),
+            );
+            let unified = world::run(&words(&["git", "diff", &range]), Some(worktree));
+            let diff_facts =
+                observe::diff_facts(&numstat.stdout, &name_only.stdout, &unified.stdout);
+            // Escalation-only: bound from Triage's own call, never lower. A Triage decision
+            // that could not be read fails closed to T2, same as `select_tier`'s own reading
+            // of an absent required fact.
+            let floor = world::read_to_string(&stages_dir.join("triage").join("decision.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<decide::Decision>(&text).ok())
+                .map(|d| d.tier)
+                .unwrap_or(Tier::T2);
+            decide::select_tier(
+                Pass::DiffTriage,
+                None,
+                Some(&diff_facts),
+                None,
+                floor,
+                &tiers,
+            )
+        }
+        _ => unreachable!("run_r_pass is only ever called for Triage or DiffTriage"),
+    };
+
+    let name = stage.to_string();
+    let dir = stages_dir.join(&name);
+    world::create_dir_all(&dir).map_err(Refusal::saying)?;
+    let decision_json = serde_json::to_string_pretty(&decision)
+        .map_err(|e| Refusal::saying(format!("could not serialise the {name} decision: {e}")))?;
+    world::write(&dir.join("decision.json"), &(decision_json + "\n")).map_err(Refusal::saying)?;
+
+    let ret = StageReturn {
+        status: ReturnStatus::Complete,
+        revised: false,
+    };
+    let ret_json = serde_json::to_string(&ret)
+        .map_err(|e| Refusal::saying(format!("could not serialise the {name} return: {e}")))?;
+    world::write(&stages_dir.join(format!("{name}.return.json")), &ret_json)
+        .map_err(Refusal::saying)?;
+
+    say(
+        run_dir,
+        &format!(
+            "  [R] {name} decided {} (floor {})",
+            decision.tier, decision.floor_from_plan
+        ),
+    );
+    record.push_stage_entry(rung::StageEntry {
+        name,
+        session_id: "[R]".to_string(),
+        status: ReturnStatus::Complete,
+        artifact_paths: vec![
+            format!("stages/{stage}/decision.json"),
+            format!("stages/{stage}.return.json"),
+        ],
+        model: None,
+        cost_usd: Some(0.0),
+        turns: Some(0),
+    });
+    Ok(())
+}
+
+/// Which model class (`decide::Decision::model_per_stage`) resolves to for one stage, per the
+/// plan's decision 2. **The Job's `Model` row, when present, pins every stage** and short-circuits
+/// the class lookup entirely — the freeze beats the routing. Absent that, Plan runs before any
+/// Decision exists and is always routed `strong` (the harness default, no `--model` flag); every
+/// later stage reads its class off Diff-triage's decision when it exists, else Triage's, else
+/// falls back to `strong` — the same fail-closed direction `select_tier` itself takes.
+fn resolve_stage_model(record: &RunRecord, run_dir: &Path, stage: Stage) -> Option<String> {
+    if let Some(pinned) = &record.model {
+        return Some(pinned.clone());
+    }
+    if stage == Stage::Plan {
+        return None;
+    }
+    let stages_dir = run_dir.join("stages");
+    let decision = world::read_to_string(&stages_dir.join("diff-triage").join("decision.json"))
+        .ok()
+        .or_else(|| world::read_to_string(&stages_dir.join("triage").join("decision.json")).ok())
+        .and_then(|text| serde_json::from_str::<decide::Decision>(&text).ok());
+    let class = decision
+        .as_ref()
+        .and_then(|d| d.model_per_stage.get(&stage.to_string()).cloned())
+        .unwrap_or_else(|| "strong".to_string());
+    match class.as_str() {
+        "fast" => Some("claude-sonnet-5".to_string()),
+        _ => None,
+    }
+}
+
+/// Plan-only injected notes and lessons (unit B's `StageContext::notes`), read by the caller so
+/// the composition itself stays pure. `~/.grind/repos/<owner-name>/notes.md`, read as one
+/// hyphen-joined directory segment (`owner-name`, not `owner/name`) — deliberately not
+/// `job::repo_path`'s two-level clone layout, since notes travel with the *host's* memory of a
+/// repo rather than living inside the git checkout itself. **Default is silence**: an absent
+/// file is `None`, never a refusal — notes are an enrichment, and Plan composes identically
+/// without them.
+fn notes_for(home: &Path, target_repo: &str) -> Option<String> {
+    let (owner, name) = job::repo_owner_and_name(target_repo);
+    let path = job::grind_dir(home)
+        .join("repos")
+        .join(format!("{owner}-{name}"))
+        .join("notes.md");
+    world::read_to_string(&path).ok()
+}
+
+/// One Attempt for one ladder rung: the stage's own session, dispatched fresh or resumed by
+/// whether its transcript already has lines, run through the same `attempt::run` raw-before-parse
+/// machinery every Attempt uses. After the child lands, its own return file (if now present)
+/// decides the pushed `StageEntry`'s status — fail-closed to `Incomplete` when it is absent, the
+/// same reading `rung::next` gives an absent return.
+fn run_ladder_attempt(
+    record: &mut RunRecord,
+    run_dir: &Path,
+    worktree: &Path,
+    stage: Stage,
+) -> Result<(), Refusal> {
+    let home = world::home().ok_or_else(|| Refusal::saying("$HOME is unset"))?;
+    let skill_path = skills_root(&home).join(stage.to_string()).join("SKILL.md");
+    let skill_text = world::read_to_string(&skill_path)
+        .map_err(|e| Refusal::saying(format!("stage `{stage}` skill text unreadable: {e}")))?;
+
+    let session_id = attempt::stage_session_id(&record.run_id, stage);
+    // The same two-fact test `entry_mode` applies to the Run's mega-session, scoped to this
+    // stage: a crash after `claude` opened the session but before this stage's own
+    // `StageEntry` was ever recorded would re-dispatch under `--session-id` and lose that
+    // session's work if this read the transcript alone — a transcript with no lines yet reads
+    // the same as no transcript at all.
+    let stage_attempts_so_far = record
+        .stages()
+        .iter()
+        .filter(|entry| entry.name == stage.to_string())
+        .count();
+    let mode = if stage_attempts_so_far == 0 && transcript_lines_for(worktree, &session_id) == 0 {
+        Mode::Dispatch
+    } else {
+        Mode::Resume
+    };
+    let model = resolve_stage_model(record, run_dir, stage);
+    let notes = (stage == Stage::Plan)
+        .then(|| notes_for(&home, &record.job.target_repo))
+        .flatten();
+    let stages_dir_str = run_dir.join("stages").display().to_string();
+    let ctx = StageContext {
+        stage,
+        skill_text: &skill_text,
+        stages_dir: &stages_dir_str,
+        worktree: &record.worktree,
+        job: &record.job,
+        model: model.as_deref(),
+        notes: notes.as_deref(),
+    };
+    let conditions = StageConditions {
+        claude_bin: &record.claude_bin,
+        run_id: &record.run_id,
+    };
+    let invocation = attempt::stage_invocation(&conditions, &ctx, mode, record.clearances().last());
+
+    let n = record.attempts().len() + 1;
+    let started_at = world::now_iso();
+    say(
+        run_dir,
+        &format!("  [{started_at}] {stage} attempt {n} ({mode}) …"),
+    );
+    let already_written = transcript_lines_for(worktree, &session_id);
+    let raw = attempt::run(
+        &invocation,
+        worktree,
+        &run_dir.join(format!("attempt-{n}.prompt.txt")),
+        &run_dir.join(format!("attempt-{n}.stdout.json")),
+        &run_dir.join(format!("attempt-{n}.stderr.log")),
+    )
+    .map_err(|reason| Refusal::saying(reason.to_string()))?;
+    let classified = raw
+        .classify(n, mode, &started_at, &world::now_iso())
+        .with_fanout(fanout_of_session(worktree, &session_id, already_written));
+    let cost_usd = classified.total_cost_usd;
+    let turns = classified.num_turns;
+    record.push_attempt(classified);
+
+    let stage_return_path = run_dir.join("stages").join(format!("{stage}.return.json"));
+    let status = world::read_to_string(&stage_return_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<StageReturn>(&text).ok())
+        .map(|r| r.status)
+        .unwrap_or(ReturnStatus::Incomplete);
+    let stage_dir = run_dir.join("stages").join(stage.to_string());
+    let artifact_paths: Vec<String> = world::list_dir(&stage_dir)
+        .into_iter()
+        .filter_map(|p| {
+            p.strip_prefix(run_dir)
+                .ok()
+                .map(|rel| rel.display().to_string())
+        })
+        .collect();
+    record.push_stage_entry(rung::StageEntry {
+        name: stage.to_string(),
+        session_id,
+        status,
+        artifact_paths,
+        model,
+        cost_usd,
+        turns,
+    });
+    Ok(())
+}
+
+/// Ship's one bounded CI-babysit round, continuing **Ship's own session** (`<run>-ship`) rather
+/// than a fresh stage composition — there is no stage-shaped babysit prompt to build, so this
+/// reuses the existing [`attempt::ci_babysit`] builder exactly as the legacy path does, pointed
+/// at the stage session instead of the Run-level one.
+fn run_ship_babysit_attempt(
+    record: &mut RunRecord,
+    run_dir: &Path,
+    worktree: &Path,
+) -> Result<(), Refusal> {
+    let session_id = attempt::stage_session_id(&record.run_id, Stage::Ship);
+    let conditions = Conditions {
+        claude_bin: &record.claude_bin,
+        session_id: &session_id,
+        plugin_dir: &record.plugin_dir,
+        model: record.model.as_deref(),
+    };
+    let invocation = attempt::ci_babysit(&conditions);
+    let n = record.attempts().len() + 1;
+    let started_at = world::now_iso();
+    say(
+        run_dir,
+        &format!("  [{started_at}] attempt {n} (ci-babysit) …"),
+    );
+    let already_written = transcript_lines_for(worktree, &session_id);
+    let raw = attempt::run(
+        &invocation,
+        worktree,
+        &run_dir.join(format!("attempt-{n}.prompt.txt")),
+        &run_dir.join(format!("attempt-{n}.stdout.json")),
+        &run_dir.join(format!("attempt-{n}.stderr.log")),
+    )
+    .map_err(|reason| Refusal::saying(reason.to_string()))?;
+    let classified = raw
+        .classify(n, Mode::CiBabysit, &started_at, &world::now_iso())
+        .with_fanout(fanout_of_session(worktree, &session_id, already_written));
+    record.push_attempt(classified);
+    Ok(())
 }
 
 fn run_one_attempt(
@@ -794,8 +1476,8 @@ fn run_one_attempt(
     say(run_dir, &format!("  [{started_at}] attempt {n} ({mode}) …"));
 
     // **Taken before the child spawns, and this is what makes the pair belong to this Attempt.**
-    // The transcript is keyed on `record.session_id`, which `fresh_session_id` fixes for the
-    // Run's life, and every attempt after the first resumes that session and appends to the same
+    // The transcript is keyed on `record.session_id`, fixed for the Run's life, and every
+    // attempt after the first resumes that session and appends to the same
     // `.jsonl`. Counting the whole file on Attempt N therefore counted Attempts 1..N — and
     // `render::fanout_totals` sums those pairs, so a Run fanning out to 2 agents on each of 3
     // attempts recorded (2,2), (4,4), (6,6) and published *12 spawned, 12 returned*. R51 says
@@ -837,16 +1519,25 @@ fn entry_mode(attempts: &[Attempt], transcript_lines: usize) -> Mode {
     }
 }
 
-/// How much of the Run's transcript exists right now, in lines. A transcript that is not there
-/// yet is zero rather than a refusal: the first Attempt of a Run has nothing to skip, and that
-/// is the same answer.
+/// How much of the Run's mega-session transcript exists right now, in lines. Legacy-path
+/// callers only — a ladder-mode caller names its own stage's session id and reaches
+/// [`transcript_lines_for`] directly, since a Run carries one transcript per stage rather than
+/// one for its life.
+fn transcript_lines(record: &RunRecord) -> usize {
+    transcript_lines_for(&PathBuf::from(&record.worktree), &record.session_id)
+}
+
+/// How much of **one session's** transcript exists right now, in lines. A transcript that is not
+/// there yet is zero rather than a refusal: a fresh session has nothing to skip, and that is the
+/// same answer whether the session is the Run's old mega-session or one stage's own.
 ///
 /// Read while the child is not running, so the file is quiescent and the last line is whole.
-fn transcript_lines(record: &RunRecord) -> usize {
+fn transcript_lines_for(worktree: &Path, session_id: &str) -> usize {
     let Some(home) = world::home() else {
         return 0;
     };
-    let transcript = crate::view::transcript_path(&home, &record.worktree, &record.session_id);
+    let transcript =
+        crate::view::transcript_path(&home, &worktree.display().to_string(), session_id);
     match world::read_to_string(&transcript) {
         Ok(text) => text.lines().count(),
         Err(_) => 0,
@@ -854,12 +1545,28 @@ fn transcript_lines(record: &RunRecord) -> usize {
 }
 
 /// The Attempt's fan-out arithmetic, over **the lines this Attempt appended** and no earlier
-/// ones. `world` reads the file; a pure counter reads the text.
+/// ones. `world` reads the file; a pure counter reads the text. Legacy-path callers only, for
+/// the same reason `transcript_lines` names one — see [`fanout_of_session`] for the ladder.
 fn fanout_of(record: &RunRecord, already_written: usize) -> Observed<(u64, u64)> {
+    fanout_of_session(
+        &PathBuf::from(&record.worktree),
+        &record.session_id,
+        already_written,
+    )
+}
+
+/// The fan-out arithmetic over one named session's transcript, over the lines appended since
+/// `already_written`.
+fn fanout_of_session(
+    worktree: &Path,
+    session_id: &str,
+    already_written: usize,
+) -> Observed<(u64, u64)> {
     let Some(home) = world::home() else {
         return Observed::Unobservable(Reason::saying("$HOME is unset"));
     };
-    let transcript = crate::view::transcript_path(&home, &record.worktree, &record.session_id);
+    let transcript =
+        crate::view::transcript_path(&home, &worktree.display().to_string(), session_id);
     match world::read_to_string(&transcript) {
         Ok(text) => crate::view::fanout_since(&text, already_written),
         Err(said) => Observed::Unobservable(Reason::saying(&format!(
@@ -935,8 +1642,87 @@ fn check_presence(home: &Path, job: &Job, check: job::Check) -> Observed<ItemOut
         job::Check::PluginInstalled => {
             obs::plugin_installed(world::is_dir(&job::plugin_dir(home, &job.plugin)))
         }
+        job::Check::SkillsPresent => obs::skills_present(&skill_dir_names(home)),
         other => obs::unchecked(&format!("{other:?} is not a dispatch-depth check")),
     }
+}
+
+/// `~/.grind/skills/run` — the host skill root ADR-0015 declares (decision 1). Provisioning
+/// copies `skills/run/*` here.
+fn skills_root(home: &Path) -> PathBuf {
+    job::grind_dir(home).join("skills").join("run")
+}
+
+/// The directory names directly under the skill root, for `observe::skills_present` to check
+/// against `observe::STAGE_SKILLS`.
+fn skill_dir_names(home: &Path) -> Vec<String> {
+    world::list_dir(&skills_root(home))
+        .into_iter()
+        .filter(|p| world::is_dir(p))
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+        .collect()
+}
+
+/// Provenance, frozen once at dispatch (plan's decision 1): the grind binary version this Run
+/// was dispatched by, plus an identity hash of the host skill root at that moment. Never
+/// re-resolved — the same rule the plugin pin followed, for the same reason: a Run spans hours,
+/// and provenance that changed mid-Run would be silent.
+fn provenance(home: &Path) -> Provenance {
+    Provenance {
+        binary_version: env!("CARGO_PKG_VERSION").to_string(),
+        skills_hash: skills_hash(&skill_files(&skills_root(home))),
+    }
+}
+
+/// Every file under a skill root, as `(path relative to root, bytes)` — directory reading
+/// through `world` alone, recursing on `world::is_dir`. Read failures are skipped rather than
+/// refused: an identity hash over what could be read is still an honest, comparable fact, and a
+/// hash this fails to compute over must never block a Dispatch the presence check already
+/// cleared.
+fn skill_files(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        for entry in world::list_dir(dir) {
+            if world::is_dir(&entry) {
+                walk(&entry, root, out);
+            } else if let Ok(bytes) = world::read_bytes(&entry) {
+                let rel = entry
+                    .strip_prefix(root)
+                    .unwrap_or(&entry)
+                    .display()
+                    .to_string();
+                out.push((rel, bytes));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(root, root, &mut files);
+    files
+}
+
+/// A sorted FNV-1a hash over relative path and file bytes. **An identity check, not a security
+/// boundary** — the design's own words — so a hand-rolled hash is exactly right rather than a
+/// cut corner: it takes no dependency (ADR-0005) and answers the one question this needs
+/// answered, *did the skill tree change under this Run's feet*, without claiming to resist a
+/// deliberate collision.
+fn skills_hash(files: &[(String, Vec<u8>)]) -> String {
+    let mut sorted: Vec<&(String, Vec<u8>)> = files.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut fnv1a = |byte: u8| {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for (path, bytes) in sorted {
+        for byte in path.bytes() {
+            fnv1a(byte);
+        }
+        fnv1a(0); // a separator, so "ab"+"c" and "a"+"bc" hash differently
+        for &byte in bytes {
+            fnv1a(byte);
+        }
+        fnv1a(0);
+    }
+    format!("{hash:016x}")
 }
 
 fn adopt_or_create_worktree(repo_path: &Path, branch: &str) -> Result<PathBuf, Refusal> {
@@ -1108,26 +1894,6 @@ fn say(run_dir: &Path, line: &str) {
     let _ = world::append_line(&log_path(run_dir), line);
 }
 
-/// A session id with no dependency on a uuid crate. It has to be unique per Run and stable for
-/// the Run's life; the run id plus the dispatching pid is both.
-fn fresh_session_id(run_id: &str, pid: u32) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in run_id.bytes().chain(pid.to_le_bytes()) {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    let high = format!("{hash:016x}");
-    let low = format!("{:016x}", hash.rotate_left(17) ^ u64::from(pid));
-    format!(
-        "{}-{}-4{}-a{}-{}",
-        &high[0..8],
-        &high[8..12],
-        &high[13..16],
-        &low[1..4],
-        &low[4..16]
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1207,19 +1973,136 @@ mod tests {
     }
 
     #[test]
-    fn a_session_id_is_shaped_like_one_and_is_stable_for_a_run() {
-        let first = fresh_session_id("20260806-122620-snapper-28", 30412);
-        assert_eq!(first, fresh_session_id("20260806-122620-snapper-28", 30412));
-        assert_ne!(first, fresh_session_id("20260806-122620-snapper-29", 30412));
-        let parts: Vec<&str> = first.split('-').collect();
+    fn a_new_records_session_id_is_the_plan_stages_own() {
+        // Decision 4: a new record leaves the Run-level `session_id` as the Plan stage's id
+        // rather than a Run-wide mega-session — Plan is where the ladder always starts.
         assert_eq!(
-            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
-            vec![8, 4, 4, 4, 12]
+            attempt::stage_session_id("20260806-122620-snapper-28", Stage::Plan),
+            "20260806-122620-snapper-28-plan"
         );
-        assert!(
-            first.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
-            "{first}"
+    }
+
+    // --- the ladder walk's pure and near-pure pieces --------------------------------------
+
+    #[test]
+    fn skills_hash_is_order_independent_and_content_sensitive() {
+        let a = vec![
+            ("plan/SKILL.md".to_string(), b"one".to_vec()),
+            ("work/SKILL.md".to_string(), b"two".to_vec()),
+        ];
+        let shuffled = vec![
+            ("work/SKILL.md".to_string(), b"two".to_vec()),
+            ("plan/SKILL.md".to_string(), b"one".to_vec()),
+        ];
+        assert_eq!(skills_hash(&a), skills_hash(&shuffled));
+
+        let edited = vec![
+            ("plan/SKILL.md".to_string(), b"one!".to_vec()),
+            ("work/SKILL.md".to_string(), b"two".to_vec()),
+        ];
+        assert_ne!(skills_hash(&a), skills_hash(&edited));
+    }
+
+    #[test]
+    fn skills_hash_of_no_files_is_stable_and_not_a_special_case() {
+        assert_eq!(skills_hash(&[]), skills_hash(&[]));
+    }
+
+    #[test]
+    fn resolve_stage_model_pins_every_stage_when_the_job_names_one() {
+        let mut record = day_one();
+        record.model = Some("claude-opus-9".to_string());
+        let run_dir = world::temp_dir("resolve-model-pinned");
+        for stage in [Stage::Plan, Stage::Work, Stage::Ship] {
+            assert_eq!(
+                resolve_stage_model(&record, &run_dir, stage),
+                Some("claude-opus-9".to_string()),
+                "{stage} must take the Job's pinned model"
+            );
+        }
+        world::remove_tree(&run_dir);
+    }
+
+    #[test]
+    fn resolve_stage_model_routes_plan_strong_before_any_decision_exists() {
+        let mut record = day_one();
+        record.model = None;
+        let run_dir = world::temp_dir("resolve-model-plan");
+        assert_eq!(
+            resolve_stage_model(&record, &run_dir, Stage::Plan),
+            None,
+            "strong means the harness default: no --model flag"
         );
+        world::remove_tree(&run_dir);
+    }
+
+    #[test]
+    fn read_stage_returns_is_absent_over_an_empty_stages_directory() {
+        let run_dir = world::temp_dir("read-returns-empty");
+        world::create_dir_all(&run_dir).unwrap();
+        assert_eq!(read_stage_returns(&run_dir), rung::StageReturns::default());
+        world::remove_tree(&run_dir);
+    }
+
+    #[test]
+    fn read_stage_returns_reads_a_written_plan_return_off_disk() {
+        let run_dir = world::temp_dir("read-returns-plan");
+        let stages_dir = run_dir.join("stages");
+        world::create_dir_all(&stages_dir).unwrap();
+        world::write(
+            &stages_dir.join("plan.return.json"),
+            r#"{"status":"complete"}"#,
+        )
+        .unwrap();
+        let returns = read_stage_returns(&run_dir);
+        assert_eq!(
+            returns.plan,
+            Some(StageReturn {
+                status: ReturnStatus::Complete,
+                revised: false,
+            })
+        );
+        assert_eq!(rung::next(&returns), Some(Stage::Triage));
+        world::remove_tree(&run_dir);
+    }
+
+    #[test]
+    fn is_pre_cutover_is_false_for_a_brand_new_record_with_no_attempts() {
+        // A fresh record — no `stages`, no `attempts` — walks the ladder from Attempt 1; it is
+        // not the pre-cutover fallback, which needs an attempt already on it.
+        let record = day_one();
+        let run_dir = world::temp_dir("pre-cutover-fresh");
+        world::create_dir_all(&run_dir).unwrap();
+        let mut fresh = record.clone();
+        fresh.attempts.clear();
+        assert!(!is_pre_cutover(&fresh, &run_dir));
+        world::remove_tree(&run_dir);
+    }
+
+    #[test]
+    fn is_pre_cutover_is_true_for_an_old_record_with_attempts_and_no_stage_rows_or_returns() {
+        let record = day_one();
+        let run_dir = world::temp_dir("pre-cutover-old");
+        world::create_dir_all(&run_dir).unwrap();
+        assert!(record.stages().is_empty());
+        assert!(!record.attempts().is_empty());
+        assert!(is_pre_cutover(&record, &run_dir));
+        world::remove_tree(&run_dir);
+    }
+
+    #[test]
+    fn is_pre_cutover_is_false_once_any_stage_return_file_exists() {
+        let record = day_one();
+        let run_dir = world::temp_dir("pre-cutover-with-return");
+        let stages_dir = run_dir.join("stages");
+        world::create_dir_all(&stages_dir).unwrap();
+        world::write(
+            &stages_dir.join("plan.return.json"),
+            r#"{"status":"complete"}"#,
+        )
+        .unwrap();
+        assert!(!is_pre_cutover(&record, &run_dir));
+        world::remove_tree(&run_dir);
     }
 
     #[test]
@@ -1271,6 +2154,20 @@ mod tests {
             cleared_at: "2026-08-21T19:00:00+00:00".to_string(),
             note: "the deploy key was rotated".to_string(),
         });
+        written.push_stage_entry(rung::StageEntry {
+            name: "plan".to_string(),
+            session_id: "20260806-122620-snapper-28-plan".to_string(),
+            status: ReturnStatus::Complete,
+            artifact_paths: vec!["stages/plan/anchor-plan.md".to_string()],
+            model: None,
+            cost_usd: Some(3.2),
+            turns: Some(11),
+        });
+        written.provenance = Some(Provenance {
+            binary_version: env!("CARGO_PKG_VERSION").to_string(),
+            skills_hash: "deadbeef".to_string(),
+        });
+        written.reflected = true;
         let bytes = serde_json::to_string(&written).expect("serialise");
         let read: crate::view::RunView = serde_json::from_str(&bytes)
             .expect("the reader must accept every field the writer emits");
@@ -1279,10 +2176,18 @@ mod tests {
         assert_eq!(read.attempts.len(), written.attempts().len());
         assert_eq!(read.attempt_budget, written.attempt_budget);
         assert_eq!(read.limit_sleep_seconds, written.limit_sleep_seconds);
+        assert_eq!(read.plan_revisions, written.plan_revisions);
+        assert_eq!(read.fix_rounds, written.fix_rounds);
         assert_eq!(read.supervisor_pid, written.supervisor_pid);
         assert_eq!(read.state, written.state.as_str());
         assert_eq!(read.denied_tools, written.denied_tools);
         assert_eq!(read.clearances, written.clearances());
+        assert_eq!(read.stages, written.stages());
+        assert_eq!(
+            read.provenance.map(|p| p.skills_hash),
+            written.provenance.map(|p| p.skills_hash)
+        );
+        assert_eq!(read.reflected, written.reflected);
     }
 
     #[test]

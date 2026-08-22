@@ -459,6 +459,10 @@ pub enum Check {
     OnPath(&'static str),
     GitVersionFloor,
     PluginInstalled,
+    /// The ten stage skill directories under `~/.grind/skills/run` (ADR-0015). Named alongside
+    /// `PluginInstalled` rather than in its place — unit D's job is deleting the plugin pin once
+    /// nothing invokes it; this unit only adds what the ladder actually reads.
+    SkillsPresent,
     /// The **first platform-branching check** in a list where every other one is a single
     /// command everywhere: `launchctl print` on darwin, `systemctl --user is-enabled` on linux.
     BootOneShot,
@@ -533,6 +537,12 @@ pub fn host_items() -> &'static [HostItem] {
             depth: Depth::Dispatch,
             check: Check::PluginInstalled,
             doc_anchor: "The `lfg` plugin is installed.",
+        },
+        HostItem {
+            name: "stage skills present",
+            depth: Depth::Dispatch,
+            check: Check::SkillsPresent,
+            doc_anchor: "The ten stage skill directories are present under `~/.grind/skills/run`.",
         },
         HostItem {
             name: "restart one-shot loaded",

@@ -41,6 +41,11 @@ pub struct RunView {
     pub hostname: String,
     pub attempt_budget: usize,
     pub limit_sleep_seconds: u64,
+    /// Absent on a pre-cutover record, the same reasoning `clearances` documents.
+    #[serde(default)]
+    pub plan_revisions: usize,
+    #[serde(default)]
+    pub fix_rounds: usize,
     pub supervisor_pid: u32,
     pub supervisor_identity: Option<String>,
     pub attempts: Vec<Attempt>,
@@ -48,6 +53,22 @@ pub struct RunView {
     /// as empty — see the writer's field for why that default is honest.
     #[serde(default)]
     pub clearances: Vec<Clearance>,
+    /// Empty on a pre-cutover record — the same fact `supervisor`'s legacy-path gate reads.
+    #[serde(default)]
+    pub stages: Vec<crate::rung::StageEntry>,
+    #[serde(default)]
+    pub provenance: Option<Provenance>,
+    #[serde(default)]
+    pub reflected: bool,
+}
+
+/// The read-only mirror of `supervisor::Provenance`. Field names duplicated by design, the same
+/// carrier `RunView` itself is for `RunRecord` — see this module's own doc comment.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Provenance {
+    pub binary_version: String,
+    pub skills_hash: String,
 }
 
 impl RunView {

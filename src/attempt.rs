@@ -216,6 +216,52 @@ pub fn stage_invocation(
     }
 }
 
+/// Reflect's first Attempt, opening `<run>-reflect`. Not a rung — [`rung::Stage`] has no
+/// variant for it (the design's own words: *deliberately not an eleventh stage*) — so it never
+/// goes through [`stage_invocation`]; the supervisor calls this directly once a terminal
+/// observation lands. Dispatched with the **run directory** as cwd rather than the worktree
+/// (unit C's job), so there is no repo tree under the session for a `Write`/`Edit` denial to
+/// matter over — its worktree protection is [`denied_for_reflect`]'s write-capable Bash-form
+/// denials instead.
+pub fn reflect_dispatch(conditions: &StageConditions, skill_text: &str) -> Invocation {
+    build_reflect(conditions, skill_text, Mode::Dispatch)
+}
+
+/// A later Attempt for Reflect, resuming `<run>-reflect` — bounded to one re-entry by the
+/// supervisor, never by this builder.
+pub fn reflect_resume(conditions: &StageConditions, skill_text: &str) -> Invocation {
+    build_reflect(conditions, skill_text, Mode::Resume)
+}
+
+fn build_reflect(conditions: &StageConditions, skill_text: &str, mode: Mode) -> Invocation {
+    let session_id = format!("{}-reflect", conditions.run_id);
+    let mut argv = vec![
+        conditions.claude_bin.to_string(),
+        "-p".to_string(),
+        "--output-format".to_string(),
+        "json".to_string(),
+        "--permission-mode".to_string(),
+        "bypassPermissions".to_string(),
+    ];
+    match mode {
+        Mode::Dispatch => {
+            argv.push("--session-id".to_string());
+            argv.push(session_id);
+        }
+        Mode::Resume | Mode::CiBabysit => {
+            argv.push("--resume".to_string());
+            argv.push(session_id);
+        }
+    }
+    argv.push("--disallowedTools".to_string());
+    argv.extend(denied_for_reflect());
+    Invocation {
+        argv,
+        prompt: skill_text.to_string(),
+        mode,
+    }
+}
+
 fn build_stage(
     conditions: &StageConditions,
     ctx: &StageContext,

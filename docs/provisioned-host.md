@@ -95,6 +95,11 @@ resolves.
   and every attempt and every `--resume` reads the record — the version is pinned per Job and
   frozen for the Run's whole life. The host owes an installed plugin, which is all this check
   looks for; which version matters is the Job's literal, never the host's.
+- **The ten stage skill directories are present under `~/.grind/skills/run`.** — *dispatch* — Grit
+  (ADR-0015) dispatches one stage skill per rung rather than the `lfg` plugin's mega-session; a
+  host that provisioned the plugin but never copied `skills/run/*` into place would pass every
+  check above and still have nothing to read at the first stage. Presence only, the same
+  layout-declared shape `job::plugin_dir()` reads: the host declares itself by what is on disk.
 
 ## Lifetime
 

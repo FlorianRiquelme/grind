@@ -28,6 +28,21 @@ pub enum Stage {
     Ship,
 }
 
+/// Every rung, in ladder order — the same order [`next`] walks. Lets a caller enumerate
+/// `stages/<name>.return.json` on disk without hand-writing the ten names a second time.
+pub const ALL: [Stage; 10] = [
+    Stage::Plan,
+    Stage::Triage,
+    Stage::PlanReview,
+    Stage::Work,
+    Stage::Simplify,
+    Stage::DiffTriage,
+    Stage::Review,
+    Stage::Validate,
+    Stage::Fixes,
+    Stage::Ship,
+];
+
 impl std::fmt::Display for Stage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let word = match self {
@@ -128,18 +143,46 @@ pub fn next(returns: &StageReturns) -> Option<Stage> {
     None
 }
 
-/// The serde row a Run's record carries per stage. Wired into `RunRecord.stages` in a later
-/// phase; defined here as the pure vocabulary. Shapes follow `attempt::Attempt`'s conventions:
-/// cost and turn counts are `Option`, present only once a session actually reports them.
+/// The serde row a Run's record carries per stage. Wired into `RunRecord.stages` (unit C).
+/// Shapes follow `attempt::Attempt`'s conventions: cost and turn counts are `Option`, present
+/// only once a session actually reports them.
+///
+/// **`name` is a `String`, not a `Stage`.** Reflect is a post-run pass, not a rung — it has no
+/// `Stage` variant by design (the design's own words: *deliberately not an eleventh stage*), yet
+/// it still needs a row so its session, cost and turns land in the record. A `Stage`-typed field
+/// would have no honest variant to give it; `String` carries both a rung's `Display` output
+/// (`"plan"`, `"work"`, …) and a post-run pass's own name (`"reflect"`) without inventing a
+/// rung that does not exist.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StageEntry {
-    pub name: Stage,
+    pub name: String,
     pub session_id: String,
     pub status: ReturnStatus,
     pub artifact_paths: Vec<String>,
     pub model: Option<String>,
     pub cost_usd: Option<f64>,
     pub turns: Option<u64>,
+}
+
+/// Assemble [`StageReturns`] from ten optional slots of raw JSON text, one per stage in ladder
+/// order — the shape a supervisor reading `stages/<name>.return.json` fresh off disk naturally
+/// produces. **Tolerant per slot**: an absent file is `None`, and unparseable text also reads as
+/// `None` rather than refusing the whole assembly — fail-closed toward re-entering that one
+/// stage, never toward losing every other stage's progress over one bad file.
+pub fn returns_from(slots: [Option<&str>; 10]) -> StageReturns {
+    let parse = |raw: Option<&str>| raw.and_then(|text| serde_json::from_str(text).ok());
+    StageReturns {
+        plan: parse(slots[0]),
+        triage: parse(slots[1]),
+        plan_review: parse(slots[2]),
+        work: parse(slots[3]),
+        simplify: parse(slots[4]),
+        diff_triage: parse(slots[5]),
+        review: parse(slots[6]),
+        validate: parse(slots[7]),
+        fixes: parse(slots[8]),
+        ship: parse(slots[9]),
+    }
 }
 
 /// The explicit total mapping from the pre-cutover `decide::Stage` to the earliest new rung
@@ -286,7 +329,7 @@ mod tests {
     #[test]
     fn a_stage_entry_round_trips_through_serde() {
         let entry = StageEntry {
-            name: Stage::Work,
+            name: Stage::Work.to_string(),
             session_id: "run-1-work".to_string(),
             status: ReturnStatus::Complete,
             artifact_paths: vec!["stages/work/evidence.json".to_string()],
@@ -297,6 +340,46 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         let back: StageEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn returns_from_assembles_ten_optional_slots_in_ladder_order() {
+        let plan = r#"{"status":"complete"}"#;
+        let triage = r#"{"status":"complete"}"#;
+        let assembled = returns_from([
+            Some(plan),
+            Some(triage),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(assembled.plan, Some(complete()));
+        assert_eq!(assembled.triage, Some(complete()));
+        assert_eq!(assembled.plan_review, None);
+        assert_eq!(next(&assembled), Some(Stage::PlanReview));
+    }
+
+    #[test]
+    fn returns_from_reads_an_unparseable_slot_as_absent_rather_than_refusing() {
+        let assembled = returns_from([
+            Some("not json at all"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(assembled.plan, None);
+        assert_eq!(next(&assembled), Some(Stage::Plan));
     }
 
     #[test]
