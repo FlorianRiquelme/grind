@@ -33,3 +33,9 @@ autonomous residual handoff that files durable records without prompting.
 - If `lfg` turns out to be too opinionated, composing later is a mechanical decomposition
   of a known-good sequence rather than a redesign — and by then we will know which of its
   opinions actually cost us something.
+
+> **Superseded 2026-08-22 by ADR-0015
+> ([#92](https://github.com/FlorianRiquelme/grind/issues/92)).** This clause is exercised, not
+> overridden: `docs/findings/0004` is the "by then we will know," and the opinion that cost
+> something was the mega-session shape. Grind now owns a ten-stage ladder decomposed from the same
+> known-good sequence this ADR chose to consume wholesale.

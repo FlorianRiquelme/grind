@@ -136,6 +136,58 @@ fn denied_invocations(attempt: &Attempt) -> Vec<String> {
         .collect()
 }
 
+/// Read the stated reset hour out of a rate-limit message shaped like Run 4's — `"resets 12am
+/// (Europe/Paris)"`, `"resets 3pm"` — and the sleep needed to reach that wall-clock hour from
+/// `now`, capped at 12h so a garbled parse can never park a Run for a week.
+///
+/// **The timezone name is not resolved.** Only the stated hour is read; a message naming a
+/// timezone the host is not itself in reads against the host's own clock, which is a coarser
+/// answer than resolving it properly but strictly better than the fixed sleep it replaces — that
+/// one ignored the wall clock entirely. Unparseable or absent text returns `None`, and the caller
+/// falls back to the recorded fixed sleep (`Budget::limit_sleep`) for that reading, exactly as
+/// before this existed.
+///
+/// `now` is `(hour, minute)`, 24-hour, supplied by the caller — this module stays pure, so it
+/// never reads a clock itself (ADR-0007).
+pub fn reset_time_sleep(text: &str, now: (u32, u32)) -> Option<Duration> {
+    let target_hour = parse_reset_hour(text)?;
+    let (now_hour, now_minute) = (now.0 % 24, now.1.min(59));
+    let hours_ahead = if target_hour >= now_hour {
+        target_hour - now_hour
+    } else {
+        24 - now_hour + target_hour
+    };
+    let mut seconds = u64::from(hours_ahead) * 3600;
+    seconds = seconds.saturating_sub(u64::from(now_minute) * 60);
+    // Landing exactly on the target hour (0 minutes past, 0 hours ahead) means the reset is
+    // now — the same sleep-then-look-again shape the caller already handles, so a full cycle
+    // is asked for rather than a zero-length sleep that would spin.
+    if seconds == 0 {
+        seconds = 24 * 3600;
+    }
+    Some(Duration::from_secs(seconds.min(12 * 3600)))
+}
+
+/// `"resets 12am (Europe/Paris)"` -> `Some(0)`, `"resets 3pm"` -> `Some(15)`, garbage or a
+/// missing `"resets "` marker -> `None`. Also accepts a bare 24-hour hour with no am/pm marker,
+/// since a message need not use 12-hour time to be a stated reset time.
+fn parse_reset_hour(text: &str) -> Option<u32> {
+    let after = text.find("resets ").map(|i| &text[i + "resets ".len()..])?;
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || digits.len() > 2 {
+        return None;
+    }
+    let mut hour: u32 = digits.parse().ok()?;
+    let rest = &after[digits.len()..];
+    let marker: String = rest.chars().take(2).collect::<String>().to_lowercase();
+    if marker == "am" && hour == 12 {
+        hour = 0;
+    } else if marker == "pm" && hour != 12 {
+        hour += 12;
+    }
+    (hour < 24).then_some(hour)
+}
+
 /// The whole policy, as one pure function over the attempt list and the verdict.
 pub fn next(
     attempts: &[Attempt],
@@ -707,6 +759,53 @@ mod tests {
             Stop::Blocked("Bash(git push --force)".to_string()),
             Stop::Blocked(_)
         ));
+    }
+
+    // --- the reset-time sleep (decision 5) ------------------------------------------------
+
+    #[test]
+    fn a_stated_midnight_reset_is_read_from_a_run_4_shaped_message() {
+        let text = "The 5-hour limit resets 12am (Europe/Paris).";
+        // now is 22:00, so midnight is two hours away.
+        assert_eq!(
+            reset_time_sleep(text, (22, 0)),
+            Some(Duration::from_secs(2 * 3600))
+        );
+    }
+
+    #[test]
+    fn a_stated_afternoon_reset_is_read_and_partial_minutes_are_subtracted() {
+        let text = "resets 3pm";
+        // now is 13:30, so 3pm is 1h30m away.
+        assert_eq!(
+            reset_time_sleep(text, (13, 30)),
+            Some(Duration::from_secs(3600 + 1800))
+        );
+    }
+
+    #[test]
+    fn garbage_text_falls_back_to_none() {
+        assert_eq!(
+            reset_time_sleep("nothing about a reset here", (10, 0)),
+            None
+        );
+        assert_eq!(reset_time_sleep("resets whenever", (10, 0)), None);
+        assert_eq!(reset_time_sleep("resets 37pm", (10, 0)), None);
+    }
+
+    #[test]
+    fn the_reset_sleep_never_exceeds_twelve_hours() {
+        // now is 00:01, target is 23 (11pm) — 23h59m away by naive arithmetic, capped at 12h.
+        let text = "resets 11pm";
+        let found = reset_time_sleep(text, (0, 1)).unwrap();
+        assert!(found <= Duration::from_secs(12 * 3600), "{found:?}");
+    }
+
+    #[test]
+    fn a_reset_landing_now_asks_for_a_full_cycle_rather_than_spinning() {
+        let text = "resets 12am";
+        let found = reset_time_sleep(text, (0, 0)).unwrap();
+        assert!(found > Duration::ZERO, "a zero sleep would spin");
     }
 
     #[test]

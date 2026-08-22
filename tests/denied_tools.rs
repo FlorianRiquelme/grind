@@ -13,8 +13,23 @@
 //! What it catches is a **half changed alone**, never a list that is too narrow. Widening is
 //! still a judgement, and no carrier defends against intent (ADR-0006).
 
+use grind::attempt::{DENIED_TOOLS, denied_for, denied_for_reflect};
+use grind::rung::Stage;
 use std::fs;
 use std::path::PathBuf;
+
+const ALL_STAGES: [Stage; 10] = [
+    Stage::Plan,
+    Stage::Triage,
+    Stage::PlanReview,
+    Stage::Work,
+    Stage::Simplify,
+    Stage::DiffTriage,
+    Stage::Review,
+    Stage::Validate,
+    Stage::Fixes,
+    Stage::Ship,
+];
 
 fn read(relative: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
@@ -106,4 +121,98 @@ fn the_declared_length_matches_the_globs_actually_listed() {
         .parse()
         .expect("the declared length is a number");
     assert_eq!(declared, bound().len());
+}
+
+/// Widening per stage never drops a base denial: every one of the ten stages, iterated against
+/// every glob CLAUDE.md documents, must carry it. Read the documented list rather than the
+/// linked constant, so a base glob added to one and not the other is caught here too.
+#[test]
+fn every_stage_carries_every_documented_base_denial() {
+    let base = documented();
+    for stage in ALL_STAGES {
+        let denied = denied_for(stage);
+        for glob in &base {
+            assert!(
+                denied.contains(glob),
+                "{stage} must carry the base denial {glob}"
+            );
+        }
+    }
+    let reflect = denied_for_reflect();
+    for glob in &base {
+        assert!(reflect.contains(glob), "reflect must carry {glob}");
+    }
+}
+
+#[test]
+fn the_report_only_stages_deny_write_and_edit() {
+    for stage in [Stage::PlanReview, Stage::Review, Stage::Validate] {
+        let denied = denied_for(stage);
+        assert!(denied.contains(&"Write".to_string()), "{stage}");
+        assert!(denied.contains(&"Edit".to_string()), "{stage}");
+    }
+}
+
+#[test]
+fn only_review_and_validate_carry_the_write_capable_bash_forms() {
+    let forms = [
+        "Bash(git commit*)",
+        "Bash(git add*)",
+        "Bash(git apply*)",
+        "Bash(git stash*)",
+        "Bash(mv *)",
+        "Bash(cp *)",
+        "Bash(rm *)",
+        "Bash(tee *)",
+        "Bash(sed -i*)",
+        "Bash(git push*)",
+    ];
+    for stage in [Stage::Review, Stage::Validate] {
+        let denied = denied_for(stage);
+        for form in forms {
+            assert!(
+                denied.iter().any(|g| g == form),
+                "{stage} must carry {form}"
+            );
+        }
+    }
+    for stage in [
+        Stage::Plan,
+        Stage::Triage,
+        Stage::PlanReview,
+        Stage::Work,
+        Stage::Simplify,
+        Stage::DiffTriage,
+        Stage::Fixes,
+        Stage::Ship,
+    ] {
+        let denied = denied_for(stage);
+        for form in forms {
+            assert!(
+                !denied.iter().any(|g| g == form),
+                "{stage} must not carry the panel-only {form}"
+            );
+        }
+    }
+}
+
+#[test]
+fn work_fixes_and_ship_do_not_deny_write_or_edit() {
+    for stage in [Stage::Work, Stage::Fixes, Stage::Ship] {
+        let denied = denied_for(stage);
+        assert!(!denied.contains(&"Write".to_string()), "{stage}");
+        assert!(!denied.contains(&"Edit".to_string()), "{stage}");
+    }
+}
+
+#[test]
+fn every_built_argv_carries_all_base_denials_regardless_of_stage() {
+    // The base list must show up verbatim in every `denied_for` call and in `denied_for_reflect`
+    // — nothing here should ever filter a base glob out for any stage.
+    for stage in ALL_STAGES {
+        let denied = denied_for(stage);
+        for glob in DENIED_TOOLS {
+            assert!(denied.iter().any(|g| g == glob), "{stage}: missing {glob}");
+        }
+    }
 }

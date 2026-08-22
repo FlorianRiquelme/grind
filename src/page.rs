@@ -7,7 +7,7 @@
 
 use crate::attempt::Attempt;
 use crate::observe::Observed;
-use crate::view::{Facts, Live, RosterRow, RunView};
+use crate::view::{Facts, Live, ProposalEntry, RosterRow, RunView};
 
 // ───────────────────────────── escaping ─────────────────────────────
 
@@ -417,7 +417,36 @@ pub fn roster_fragment(rows: &[RosterRow]) -> String {
     board(rows)
 }
 
-pub fn roster_page(rows: &[RosterRow]) -> String {
+/// One drafted follow-up Job or proposed skill diff, as Reflect left it — a GET-only
+/// projection over `stages/reflect/` (design line 160): nothing stores this list, so
+/// [`crate::view::proposal_queue`] rebuilds it fresh on every request and this only renders
+/// what came back. Empty when nothing has been proposed.
+fn proposal_queue_section(proposals: &[(String, ProposalEntry)]) -> String {
+    if proposals.is_empty() {
+        return String::new();
+    }
+    let mut rows = String::new();
+    for (run_id, entry) in proposals {
+        // Not a link: the raw-evidence route whitelists a fixed six names (R5), and a
+        // Reflect artifact's own path is not one of them. The path names where to look on
+        // the host, verbatim, the same register the Handback's own paths use.
+        rows.push_str(&format!(
+            "<div class=\"g-a\"><div class=\"g-aline\"><span class=\"g-idx\">{}</span>\
+<span class=\"g-verdict\">{}</span></div>\
+<div class=\"g-asub\">{} — {}</div></div>",
+            esc(run_id),
+            esc(entry.kind),
+            esc(&entry.summary),
+            esc(&entry.path.display().to_string()),
+        ));
+    }
+    format!(
+        "<div style=\"max-width:1010px;margin:0 auto;padding:0 16px\">\
+<div class=\"g-panel\"><div class=\"g-phead\">proposal queue<span class=\"g-r\">drafted by reflect · read-only</span></div>{rows}</div></div>"
+    )
+}
+
+pub fn roster_page(rows: &[RosterRow], proposals: &[(String, ProposalEntry)]) -> String {
     let needs = rows.iter().any(|r| r.recorded_state == "blocked");
     let inflight = rows
         .iter()
@@ -430,10 +459,11 @@ pub fn roster_page(rows: &[RosterRow]) -> String {
     layout(
         &title,
         &format!(
-            "{}{}<div style=\"max-width:1010px;margin:0 auto;padding:0 16px\">{}</div>{}",
+            "{}{}<div style=\"max-width:1010px;margin:0 auto;padding:0 16px\">{}</div>{}{}",
             command_bar(),
             telemetry(rows),
             roster_fragment(rows),
+            proposal_queue_section(proposals),
             status_bar()
         ),
     )
@@ -637,6 +667,152 @@ fn clearance_panel(facts: &Facts) -> String {
     )
 }
 
+/// The ten-rung stage table, one row per [`crate::rung::StageEntry`] the record carries. `[R]`
+/// rows (Triage, Diff-triage) render as the zero-cost passes they are — the record already
+/// carries their true cost and turns, so nothing here special-cases them. Absent entirely on a
+/// pre-cutover or early Run, whose `stages` list is empty rather than partially populated.
+fn stage_panel(found: &RunView) -> String {
+    if found.stages.is_empty() {
+        return String::new();
+    }
+    let mut rows = String::new();
+    for s in &found.stages {
+        let cost_turns = match (s.cost_usd, s.turns) {
+            (Some(c), Some(t)) => format!("${c:.2} · {t} turns"),
+            (Some(c), None) => format!("${c:.2}"),
+            (None, Some(t)) => format!("{t} turns"),
+            (None, None) => String::new(),
+        };
+        rows.push_str(&format!(
+            "<div class=\"g-a\"><div class=\"g-aline\"><span class=\"g-idx\">{}</span>\
+<span class=\"g-verdict\">{}</span><span class=\"g-dur\">{cost_turns}</span></div>\
+<div class=\"g-asub\">session {} · model {}</div></div>",
+            esc(&s.name),
+            esc(stage_status_label(s.status)),
+            esc(&s.session_id),
+            esc(s.model.as_deref().unwrap_or("(session default)")),
+        ));
+    }
+    format!(
+        "<div class=\"g-panel\"><div class=\"g-phead\">stages<span class=\"g-r\">rung ladder</span></div>{rows}</div>"
+    )
+}
+
+fn stage_status_label(status: crate::rung::ReturnStatus) -> &'static str {
+    match status {
+        crate::rung::ReturnStatus::Complete => "complete",
+        crate::rung::ReturnStatus::Skipped => "skipped",
+        crate::rung::ReturnStatus::Incomplete => "incomplete",
+    }
+}
+
+/// One tier-selection pass's receipt: tier, floor, personas, and the rationale rows that
+/// produced them — a fact, never a grade (ADR-0003 applies to rendering too: no ✓/✗ over a
+/// tier). Absent entirely when the stage never ran, which is `decision.json` never existing
+/// rather than a zero value to show.
+fn decision_panel(label: &str, decision: &Option<crate::decide::Decision>) -> String {
+    let Some(decision) = decision else {
+        return String::new();
+    };
+    let personas = if decision.personas.is_empty() {
+        "none".to_string()
+    } else {
+        decision
+            .personas
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut rows = String::new();
+    for r in &decision.rationale {
+        rows.push_str(&format!(
+            "<div class=\"g-asub\">{} \u{2192} {} ({})</div>",
+            esc(&r.signal),
+            esc(&r.value),
+            esc(&r.weight)
+        ));
+    }
+    format!(
+        "<div class=\"g-panel\"><div class=\"g-phead\">{} decision<span class=\"g-r\">tier {} · floor {}</span></div>\
+<div style=\"padding:10px 12px\">personas: {}</div>{rows}</div>",
+        esc(label),
+        esc(&decision.tier.to_string()),
+        esc(&decision.floor_from_plan.to_string()),
+        esc(&personas)
+    )
+}
+
+/// Reflect's calibration row, walked as plain key/value facts. Its shape is Reflect's own — the
+/// pass's own words call it "statistics feeding the monthly audit," not a schema this base
+/// forces — so this reads whatever keys the row carries. Absent entirely when Reflect wrote
+/// none.
+fn calibration_panel(calibration: &Option<serde_json::Value>) -> String {
+    let Some(serde_json::Value::Object(map)) = calibration else {
+        return String::new();
+    };
+    let mut rows = String::new();
+    for (key, value) in map {
+        rows.push_str(&format!(
+            "<div class=\"g-asub\">{}: {}</div>",
+            esc(key),
+            esc(&json_text(value))
+        ));
+    }
+    format!("<div class=\"g-panel\"><div class=\"g-phead\">calibration</div>{rows}</div>")
+}
+
+fn json_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// `outcome.json`'s facts, once `grind outcomes` has collected them: merged/closed state and
+/// any revert — never a grade on the Run. Absent entirely until the human runs `grind
+/// outcomes`.
+fn outcome_panel(outcome: &Option<crate::observe::RunOutcome>) -> String {
+    let Some(o) = outcome else {
+        return String::new();
+    };
+    let merged_at = o
+        .pr_merged_at
+        .as_ref()
+        .map(|a| format!(" · merged at {}", esc(a)))
+        .unwrap_or_default();
+    let closed_at = o
+        .pr_closed_at
+        .as_ref()
+        .map(|a| format!(" · closed at {}", esc(a)))
+        .unwrap_or_default();
+    let reverted = if o.reverted_by.is_empty() {
+        String::new()
+    } else {
+        format!(" · reverted by {}", esc(&o.reverted_by.join(", ")))
+    };
+    format!(
+        "<div class=\"g-panel\"><div class=\"g-phead\">outcome<span class=\"g-r\">{}</span></div>\
+<div style=\"padding:10px 12px\">merged {}{merged_at}{closed_at}{reverted}</div></div>",
+        esc(&o.pr_state),
+        if o.pr_merged { "yes" } else { "no" },
+    )
+}
+
+/// The stage table, decision receipts, calibration and outcome — Grit's own facts, folded into
+/// one block so a Run with none of them (pre-cutover, or one that has not reached the ladder
+/// yet) adds nothing to the page. Each panel is independently absent-safe.
+fn grit_panels(facts: &Facts) -> String {
+    format!(
+        "{}{}{}{}{}",
+        stage_panel(&facts.found),
+        decision_panel("triage", &facts.triage_decision),
+        decision_panel("diff-triage", &facts.diff_triage_decision),
+        calibration_panel(&facts.calibration),
+        outcome_panel(&facts.outcome),
+    )
+}
+
 fn budget(found: &RunView) -> String {
     let (n, m) = found.attempt_counter();
     budget_dots(n, m)
@@ -711,27 +887,28 @@ fn run_grid(run_id: &str, facts: &Facts) -> String {
 
 pub fn run_fragment(run_id: &str, facts: &Facts, live: &Live, here: &Observed<bool>) -> String {
     let any_live = matches!(facts.found.state.as_str(), "dispatched" | "rate_limited");
+    let side = format!("{}{}", last_words_block(live), grit_panels(facts));
     format!(
         "<div data-g-root=\"run\" data-live=\"{}\">{}\
 <div style=\"max-width:1010px;margin:0 auto;padding:12px 16px\">\
 <div class=\"g-grid\" style=\"display:grid;grid-template-columns:1fr 396px;gap:12px;align-items:start\">\
-<div style=\"min-width:0\">{}</div><div>{}</div></div></div>\
+<div style=\"min-width:0\">{}</div><div>{side}</div></div></div>\
 <div class=\"g-panel g-jump\" style=\"max-width:1010px;margin:0 auto\"><div class=\"g-phead\">supervisor.log<span class=\"g-r g-follow\">\u{25aa} following</span></div>\
 <div data-g-root=\"log\"><div class=\"g-log\" data-offset=\"0\"></div><div class=\"g-pill\">\u{2193} following</div></div></div></div>{}",
         if any_live { "true" } else { "false" },
         run_head(facts, live, here),
         run_grid(run_id, facts),
-        last_words_block(live),
         clearance_panel(facts)
     )
 }
 
 pub fn run_page(run_id: &str, facts: &Facts, live: &Live, here: &Observed<bool>) -> String {
+    let side = format!("{}{}", last_words_block(live), grit_panels(facts));
     let body = format!(
         "{}{}<div style=\"max-width:1010px;margin:0 auto;padding:12px 16px\">\
 <div class=\"g-grid\" style=\"display:grid;grid-template-columns:1fr 396px;gap:12px;align-items:start\">\
 <div style=\"min-width:0\">{}</div>\
-<div>{}{}</div></div></div>",
+<div>{}{side}</div></div></div>",
         crumb(run_id),
         run_head(facts, live, here),
         run_grid(run_id, facts),
@@ -741,7 +918,6 @@ pub fn run_page(run_id: &str, facts: &Facts, live: &Live, here: &Observed<bool>)
 <span class=\"g-r g-follow\">\u{25aa} following</span></div>\
 <div data-g-root=\"log\"><div class=\"g-log\" data-offset=\"0\"></div>\
 <div class=\"g-pill\">\u{2193} following</div></div></div>",
-        last_words_block(live)
     );
     layout(
         &format!("grind \u{b7} {}", esc(run_id)),
@@ -852,6 +1028,8 @@ mod tests {
                 ledger_entries: Observed::Absent,
                 changed_files: Observed::Absent,
                 base_drift: Observed::Absent,
+                pr_head_matches_job_branch: Observed::Absent,
+                pr_base_matches_declared: Observed::Absent,
             },
             verdict: Verdict::Incomplete(Vec::new()),
             contract: VerifyContract {
@@ -863,6 +1041,10 @@ mod tests {
             blocker: None,
             cleared: None,
             run_state: std::path::PathBuf::new(),
+            triage_decision: None,
+            diff_triage_decision: None,
+            outcome: None,
+            calibration: None,
         }
     }
 
@@ -911,7 +1093,7 @@ mod tests {
 
     #[test]
     fn pages_carry_the_shell_and_hooks() {
-        let html = roster_page(&[]);
+        let html = roster_page(&[], &[]);
         assert!(html.contains("<!DOCTYPE html>"));
         assert!(html.contains("/style.css"));
         assert!(html.contains("/script.js"));
@@ -923,5 +1105,164 @@ mod tests {
         let run = run_page("r", &facts_of(found), &live_of(), &here);
         assert!(run.contains("unobservable"));
         assert!(run.contains("data-g-root=\"log\""));
+    }
+
+    // --- Grit surfaces: the stage table, decision receipts, calibration and outcome -----------
+
+    fn stages_two() -> Vec<crate::rung::StageEntry> {
+        vec![
+            crate::rung::StageEntry {
+                name: "plan".to_string(),
+                session_id: "run-1-plan".to_string(),
+                status: crate::rung::ReturnStatus::Complete,
+                artifact_paths: vec![],
+                model: Some("claude-sonnet-5".to_string()),
+                cost_usd: Some(1.23),
+                turns: Some(4),
+            },
+            crate::rung::StageEntry {
+                name: "triage".to_string(),
+                session_id: "[R]".to_string(),
+                status: crate::rung::ReturnStatus::Complete,
+                artifact_paths: vec![],
+                model: None,
+                cost_usd: Some(0.0),
+                turns: Some(0),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_run_page_with_two_stage_entries_renders_both_rows() {
+        let mut found = day_one();
+        found.stages = stages_two();
+        let html = run_fragment(
+            "id",
+            &facts_of(found),
+            &live_of(),
+            &Observed::Present(false),
+        );
+        assert!(html.contains("run-1-plan"), "{html}");
+        assert!(html.contains("[R]"), "{html}");
+        assert!(html.contains("$1.23"), "{html}");
+    }
+
+    #[test]
+    fn a_run_page_with_no_stages_carries_no_stage_panel() {
+        let html = run_fragment(
+            "id",
+            &facts_of(day_one()),
+            &live_of(),
+            &Observed::Present(false),
+        );
+        assert!(!html.contains("rung ladder"), "{html}");
+    }
+
+    fn decision_literal() -> crate::decide::Decision {
+        crate::decide::Decision {
+            tier: crate::decide::Tier::T1,
+            personas: vec![crate::decide::Persona::Correctness],
+            depth: crate::decide::PlanReviewDepth { reviewers: 1 },
+            model_per_stage: std::collections::BTreeMap::new(),
+            floor_from_plan: crate::decide::Tier::T0,
+            rationale: vec![crate::decide::RationaleRow {
+                signal: "loc_changed".to_string(),
+                value: "180".to_string(),
+                weight: "t1".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_decision_literal_renders_inert_in_its_own_panel() {
+        let html = decision_panel("triage", &Some(decision_literal()));
+        assert!(html.contains("triage decision"), "{html}");
+        assert!(html.contains("tier t1"), "{html}");
+        assert!(html.contains("loc_changed"), "{html}");
+        assert_eq!(decision_panel("triage", &None), "");
+    }
+
+    #[test]
+    fn hostile_rationale_text_renders_inert_in_the_decision_panel() {
+        let mut decision = decision_literal();
+        decision.rationale[0].value = "<script>alert(1)</script>".to_string();
+        let html = decision_panel("triage", &Some(decision));
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    #[test]
+    fn an_empty_run_dir_adds_no_grit_panels() {
+        let html = run_fragment(
+            "id",
+            &facts_of(day_one()),
+            &live_of(),
+            &Observed::Present(false),
+        );
+        for absent in ["decision", "calibration", ">outcome<"] {
+            assert!(
+                !html.contains(absent),
+                "`{absent}` on an empty run dir:\n{html}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_calibration_panel_renders_key_value_facts() {
+        let row = serde_json::json!({"tier": "t1", "confirmed": "P1"});
+        let html = calibration_panel(&Some(row));
+        assert!(html.contains("calibration"), "{html}");
+        assert!(html.contains("tier: t1"), "{html}");
+        assert_eq!(calibration_panel(&None), "");
+    }
+
+    #[test]
+    fn the_outcome_panel_renders_the_merged_and_reverted_facts() {
+        let outcome = crate::observe::RunOutcome {
+            collected_at: "2026-09-01T00:00:00+00:00".to_string(),
+            pr_state: "MERGED".to_string(),
+            pr_merged: true,
+            pr_merged_at: Some("2026-08-20T00:00:00+00:00".to_string()),
+            pr_closed_at: None,
+            reverted_by: vec!["abc123".to_string()],
+            followup_issues: vec![],
+        };
+        let html = outcome_panel(&Some(outcome));
+        assert!(html.contains("MERGED"), "{html}");
+        assert!(html.contains("merged yes"), "{html}");
+        assert!(html.contains("abc123"), "{html}");
+        assert_eq!(outcome_panel(&None), "");
+    }
+
+    #[test]
+    fn the_proposal_queue_section_renders_each_entrys_kind_and_summary() {
+        let proposals = vec![(
+            "20260901-000000-snapper-40".to_string(),
+            ProposalEntry {
+                kind: "job",
+                path: std::path::PathBuf::from("/home/op/.grind/runs/x/stages/reflect/jobs/a.md"),
+                summary: "Fix the residual finding in observe.rs".to_string(),
+            },
+        )];
+        let html = proposal_queue_section(&proposals);
+        assert!(html.contains("proposal queue"), "{html}");
+        assert!(html.contains("20260901-000000-snapper-40"), "{html}");
+        assert!(html.contains("Fix the residual finding"), "{html}");
+        assert_eq!(proposal_queue_section(&[]), "");
+    }
+
+    #[test]
+    fn the_roster_page_carries_the_proposal_queue_section() {
+        let proposals = vec![(
+            "r1".to_string(),
+            ProposalEntry {
+                kind: "diff",
+                path: std::path::PathBuf::from("/x/diffs/a.diff"),
+                summary: "wording tweak".to_string(),
+            },
+        )];
+        let html = roster_page(&[], &proposals);
+        assert!(html.contains("proposal queue"), "{html}");
+        assert!(html.contains("wording tweak"), "{html}");
     }
 }

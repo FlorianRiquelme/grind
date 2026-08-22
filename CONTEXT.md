@@ -7,10 +7,10 @@ human is not present for, and stops at an open PR.
 
 **Job**:
 One unit of queued work, filed as a GitHub issue in the repo the work happens in. Names a
-target repo, a branch, a Handoff SHA, an Anchor artifact and a pinned plugin version, and may
-name a model and an **Intent** — one line on the work's nature, never a requirement. It carries
-no spend ceiling: ADR-0010 withdrew it. What makes it a Job is what its body names, never a
-label — Grind applies none (ADR-0012).
+target repo, a branch, a Handoff SHA, an Anchor artifact, a done predicate, a base branch and
+a verify entrypoint, and may name a model, declared hot paths and an **Intent** — one line on
+the work's nature, never a requirement. It carries no spend ceiling: ADR-0010 withdrew it. What
+makes it a Job is what its body names, never a label — Grind applies none (ADR-0012).
 _Avoid_: ticket, task, plan
 
 **Enqueue**:
@@ -36,7 +36,7 @@ the act that files a Job is the act that may start it.
 _Avoid_: launch, trigger, kick off
 
 **Run**:
-One supervised execution of `lfg` against a Job. Restartable, and re-enterable at the
+One supervised execution of a Job's ladder (ADR-0015). Restartable, and re-enterable at the
 stage it died on. Runs are independent and any number may be in flight at once; the only
 thing two of them share is the usage pool. The world moves underneath one — colleagues
 and other Runs land commits while it works.
@@ -75,11 +75,12 @@ cleared it — the world changed, not the budget.
 _Avoid_: failure, error, stuck
 
 **Fan-out**:
-The subagents one Attempt spawns to work in parallel. Claude Code substrate, never an `lfg`
-stage — which is what lets the supervisor count it without observing the pipeline. How many were
+The subagents one stage session spawns to work in parallel, counted per Attempt. Claude Code
+substrate, distinct from the ladder's stages — which the supervisor observes directly rather
+than by counting a fan-out — so a stage that spawns nothing is still a stage. How many were
 spawned and how many returned is readable from outside; what any of them concluded is not, and
 the difference is a fact about processes rather than a judgement about the work.
-_Avoid_: stage, review pass, swarm
+_Avoid_: review pass, swarm
 
 **Handoff SHA**:
 The commit at which the human stopped and the Run begins. It bounds **authorship**, not
@@ -154,7 +155,8 @@ _Avoid_: verify command, test command, gate
 
 **Promotion**:
 Moving a capability from supervised local sessions into Grind, once it has stopped
-needing correction. Enacted by changing Grind — never by advancing a pinned plugin version,
-which is resolved fresh at each Enqueue and so moves without anyone deciding it
-(ADR-0002 as amended a third time).
+needing correction. Enacted by changing Grind — never by an unreviewed drift in provenance,
+since a skill edit or a binary upgrade only ever lands on a Run through a frozen, recorded
+hash and version, not by advancing silently the way the retired plugin pin once could
+(ADR-0002 as amended a fourth time).
 _Avoid_: rollout, enablement, release

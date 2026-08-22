@@ -11,6 +11,7 @@
 //! so a test that *this call site* yields could-not-observe rather than absent is three string
 //! literals instead of a process.
 
+use crate::decide::{ContentKind, DiffFacts, RiskyPathKind};
 use crate::world::Completed;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -101,6 +102,13 @@ pub struct Pr {
     pub url: String,
     pub state: String,
     pub is_draft: bool,
+    /// The branch the PR's head actually points at. Compared against the Job's `branch` row by
+    /// [`pr_head_matches_job_branch`] — Run 2 pushed to `…-run` while its Job named `…-seam`,
+    /// and nothing before this checked that the two agree.
+    pub head_ref: String,
+    /// The branch the PR opens against. Compared against the Job's `base_branch` row by
+    /// [`pr_base_matches_declared`].
+    pub base_ref: String,
 }
 
 impl fmt::Display for Pr {
@@ -159,6 +167,12 @@ pub struct Observation {
     /// three listings above are drawn from.
     pub changed_files: Observed<Vec<String>>,
     pub base_drift: Observed<BaseDrift>,
+    /// The fifth completion signal: the found PR's head ref against the Job's `branch` row.
+    /// `Absent` when there is no PR yet, mirroring `pr_open`'s own fold — a Run that has not
+    /// opened a PR is not a Run that is blind.
+    pub pr_head_matches_job_branch: Observed<bool>,
+    /// The sixth completion signal: the found PR's base ref against the Job's `base_branch` row.
+    pub pr_base_matches_declared: Observed<bool>,
 }
 
 // --- one classifier per call site -----------------------------------------------------
@@ -185,7 +199,7 @@ pub fn tree_clean(completed: &Completed) -> Observed<bool> {
     Observed::Present(completed.stdout.trim().is_empty())
 }
 
-/// `gh pr view --json number,url,state,isDraft`.
+/// `gh pr view --json number,url,state,isDraft,headRefName,baseRefName`.
 ///
 /// `gh` exits non-zero when there is genuinely no PR *and* when it cannot reach GitHub at all,
 /// and the two are separated by what it says rather than by what it returns. Anything it says
@@ -210,7 +224,8 @@ fn says_no_pr(stderr: &str) -> bool {
     said.contains("no pull requests found") || said.contains("no open pull requests")
 }
 
-/// `gh pr list --search <head-sha> --state all --json number,url,state,isDraft,headRefOid`.
+/// `gh pr list --search <head-sha> --state all --json
+/// number,url,state,isDraft,headRefOid,headRefName,baseRefName`.
 ///
 /// **A Run's identity on GitHub is the commit it pushed, not the branch its Job named.** Run 2
 /// pushed to `…-run` while its Job named `…-seam`, so the branch lookup answered truthfully
@@ -269,7 +284,41 @@ fn parse_pr_value(value: &serde_json::Value) -> Option<Pr> {
             .get("isDraft")
             .and_then(|d| d.as_bool())
             .unwrap_or(false),
+        head_ref: value
+            .get("headRefName")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        base_ref: value
+            .get("baseRefName")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
     })
+}
+
+/// Whether the found PR's head ref is the branch the Job named. Trivial string equality — the
+/// interesting part is that it is asked at all: Run 2 pushed to `…-run` while its Job named
+/// `…-seam`, and nothing before this checked that the two agree. Never called on a PR that
+/// could not be fetched; that direction is [`observe_run`]'s to fold, mirroring `pr_open`'s own
+/// Absent/Unobservable handling.
+pub fn pr_head_matches_job_branch(pr_head: &str, job_branch: &str) -> Observed<bool> {
+    Observed::Present(pr_head == job_branch)
+}
+
+/// Whether the found PR's base ref is the branch the Job declared. Same shape as
+/// [`pr_head_matches_job_branch`], compared against the Job's `base_branch` row.
+///
+/// **An undeclared base cannot mismatch.** A record serialized before the `Base branch` row
+/// existed carries `""` (serde default) — comparing a real PR base against that would hold
+/// every pre-cutover Run at `Uncorroborated` forever. The signal guards the declaration, not
+/// the PR, so no declaration reads as satisfied. Only pre-cutover records can be empty here:
+/// `job::from_issue_json` refuses a blank row, so nothing enqueued today reaches this arm.
+pub fn pr_base_matches_declared(pr_base: &str, declared: &str) -> Observed<bool> {
+    if declared.is_empty() {
+        return Observed::Present(true);
+    }
+    Observed::Present(pr_base == declared)
 }
 
 /// `gh pr view --json statusCheckRollup`, classified twice — *is anything still running* and
@@ -425,6 +474,251 @@ pub fn base_drift(
     })
 }
 
+/// The compiled literal path lists Triage/Diff-triage score against. A path is a fact about
+/// where the diff touched, never a grade of what it did there (ADR-0012).
+///
+/// Keyword segments (`auth`, `login`, `session`, `token`, `crypto`, `tls`, `cert`, `payment`,
+/// `billing`, `invoice`, `schema`, `deploy`) match a **whole path token** — the path split on
+/// every non-alphanumeric character — so `author.rs` does not read as `auth`. Directory-shaped
+/// entries (`migrations/`, `api/`, `.github/workflows/`, `helm/`, `terraform/`) and filename
+/// entries (`Justfile`, `justfile`, `Dockerfile`, `Info.plist`, `.entitlements`, `*.proto`,
+/// `openapi`) match as substrings or suffixes of the raw path instead, because the slash already
+/// carries the boundary a token split would otherwise have to reconstruct.
+fn path_tokens(path: &str) -> Vec<String> {
+    path.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn hits_risky_path(path: &str, kind: RiskyPathKind) -> bool {
+    let tokens = path_tokens(path);
+    let has = |words: &[&str]| words.iter().any(|word| tokens.iter().any(|t| t == word));
+    match kind {
+        RiskyPathKind::Auth => has(&["auth", "login", "session", "token"]),
+        RiskyPathKind::Crypto => has(&["crypto", "tls", "cert"]),
+        RiskyPathKind::Payments => has(&["payment", "payments", "billing", "invoice"]),
+        RiskyPathKind::Migrations => path.contains("migrations/") || has(&["schema"]),
+        RiskyPathKind::PublicApi => {
+            path.contains("api/")
+                || path.to_ascii_lowercase().contains("openapi")
+                || path.ends_with(".proto")
+        }
+        RiskyPathKind::CiConfig => {
+            path.contains(".github/workflows/")
+                || path.ends_with("Justfile")
+                || path.ends_with("justfile")
+                || path.ends_with("Dockerfile")
+        }
+        RiskyPathKind::DeploySurface => {
+            has(&["deploy", "deployment"])
+                || path.contains("helm/")
+                || path.contains("terraform/")
+                || path.ends_with("Info.plist")
+                || path.ends_with(".entitlements")
+        }
+    }
+}
+
+/// Lockfiles and generated churn `changed_loc` excludes — a thousand-line `Cargo.lock` bump
+/// reads as a huge diff and says nothing about the risk the size signal exists to catch.
+fn is_lockfile_or_generated(path: &str) -> bool {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    matches!(
+        base,
+        "Cargo.lock" | "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml"
+    ) || base.contains(".generated.")
+        || path
+            .split('/')
+            .any(|segment| segment == "target" || segment == "node_modules")
+}
+
+fn added_lines(diff_text: &str) -> impl Iterator<Item = &str> {
+    diff_text
+        .lines()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+}
+
+/// Content-kind scan, **added lines only**. Deliberately tolerant of false positives — a raw-SQL
+/// match on `UPDATE ` inside an English sentence, or `unsafe ` inside a doc comment, costs
+/// nothing but a tier that rounds up one notch (the design's own rule: any ambiguity rounds up);
+/// missing a real hit costs the review the diff needed.
+fn hits_content(diff_text: &str, kind: ContentKind) -> bool {
+    added_lines(diff_text).any(|line| match kind {
+        ContentKind::Unsafe => line.contains("unsafe "),
+        ContentKind::RawSql => {
+            let upper = line.to_ascii_uppercase();
+            upper.contains("SELECT ") || upper.contains("INSERT INTO") || upper.contains("UPDATE ")
+        }
+        ContentKind::EvalExec => line.contains("eval(") || line.contains("exec("),
+        ContentKind::Subprocess => {
+            line.contains("Command::new")
+                || line.contains("subprocess")
+                || line.contains("child_process")
+        }
+        ContentKind::Concurrency => [
+            "Mutex",
+            "RwLock",
+            "AtomicU",
+            "mpsc",
+            "tokio::spawn",
+            "thread::spawn",
+        ]
+        .iter()
+        .any(|needle| line.contains(needle)),
+        ContentKind::Secrets => {
+            ["SECRET", "API_KEY", "PRIVATE_KEY"]
+                .iter()
+                .any(|needle| line.contains(needle))
+                || line.contains("password")
+        }
+        ContentKind::TodoFixme => line.contains("TODO") || line.contains("FIXME"),
+    })
+}
+
+/// A line is at signature position if, once the diff marker is stripped, it **starts with** one
+/// of the exported-declaration spellings. Approximate on purpose — a `pub fn` inside a doc
+/// comment example counts, a signature split across lines does not — and documented rather than
+/// hidden behind a parser this module has no business owning.
+fn is_signature_line(marked_line: &str) -> bool {
+    let stripped = marked_line
+        .strip_prefix(['+', '-'])
+        .unwrap_or(marked_line)
+        .trim_start();
+    [
+        "pub fn ",
+        "pub struct ",
+        "pub enum ",
+        "pub trait ",
+        "export function ",
+        "export const ",
+        "def ",
+    ]
+    .iter()
+    .any(|prefix| stripped.starts_with(prefix))
+}
+
+fn surface_delta(diff_text: &str) -> usize {
+    diff_text
+        .lines()
+        .filter(|line| {
+            (line.starts_with('+') && !line.starts_with("+++"))
+                || (line.starts_with('-') && !line.starts_with("---"))
+        })
+        .filter(|line| is_signature_line(line))
+        .count()
+}
+
+const DEP_MANIFEST_NAMES: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "Gemfile",
+];
+
+/// `decide::DiffFacts`, from `git diff --numstat <handoff>..HEAD`, `git diff --name-only` and
+/// the unified diff text — all three handed in as text; the `world` calls that produce them are
+/// the supervisor's job, not this parser's.
+pub fn diff_facts(numstat: &str, name_only: &str, diff_text: &str) -> DiffFacts {
+    let mut changed_loc = 0usize;
+    for line in numstat.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let (Some(additions), Some(deletions), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let path = path.trim();
+        // `-\t-\t<path>` is numstat's spelling for a binary file — no line count to add.
+        if additions == "-" || deletions == "-" || is_lockfile_or_generated(path) {
+            continue;
+        }
+        changed_loc +=
+            additions.parse::<usize>().unwrap_or(0) + deletions.parse::<usize>().unwrap_or(0);
+    }
+
+    let names: Vec<&str> = name_only
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    let risky_paths_hit: Vec<RiskyPathKind> = [
+        RiskyPathKind::Auth,
+        RiskyPathKind::Crypto,
+        RiskyPathKind::Payments,
+        RiskyPathKind::Migrations,
+        RiskyPathKind::PublicApi,
+        RiskyPathKind::CiConfig,
+        RiskyPathKind::DeploySurface,
+    ]
+    .into_iter()
+    .filter(|kind| names.iter().any(|path| hits_risky_path(path, *kind)))
+    .collect();
+
+    let content_kinds: Vec<ContentKind> = [
+        ContentKind::Unsafe,
+        ContentKind::RawSql,
+        ContentKind::EvalExec,
+        ContentKind::Subprocess,
+        ContentKind::Concurrency,
+        ContentKind::Secrets,
+        ContentKind::TodoFixme,
+    ]
+    .into_iter()
+    .filter(|kind| hits_content(diff_text, *kind))
+    .collect();
+
+    let dep_manifest_touched = names.iter().any(|path| {
+        let base = path.rsplit('/').next().unwrap_or(path);
+        DEP_MANIFEST_NAMES.contains(&base)
+    });
+
+    DiffFacts {
+        changed_loc,
+        risky_paths_hit,
+        content_kinds,
+        surface_delta: surface_delta(diff_text),
+        dep_manifest_touched,
+    }
+}
+
+/// The ten stage skill directories a host must have copied under `~/.grind/skills/run` before
+/// a Run can walk the ladder (ADR-0015). Named here, once, so `skills_present` and whatever
+/// provisions the host read the same list.
+pub const STAGE_SKILLS: [&str; 10] = [
+    "plan",
+    "plan-review",
+    "work",
+    "simplify",
+    "review",
+    "validate",
+    "fixes",
+    "ship",
+    "babysit",
+    "reflect",
+];
+
+/// The layout check: every stage skill directory present under the host skill root. `entries` is
+/// the caller's directory listing — `world::list_dir` is the caller's door, this stays pure over
+/// the names it was handed.
+pub fn skills_present(entries: &[String]) -> Observed<Outcome> {
+    let missing: Vec<&str> = STAGE_SKILLS
+        .iter()
+        .copied()
+        .filter(|name| !entries.iter().any(|entry| entry == name))
+        .collect();
+    if missing.is_empty() {
+        satisfied("all ten stage skill directories are present under ~/.grind/skills/run")
+    } else {
+        unsatisfied(&format!(
+            "missing stage skill directories: {}",
+            missing.join(", ")
+        ))
+    }
+}
+
 /// One artifact directory, **scoped to the Run's own diff**.
 ///
 /// The whole-directory listing this replaces counted other people's files: `furthest stage`
@@ -468,6 +762,8 @@ pub const LEDGER_DIR: &str = "docs/ledger";
 pub fn observe_run(
     observed_at: String,
     handoff_sha: &str,
+    job_branch: &str,
+    declared_base: &str,
     run: &mut dyn FnMut(&[String]) -> Completed,
 ) -> Observation {
     let argv = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<String>>();
@@ -543,7 +839,7 @@ pub fn observe_run(
                 "--state",
                 "all",
                 "--json",
-                "number,url,state,isDraft,headRefOid",
+                "number,url,state,isDraft,headRefOid,headRefName,baseRefName",
             ])),
         )
     } else {
@@ -559,7 +855,7 @@ pub fn observe_run(
             "pr",
             "view",
             "--json",
-            "number,url,state,isDraft",
+            "number,url,state,isDraft,headRefName,baseRefName",
         ]))),
         // Blind stays blind. A head lookup that could not be made must not become *no PR*
         // because the branch lookup also found nothing.
@@ -568,7 +864,7 @@ pub fn observe_run(
             "pr",
             "view",
             "--json",
-            "number,url,state,isDraft",
+            "number,url,state,isDraft,headRefName,baseRefName",
         ]))) {
             Observed::Present(fallback) => Observed::Present(fallback),
             _ => Observed::Unobservable(reason),
@@ -593,6 +889,21 @@ pub fn observe_run(
         ),
     };
 
+    // The fifth and sixth completion signals, ANDed in `decide::verdict`. `Absent` mirrors
+    // `pr_open`'s own fold — no PR yet is a Run's normal early state, not a blind one — and a
+    // fetch failure stays could-not-observe rather than becoming a mismatch.
+    let (pr_head_matches_job_branch, pr_base_matches_declared) = match &found {
+        Observed::Present(open) => (
+            pr_head_matches_job_branch(&open.head_ref, job_branch),
+            pr_base_matches_declared(&open.base_ref, declared_base),
+        ),
+        Observed::Absent => (Observed::Present(false), Observed::Present(false)),
+        Observed::Unobservable(reason) => (
+            Observed::Unobservable(reason.clone()),
+            Observed::Unobservable(reason.clone()),
+        ),
+    };
+
     Observation {
         observed_at,
         commits_ahead: commits_ahead(&counted),
@@ -603,9 +914,120 @@ pub fn observe_run(
         plan_files: scoped_listing(&changed, PLAN_DIR),
         residual_findings: scoped_listing(&changed, RESIDUAL_DIR),
         ledger_entries: scoped_listing(&changed, LEDGER_DIR),
+        pr_head_matches_job_branch,
+        pr_base_matches_declared,
         changed_files: changed,
         base_drift: drift,
     }
+}
+
+// --- the outcome collector ----------------------------------------------------------------
+//
+// `grind outcomes` (`cli.rs`) is the human-initiated pass the design calls the loop's best
+// fuel: did the merged work *survive*. It reads GitHub, never writes to it, and the two
+// classifiers below are the pure halves — the argv that produces their input is the caller's.
+
+/// A PR's terminal facts, once it stopped moving. Facts only, never a grade (ADR-0012):
+/// `merged: true` is what happened, and it carries no opinion about whether that was good.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrFinal {
+    pub state: String,
+    pub merged: bool,
+    pub merged_at: Option<String>,
+    pub closed_at: Option<String>,
+}
+
+/// `gh pr view --json state,mergedAt,closedAt,mergeCommit`, already reduced to its stdout.
+/// Whether the call succeeded at all is the caller's to read off the exit code first — this
+/// stays a parse over text, mirroring [`pr`]'s own split between spawn and classification.
+pub fn pr_final_state(gh_json: &str) -> Observed<PrFinal> {
+    let body = gh_json.trim();
+    if body.is_empty() {
+        return Observed::Unobservable(Reason::saying("gh pr view --json state,...: empty output"));
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Observed::Unobservable(Reason::saying(
+            "gh pr view --json state,mergedAt,closedAt,mergeCommit: unreadable JSON",
+        ));
+    };
+    let Some(state) = value.get("state").and_then(|s| s.as_str()) else {
+        return Observed::Unobservable(Reason::saying(
+            "gh pr view --json state,mergedAt,closedAt,mergeCommit: missing state",
+        ));
+    };
+    Observed::Present(PrFinal {
+        state: state.to_string(),
+        merged: state.eq_ignore_ascii_case("MERGED"),
+        merged_at: value
+            .get("mergedAt")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        closed_at: value
+            .get("closedAt")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    })
+}
+
+/// A line this module accepts as a commit sha rather than a path — hex, and long enough that a
+/// path made only of hex-looking segments (vanishingly unlikely, but not this module's problem
+/// to rule out further) is not what a `git log --format=%H --name-only` run actually emits.
+fn is_sha_line(line: &str) -> bool {
+    line.len() >= 7 && line.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The commit shas, from `git log --grep=Revert -i --format=%H --name-only <run's own diff
+/// window>`, whose touched files intersect `run_paths` — the Run's own diff, so a revert of
+/// somebody else's file never attributes here.
+///
+/// The output alternates a bare sha line with the file lines that commit touched; this parses
+/// that shape without assuming a blank separator, because git's own spacing around `--name-only`
+/// blocks is not part of the contract this module owns.
+pub fn reverts_touching(log_text: &str, run_paths: &[String]) -> Vec<String> {
+    let mut hits = Vec::new();
+    let mut current: Option<(&str, Vec<&str>)> = None;
+    for raw in log_text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if is_sha_line(line) {
+            if let Some((sha, paths)) = current.take()
+                && paths.iter().any(|p| run_paths.iter().any(|mine| mine == p))
+            {
+                hits.push(sha.to_string());
+            }
+            current = Some((line, Vec::new()));
+        } else if let Some((_, paths)) = current.as_mut() {
+            paths.push(line);
+        }
+    }
+    if let Some((sha, paths)) = current
+        && paths.iter().any(|p| run_paths.iter().any(|mine| mine == p))
+    {
+        hits.push(sha.to_string());
+    }
+    hits
+}
+
+/// `outcome.json`, written beside a Run's record by `grind outcomes` — a separate file, never
+/// `run.json`, so the sole-writer rule on `attempts[]` is never in the same room as this
+/// read-mostly pass. Facts, computed rather than classified: `reverted_by` is a list of shas,
+/// never a verdict.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunOutcome {
+    pub collected_at: String,
+    pub pr_state: String,
+    pub pr_merged: bool,
+    pub pr_merged_at: Option<String>,
+    pub pr_closed_at: Option<String>,
+    pub reverted_by: Vec<String>,
+    /// Follow-up issues filed against the Run's PR. Left empty on purpose: a `gh issue list
+    /// --search` scan proportionate to this unit would need to decide what "filed against"
+    /// means (linked how, by whom), and that is disproportionate machinery for the unit this
+    /// is — shipped as an empty, stable field so a later pass can fill it in without a shape
+    /// change.
+    pub followup_issues: Vec<u64>,
 }
 
 // --- the host item list's classifiers ---------------------------------------------------
@@ -846,15 +1268,6 @@ fn parse_git_version(output: &str) -> Option<(u64, u64)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
-/// The pinned plugin directory is installed on this host.
-pub fn plugin_installed(exists: bool) -> Observed<Outcome> {
-    if exists {
-        satisfied("the pinned plugin version is installed")
-    } else {
-        unsatisfied("the pinned plugin version is not installed on this host")
-    }
-}
-
 /// `gh auth status`. A headless box stores the token in plaintext `hosts.yml`; a laptop uses a
 /// keyring. Both are satisfied — what is checked is that a token store exists at all.
 pub fn gh_auth_store(completed: &Completed) -> Observed<Outcome> {
@@ -1051,9 +1464,12 @@ mod tests {
 
     // The head OID rides every fixture because the lookup now matches on it client-side
     // (#84): `3333…` is what the fake `git rev-parse HEAD` answers in `observing`.
-    const PR_JSON: &str = r#"{"number":30,"url":"https://github.com/o/n/pull/30","state":"OPEN","isDraft":false,"headRefOid":"3333333333333333333333333333333333333333"}"#;
+    const PR_JSON: &str = r#"{"number":30,"url":"https://github.com/o/n/pull/30","state":"OPEN","isDraft":false,"headRefOid":"3333333333333333333333333333333333333333","headRefName":"feat/28-slice-1b-seam","baseRefName":"main"}"#;
 
     const HEAD_SHA: &str = "3333333333333333333333333333333333333333";
+
+    const JOB_BRANCH: &str = "feat/28-slice-1b-seam";
+    const DECLARED_BASE: &str = "main";
 
     /// One whole observation from literals: the head-commit lookup, the branch fallback, and
     /// the rollup, plus every argv the sequence actually built.
@@ -1083,7 +1499,13 @@ mod tests {
                     completed("", "", Some(0))
                 }
             };
-            observe_run("at".to_string(), "9d1f4c7a", &mut run)
+            observe_run(
+                "at".to_string(),
+                "9d1f4c7a",
+                JOB_BRANCH,
+                DECLARED_BASE,
+                &mut run,
+            )
         };
         (observation, seen)
     }
@@ -1111,7 +1533,13 @@ mod tests {
                     completed("", "", Some(0))
                 }
             };
-            observe_run("at".to_string(), "9d1f4c7a", &mut run)
+            observe_run(
+                "at".to_string(),
+                "9d1f4c7a",
+                "feat/some-branch",
+                "main",
+                &mut run,
+            )
         };
         (observation, seen)
     }
@@ -1604,6 +2032,8 @@ mod tests {
             url: "https://github.com/o/n/pull/30".to_string(),
             state: "OPEN".to_string(),
             is_draft: false,
+            head_ref: "feat/x".to_string(),
+            base_ref: "main".to_string(),
         });
         assert_eq!(stage(&walk), "pr-open");
     }
@@ -1858,7 +2288,6 @@ mod tests {
             claude_binary(true, Some("/tmp/shim/claude")),
             on_path("just", &completed("", "", Some(1))),
             git_version_floor(&completed("git version 2.20.1\n", "", Some(0)), (2, 34)),
-            plugin_installed(false),
             gh_auth_store(&completed("", "", Some(1))),
         ];
         for outcome in said {
@@ -1872,6 +2301,269 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- the fifth and sixth completion signals ---------------------------------------------
+
+    #[test]
+    fn a_pr_pushed_to_the_branch_the_job_named_matches_on_both_head_and_base() {
+        let (observation, _) = observing(
+            completed(&format!("[{PR_JSON}]"), "", Some(0)),
+            no_pr_on_this_branch(),
+            completed(r#"{"statusCheckRollup":[]}"#, "", Some(0)),
+        );
+        assert_eq!(
+            observation.pr_head_matches_job_branch,
+            Observed::Present(true)
+        );
+        assert_eq!(
+            observation.pr_base_matches_declared,
+            Observed::Present(true)
+        );
+    }
+
+    #[test]
+    fn a_pr_pushed_to_a_different_branch_than_the_job_named_is_a_false_not_a_blind_signal() {
+        assert_eq!(
+            pr_head_matches_job_branch("feat/28-slice-1b-run", "feat/28-slice-1b-seam"),
+            Observed::Present(false)
+        );
+        assert_eq!(
+            pr_base_matches_declared("develop", "main"),
+            Observed::Present(false)
+        );
+    }
+
+    #[test]
+    fn an_undeclared_base_cannot_mismatch_so_a_pre_cutover_record_still_completes() {
+        // Only a record from before the `Base branch` row existed can carry "" here —
+        // `job::from_issue_json` refuses a blank row — and holding those Runs at
+        // `Uncorroborated` forever would punish them for a declaration they never made.
+        assert_eq!(
+            pr_base_matches_declared("main", ""),
+            Observed::Present(true)
+        );
+    }
+
+    #[test]
+    fn no_pr_yet_reads_both_new_signals_as_false_mirroring_pr_open() {
+        let (observation, _) = observing_with_diff("src/lib.rs\n");
+        assert_eq!(observation.pr, Observed::Absent);
+        assert_eq!(
+            observation.pr_head_matches_job_branch,
+            Observed::Present(false)
+        );
+        assert_eq!(
+            observation.pr_base_matches_declared,
+            Observed::Present(false)
+        );
+    }
+
+    #[test]
+    fn a_pr_lookup_that_could_not_be_made_leaves_both_new_signals_blind() {
+        let code: i32 = GH_AUTH_CODE.trim().parse().expect("the recorded exit code");
+        let broken = completed(GH_AUTH_STDOUT, GH_AUTH_STDERR, Some(code));
+        let (observation, _) = observing(broken.clone(), broken.clone(), broken);
+        assert!(matches!(
+            observation.pr_head_matches_job_branch,
+            Observed::Unobservable(_)
+        ));
+        assert!(matches!(
+            observation.pr_base_matches_declared,
+            Observed::Unobservable(_)
+        ));
+    }
+
+    // --- `diff_facts` ------------------------------------------------------------------------
+
+    #[test]
+    fn lockfile_and_generated_churn_is_excluded_from_changed_loc() {
+        let numstat = "500\t300\tCargo.lock\n\
+             10\t2\tsrc/lib.rs\n\
+             40\t0\tweb/dist/app.generated.js\n\
+             8\t0\tnode_modules/pkg/index.js\n\
+             3\t0\ttarget/debug/build.rs\n\
+             0\t0\tbinary.png\n";
+        let facts = diff_facts(numstat, "src/lib.rs\n", "+fn f() {}\n");
+        assert_eq!(facts.changed_loc, 12);
+    }
+
+    #[test]
+    fn a_binary_row_in_numstat_contributes_no_lines() {
+        let facts = diff_facts("-\t-\tassets/icon.png\n", "assets/icon.png\n", "");
+        assert_eq!(facts.changed_loc, 0);
+    }
+
+    #[test]
+    fn risky_path_kinds_are_counted_once_each_regardless_of_how_many_paths_hit() {
+        let names = "src/auth/login.rs\nsrc/auth/session.rs\n.github/workflows/ci.yml\n";
+        let facts = diff_facts("2\t1\tsrc/auth/login.rs\n", names, "");
+        assert_eq!(
+            facts.risky_paths_hit,
+            vec![RiskyPathKind::Auth, RiskyPathKind::CiConfig]
+        );
+        assert_eq!(facts.risky_path_hits(), 2);
+    }
+
+    #[test]
+    fn a_token_boundary_keeps_author_rs_from_reading_as_auth() {
+        let facts = diff_facts("1\t0\tsrc/author.rs\n", "src/author.rs\n", "");
+        assert!(facts.risky_paths_hit.is_empty());
+    }
+
+    #[test]
+    fn directory_shaped_risky_kinds_match_on_the_slash_boundary() {
+        let names = "migrations/2026_add_users.sql\napi/v1/openapi.yaml\nhelm/values.yaml\n";
+        let facts = diff_facts("1\t0\tmigrations/2026_add_users.sql\n", names, "");
+        assert_eq!(
+            facts.risky_paths_hit,
+            vec![
+                RiskyPathKind::Migrations,
+                RiskyPathKind::PublicApi,
+                RiskyPathKind::DeploySurface,
+            ]
+        );
+    }
+
+    #[test]
+    fn content_signals_scan_added_lines_only_and_count_each_kind_once() {
+        let diff_text = "+let m = Mutex::new(0);\n\
+             -let m = old_mutex();\n\
+             +tokio::spawn(async {});\n\
+             + // TODO: revisit\n";
+        let facts = diff_facts("4\t1\tsrc/lib.rs\n", "src/lib.rs\n", diff_text);
+        assert_eq!(
+            facts.content_kinds,
+            vec![ContentKind::Concurrency, ContentKind::TodoFixme]
+        );
+        assert_eq!(facts.content_signals(), 2);
+    }
+
+    #[test]
+    fn a_removed_line_never_contributes_a_content_signal() {
+        let diff_text = "-unsafe { do_it() }\n+safe_call();\n";
+        let facts = diff_facts("1\t1\tsrc/lib.rs\n", "src/lib.rs\n", diff_text);
+        assert!(facts.content_kinds.is_empty());
+    }
+
+    #[test]
+    fn surface_delta_counts_added_and_removed_public_signatures() {
+        let diff_text = "+pub fn new_one() {}\n\
+             -pub struct Old {}\n\
+             +export function widget() {}\n\
+             +fn private_helper() {}\n";
+        let facts = diff_facts("4\t1\tsrc/lib.rs\n", "src/lib.rs\n", diff_text);
+        assert_eq!(facts.surface_delta, 3);
+    }
+
+    #[test]
+    fn a_dependency_manifest_touched_anywhere_in_the_diff_is_flagged() {
+        let facts = diff_facts("2\t0\tCargo.toml\n", "Cargo.toml\nsrc/lib.rs\n", "");
+        assert!(facts.dep_manifest_touched);
+        let clean = diff_facts("2\t0\tsrc/lib.rs\n", "src/lib.rs\n", "");
+        assert!(!clean.dep_manifest_touched);
+    }
+
+    // --- `skills_present` ---------------------------------------------------------------------
+
+    #[test]
+    fn all_ten_stage_skills_present_is_satisfied() {
+        let entries: Vec<String> = STAGE_SKILLS.iter().map(|s| s.to_string()).collect();
+        assert!(matches!(
+            skills_present(&entries),
+            Observed::Present(Outcome::Satisfied(_))
+        ));
+    }
+
+    #[test]
+    fn a_missing_stage_skill_is_named_in_the_unsatisfied_text() {
+        let entries: Vec<String> = STAGE_SKILLS
+            .iter()
+            .filter(|s| **s != "reflect")
+            .map(|s| s.to_string())
+            .collect();
+        let Observed::Present(Outcome::Unsatisfied(text)) = skills_present(&entries) else {
+            panic!("a missing skill must be reported, never satisfied");
+        };
+        assert!(text.contains("reflect"), "{text}");
+    }
+
+    // --- the outcome collector -----------------------------------------------------------
+
+    #[test]
+    fn pr_final_state_reads_a_merged_pr() {
+        let body = r#"{"state":"MERGED","mergedAt":"2026-08-20T10:00:00Z","closedAt":"2026-08-20T10:00:00Z","mergeCommit":{"oid":"abc"}}"#;
+        assert_eq!(
+            pr_final_state(body),
+            Observed::Present(PrFinal {
+                state: "MERGED".to_string(),
+                merged: true,
+                merged_at: Some("2026-08-20T10:00:00Z".to_string()),
+                closed_at: Some("2026-08-20T10:00:00Z".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn pr_final_state_reads_a_closed_unmerged_pr_as_not_merged() {
+        let body = r#"{"state":"CLOSED","mergedAt":null,"closedAt":"2026-08-20T10:00:00Z"}"#;
+        assert_eq!(
+            pr_final_state(body),
+            Observed::Present(PrFinal {
+                state: "CLOSED".to_string(),
+                merged: false,
+                merged_at: None,
+                closed_at: Some("2026-08-20T10:00:00Z".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn pr_final_state_is_unobservable_over_empty_or_unreadable_output() {
+        assert!(matches!(pr_final_state(""), Observed::Unobservable(_)));
+        assert!(matches!(
+            pr_final_state("not json"),
+            Observed::Unobservable(_)
+        ));
+        assert!(matches!(pr_final_state("{}"), Observed::Unobservable(_)));
+    }
+
+    #[test]
+    fn reverts_touching_matches_commits_whose_files_intersect_the_run_diff() {
+        let log = "\
+deadbeef1
+src/observe.rs
+docs/adr/0001.md
+cafebabe2
+README.md
+";
+        let run_paths = vec!["src/observe.rs".to_string()];
+        assert_eq!(
+            reverts_touching(log, &run_paths),
+            vec!["deadbeef1".to_string()]
+        );
+    }
+
+    #[test]
+    fn reverts_touching_is_empty_when_nothing_overlaps() {
+        let log = "\
+deadbeef1
+README.md
+";
+        let run_paths = vec!["src/observe.rs".to_string()];
+        assert!(reverts_touching(log, &run_paths).is_empty());
+    }
+
+    #[test]
+    fn reverts_touching_reads_the_final_commit_block_with_no_trailing_blank_line() {
+        // The parser flushes on end-of-input, not only on the next sha line — a log that ends
+        // mid-block (no trailing newline shape) must not silently drop its last commit.
+        let log = "deadbeef1\nsrc/observe.rs";
+        let run_paths = vec!["src/observe.rs".to_string()];
+        assert_eq!(
+            reverts_touching(log, &run_paths),
+            vec!["deadbeef1".to_string()]
+        );
     }
 
     #[test]

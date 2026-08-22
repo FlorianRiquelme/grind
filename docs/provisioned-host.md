@@ -89,12 +89,17 @@ resolves.
   minimal Linux host is quite likely to be. Presence only: a busybox `ps` is on `PATH` and still
   cannot answer, so this item catches the absent one and `observe::process_start_stamp` catches
   the rest by reading three-valued.
-- **The `lfg` plugin is installed.** — *dispatch* — The Job names both the plugin and a literal
-  `x.y.z` version, which Enqueue wrote when it drafted the Job (ADR-0002, #50, #69). Nothing on
-  the host resolves anything: `job::plugin_dir()` builds the path from that literal, records it,
-  and every attempt and every `--resume` reads the record — the version is pinned per Job and
-  frozen for the Run's whole life. The host owes an installed plugin, which is all this check
-  looks for; which version matters is the Job's literal, never the host's.
+- **The ten stage skill directories are present under `~/.grind/skills/run`.** — *dispatch* — Grit
+  (ADR-0015) dispatches one stage skill per rung rather than the retired `lfg` plugin's
+  mega-session; a host that never copied `skills/run/*` into place would pass every check above
+  and still have nothing to read at the first stage. Presence only, the same layout-declared
+  shape every other item here reads: the host declares itself by what is on disk.
+
+  Provisioning what once pinned a plugin version now freezes **provenance**: the `grind` binary's
+  own version plus a hash of this skill tree, both resolved once at dispatch and recorded on the
+  Run (ADR-0002 as amended, #98) — a skill edited or a binary upgraded mid-Run becomes visible on
+  the record instead of silent, the same freeze discipline the plugin pin used to carry under a
+  different carrier.
 
 ## Lifetime
 
@@ -219,11 +224,10 @@ heuristic guess of the kind this list keeps removing.
   file and never builds on the host; where it lands is the human's `PATH`, and `grind --version`
   answers *which one is this* if the wrong copy is ever found there. Decided resolving
   [#48](https://github.com/FlorianRiquelme/grind/issues/48).
-- **Auto-update for `claude` and for the plugin.** — *step* — Since the plugin version floats
-  (ADR-0002 as amended), a box whose cache is baked into an image and never refreshed drifts *old*
-  silently — the mirror of the risk the amendment accepts. The record makes it observable, since
-  every Run names the version it actually ran; nothing is built for it. A staleness check would be
-  a mtime threshold, which is a guess.
+- **Auto-update for `claude`.** — *step* — A box whose binary is baked into an image and never
+  refreshed drifts *old* silently. The record makes it observable, since every Run's provenance
+  names the binary and skill-tree state it actually ran under; nothing is built for it. A
+  staleness check would be a mtime threshold, which is a guess.
 - **The dispatching user's `$HOME`.** — *step* — A systemd unit with a different `User=` resolves
   a different `~/.grind` and finds nothing. Loud, not silent, which is why no override exists to
   paper over it (ADR-0008).

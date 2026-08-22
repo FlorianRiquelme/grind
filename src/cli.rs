@@ -69,6 +69,7 @@ pub fn run() -> i32 {
         // patterns match by position, so unparsed flags would otherwise be read as tokens of
         // an unknown command instead of parsed.
         ["serve", rest @ ..] => serve_dashboard(rest),
+        ["outcomes"] => outcomes(),
         // No `list`. A bare status that resolves to one Run is Grind selecting, and the repair
         // *"pick the one in flight"* would pick a zombie.
         other => refuse(&format!("unknown command: {}", other.join(" "))),
@@ -84,6 +85,7 @@ const USAGE: &str = "grind — dispatch and supervise headless `lfg` Runs agains
     grind status [run-id]   roster when bare; one Run's live view when named
     grind doctor            check the provisioned-host list
     grind serve [--bind <addr>] [--port <n>]   serve the dashboard — pull-only; writes nothing
+    grind outcomes          human-initiated: read past Runs' PR fate, write outcome.json
     grind --version         which copy of the binary is this
 ";
 
@@ -165,6 +167,109 @@ fn resume_all() -> i32 {
     Observability::Answered.code()
 }
 
+// --- outcomes ----------------------------------------------------------------------------------
+
+/// The human-initiated post-merge collector (ADR-0012 permits no watcher). For every Run on
+/// this host it reads the record **read-only**, through `view::RunView` — never the writer type,
+/// never saved back — shells `gh pr view` and a revert scan through `world` in the Run's own
+/// worktree, and writes one `outcome.json` beside the record. It never touches `run.json` and
+/// it writes nothing to GitHub.
+fn outcomes() -> i32 {
+    let Some(home) = world::home() else {
+        print_err(&render::refusal("$HOME is unset"));
+        return INCOHERENT_INPUT;
+    };
+    let runs_dir = job::runs_dir(&home);
+    for entry in world::list_dir(&runs_dir) {
+        let Some(run_id) = entry.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        match view::load(&home, run_id) {
+            view::Lookup::NotHere => continue,
+            view::Lookup::Unreadable(reason) => {
+                print(&format!("skipped    {run_id}: unreadable: {reason}"));
+            }
+            view::Lookup::Here(found) => print(&outcome_line(&home, run_id, &found)),
+        }
+    }
+    Observability::Answered.code()
+}
+
+fn outcome_line(home: &Path, run_id: &str, found: &view::RunView) -> String {
+    let worktree = Path::new(&found.worktree);
+    let observation = observe_for(found);
+    let pr = match &observation.pr {
+        Observed::Present(pr) => pr,
+        Observed::Absent => return format!("skipped    {run_id}: no PR observed"),
+        Observed::Unobservable(reason) => {
+            return format!("skipped    {run_id}: could not observe a PR: {reason}");
+        }
+    };
+
+    let view_out = world::run(
+        &words(&[
+            "gh",
+            "pr",
+            "view",
+            &pr.number.to_string(),
+            "--json",
+            "state,mergedAt,closedAt,mergeCommit",
+        ]),
+        Some(worktree),
+    );
+    let pr_final = if view_out.code == Some(0) {
+        observe::pr_final_state(&view_out.stdout)
+    } else {
+        Observed::Unobservable(observe::Reason::of(
+            "gh pr view --json state,...",
+            &view_out,
+        ))
+    };
+    let Observed::Present(pr_final) = pr_final else {
+        return format!("skipped    {run_id}: could not read the PR's final state");
+    };
+
+    let run_paths: Vec<String> = match &observation.changed_files {
+        Observed::Present(files) => files.clone(),
+        _ => Vec::new(),
+    };
+    let log = world::run(
+        &words(&[
+            "git",
+            "log",
+            "--grep=Revert",
+            "-i",
+            "--format=%H",
+            "--name-only",
+        ]),
+        Some(worktree),
+    );
+    let reverted_by = observe::reverts_touching(&log.stdout, &run_paths);
+
+    let outcome = observe::RunOutcome {
+        collected_at: world::now_iso(),
+        pr_state: pr_final.state.clone(),
+        pr_merged: pr_final.merged,
+        pr_merged_at: pr_final.merged_at.clone(),
+        pr_closed_at: pr_final.closed_at.clone(),
+        reverted_by: reverted_by.clone(),
+        followup_issues: Vec::new(),
+    };
+    let path = job::runs_dir(home).join(run_id).join("outcome.json");
+    let Ok(json) = serde_json::to_string_pretty(&outcome) else {
+        return format!("skipped    {run_id}: outcome.json could not be composed");
+    };
+    match world::write_atomic(&path, &json) {
+        Ok(()) => format!(
+            "updated    {run_id}: {} merged={} reverted_by={}",
+            outcome.pr_state,
+            outcome.pr_merged,
+            reverted_by.len()
+        ),
+        Err(said) => format!("skipped    {run_id}: {said}"),
+    }
+}
+
 // --- status ------------------------------------------------------------------------------------
 
 /// Bare `grind status` prints the roster and **never resolves to a single Run**.
@@ -240,6 +345,8 @@ fn observe_for(found: &view::RunView) -> observe::Observation {
     view::observe_fresh(
         Path::new(&found.worktree),
         &found.job.handoff_sha,
+        &found.job.branch,
+        &found.job.base_branch,
         world::now_iso(),
     )
 }
@@ -405,12 +512,15 @@ fn check(home: &Path, clones: &[(String, PathBuf)], check: Check) -> Observed<Ou
             &world::run(&words(&["git", "--version"]), None),
             job::GIT_VERSION_FLOOR,
         ),
-        // With no Job there is no pin to resolve, so what is checked at this depth is that the
-        // host has a plugin cache with something in it. The pinned directory itself is a
-        // dispatch-depth check, where a Job names it.
-        Check::PluginInstalled => observe::plugin_installed(
-            !world::list_dir(&home.join(".claude").join("plugins").join("cache")).is_empty(),
-        ),
+        Check::SkillsPresent => {
+            let root = job::grind_dir(home).join("skills").join("run");
+            let names: Vec<String> = world::list_dir(&root)
+                .into_iter()
+                .filter(|p| world::is_dir(p))
+                .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+                .collect();
+            observe::skills_present(&names)
+        }
         // Spelled `cfg!` rather than `std::env::consts::OS`, which is the idiomatic runtime
         // spelling: `tests/topology.rs` string-matches the literal `std::env` and asserts only
         // `world` names it, so the idiom would turn `just verify` red on a carrier that must

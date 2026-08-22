@@ -207,8 +207,8 @@ fn a_fifth_signal_dropped_at_the_fold_does_not_compile() {
     // outside, an extra field on a constructor is `E0560` and the fold is unreachable.
     let root = scratch_crate("fifth-signal");
     let decide = read(&root, "decide").replace(
-        "    pub no_check_pending: Observed<bool>,\n}",
-        "    pub no_check_pending: Observed<bool>,\n    pub fanout_healthy: Observed<bool>,\n}",
+        "    pub pr_base_matches_declared: Observed<bool>,\n}",
+        "    pub pr_base_matches_declared: Observed<bool>,\n    pub fanout_healthy: Observed<bool>,\n}",
     );
     assert!(
         decide.contains("fanout_healthy"),

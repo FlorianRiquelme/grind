@@ -8,8 +8,9 @@
 //! this module emits against that rule; there is a test at the bottom that does.
 
 use crate::attempt::Clearance;
-use crate::decide::{Stage, Verdict, VerifyContract};
-use crate::observe::{Observation, Observed, Outcome, UNOBSERVABLE_MARK};
+use crate::decide::{Decision, Stage, Verdict, VerifyContract};
+use crate::observe::{Observation, Observed, Outcome, RunOutcome, UNOBSERVABLE_MARK};
+use crate::rung::{ReturnStatus, StageEntry};
 use crate::view::{Facts, Live, RosterRow, RunView, one_line};
 use std::path::Path;
 
@@ -143,6 +144,7 @@ pub fn run_view(view: &SingleRun) -> String {
         &mut out,
         &format!("  verify contract   {}", contract_line(contract)),
     );
+    out.push_str(&stage_table(&found.stages));
     line(&mut out, "");
     line(&mut out, "  last words");
     for said in live.last_words.iter().take(3) {
@@ -220,6 +222,10 @@ pub fn handback(view: &Facts) -> String {
         blocker,
         cleared,
         run_state,
+        triage_decision,
+        diff_triage_decision,
+        outcome,
+        calibration,
     } = view;
     let furthest = *furthest;
     let blocker = blocker.as_deref();
@@ -357,6 +363,12 @@ pub fn handback(view: &Facts) -> String {
         }
     }
 
+    out.push_str(&stage_table(&found.stages));
+    out.push_str(&decision_receipts("triage", triage_decision));
+    out.push_str(&decision_receipts("diff-triage", diff_triage_decision));
+    out.push_str(&calibration_row(calibration));
+    out.push_str(&outcome_rows(outcome));
+
     // Things you type at something, rather than claims about the world. The session handle is
     // worthless off its host, and the worktree path is a place rather than a fact.
     line(&mut out, "");
@@ -399,6 +411,14 @@ pub fn job_comment(view: &Facts) -> String {
         blocker,
         cleared,
         run_state,
+        triage_decision,
+        diff_triage_decision,
+        // Chronologically always `None` here: `grind outcomes` collects both only after this
+        // comment is posted, at the Run's terminal moment. Bound and unused rather than
+        // dropped from the pattern, so a caller who ever changes that ordering meets a live
+        // binding here instead of a silently absent one.
+        outcome: _outcome,
+        calibration: _calibration,
     } = view;
     let (made, budget) = found.attempt_counter();
     let mut out = String::new();
@@ -487,6 +507,11 @@ pub fn job_comment(view: &Facts) -> String {
         &or_none(&contract.missing.join(", ")),
     );
     cell("verify coverage", &marked(coverage));
+    // Tier receipts, terse: the full rationale rows stay on the host (the Handback prints
+    // them), and this comment carries only what the review depth bought.
+    if let Some(decision) = diff_triage_decision.as_ref().or(triage_decision.as_ref()) {
+        cell("tier", &decision.tier.to_string());
+    }
     cell("run state", &format!("`{}`", run_state.display()));
     out
 }
@@ -769,6 +794,147 @@ fn fanout_line(live: &Live) -> String {
     }
 }
 
+/// The stage table: one row per rung the Run has walked, in the order it walked them. `[R]`
+/// rows (Triage, Diff-triage) render as the zero-cost passes they are because the record
+/// already carries their true cost and turns (`Some(0.0)`, `Some(0)`, `session_id: "[R]"`) —
+/// nothing here special-cases them. Absent entirely on a pre-cutover or early Run, whose
+/// `stages` list is empty rather than partially populated.
+fn stage_table(stages: &[StageEntry]) -> String {
+    if stages.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    line(&mut out, "");
+    line(&mut out, "  stages");
+    for s in stages {
+        line(
+            &mut out,
+            &format!(
+                "    {:<14} {:<24} {:<10} {:<20} {:<8} {}",
+                s.name,
+                s.session_id,
+                stage_status_word(s.status),
+                s.model.as_deref().unwrap_or("(session default)"),
+                s.cost_usd
+                    .map(|c| format!("${c:.2}"))
+                    .unwrap_or_else(|| UNOBSERVABLE_MARK.to_string()),
+                s.turns
+                    .map(|t| format!("{t} turns"))
+                    .unwrap_or_else(|| UNOBSERVABLE_MARK.to_string()),
+            ),
+        );
+    }
+    out
+}
+
+fn stage_status_word(status: ReturnStatus) -> &'static str {
+    match status {
+        ReturnStatus::Complete => "complete",
+        ReturnStatus::Skipped => "skipped",
+        ReturnStatus::Incomplete => "incomplete",
+    }
+}
+
+/// Tier, floor, personas and the rationale rows one tier-selection pass left behind — a
+/// receipt, never a grade (ADR-0003 applies to rendering too: no ✓/✗ over a tier). Absent
+/// entirely when the stage never ran, which is `decision.json` never existing rather than a
+/// zero value to print.
+fn decision_receipts(stage: &str, decision: &Option<Decision>) -> String {
+    let Some(decision) = decision else {
+        return String::new();
+    };
+    let mut out = String::new();
+    line(&mut out, "");
+    line(&mut out, &format!("  {stage} decision"));
+    let personas = if decision.personas.is_empty() {
+        "none".to_string()
+    } else {
+        decision
+            .personas
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    line(
+        &mut out,
+        &format!(
+            "    tier {}  floor {}  personas {personas}",
+            decision.tier, decision.floor_from_plan
+        ),
+    );
+    for row in &decision.rationale {
+        line(
+            &mut out,
+            &format!(
+                "      {} \u{2192} {} ({})",
+                row.signal, row.value, row.weight
+            ),
+        );
+    }
+    out
+}
+
+/// Reflect's calibration row, walked as plain key/value facts. Its shape is Reflect's own
+/// (SKILL.md states the intent — "statistics feeding the monthly audit" — not a schema this
+/// base forces), so this reads whatever keys the row carries rather than naming fields that
+/// might not exist on the next Run's row. Absent entirely when Reflect wrote no row.
+fn calibration_row(calibration: &Option<serde_json::Value>) -> String {
+    let Some(serde_json::Value::Object(map)) = calibration else {
+        return String::new();
+    };
+    let mut out = String::new();
+    line(&mut out, "");
+    line(&mut out, "  calibration");
+    for (key, value) in map {
+        line(&mut out, &format!("    {key}: {}", json_text(value)));
+    }
+    out
+}
+
+fn json_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// `outcome.json`'s facts, once `grind outcomes` has collected them: merged/closed state and
+/// any revert — never a grade on the Run. Absent entirely until the human runs `grind
+/// outcomes`.
+fn outcome_rows(outcome: &Option<RunOutcome>) -> String {
+    let Some(outcome) = outcome else {
+        return String::new();
+    };
+    let mut out = String::new();
+    line(&mut out, "");
+    line(&mut out, "  outcome");
+    line(
+        &mut out,
+        &format!("    PR state       {}", outcome.pr_state),
+    );
+    line(
+        &mut out,
+        &format!(
+            "    merged         {}",
+            if outcome.pr_merged { "yes" } else { "no" }
+        ),
+    );
+    if let Some(at) = &outcome.pr_merged_at {
+        line(&mut out, &format!("    merged at      {at}"));
+    }
+    if let Some(at) = &outcome.pr_closed_at {
+        line(&mut out, &format!("    closed at      {at}"));
+    }
+    if !outcome.reverted_by.is_empty() {
+        line(
+            &mut out,
+            &format!("    reverted by    {}", outcome.reverted_by.join(", ")),
+        );
+    }
+    out
+}
+
 /// Presence and absence, and **never a verdict on quality**. This is the one place a gate would
 /// be one line away, which is why the contract carries no summary boolean to test.
 fn contract_line(contract: &VerifyContract) -> String {
@@ -817,6 +983,8 @@ mod tests {
                 url: "https://github.com/FlorianRiquelme/snapper/pull/30".to_string(),
                 state: "OPEN".to_string(),
                 is_draft: false,
+                head_ref: "feat/x".to_string(),
+                base_ref: "main".to_string(),
             }),
             checks_pending: Observed::Present(false),
             checks_red: Observed::Present(false),
@@ -831,6 +999,8 @@ mod tests {
                 commits: 0,
                 overlapping: vec![],
             }),
+            pr_head_matches_job_branch: Observed::Present(true),
+            pr_base_matches_declared: Observed::Present(true),
         }
     }
 
@@ -1072,6 +1242,10 @@ mod tests {
             blocker: blocker.map(str::to_string),
             cleared,
             run_state: PathBuf::from("/home/op/.grind/runs/20260806-122620-snapper-28/run.json"),
+            triage_decision: None,
+            diff_triage_decision: None,
+            outcome: None,
+            calibration: None,
         }
     }
 
@@ -1208,6 +1382,8 @@ mod tests {
             url: "https://github.com/o/n/pull/30".to_string(),
             state: "OPEN".to_string(),
             is_draft: true,
+            head_ref: "feat/x".to_string(),
+            base_ref: "main".to_string(),
         });
         assert!(handed_back(&draft, &Verdict::Completed).contains("draft"));
     }
@@ -1676,6 +1852,8 @@ mod tests {
             url: "https://github.com/FlorianRiquelme/snapper/pull/30".to_string(),
             state: "OPEN".to_string(),
             is_draft: true,
+            head_ref: "feat/x".to_string(),
+            base_ref: "main".to_string(),
         });
         let marked_up = commented(&draft, &Verdict::Completed);
         assert!(
@@ -1798,5 +1976,125 @@ mod tests {
         assert!(text.contains("snapper.local"));
         assert!(text.contains("this host only"));
         assert!(text.contains("no Runs here"));
+    }
+
+    // --- Grit surfaces: the stage table, decision receipts, calibration and outcome -----------
+
+    fn stages_two() -> Vec<StageEntry> {
+        vec![
+            StageEntry {
+                name: "plan".to_string(),
+                session_id: "run-1-plan".to_string(),
+                status: ReturnStatus::Complete,
+                artifact_paths: vec![],
+                model: Some("claude-sonnet-5".to_string()),
+                cost_usd: Some(1.23),
+                turns: Some(4),
+            },
+            StageEntry {
+                name: "triage".to_string(),
+                session_id: "[R]".to_string(),
+                status: ReturnStatus::Complete,
+                artifact_paths: vec![],
+                model: None,
+                cost_usd: Some(0.0),
+                turns: Some(0),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_run_view_with_two_stage_entries_renders_both_rows_and_the_r_pass_as_zero_cost() {
+        let mut record = found();
+        record.stages = stages_two();
+        let text = rendered_of(&record, &observation(), &live(3), &Verdict::Completed);
+        assert!(text.contains("plan"), "{text}");
+        assert!(text.contains("run-1-plan"), "{text}");
+        assert!(text.contains("$1.23"), "{text}");
+        assert!(text.contains("triage"), "{text}");
+        assert!(text.contains("[R]"), "{text}");
+        assert!(text.contains("$0.00"), "{text}");
+    }
+
+    #[test]
+    fn a_run_with_no_stages_renders_no_stage_table() {
+        let text = rendered(&observation(), &live(3), &Verdict::Completed);
+        assert!(!text.contains("stages"), "{text}");
+    }
+
+    fn decision_literal() -> Decision {
+        Decision {
+            tier: crate::decide::Tier::T1,
+            personas: vec![
+                crate::decide::Persona::Correctness,
+                crate::decide::Persona::Tests,
+            ],
+            depth: crate::decide::PlanReviewDepth { reviewers: 1 },
+            model_per_stage: std::collections::BTreeMap::new(),
+            floor_from_plan: crate::decide::Tier::T0,
+            rationale: vec![crate::decide::RationaleRow {
+                signal: "loc_changed".to_string(),
+                value: "180".to_string(),
+                weight: "t1".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_decision_literal_renders_its_tier_floor_personas_and_rationale() {
+        let text = decision_receipts("triage", &Some(decision_literal()));
+        assert!(text.contains("triage decision"), "{text}");
+        assert!(text.contains("tier t1"), "{text}");
+        assert!(text.contains("floor t0"), "{text}");
+        assert!(text.contains("correctness"), "{text}");
+        assert!(text.contains("tests"), "{text}");
+        assert!(text.contains("loc_changed"), "{text}");
+        assert!(text.contains("180"), "{text}");
+    }
+
+    #[test]
+    fn an_absent_decision_renders_nothing() {
+        assert_eq!(decision_receipts("diff-triage", &None), "");
+    }
+
+    #[test]
+    fn an_empty_run_dir_adds_no_grit_sections_to_the_handback() {
+        let facts = facts_of(found(), observation(), Verdict::Completed, coverage(), None);
+        let text = handback(&facts);
+        for absent in ["decision", "calibration", "  outcome"] {
+            assert!(
+                !text.contains(absent),
+                "`{absent}` present on an empty run dir:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_calibration_row_renders_as_key_value_facts() {
+        let row = serde_json::json!({"tier": "t1", "confirmed": "P1"});
+        let text = calibration_row(&Some(row));
+        assert!(text.contains("calibration"), "{text}");
+        assert!(text.contains("tier: t1"), "{text}");
+        assert!(text.contains("confirmed: P1"), "{text}");
+        assert_eq!(calibration_row(&None), "");
+    }
+
+    #[test]
+    fn an_outcome_row_renders_the_merged_and_reverted_facts() {
+        let outcome = RunOutcome {
+            collected_at: "2026-09-01T00:00:00+00:00".to_string(),
+            pr_state: "MERGED".to_string(),
+            pr_merged: true,
+            pr_merged_at: Some("2026-08-20T00:00:00+00:00".to_string()),
+            pr_closed_at: None,
+            reverted_by: vec!["abc123".to_string()],
+            followup_issues: vec![],
+        };
+        let text = outcome_rows(&Some(outcome));
+        assert!(text.contains("MERGED"), "{text}");
+        assert!(text.contains("merged         yes"), "{text}");
+        assert!(text.contains("2026-08-20T00:00:00+00:00"), "{text}");
+        assert!(text.contains("abc123"), "{text}");
+        assert_eq!(outcome_rows(&None), "");
     }
 }
