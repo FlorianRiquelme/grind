@@ -709,6 +709,10 @@ mod tests {
             model: None,
             plugin: PluginPin::parse("compound-engineering@compound-engineering-plugin 3.21.3")
                 .unwrap(),
+            done_predicate: "just verify is green".to_string(),
+            base_branch: "main".to_string(),
+            verify_entrypoint: "just verify".to_string(),
+            declared_hot_paths: vec![],
         }
     }
 

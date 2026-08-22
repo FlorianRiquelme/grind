@@ -14,11 +14,25 @@ dropped. Everything else in the body is prose Grind never reads.
 | **Handoff SHA** | `723ca913536d279e45549018f022e9d1092bbbec` (`main` after #29) |
 | **Anchor artifact** | `docs/plans/2026-08-05-002-slice-1b-plan.md` |
 | **Pinned plugin version** | `compound-engineering@compound-engineering-plugin` **3.21.4** |
+| **Done predicate** | `just verify` is green and the screensource seam has a passing test |
+| **Base branch** | `main` |
+| **Verify entrypoint** | `just verify` |
+| **Declared hot paths** | `src/decide.rs, src/policy.rs` |
 | **Intent** | A settled plan transcribed into one module; the shape is decided. |
 ```
 
-**The first five are required and refused at dispatch if missing.** A row reading `none`, `-`,
+**The first eight are required and refused at dispatch if missing.** A row reading `none`, `-`,
 `n/a` or empty counts as missing, so never write a placeholder into a required row.
+
+**`Done predicate`, `Base branch` and `Verify entrypoint` are the same absence-of-spelling
+refusal as a missing Anchor** — blank is refused, not waved through as *nothing to check*.
+`Done predicate` is stated so a machine could grade it; `Base branch` is the merge target the
+PR opens against; `Verify entrypoint` is handed verbatim to the Run, the repo's own generic
+answer to "how do I check this".
+
+**`Declared hot paths` is optional**, and it is human-declared rather than Grind-classified
+(ADR-0012): performance-sensitive paths the human already knows about. A row reading `none`,
+`-`, `n/a` or empty is the same as no row, and the list is then empty.
 
 `tests/enqueue_template.rs` parses this very table through `job::from_issue_json`, so a required
 row renamed on either side turns `just verify` red. That is the whole of the seam.

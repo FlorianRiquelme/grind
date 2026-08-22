@@ -390,6 +390,9 @@ fn sandbox(name: &str) -> Sandbox {
                  | Handoff SHA | {handoff_sha} |\n\
                  | Anchor artifact | docs/plans/a-plan.md |\n\
                  | Pinned plugin version | `{PLUGIN}@{MARKETPLACE}` {VERSION} |\n\
+                 | Done predicate | `just verify` is green |\n\
+                 | Base branch | main |\n\
+                 | Verify entrypoint | `just verify` |\n\
                  | Budget ceiling | $12.50 |\n"
             ),
         })

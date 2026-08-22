@@ -22,6 +22,8 @@ gh repo view --json nameWithOwner -q .nameWithOwner        # target repo
 git branch --show-current                                   # branch
 gh repo view --json defaultBranchRef -q .defaultBranchRef.name
 ls ~/.claude/plugins/cache/compound-engineering-plugin/compound-engineering | sort -V | tail -1
+test -f justfile && grep -m1 '^verify' justfile             # verify entrypoint, first guess
+test -f package.json && jq -r '.scripts.verify // empty' package.json
 ```
 
 The **Anchor artifact** is the plan document this session just wrote, as a repo-relative path.
@@ -30,6 +32,23 @@ Show it; don't ask for it.
 **Always latest** for the plugin: write the newest installed version as a literal `x.y.z`. Never
 write a bare `name@marketplace` — `PluginPin::parse` refuses it, which is what keeps `Latest`
 unspellable.
+
+**Base branch** derives from `defaultBranchRef` above — write it unless the human names another
+merge target in the session.
+
+**Verify entrypoint** derives from the repo the same way `VERIFY_CONTRACT` does: a `justfile`
+recipe first, then a `package.json` script. When neither exists, **ask the human** rather than
+inventing one — a Job naming no runnable command is an enqueue-time refusal waiting to happen,
+not a guess worth writing down.
+
+**Done predicate** is not derivable. Draft it from what this session knows the work to be, and
+state it so a machine could grade it: *`just verify` is green and the new endpoint returns 404
+for an unknown id* is gradable; *the feature works well* is not — nobody, human or Run, can
+check it against evidence.
+
+**Declared hot paths** is asked-for, never derived: **Grind does not classify a path as hot**
+(ADR-0012), so this row exists only when the human names one in the session. Leave it out rather
+than guessing from a diff or a directory name.
 
 ## 2. Refuse a Job on the default branch
 
