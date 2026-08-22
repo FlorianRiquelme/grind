@@ -1,6 +1,6 @@
 ---
 name: Grind
-last_updated: 2026-08-21
+last_updated: 2026-08-22
 ---
 
 # Grind Strategy
@@ -14,11 +14,13 @@ questions, so picking it up in the morning can cost more than the unattended run
 
 ## Our approach
 
-Consume `lfg` wholesale and build only the four things it has no opinion about: enqueue,
-unattended dispatch, supervision of a run that dies, and the handback. Every capability lags
-supervised local use until it stops needing correction, and a Run stops at an open PR
-without ever asserting the work is ready — so the gate stays downstream of Grind, where it
-already was: an agent-run review, and the human's merge decision over the PR's record.
+Grind has owned its pipeline since ADR-0015 — superseding ADR-0001's reserved escape clause,
+on Run 4's evidence (`docs/findings/0004`): enqueue, unattended dispatch, supervision of a run
+that dies, the handback, and now the ten-stage ladder itself, walked one Attempt per stage from
+Plan through Ship. Every capability lags supervised local use until it stops needing correction,
+and a Run stops at an open PR without ever asserting the work is ready — so the gate stays
+downstream of Grind, where it already was: an agent-run review, and the human's merge decision
+over the PR's record.
 
 Leg 1 exists. The four things shipped as one accumulating build on the Rust base — #76
 spec'd it, PR #79 landed it 2026-08-20 — with the review sweep (#86) and the transcript
@@ -33,7 +35,7 @@ PR that costs as little as possible to pick up.
 
 Single-user and opinionated on purpose: no auth, no multi-tenancy, no configuration surface
 for other people's repo conventions. If a colleague wants this, they fork their own — which
-is affordable precisely because the shell over `lfg` is thin.
+is affordable precisely because the base is one thin compiled binary over its own stage skills.
 
 ## Key metrics
 
@@ -67,7 +69,8 @@ is affordable precisely because the shell over `lfg` is thin.
 ### Enqueue
 
 Everything at the seam: the Job issue in the target repo, the Handoff SHA, the anchor
-artifact, the decomposability admission check, the pinned plugin version. Enqueue is also
+artifact, the decomposability admission check, and the frozen provenance (binary version plus
+`skills_hash`). Enqueue is also
 where the Dispatch is offered — the trigger is a push closing this step, never a watcher
 observing anything (ADR-0012).
 
@@ -79,8 +82,9 @@ only place a badly shaped job can be caught before it fails unattended and expen
 
 ### The supervisor
 
-Run-now before any schedule, re-entry at the stage that died, limit handling by sleeping and
-re-entering rather than pre-flight quota checks, and run state on gitignored local disk that
+Run-now before any schedule, a ten-stage ladder walked one Attempt per stage with re-entry at
+the stage that died, limit handling by sleeping and re-entering rather than pre-flight quota
+checks, and run state on gitignored local disk that
 
 is structured enough for a day session to read.
 
@@ -119,8 +123,9 @@ that earns trust. A Run that produces good code and an unreadable pile has still
   state is an hour's work if a week of runs shows it is wanted.
 - Gating a PR on review findings — the gate is downstream of Grind and Grind does not own
   it. See ADR-0003.
-- Proving new capabilities headlessly — new lenses, an adversarial pass, `depth:full` and
-  guidelines checking all earn their way in from supervised use. See ADR-0002.
+- Proving new capabilities headlessly — new lenses, an adversarial pass, deeper rungs of the
+  review tier table and guidelines checking all earn their way in from supervised use. See
+  ADR-0002.
 - Giving the runner its own Claude plan — still deferred, but no longer for the reason first
   written. Dispatch is human-managed because Grind never selects a Job, not because the human
   is rationing the weekly limit. The credentials half is already settled: a remote host needs

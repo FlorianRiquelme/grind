@@ -43,6 +43,7 @@ grind cleared <run-id> <note>   record what changed on a Run a Blocker stopped
 grind status [run-id]   roster when bare; one Run's live view when named
 grind outcomes          human-initiated: read past Runs' PR fate, write outcome.json
 grind doctor            check the provisioned-host list
+grind serve [--bind <addr>] [--port <n>]   serve the dashboard — pull-only; writes nothing
 grind --version         which copy of the binary is this
 ```
 

@@ -1,7 +1,7 @@
 # Grind
 
-A queue, a supervisor and a record around headless `lfg` runs. It executes plans the
-human is not present for, and stops at an open PR.
+A queue, a supervisor and a record around headless runs of its own stage ladder (ADR-0015).
+It executes plans the human is not present for, and stops at an open PR.
 
 ## Language
 

@@ -5,7 +5,7 @@ edition = "2024"
 # `File::try_lock` (the dispatch lock) stabilised here, and let-chains are used throughout.
 # Stated so a runner on an older toolchain fails with the reason rather than with a syntax error.
 rust-version = "1.89"
-description = "A queue, a supervisor and a record around headless `lfg` runs."
+description = "A queue, a supervisor and a record around headless runs of its own stage ladder."
 publish = false
 
 # ADR-0005: serde is the only dependency the base takes, read as the family — JSON is the
