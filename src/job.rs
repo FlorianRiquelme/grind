@@ -1,5 +1,5 @@
-//! How a Job reference becomes everything a dispatch needs — the field table, the plugin pin,
-//! the repo path, the `claude` binary, the worktree choice.
+//! How a Job reference becomes everything a dispatch needs — the field table, the repo path,
+//! the `claude` binary, the worktree choice.
 //!
 //! All four resolutions are one act, and all four are pure over text some child printed. The
 //! fix for *nothing that touches git is tested* is pure parse functions over output text, not
@@ -35,52 +35,6 @@ pub struct Reference {
     pub number: u64,
 }
 
-/// The plugin pin. **No `Default`, no `Latest`, and no way to build one that is missing a
-/// half** — once `Latest` is spelled, resolve-at-dispatch is one match arm away, and advancing
-/// a pin is the act of Promotion. Refusal is the absence of a spelling rather than a rejected
-/// case (ADR-0006), so nothing in this file tests for the string `latest`: it is refused
-/// because it carries neither a marketplace nor a version, like any other prose.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PluginPin {
-    name: String,
-    marketplace: String,
-    version: String,
-}
-
-impl PluginPin {
-    /// The only constructor. Both halves or nothing.
-    pub fn parse(spec: &str) -> Result<Self, Refusal> {
-        let cleaned = clean(spec);
-        let version = find_version(&cleaned).ok_or_else(|| {
-            Refusal::saying(format!(
-                "the `pinned plugin version` row carries no literal x.y.z: {spec}"
-            ))
-        })?;
-        let (name, marketplace) = find_name_at_marketplace(&cleaned).ok_or_else(|| {
-            Refusal::saying(format!(
-                "the `pinned plugin version` row carries no name@marketplace: {spec}"
-            ))
-        })?;
-        Ok(PluginPin {
-            name,
-            marketplace,
-            version,
-        })
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn marketplace(&self) -> &str {
-        &self.marketplace
-    }
-
-    pub fn version(&self) -> &str {
-        &self.version
-    }
-}
-
 /// One unit of queued work, as read off its issue.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Job {
@@ -97,7 +51,6 @@ pub struct Job {
     /// branch contract out. No validator: it is prose.
     pub intent: Option<String>,
     pub model: Option<String>,
-    pub plugin: PluginPin,
     /// How the Run will know this is done, stated so a machine could grade it. Consumed by the
     /// stage machinery (ADR-0015) — the Plan stage inherits it, plan review grades it, the PR
     /// body renders its verdict; parsed and recorded here. `#[serde(default)]` because a record
@@ -227,7 +180,6 @@ pub fn from_issue_json(raw: &str) -> Result<Job, Refusal> {
     let handoff_sha = extract_handoff_sha(&required("handoff sha")?)?;
     let anchor = required("anchor artifact")?;
     validate_anchor(&anchor)?;
-    let plugin = PluginPin::parse(&required("pinned plugin version")?)?;
     // No `budget ceiling` row is read. ADR-0010 withdrew the ceiling, and a Job still carrying
     // the row is ignored the way any unknown row is.
     let intent = optional("intent");
@@ -250,7 +202,6 @@ pub fn from_issue_json(raw: &str) -> Result<Job, Refusal> {
         anchor,
         intent,
         model,
-        plugin,
         done_predicate,
         base_branch,
         verify_entrypoint,
@@ -350,9 +301,10 @@ fn validate_branch(branch: &str) -> Result<(), Refusal> {
 /// Run 2's read `` `723ca91…` (`main` after #29) `` and every consumer took the whole cell.
 /// Take the longest run of `[0-9a-f]` and accept it at a commit's length, 7 to 40.
 ///
-/// A bare function beside the three validators, and not a newtype: `PluginPin` earns its type
-/// because `Latest` must be unspellable (ADR-0006), and a SHA has no forbidden spelling, only
-/// a required shape. No regex crate either — ADR-0005's single dependency holds.
+/// A bare function beside the three validators, and not a newtype: the retired `PluginPin`
+/// earned its type because `Latest` had to be unspellable (ADR-0006), and a SHA has no
+/// forbidden spelling, only a required shape. No regex crate either — ADR-0005's single
+/// dependency holds.
 fn extract_handoff_sha(cell: &str) -> Result<String, Refusal> {
     let mut longest = "";
     for run in cell.split(|c: char| !matches!(c, '0'..='9' | 'a'..='f')) {
@@ -409,23 +361,11 @@ pub fn locks_dir(home: &Path) -> PathBuf {
     grind_dir(home).join("locks")
 }
 
-/// Resolved **once**, at dispatch. The resolved path goes into the record and every attempt
-/// and every `--resume` reads the record — an eight-attempt Run spanning hours of rate-limit
-/// sleeps must not start on one version and finish on another.
-pub fn plugin_dir(home: &Path, pin: &PluginPin) -> PathBuf {
-    home.join(".claude")
-        .join("plugins")
-        .join("cache")
-        .join(pin.marketplace())
-        .join(pin.name())
-        .join(pin.version())
-}
-
 // --- the host item list -------------------------------------------------------------------
 //
 // One list, checked at two depths: presence before every Dispatch, the full list by
 // `grind doctor`. The list lives here because `job` already absorbs host resolution — repo
-// path, worktree adoption, plugin directory, `claude` binary — and the dispatch-time subset is
+// path, worktree adoption, `claude` binary — and the dispatch-time subset is
 // part of turning a Job reference into a dispatch.
 //
 // The tension is named rather than hidden: `grind doctor` takes no Job argument, so the list
@@ -458,10 +398,8 @@ pub enum Check {
     ClaudeBinary,
     OnPath(&'static str),
     GitVersionFloor,
-    PluginInstalled,
-    /// The ten stage skill directories under `~/.grind/skills/run` (ADR-0015). Named alongside
-    /// `PluginInstalled` rather than in its place — unit D's job is deleting the plugin pin once
-    /// nothing invokes it; this unit only adds what the ladder actually reads.
+    /// The ten stage skill directories under `~/.grind/skills/run` (ADR-0015), replacing the
+    /// retired `PluginInstalled` check the moment nothing invoked the plugin anymore.
     SkillsPresent,
     /// The **first platform-branching check** in a list where every other one is a single
     /// command everywhere: `launchctl print` on darwin, `systemctl --user is-enabled` on linux.
@@ -533,12 +471,6 @@ pub fn host_items() -> &'static [HostItem] {
             doc_anchor: "`ps` on `PATH`.",
         },
         HostItem {
-            name: "lfg plugin installed",
-            depth: Depth::Dispatch,
-            check: Check::PluginInstalled,
-            doc_anchor: "The `lfg` plugin is installed.",
-        },
-        HostItem {
             name: "stage skills present",
             depth: Depth::Dispatch,
             check: Check::SkillsPresent,
@@ -593,10 +525,10 @@ pub fn host_items() -> &'static [HostItem] {
             doc_anchor: "The `grind` binary is on `PATH`.",
         },
         HostItem {
-            name: "auto-update for claude and the plugin",
+            name: "auto-update for claude",
             depth: Depth::Step,
             check: Check::NoBoolean,
-            doc_anchor: "Auto-update for `claude` and for the plugin.",
+            doc_anchor: "Auto-update for `claude`.",
         },
         HostItem {
             name: "the dispatching user's $HOME",
@@ -737,42 +669,6 @@ fn short(sha: &str) -> String {
     sha.chars().take(8).collect()
 }
 
-// --- the two scanners the plugin pin needs -----------------------------------------------
-
-fn find_version(text: &str) -> Option<String> {
-    for token in text.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
-        let parts: Vec<&str> = token.split('.').collect();
-        if parts.len() == 3
-            && parts
-                .iter()
-                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-        {
-            return Some(token.to_string());
-        }
-    }
-    None
-}
-
-fn find_name_at_marketplace(text: &str) -> Option<(String, String)> {
-    for token in text.split_whitespace() {
-        let Some((name, rest)) = token.split_once('@') else {
-            continue;
-        };
-        let marketplace = rest.split('@').next().unwrap_or_default();
-        if is_pin_word(name) && is_pin_word(marketplace) && find_version(marketplace).is_none() {
-            return Some((name.to_string(), marketplace.to_string()));
-        }
-    }
-    None
-}
-
-fn is_pin_word(word: &str) -> bool {
-    !word.is_empty()
-        && word
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,7 +695,6 @@ mod tests {
          | Branch | feat/28-slice-1b-agent-surface-screensource-seam |\n\
          | Handoff SHA | `9d1f4c7a2b6e0538d4a17c9b3e5f8021ac6d4e77` |\n\
          | Anchor artifact | docs/plans/2026-08-05-002-plan.md |\n\
-         | Pinned plugin version | `compound-engineering@compound-engineering-plugin` 3.21.3 |\n\
          | Done predicate | `just verify` is green and the screensource seam has a test |\n\
          | Base branch | main |\n\
          | Verify entrypoint | `just verify` |";
@@ -915,35 +810,6 @@ mod tests {
             let refusal = from_issue_json(&issue_json(&rows)).expect_err("must refuse");
             assert!(refusal.to_string().contains("anchor artifact"), "{refusal}");
         }
-    }
-
-    #[test]
-    fn the_plugin_pin_needs_both_halves_and_has_no_latest_to_spell() {
-        assert!(PluginPin::parse("latest").is_err());
-        assert!(
-            PluginPin::parse("compound-engineering@compound-engineering-plugin latest").is_err()
-        );
-        assert!(
-            PluginPin::parse("3.21.3").is_err(),
-            "a bare version has no marketplace"
-        );
-        let pinned = PluginPin::parse("`compound-engineering@compound-engineering-plugin` 3.21.3")
-            .expect("both halves");
-        assert_eq!(pinned.name(), "compound-engineering");
-        assert_eq!(pinned.marketplace(), "compound-engineering-plugin");
-        assert_eq!(pinned.version(), "3.21.3");
-    }
-
-    #[test]
-    fn the_plugin_resolves_under_the_pin() {
-        let pin =
-            PluginPin::parse("compound-engineering@compound-engineering-plugin 3.21.3").unwrap();
-        assert_eq!(
-            plugin_dir(Path::new("/home/op"), &pin),
-            Path::new(
-                "/home/op/.claude/plugins/cache/compound-engineering-plugin/compound-engineering/3.21.3"
-            )
-        );
     }
 
     #[test]

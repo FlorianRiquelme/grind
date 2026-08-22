@@ -1,14 +1,14 @@
 # Grind
 
-A queue, a supervisor and a record around headless `lfg` runs. It executes plans the human
-is not present for, and stops at an open PR.
+A queue, a supervisor and a record around headless runs of its own stage ladder (ADR-0015). It
+executes plans the human is not present for, and stops at an open PR.
 
 ## Read before working here
 
 - **`CONTEXT.md`** — the glossary. Job, Enqueue, Dispatch, Run, Handoff SHA, Anchor
   artifact, Handback and the rest are defined terms with explicit `_Avoid_` lists. Use them;
   don't drift to the synonyms they rule out.
-- **`docs/adr/`** — twelve accepted decisions that constrain almost every change here.
+- **`docs/adr/`** — fifteen accepted decisions that constrain almost every change here.
 - **`docs/provisioned-host.md`** — what a host must guarantee before a Dispatch succeeds on
   it: the `~/.grind/` layout, the executables, the six credential steps, and which items are
   checked at dispatch, by `grind doctor`, or not at all. Read it before provisioning anything.
@@ -28,8 +28,9 @@ Grind is a compiled Rust binary (ADR-0005), and `serde` is the only dependency i
 survives: a resilience layer built from the thing that gets rate-limited loses its state exactly
 when that matters. A compiled binary satisfies that better than a script; an agent cannot.
 
-The base is **one crate, ten modules, exactly one of them impure** (ADR-0007): `world` is the
-sole namer of `std::process` and `std::fs`; `job`, `observe`, `decide`, `policy`, `attempt`,
+The base is **one crate, every module a crate-root sibling, exactly two of them impure**
+(ADR-0007, amended by ADR-0014): `world` is the sole namer of `std::process` and `std::fs`,
+`serve` the sole namer of `std::net`; `job`, `observe`, `decide`, `policy`, `attempt`, `rung`,
 `view` and `render` are pure; `supervisor` holds the loop and the record; `cli` is the only
 thing that prints. Effects are returned as values — `policy` returns the sleep, `render` returns
 a `String` — so every decision is testable from literals with no network.
@@ -105,20 +106,22 @@ change carries a safety property, not for coverage's sake.
   project or milestone, on any repo — `world`'s stated invariant is *one place, two writes*, and
   both writes are comments. `QUEUE_LABEL` erased a triage fact to record a queue fact.
   `tests/topology.rs` carries the absence of every classifying flag.
-- **Grind is a scheduler, not a pipeline** (ADR-0001). Everything between plan and open PR
-  belongs to `lfg`. Don't reimplement stages it already runs. *(Superseded 2026-08-22 by
-  ADR-0015, #92: Grind now owns its own ten-stage ladder — Grit — landing in phases. This
-  bullet is rewritten when the cutover Job lands; until then `lfg` still runs the Runs.)*
-- **The plugin version is pinned per Job and frozen per Run** (ADR-0002 as amended by #42,
-  re-amended by #50, and amended a third time by #69). The Job names both the plugin and the
-  version, and a reference without a literal `x.y.z` is refused at parse time — that shape is
-  what makes `Latest` unspellable.
-  `job::plugin_dir()` then runs **once**, at dispatch, and the resolved path goes into the record —
-  every attempt and every `--resume` reads the record. Never re-resolve per attempt: an 8-attempt
-  Run spans hours of rate-limit sleeps, and a version changing mid-Run is silent. Nobody advances
-  the pin: Enqueue resolves the newest installed version when it drafts the Job and writes that
-  literal, so a pin moves because the local cache updated — the freeze is the whole of what the
-  pin is for.
+- **Grind owns the ladder** (ADR-0015). The supervisor walks the ten stage rungs itself — Plan,
+  Triage, Plan-review, Work, Simplify, Diff-triage, Review, Validate, Fixes, Ship — one Attempt
+  per stage rather than one Attempt per `lfg` mega-session. Everything a stage does lives in its
+  own authored skill under `skills/run/`, read by the caller through `world` and composed into
+  that stage's own prompt; the supervisor observes each stage's return directly rather than
+  scanning the pipeline for how far it got. The `lfg` plugin this superseded is gone (#98).
+- **Provenance is frozen per Run at dispatch, never re-resolved** (ADR-0002 as amended a fourth
+  time by ADR-0015 and #98; the freeze discipline itself is unchanged from #42/#50/#69, only the
+  carrier moved). What used to be a pinned plugin version is now the `grind` binary's own version
+  plus a hash of the host's stage-skill tree (`skills_hash`, an FNV-1a over every file under
+  `~/.grind/skills/run`), both resolved **once**, at dispatch, and recorded on the Run —
+  `supervisor::provenance()`. Every attempt and every `--resume` reads the record rather than
+  re-resolving: an 8-attempt Run spans hours of rate-limit sleeps, and a skill edit or a binary
+  upgrade changing mid-Run is silent. Nobody advances it moment to moment: it moves only because
+  a fresh Dispatch reads whatever is installed at that instant, the same freeze rationale the
+  plugin pin used to carry under a different carrier.
 - **Headless deliberately lags local** (ADR-0002). New capabilities get proven in supervised
   sessions first. Grind is not where we experiment.
 - **`DENIED_TOOLS` in `src/attempt.rs` is a safety property, and the list lives here.** A Run

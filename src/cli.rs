@@ -407,12 +407,6 @@ fn check(home: &Path, clones: &[(String, PathBuf)], check: Check) -> Observed<Ou
             &world::run(&words(&["git", "--version"]), None),
             job::GIT_VERSION_FLOOR,
         ),
-        // With no Job there is no pin to resolve, so what is checked at this depth is that the
-        // host has a plugin cache with something in it. The pinned directory itself is a
-        // dispatch-depth check, where a Job names it.
-        Check::PluginInstalled => observe::plugin_installed(
-            !world::list_dir(&home.join(".claude").join("plugins").join("cache")).is_empty(),
-        ),
         Check::SkillsPresent => {
             let root = job::grind_dir(home).join("skills").join("run");
             let names: Vec<String> = world::list_dir(&root)

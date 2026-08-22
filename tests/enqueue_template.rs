@@ -65,9 +65,6 @@ fn the_templates_own_example_table_parses_and_every_required_row_resolves() {
     assert_eq!(job.target_repo, "owner/name");
     assert_eq!(job.branch, "feat/28-slice-1b-agent-surface");
     assert_eq!(job.anchor, "docs/plans/2026-08-05-002-slice-1b-plan.md");
-    assert_eq!(job.plugin.name(), "compound-engineering");
-    assert_eq!(job.plugin.marketplace(), "compound-engineering-plugin");
-    assert_eq!(job.plugin.version(), "3.21.4");
     assert!(!job.done_predicate.is_empty());
     assert_eq!(job.base_branch, "main");
     assert!(!job.verify_entrypoint.is_empty());
@@ -108,11 +105,6 @@ fn renaming_a_required_row_on_either_side_fails_and_names_the_row() {
         ("**Handoff SHA**", "**Handoff commit**", "handoff sha"),
         ("**Target repo**", "**Repo**", "target repo"),
         ("**Branch**", "**Branch name**", "branch"),
-        (
-            "**Pinned plugin version**",
-            "**Plugin**",
-            "pinned plugin version",
-        ),
         ("**Done predicate**", "**Done check**", "done predicate"),
         ("**Base branch**", "**Merge target**", "base branch"),
         (

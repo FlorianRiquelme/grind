@@ -9,7 +9,7 @@ The single conversational step, with the human present, that turns a prepared br
 Run it **from the session that prepared the branch** — the plan is in context, the worktree is the
 cwd. A cold invocation is the same steps asking more questions, never a second mode.
 
-Grind reads the Job back with `job::from_issue_json` (`src/job.rs:139`). The table in
+Grind reads the Job back with `job::from_issue_json` (`src/job.rs:120`). The table in
 [JOB-TEMPLATE.md](JOB-TEMPLATE.md) is that parser's contract, and `tests/enqueue_template.rs`
 parses the template's own example table through that parser — so a required row renamed on either
 side turns `just verify` red. A change to either still belongs in the same diff: the test catches
@@ -21,17 +21,12 @@ a rename, not a meaning that drifted.
 gh repo view --json nameWithOwner -q .nameWithOwner        # target repo
 git branch --show-current                                   # branch
 gh repo view --json defaultBranchRef -q .defaultBranchRef.name
-ls ~/.claude/plugins/cache/compound-engineering-plugin/compound-engineering | sort -V | tail -1
 test -f justfile && grep -m1 '^verify' justfile             # verify entrypoint, first guess
 test -f package.json && jq -r '.scripts.verify // empty' package.json
 ```
 
 The **Anchor artifact** is the plan document this session just wrote, as a repo-relative path.
 Show it; don't ask for it.
-
-**Always latest** for the plugin: write the newest installed version as a literal `x.y.z`. Never
-write a bare `name@marketplace` — `PluginPin::parse` refuses it, which is what keeps `Latest`
-unspellable.
 
 **Base branch** derives from `defaultBranchRef` above — write it unless the human names another
 merge target in the session.
@@ -71,18 +66,14 @@ git fetch origin --quiet && git rev-parse origin/<default>   # the default branc
 Real Jobs have used each. Do not guess: the wrong one is invisible until a Run has committed onto
 it.
 
-## 4. Run the three advisory checks
+## 4. Run the two advisory checks
 
 Warnings the human may override — never refusals.
 
 ```sh
 git branch -r --contains <handoff-sha>            # empty → on no remote, so un-dispatchable off this box
 test -f <anchor>                                  # missing → Dispatch will refuse
-test -d ~/.claude/plugins/cache/<marketplace>/<name>/<version>
 ```
-
-The third runs against **the host named at the offer**, not this laptop — that is where Grind
-resolves the plugin, and always-latest widens the window where a host's cache has not caught up.
 
 Do **not** check the Anchor's *shape* — no R-IDs, no readiness field. It requires none.
 

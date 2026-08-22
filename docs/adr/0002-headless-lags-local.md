@@ -5,6 +5,18 @@ date: 2026-07-29
 
 # Headless deliberately lags the local session
 
+> **Amended a fourth time 2026-08-22 by
+> [ADR-0015](0015-grind-owns-its-pipeline-a-ladder-replaces-lfgs-mega-session.md) and
+> [#98](https://github.com/FlorianRiquelme/grind/issues/98).** **The pin's carrier changes; the
+> freeze discipline does not.** Grit's stage machinery retires the plugin entirely — there is no
+> `lfg` mega-session left to pin a marketplace version for. What every earlier amendment here
+> protected, resolved once and read from the record rather than re-resolved mid-Run, is now
+> **provenance**: the `grind` binary's own version plus a hash of the host's stage-skill tree,
+> both resolved once at dispatch (`supervisor::provenance()`) and frozen on the record for the
+> Run's whole life, the same *conditions read from the record, never the environment* this ADR
+> has argued from #42 onward. Nothing about *headless still lags local* changes: a capability
+> still proves itself in supervised sessions first, whichever carrier the frozen state rides.
+>
 > **Amended a third time 2026-08-15 by [#69](https://github.com/FlorianRiquelme/grind/issues/69).**
 > **Promotion is not the pin, and never was after #42.** *Promotion is mechanical* in the
 > Consequences below — *"Grind pins a version per job. Advancing that pin is the act of

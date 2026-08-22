@@ -157,8 +157,8 @@ pub struct StageContext<'a> {
 }
 
 /// The two facts a stage invocation needs that [`Conditions`] does not carry the right shape
-/// for: a stage invocation names no plugin (ADR-0015 retires the pin the moment nothing left
-/// invokes it), so this is not `Conditions` with a field ignored — it is the narrower thing a
+/// for: a stage invocation names no plugin (ADR-0015 retired the pin once nothing was left to
+/// invoke it), so this is not `Conditions` with a field ignored — it is the narrower thing a
 /// stage argv actually is.
 #[derive(Debug, Clone, Copy)]
 pub struct StageConditions<'a> {
@@ -292,7 +292,7 @@ fn build_stage(
         }
     }
     // No `--plugin-dir`: a stage invocation names no plugin.
-    // No `--max-budget-usd`, same reason as the mega-session builder: ADR-0010.
+    // No `--max-budget-usd`: ADR-0010, spend is recorded, never bounded.
     argv.push("--disallowedTools".to_string());
     argv.extend(denied_for(ctx.stage));
     Invocation { argv, prompt, mode }
@@ -376,18 +376,6 @@ fn plan_notes_block(ctx: &StageContext) -> String {
     }
 }
 
-/// Re-entry rides Claude Code's own session resume, not an `lfg` return value: `lfg` exposes no
-/// structured return to its caller. Resuming the session restores which stage it was on; this
-/// prompt only tells it not to redo finished work.
-pub const REENTRY_PROMPT: &str = "You were interrupted mid-run and have just been resumed.
-
-Re-read the working tree and `git log` to establish where the pipeline actually got to,
-then continue `lfg` from the stage that did not complete. Do not restart stages that
-already produced their artifact, and do not open a second PR.
-
-Everything in the original instruction still applies — especially: never weaken, trim or
-skip a step of `just verify` to make it pass.";
-
 /// The one prompt the script could not supply, because it has no CI-babysit path.
 ///
 /// Reacting to a red check is the one situation where rebasing onto a moved base and
@@ -441,13 +429,13 @@ pub struct Clearance {
     pub note: String,
 }
 
-/// Everything an invocation is built from, all of it read from the record rather than the
-/// environment — so re-entering an in-flight Run never changes its conditions mid-pipeline.
+/// What the one surviving [`Conditions`] user — [`ci_babysit`] — is built from, all of it read
+/// from the record rather than the environment so re-entering an in-flight Run never changes it
+/// mid-stage.
 #[derive(Debug, Clone, Copy)]
 pub struct Conditions<'a> {
     pub claude_bin: &'a str,
     pub session_id: &'a str,
-    pub plugin_dir: &'a str,
     pub model: Option<&'a str>,
 }
 
@@ -476,49 +464,9 @@ impl Invocation {
     }
 }
 
-/// The first attempt, which opens the session id.
-pub fn dispatch(conditions: &Conditions, job: &Job) -> Invocation {
-    build(conditions, Mode::Dispatch, dispatch_prompt(job))
-}
-
-/// Every later attempt, resuming the same session id. The latest clearance rides this
-/// prompt and only this one: Dispatch has no stop behind it, and CiBabysit bounds itself to
-/// one reaction and must not grow a second subject (R2).
-pub fn resume(conditions: &Conditions, cleared: Option<&Clearance>) -> Invocation {
-    build(conditions, Mode::Resume, reentry_prompt(cleared))
-}
-
-/// `REENTRY_PROMPT`, with the human's clearance composed after it when one exists.
-/// **Default is silence**, the same rule as `intent_line`: with no note the prompt is the
-/// constant, exactly — nothing is rendered where nothing was recorded.
-///
-/// The note is dated and framed as an account to check, never as current fact: the latest
-/// clearance rides **every** later Resume (R3), so on a Run that re-blocked after the note
-/// was recorded, an unconditional *trust it* would order the agent to prefer stale
-/// information over its own newer observation.
-fn reentry_prompt(cleared: Option<&Clearance>) -> String {
-    match cleared {
-        Some(clearance) => format!(
-            "{REENTRY_PROMPT}\n\nSince you stopped, the human reports (recorded {at}): \
-             {note}\n\nThat is their account of what changed in the world, from the moment \
-             it was recorded. Check it against what you now observe: do not spend turns \
-             re-probing an obstacle the note says is cleared and the world confirms — but \
-             where the world in front of you contradicts the note, trust what you observe \
-             and say so plainly.",
-            at = clearance.cleared_at,
-            note = clearance.note,
-        ),
-        None => REENTRY_PROMPT.to_string(),
-    }
-}
-
-/// The one bounded invocation a decided-and-failing CI buys. **The same builder** — there is no
-/// second argv path, so the denials ride it by construction.
+/// The one bounded invocation a decided-and-failing CI buys, continuing whichever stage session
+/// the caller names via `conditions.session_id` (Ship's, per `run_ship_babysit_attempt`).
 pub fn ci_babysit(conditions: &Conditions) -> Invocation {
-    build(conditions, Mode::CiBabysit, CI_BABYSIT_PROMPT.to_string())
-}
-
-fn build(conditions: &Conditions, mode: Mode, prompt: String) -> Invocation {
     let mut argv = vec![
         conditions.claude_bin.to_string(),
         "-p".to_string(),
@@ -531,93 +479,17 @@ fn build(conditions: &Conditions, mode: Mode, prompt: String) -> Invocation {
         argv.push("--model".to_string());
         argv.push(model.to_string());
     }
-    match mode {
-        Mode::Dispatch => {
-            argv.push("--session-id".to_string());
-            argv.push(conditions.session_id.to_string());
-        }
-        Mode::Resume | Mode::CiBabysit => {
-            argv.push("--resume".to_string());
-            argv.push(conditions.session_id.to_string());
-        }
-    }
-    argv.push("--plugin-dir".to_string());
-    argv.push(conditions.plugin_dir.to_string());
-    // No `--max-budget-usd`. ADR-0010: spend is recorded, never bounded — a number someone
-    // guessed at Enqueue must not kill a Run mid-work for being larger than the guess.
-    // The last thing appended, on every path, from the one builder.
+    argv.push("--resume".to_string());
+    argv.push(conditions.session_id.to_string());
+    // No `--plugin-dir`: a stage invocation names no plugin (ADR-0015 retired the pin once
+    // nothing was left to invoke it). No `--max-budget-usd`: ADR-0010, spend is recorded,
+    // never bounded.
     argv.push("--disallowedTools".to_string());
     argv.extend(DENIED_TOOLS.iter().map(|glob| glob.to_string()));
-    Invocation { argv, prompt, mode }
-}
-
-/// The Run is told only what Grind can know.
-///
-/// Two constants went out of it. *No human present* invited the Run to ask a question and wait
-/// for an answer; *unsupervised* says the same thing about attention without implying anyone is
-/// there to be addressed. And *this slice is transcription, not design* is false of any Job
-/// wider than a rewrite — the half that is true of every Job, **do not re-open decisions the
-/// Anchor records**, survives the half that is not.
-///
-/// Nothing reads the narrative or the closing keyword back. They are asked for because the
-/// human reads them, and a Grind that keyed a verdict on either would be grading prose.
-fn dispatch_prompt(job: &Job) -> String {
-    format!(
-        "You are a Grind Run, executing unattended and unsupervised. Nobody is watching this
-session and no question you ask will be answered, so decide and proceed.
-
-Job:            {url}
-Branch:         {branch}
-Handoff SHA:    {handoff}
-Anchor artifact: {anchor}
-{intent}
-The Handoff SHA bounds your **output**, not your **reading**. Everything you add sits in
-front of it and is what gets reviewed; read as far around it as you need, including work
-that landed after it.
-
-Invoke the `lfg` skill against the Anchor artifact, resolving the skill name against the
-available-skills list (it may be namespaced, e.g. `compound-engineering:lfg`):
-
-    {anchor}
-
-The Anchor artifact is the requirements you must satisfy. Everything else you need is
-discoverable from this branch. Do not re-open decisions it records.
-
-Before you create a file in a shared sequential namespace — a numbered ADR, a migration, a
-changelog entry — read the current state of that namespace. Read it again on each attempt
-rather than trusting a view you took earlier: other work lands while you run, and two files
-claiming one number is a collision a human has to unpick by hand.
-
-Definition of done: `just verify` passes.
-
-If a step of `just verify` cannot be made green, say so plainly in the PR body and leave
-the step intact. Never weaken, trim, skip or remove a step of the verify entrypoint to
-make it pass — a gutted gate is worse than one that fails honestly.
-
-Put a narrative in the PR body: the decisions you took, whatever was non-obvious, and
-anything that surprised you. Those are categories and not a template — no headings, no
-order, no required sections, and nothing at all where there is nothing to say.
-
-Put `Closes #{issue}` in the PR body where this PR delivers the whole Job. Where the Job is
-wider than the code, reference it without the keyword instead.
-
-Stop at an open PR. Do not merge it.",
-        url = job.url,
-        branch = job.branch,
-        handoff = job.handoff_sha,
-        anchor = job.anchor,
-        issue = job.issue,
-        intent = intent_line(job.intent.as_deref()),
-    )
-}
-
-/// **Default is silence.** The first `Option`-gated line in the prompt: saying nothing about
-/// the work's nature is honest, and a wrong constant is not — which is exactly what *this slice
-/// is transcription, not design* was.
-fn intent_line(intent: Option<&str>) -> String {
-    match intent {
-        Some(said) => format!("Intent:         {said}\n"),
-        None => String::new(),
+    Invocation {
+        argv,
+        prompt: CI_BABYSIT_PROMPT.to_string(),
+        mode: Mode::CiBabysit,
     }
 }
 
@@ -976,7 +848,6 @@ fn normalise(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::PluginPin;
 
     const RUN2_RATE_LIMITED: &str = include_str!("../tests/fixtures/run2/rate-limited.stdout.json");
     const RUN1_ATTEMPT_1: &str = include_str!("../tests/fixtures/run1/attempt-1.stdout.json");
@@ -1000,8 +871,6 @@ mod tests {
             anchor: "docs/plans/a.md".to_string(),
             intent: None,
             model: None,
-            plugin: PluginPin::parse("compound-engineering@compound-engineering-plugin 3.21.3")
-                .unwrap(),
             done_predicate: "just verify is green".to_string(),
             base_branch: "main".to_string(),
             verify_entrypoint: "just verify".to_string(),
@@ -1013,16 +882,8 @@ mod tests {
         Conditions {
             claude_bin: "/home/op/.grind/bin/claude",
             session_id: "d51b4c39-ce1d-449b-8366-04b9b1aa6573",
-            plugin_dir: "/home/op/.claude/plugins/cache/m/n/3.21.3",
             model,
         }
-    }
-
-    /// Every prompt change is asserted against the **built** prompt string, never against the
-    /// constant it came from.
-    fn built_dispatch_prompt() -> String {
-        let built = dispatch(&conditions(None), &job());
-        built.prompt().to_string()
     }
 
     fn denials_of(invocation: &Invocation) -> Vec<String> {
@@ -1035,21 +896,36 @@ mod tests {
     }
 
     #[test]
-    fn every_built_argv_carries_all_twelve_globs_on_all_three_paths() {
-        let conditions = conditions(None);
-        for invocation in [
-            dispatch(&conditions, &job()),
-            resume(&conditions, None),
-            resume(&conditions, Some(&a_clearance("the wall moved"))),
-            ci_babysit(&conditions),
-        ] {
-            assert_eq!(
-                denials_of(&invocation),
-                DENIED_TOOLS.to_vec(),
-                "{:?} must carry every denial",
-                invocation.mode()
-            );
-        }
+    fn ci_babysit_carries_every_denial_no_plugin_flag_and_resumes_its_own_session() {
+        let conditions = conditions(Some("claude-opus-5"));
+        let invocation = ci_babysit(&conditions);
+        assert_eq!(
+            denials_of(&invocation),
+            DENIED_TOOLS.to_vec(),
+            "ci-babysit must carry every denial"
+        );
+        assert!(invocation.argv().contains(&"--resume".to_string()));
+        assert!(!invocation.argv().contains(&"--session-id".to_string()));
+        let at = invocation
+            .argv()
+            .iter()
+            .position(|a| a == "--resume")
+            .unwrap();
+        assert_eq!(invocation.argv()[at + 1], conditions.session_id);
+        assert!(!invocation.argv().contains(&"--plugin-dir".to_string()));
+        assert!(!invocation.argv().contains(&"--max-budget-usd".to_string()));
+        assert!(
+            invocation
+                .argv()
+                .windows(2)
+                .any(|w| w[0] == "--model" && w[1] == "claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn ci_babysit_with_no_model_carries_no_model_flag() {
+        let invocation = ci_babysit(&conditions(None));
+        assert!(!invocation.argv().contains(&"--model".to_string()));
     }
 
     /// A minimal reimplementation of the two facts CLAUDE.md's `DENIED_TOOLS` section states
@@ -1231,181 +1107,6 @@ mod tests {
             "git log --oneline",
         ] {
             assert!(!is_denied(allowed), "{allowed:?} must not be denied");
-        }
-    }
-
-    #[test]
-    fn the_first_attempt_opens_a_session_and_every_later_one_resumes_it() {
-        let conditions = conditions(None);
-        let first = dispatch(&conditions, &job());
-        assert!(first.argv().contains(&"--session-id".to_string()));
-        assert!(!first.argv().contains(&"--resume".to_string()));
-
-        for later in [resume(&conditions, None), ci_babysit(&conditions)] {
-            assert!(later.argv().contains(&"--resume".to_string()));
-            assert!(!later.argv().contains(&"--session-id".to_string()));
-            let at = later.argv().iter().position(|a| a == "--resume").unwrap();
-            assert_eq!(later.argv()[at + 1], conditions.session_id);
-        }
-    }
-
-    #[test]
-    fn the_argv_shape_is_the_one_two_runs_actually_used() {
-        let invocation = dispatch(&conditions(Some("claude-opus-5")), &job());
-        let argv = invocation.argv();
-        assert_eq!(argv[0], "/home/op/.grind/bin/claude");
-        assert_eq!(
-            argv[1..6].to_vec(),
-            vec!["-p", "--output-format", "json", "--permission-mode"]
-                .into_iter()
-                .chain(std::iter::once("bypassPermissions"))
-                .map(String::from)
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            argv.windows(2)
-                .any(|w| w[0] == "--model" && w[1] == "claude-opus-5")
-        );
-        assert!(argv.windows(2).any(|w| w[0] == "--plugin-dir"));
-    }
-
-    #[test]
-    fn no_built_argv_on_any_of_the_three_paths_carries_a_spend_ceiling() {
-        // ADR-0010: spend is recorded, never bounded. A number someone guessed at Enqueue must
-        // not kill a Run mid-work for being larger than the guess.
-        let conditions = conditions(Some("claude-opus-5"));
-        for invocation in [
-            dispatch(&conditions, &job()),
-            resume(&conditions, None),
-            ci_babysit(&conditions),
-        ] {
-            assert!(
-                !invocation.argv().contains(&"--max-budget-usd".to_string()),
-                "{:?}",
-                invocation.mode()
-            );
-        }
-    }
-
-    #[test]
-    fn no_model_means_no_flag_for_it() {
-        let invocation = dispatch(&conditions(None), &job());
-        assert!(!invocation.argv().contains(&"--model".to_string()));
-    }
-
-    #[test]
-    fn the_dispatch_prompt_carries_the_jobs_own_four_facts() {
-        let invocation = dispatch(&conditions(None), &job());
-        for fact in [
-            "issues/28",
-            "feat/28-slice-1b",
-            "9d1f4c7a",
-            "docs/plans/a.md",
-        ] {
-            assert!(invocation.prompt().contains(fact), "missing {fact}");
-        }
-        assert!(
-            invocation
-                .prompt()
-                .contains("Stop at an open PR. Do not merge it.")
-        );
-    }
-
-    #[test]
-    fn the_dispatch_prompt_says_unsupervised_rather_than_alone() {
-        // *No human present* invited the Run to ask a question and wait for an answer.
-        let prompt = built_dispatch_prompt();
-        assert!(prompt.contains("unsupervised"), "{prompt}");
-        assert!(!prompt.contains("no human present"), "{prompt}");
-        assert!(
-            prompt.contains("executing unattended"),
-            "the phrase that was right stays: {prompt}"
-        );
-    }
-
-    #[test]
-    fn the_dispatch_prompt_stops_calling_the_work_transcription() {
-        // False of any Job wider than a rewrite, and this one is a slice with design left in it.
-        let prompt = built_dispatch_prompt();
-        assert!(!prompt.contains("transcription"), "{prompt}");
-        assert!(
-            prompt.contains("Do not re-open decisions it records"),
-            "the half that is true of every Job survives: {prompt}"
-        );
-    }
-
-    #[test]
-    fn the_dispatch_prompt_bounds_output_rather_than_reading() {
-        let prompt = built_dispatch_prompt();
-        let at = prompt
-            .find("Handoff SHA bounds")
-            .expect("the Handoff SHA paragraph");
-        let paragraph = &prompt[at..at + 200.min(prompt.len() - at)];
-        assert!(paragraph.contains("output"), "{paragraph}");
-        assert!(paragraph.contains("reading"), "{paragraph}");
-    }
-
-    #[test]
-    fn the_dispatch_prompt_asks_for_a_narrative_by_category_and_not_by_template() {
-        // Naming a structure is how a narrative Grind promised not to parse becomes one it
-        // parses.
-        let prompt = built_dispatch_prompt();
-        for category in ["decisions you took", "non-obvious", "surprised you"] {
-            assert!(prompt.contains(category), "missing {category}: {prompt}");
-        }
-        assert!(prompt.contains("no headings"), "{prompt}");
-        assert!(prompt.contains("no required sections"), "{prompt}");
-    }
-
-    #[test]
-    fn the_dispatch_prompt_asks_for_the_closing_keyword_and_licenses_declining_it() {
-        let prompt = built_dispatch_prompt();
-        assert!(prompt.contains("Closes #28"), "{prompt}");
-        assert!(
-            prompt.contains("without the keyword"),
-            "a Job wider than its code closes nothing: {prompt}"
-        );
-    }
-
-    #[test]
-    fn the_dispatch_prompt_names_the_shared_sequential_namespaces() {
-        let prompt = built_dispatch_prompt();
-        for named in ["numbered ADR", "migration", "changelog entry"] {
-            assert!(prompt.contains(named), "missing {named}: {prompt}");
-        }
-        assert!(
-            prompt.contains("on each attempt"),
-            "a per-Attempt read, not a pinned view: {prompt}"
-        );
-    }
-
-    #[test]
-    fn a_job_with_an_intent_row_puts_that_line_in_the_built_prompt() {
-        let stated = Job {
-            intent: Some("A settled plan transcribed into one module.".to_string()),
-            ..job()
-        };
-        let prompt = dispatch(&conditions(None), &stated).prompt().to_string();
-        assert!(
-            prompt.contains("Intent:         A settled plan transcribed into one module."),
-            "{prompt}"
-        );
-    }
-
-    #[test]
-    fn a_job_with_no_intent_row_puts_no_characterisation_of_the_work_in_the_prompt() {
-        // Default is silence. Saying nothing about the work's nature is honest; a wrong
-        // constant is not, which is exactly what *this slice is transcription, not design* was.
-        let prompt = built_dispatch_prompt();
-        assert!(!prompt.contains("Intent"), "{prompt}");
-        for characterisation in [
-            "transcription",
-            "mechanical",
-            "straightforward",
-            "exploratory",
-            "greenfield",
-        ] {
-            assert!(!prompt.contains(characterisation), "{prompt}");
         }
     }
 
@@ -1635,67 +1336,6 @@ mod tests {
             cleared_at: "2026-08-21T19:00:00+00:00".to_string(),
             note: note.to_string(),
         }
-    }
-
-    #[test]
-    fn a_clearance_note_rides_the_resume_prompt_and_never_dispatch_or_ci_babysit() {
-        // The safety property R6 names: the composed prompt reaches Resume invocations only.
-        // Asserted against the **built** invocations, in the spirit of the argv tests above.
-        let conditions = conditions(None);
-        let note = "the deploy key was rotated; the push will go through now";
-        let resumed = resume(&conditions, Some(&a_clearance(note)));
-        assert!(
-            resumed.prompt().starts_with(REENTRY_PROMPT),
-            "the note composes after the re-entry text, never instead of it:\n{}",
-            resumed.prompt()
-        );
-        assert!(
-            resumed
-                .prompt()
-                .contains("Since you stopped, the human reports"),
-            "{}",
-            resumed.prompt()
-        );
-        assert!(resumed.prompt().contains(note), "{}", resumed.prompt());
-        for other in [dispatch(&conditions, &job()), ci_babysit(&conditions)] {
-            assert!(
-                !other.prompt().contains(note),
-                "{:?} must not carry the note",
-                other.mode()
-            );
-            assert!(
-                !other.prompt().contains("the human reports"),
-                "{:?} must not grow a clearance paragraph",
-                other.mode()
-            );
-        }
-    }
-
-    #[test]
-    fn the_composed_clearance_is_dated_and_checked_against_the_world_rather_than_trusted_blind() {
-        // The latest note rides every later Resume (R3), so on a Run that re-blocked after
-        // the note was recorded, an unconditional *trust it* would order the agent to prefer
-        // stale information over its own newer observation. The date is what lets the agent
-        // weigh the account, and the framing asks it to verify, not obey.
-        let prompt = resume(&conditions(None), Some(&a_clearance("the wall moved")))
-            .prompt()
-            .to_string();
-        assert!(
-            prompt.contains("recorded 2026-08-21T19:00:00+00:00"),
-            "{prompt}"
-        );
-        assert!(prompt.contains("what you now observe"), "{prompt}");
-        assert!(
-            !prompt.contains("Trust it over what you last saw"),
-            "the unconditional trust clause must not come back: {prompt}"
-        );
-    }
-
-    #[test]
-    fn no_note_composes_the_reentry_prompt_exactly() {
-        // Render nothing when no note exists — the prompt is the constant, byte for byte,
-        // so a Run that was never blocked re-enters exactly as it always has.
-        assert_eq!(resume(&conditions(None), None).prompt(), REENTRY_PROMPT);
     }
 
     // --- the Wait predicate -------------------------------------------------------------------

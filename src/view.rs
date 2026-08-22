@@ -31,6 +31,10 @@ pub struct RunView {
     pub created_at: String,
     pub state: String,
     pub job: Job,
+    /// Pre-cutover residue: the resolved plugin cache path old records carried, read by
+    /// nothing. `#[serde(default)]` so both a fresh record (which never writes the key) and a
+    /// pre-cutover fixture (which still carries it under `deny_unknown_fields`) parse.
+    #[serde(default)]
     pub plugin_dir: String,
     pub repo_path: String,
     pub worktree: String,

@@ -1159,15 +1159,6 @@ fn parse_git_version(output: &str) -> Option<(u64, u64)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
-/// The pinned plugin directory is installed on this host.
-pub fn plugin_installed(exists: bool) -> Observed<Outcome> {
-    if exists {
-        satisfied("the pinned plugin version is installed")
-    } else {
-        unsatisfied("the pinned plugin version is not installed on this host")
-    }
-}
-
 /// `gh auth status`. A headless box stores the token in plaintext `hosts.yml`; a laptop uses a
 /// keyring. Both are satisfied — what is checked is that a token store exists at all.
 pub fn gh_auth_store(completed: &Completed) -> Observed<Outcome> {
@@ -2188,7 +2179,6 @@ mod tests {
             claude_binary(true, Some("/tmp/shim/claude")),
             on_path("just", &completed("", "", Some(1))),
             git_version_floor(&completed("git version 2.20.1\n", "", Some(0)), (2, 34)),
-            plugin_installed(false),
             gh_auth_store(&completed("", "", Some(1))),
         ];
         for outcome in said {

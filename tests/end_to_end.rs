@@ -25,9 +25,6 @@ const OWNER: &str = "FlorianRiquelme";
 const NAME: &str = "snapper";
 const BRANCH: &str = "feat/28-slice-1b-agent-surface-screensource-seam";
 const ISSUE: &str = "28";
-const MARKETPLACE: &str = "compound-engineering-plugin";
-const PLUGIN: &str = "compound-engineering";
-const VERSION: &str = "3.21.3";
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -298,13 +295,6 @@ fn sandbox(name: &str) -> Sandbox {
     fs::create_dir_all(fake.join("shapes")).expect("fake shapes");
     fs::create_dir_all(home.join(".grind/bin")).expect("the layout's bin");
     fs::create_dir_all(home.join(".grind/repos").join(OWNER)).expect("the layout's repos");
-    fs::create_dir_all(
-        home.join(".claude/plugins/cache")
-            .join(MARKETPLACE)
-            .join(PLUGIN)
-            .join(VERSION),
-    )
-    .expect("the pinned plugin");
     // The ten stage skill directories (ADR-0015) — `refuse_unless_host_ready` now checks their
     // presence at every Dispatch, legacy path and ladder alike. Presence only: empty directories
     // are enough for the check, and the mega-session scenarios below never read their contents.
@@ -408,7 +398,6 @@ fn sandbox(name: &str) -> Sandbox {
                  | Branch | {BRANCH} |\n\
                  | Handoff SHA | {handoff_sha} |\n\
                  | Anchor artifact | docs/plans/a-plan.md |\n\
-                 | Pinned plugin version | `{PLUGIN}@{MARKETPLACE}` {VERSION} |\n\
                  | Done predicate | `just verify` is green |\n\
                  | Base branch | main |\n\
                  | Verify entrypoint | `just verify` |\n\
@@ -595,13 +584,13 @@ fn scenario_a_a_real_run_shape_with_the_literal_argv_of_every_attempt() {
         assert!(!argv.contains(&"--max-budget-usd".to_string()));
         assert!(argv.contains(&"bypassPermissions".to_string()));
         // A fresh Dispatch walks the ladder (ADR-0015), and a stage invocation names no
-        // plugin — the pin retires the moment nothing left invokes it (unit D deletes the
-        // record field and the resolution; this Run still carries both, unread by any argv).
+        // plugin — the retired pin's record field and resolution are gone (unit D).
         assert!(!argv.contains(&"--plugin-dir".to_string()));
     }
 
     // Reflect's own session, never the Run's: a fresh `--session-id`, no `--plugin-dir` (a
-    // stage-shaped invocation never names one), and the base denials still ride it.
+    // stage-shaped invocation never names one, and the plugin pin no longer exists to be one),
+    // and the base denials still ride it.
     assert_eq!(reflect.len(), 1);
     assert!(reflect[0].contains(&"--session-id".to_string()));
     assert!(!reflect[0].contains(&"--plugin-dir".to_string()));
@@ -1520,7 +1509,7 @@ fn a_completed_run_leaves_a_supervisor_log_beside_its_record() {
 
     let log = fs::read_to_string(box_.run_dir().join("supervisor.log")).expect("a supervisor log");
     assert!(log.contains("attempt 1 (dispatch)"), "{log}");
-    assert!(log.contains("plugin pinned to"), "{log}");
+    assert!(log.contains("model (session default — unpinned)"), "{log}");
     for said in log.lines() {
         assert!(
             out.contains(said),

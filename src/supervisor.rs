@@ -11,8 +11,7 @@
 //! watching the dashboard to be reassured.
 
 use crate::attempt::{
-    self, Attempt, Clearance, Conditions, DENIED_TOOLS, Invocation, Mode, StageConditions,
-    StageContext,
+    self, Attempt, Clearance, Conditions, DENIED_TOOLS, Mode, StageConditions, StageContext,
 };
 use crate::decide::{self, Pass, PlanFacts, Tier, Tiers, Verdict};
 use crate::job::{self, Job, Refusal};
@@ -94,7 +93,6 @@ struct RunRecord {
     created_at: String,
     state: State,
     job: Job,
-    plugin_dir: String,
     repo_path: String,
     worktree: String,
     session_id: String,
@@ -292,7 +290,6 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
     refuse_unless_host_ready(&home, &job)?;
 
     let repo_path = job::repo_path(&home, &job.target_repo);
-    let plugin_dir = job::plugin_dir(&home, &job.plugin);
     let claude_bin = job::claude_bin(&home);
 
     // Taken before the record is written, and held for the whole process.
@@ -375,7 +372,6 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         run_id: run_id.clone(),
         created_at: world::now_iso(),
         state: State::Dispatched,
-        plugin_dir: plugin_dir.display().to_string(),
         repo_path: repo_path.display().to_string(),
         worktree: worktree.display().to_string(),
         // The Run-level `session_id` field stays for pre-cutover records; a new record leaves
@@ -405,10 +401,6 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
 
     point_at_this_host(&record);
 
-    say(
-        &run_dir,
-        &format!("  plugin pinned to {}", record.plugin_dir),
-    );
     say(
         &run_dir,
         &format!(
@@ -681,8 +673,9 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
         say(
             run_dir,
             &format!(
-                "    pre-cutover record — resuming at {} via rung::from_furthest \
-                 (ADR-0015's stated fallback)",
+                "    pre-cutover record — mapped to {} via rung::from_furthest \
+                 (ADR-0015's stated fallback); entering the ladder, which starts at Plan since \
+                 no stage return exists on disk for it",
                 rung::from_furthest(decide::furthest_stage(&crate::view::observe_fresh(
                     &PathBuf::from(&record.worktree),
                     &record.job.handoff_sha,
@@ -692,14 +685,13 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
                 )))
             ),
         );
-        return supervise_legacy(record, run_dir);
     }
     supervise_ladder(record, run_dir)
 }
 
-/// See [`supervise`]. Read, never persisted — `rung::from_furthest` is logged for the operator,
-/// never consulted for control flow: the legacy loop below re-enters exactly as it always did,
-/// off the Run-level session and the attempt list alone.
+/// A record with attempts but no `stages` rows and no stage returns on disk — a Run dispatched
+/// before the ladder existed. Read only to log `rung::from_furthest`'s mapping for the operator;
+/// it changes nothing about which loop runs next, since [`supervise`] always enters the ladder.
 fn is_pre_cutover(record: &RunRecord, run_dir: &Path) -> bool {
     if !record.stages().is_empty() || record.attempts().is_empty() {
         return false;
@@ -709,133 +701,8 @@ fn is_pre_cutover(record: &RunRecord, run_dir: &Path) -> bool {
         .all(|stage| !world::exists(&run_dir.join("stages").join(format!("{stage}.return.json"))))
 }
 
-fn supervise_legacy(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal> {
-    let path = record_path(run_dir);
-    let budget = Budget {
-        attempts: record.attempt_budget,
-        limit_sleep: Duration::from_secs(record.limit_sleep_seconds),
-        reobservations: REOBSERVATIONS,
-        reobserve_pause: Duration::from_secs(REOBSERVE_PAUSE_SECONDS),
-        consecutive_waits: CONSECUTIVE_WAITS,
-    };
-    let worktree = PathBuf::from(&record.worktree);
-    let mut reobservations = 0usize;
-    // One reading per working Attempt, newest last: *did this Attempt fail to advance*. Held
-    // for the process rather than recorded, because the record carries no per-Attempt commit
-    // count — a fresh process needs two more working Attempts before a Blocker can fire, which
-    // is the safe direction.
-    let mut stalls: Vec<Observed<bool>> = Vec::new();
-    let mut commits_before: Option<Observed<u64>> = None;
-    let mut working_seen = attempt::working(record.attempts());
-
-    loop {
-        // The first pass has no attempt to classify, so the loop starts by attempting. But a
-        // crash *inside* Attempt 1 leaves a record with no attempts while the session already
-        // carries transcript lines — re-dispatching there would start the Job over under the
-        // same session id and lose what the crashed session did. Dispatch therefore means an
-        // untouched Run: no attempts *and* an empty transcript. A created-but-empty session
-        // still re-dispatches, because there is nothing in it to lose.
-        let mode = entry_mode(record.attempts(), transcript_lines(record));
-        run_one_attempt(record, run_dir, &worktree, mode)?;
-        record.save(&path)?;
-
-        let stop = loop {
-            let observation = crate::view::observe_fresh(
-                &worktree,
-                &record.job.handoff_sha,
-                &record.job.branch,
-                &record.job.base_branch,
-                world::now_iso(),
-            );
-            // The progress window advances once per working Attempt, and only ever forward.
-            let working_now = attempt::working(record.attempts());
-            if working_now > working_seen {
-                working_seen = working_now;
-                stalls.push(policy::stalled(
-                    commits_before.as_ref(),
-                    &observation.commits_ahead,
-                ));
-                commits_before = Some(observation.commits_ahead.clone());
-            }
-            let signals = decide::signals_of(&observation);
-            let promised = record.attempts().last().is_some_and(|a| a.done_promise);
-            let verdict = decide::verdict(&signals, promised);
-            announce(run_dir, record, &observation, &verdict);
-
-            // A Blocker stops at once rather than spending the rest of the budget against a
-            // wall the Run cannot move — and it never overrides a decided Run: where the
-            // artifacts agree, the Run finished, denials and all.
-            if !matches!(verdict, Verdict::Completed)
-                && let Some(stop) = policy::blocker(record.attempts(), &stalls)
-            {
-                break Some(stop);
-            }
-
-            match policy::next(
-                record.attempts(),
-                &verdict,
-                &observation.checks_red,
-                reobservations,
-                &budget,
-            ) {
-                Next::Reobserve(pause) => {
-                    reobservations += 1;
-                    say(
-                        run_dir,
-                        &format!(
-                            "    a signal could not be observed — sleeping {}s before looking again",
-                            pause.as_secs()
-                        ),
-                    );
-                    world::sleep(pause);
-                    continue;
-                }
-                Next::SpendCiBudget => {
-                    reobservations = 0;
-                    say(
-                        run_dir,
-                        "    decided, and a check came back red — spending the one CI budget",
-                    );
-                    run_one_attempt(record, run_dir, &worktree, Mode::CiBabysit)?;
-                    record.save(&path)?;
-                    continue;
-                }
-                Next::SleepThenReenter(nap) => {
-                    reobservations = 0;
-                    record.state = State::RateLimited;
-                    record.save(&path)?;
-                    say(
-                        run_dir,
-                        &format!(
-                            "    rate limited — sleeping {}s, then re-entering",
-                            nap.as_secs()
-                        ),
-                    );
-                    world::sleep(nap);
-                    break None;
-                }
-                Next::Reenter => {
-                    reobservations = 0;
-                    record.state = State::Died;
-                    record.save(&path)?;
-                    say(
-                        run_dir,
-                        "    ended without a DONE promise — re-entering at the stage that died",
-                    );
-                    break None;
-                }
-                Next::Stop(stop) => break Some(stop),
-            }
-        };
-
-        if let Some(stop) = stop {
-            return finish_run(record, run_dir, &path, stop);
-        }
-    }
-}
-
-/// Shared by the legacy loop and the ladder walk: record the terminal state, dispatch Reflect
-/// once (never for a Blocker or an Exhaustion — the design's own zero-output skip), and post the
+/// The ladder walk records the terminal state, dispatches Reflect
+/// once (never for a Blocker or an Exhaustion — the design's own zero-output skip), and posts the
 /// account on the Job issue.
 fn finish_run(
     record: &mut RunRecord,
@@ -924,8 +791,8 @@ fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
     let worktree = PathBuf::from(&record.worktree);
     // Bounded at one re-entry: a fresh dispatch, then at most one resume. Counted off the
     // recorded `StageEntry` rows rather than the transcript alone — a died-before-writing-a-
-    // line session leaves no transcript to read, and `entry_mode`'s own comment names exactly
-    // this: absence of a transcript is not absence of an attempt.
+    // line session leaves no transcript to read, and absence of a transcript is not absence
+    // of an attempt (the same reasoning `run_ladder_attempt`'s own mode selection follows).
     let reflect_attempts = record
         .stages()
         .iter()
@@ -1326,7 +1193,7 @@ fn run_ladder_attempt(
         .map_err(|e| Refusal::saying(format!("stage `{stage}` skill text unreadable: {e}")))?;
 
     let session_id = attempt::stage_session_id(&record.run_id, stage);
-    // The same two-fact test `entry_mode` applies to the Run's mega-session, scoped to this
+    // The same two-fact test the old mega-session's entry mode used to apply, scoped to this
     // stage: a crash after `claude` opened the session but before this stage's own
     // `StageEntry` was ever recorded would re-dispatch under `--session-id` and lose that
     // session's work if this read the transcript alone — a transcript with no lines yet reads
@@ -1423,7 +1290,6 @@ fn run_ship_babysit_attempt(
     let conditions = Conditions {
         claude_bin: &record.claude_bin,
         session_id: &session_id,
-        plugin_dir: &record.plugin_dir,
         model: record.model.as_deref(),
     };
     let invocation = attempt::ci_babysit(&conditions);
@@ -1449,84 +1315,6 @@ fn run_ship_babysit_attempt(
     Ok(())
 }
 
-fn run_one_attempt(
-    record: &mut RunRecord,
-    run_dir: &Path,
-    worktree: &Path,
-    mode: Mode,
-) -> Result<(), Refusal> {
-    let n = record.attempts().len() + 1;
-    let conditions = Conditions {
-        claude_bin: &record.claude_bin,
-        session_id: &record.session_id,
-        // Read from the record on every attempt. **Never re-resolved**: an eight-attempt Run
-        // spans hours of rate-limit sleeps, and a version changing mid-Run is silent.
-        plugin_dir: &record.plugin_dir,
-        model: record.model.as_deref(),
-    };
-    let invocation: Invocation = match mode {
-        Mode::Dispatch => attempt::dispatch(&conditions, &record.job),
-        // The latest clearance rides every Resume re-entry — a fact about the world does
-        // not expire — and only Resume: CiBabysit bounds itself to one reaction.
-        Mode::Resume => attempt::resume(&conditions, record.clearances().last()),
-        Mode::CiBabysit => attempt::ci_babysit(&conditions),
-    };
-
-    let started_at = world::now_iso();
-    say(run_dir, &format!("  [{started_at}] attempt {n} ({mode}) …"));
-
-    // **Taken before the child spawns, and this is what makes the pair belong to this Attempt.**
-    // The transcript is keyed on `record.session_id`, fixed for the Run's life, and every
-    // attempt after the first resumes that session and appends to the same
-    // `.jsonl`. Counting the whole file on Attempt N therefore counted Attempts 1..N — and
-    // `render::fanout_totals` sums those pairs, so a Run fanning out to 2 agents on each of 3
-    // attempts recorded (2,2), (4,4), (6,6) and published *12 spawned, 12 returned*. R51 says
-    // per Attempt; the suffix is what says it.
-    let already_written = transcript_lines(record);
-
-    let raw = attempt::run(
-        &invocation,
-        worktree,
-        &run_dir.join(format!("attempt-{n}.prompt.txt")),
-        &run_dir.join(format!("attempt-{n}.stdout.json")),
-        &run_dir.join(format!("attempt-{n}.stderr.log")),
-    )
-    .map_err(|reason| Refusal::saying(reason.to_string()))?;
-
-    // Gathered before `push_attempt`: the attempt list is append-only with no mutating
-    // accessor, so this is the one wire between transcript reading and record building — and it
-    // runs in the direction the topology already allows.
-    let classified = raw
-        .classify(n, mode, &started_at, &world::now_iso())
-        .with_fanout(fanout_of(record, already_written));
-    record.push_attempt(classified);
-    Ok(())
-}
-
-/// Dispatch or resume, from the two facts a re-entering supervisor can see: the attempt list
-/// and how much transcript the recorded session already holds.
-///
-/// `attempts.is_empty()` alone is not *fresh*: a crash inside Attempt 1 — after `claude`
-/// created the session named by `--session-id`, before any Attempt was recorded — leaves an
-/// empty list over a session that already did work. Re-dispatching there would start the Job
-/// over and lose that work, so Dispatch requires the transcript to be empty too. Absence of a
-/// transcript file reads as zero, which is the honest reading: nothing was written yet.
-fn entry_mode(attempts: &[Attempt], transcript_lines: usize) -> Mode {
-    if attempts.is_empty() && transcript_lines == 0 {
-        Mode::Dispatch
-    } else {
-        Mode::Resume
-    }
-}
-
-/// How much of the Run's mega-session transcript exists right now, in lines. Legacy-path
-/// callers only — a ladder-mode caller names its own stage's session id and reaches
-/// [`transcript_lines_for`] directly, since a Run carries one transcript per stage rather than
-/// one for its life.
-fn transcript_lines(record: &RunRecord) -> usize {
-    transcript_lines_for(&PathBuf::from(&record.worktree), &record.session_id)
-}
-
 /// How much of **one session's** transcript exists right now, in lines. A transcript that is not
 /// there yet is zero rather than a refusal: a fresh session has nothing to skip, and that is the
 /// same answer whether the session is the Run's old mega-session or one stage's own.
@@ -1542,17 +1330,6 @@ fn transcript_lines_for(worktree: &Path, session_id: &str) -> usize {
         Ok(text) => text.lines().count(),
         Err(_) => 0,
     }
-}
-
-/// The Attempt's fan-out arithmetic, over **the lines this Attempt appended** and no earlier
-/// ones. `world` reads the file; a pure counter reads the text. Legacy-path callers only, for
-/// the same reason `transcript_lines` names one — see [`fanout_of_session`] for the ladder.
-fn fanout_of(record: &RunRecord, already_written: usize) -> Observed<(u64, u64)> {
-    fanout_of_session(
-        &PathBuf::from(&record.worktree),
-        &record.session_id,
-        already_written,
-    )
 }
 
 /// The fan-out arithmetic over one named session's transcript, over the lines appended since
@@ -1639,9 +1416,6 @@ fn check_presence(home: &Path, job: &Job, check: job::Check) -> Observed<ItemOut
             tool,
             &world::run(&words(&["sh", "-c", &format!("command -v {tool}")]), None),
         ),
-        job::Check::PluginInstalled => {
-            obs::plugin_installed(world::is_dir(&job::plugin_dir(home, &job.plugin)))
-        }
         job::Check::SkillsPresent => obs::skills_present(&skill_dir_names(home)),
         other => obs::unchecked(&format!("{other:?} is not a dispatch-depth check")),
     }
@@ -2382,44 +2156,6 @@ mod tests {
             world::resolve_link(&second).unwrap()
         );
         world::remove_tree(&repo);
-    }
-    /// A minimal crashed Attempt — the child never handed back anything classifiable.
-    fn a_crashed_attempt(n: usize) -> Attempt {
-        Attempt {
-            n,
-            mode: Mode::Resume,
-            started_at: "2026-08-21T00:00:00+00:00".into(),
-            ended_at: "2026-08-21T00:01:00+00:00".into(),
-            exit_code: None,
-            is_error: true,
-            parse_ok: false,
-            subtype: Some("unparseable-output".into()),
-            stop_reason: None,
-            api_error_status: None,
-            terminal_reason: None,
-            num_turns: None,
-            total_cost_usd: None,
-            usage: None,
-            permission_denials: Vec::new(),
-            done_promise: false,
-            rate_limited: false,
-            result_tail: String::new(),
-            fanout: Observed::Absent,
-        }
-    }
-
-    #[test]
-    fn a_crash_inside_attempt_one_resumes_the_session_instead_of_redispatching_it() {
-        // A crash after `claude` created the session leaves either no recorded attempts over a
-        // transcript that already has lines, or one crashed attempt over any transcript. Keying
-        // Dispatch on the empty attempt list alone re-dispatched under the same session id and
-        // lost the crashed session's work, so Dispatch now means an untouched Run: no attempts
-        // *and* no transcript. A created-but-empty session — the crash landed before Attempt 1
-        // was ever recorded — still re-dispatches, because there is nothing in it to lose.
-        let crashed = [a_crashed_attempt(1)];
-        assert_eq!(entry_mode(&[], 0), Mode::Dispatch);
-        assert_eq!(entry_mode(&crashed, 0), Mode::Resume);
-        assert_eq!(entry_mode(&crashed, 3), Mode::Resume);
     }
 
     #[test]
