@@ -921,6 +921,115 @@ pub fn observe_run(
     }
 }
 
+// --- the outcome collector ----------------------------------------------------------------
+//
+// `grind outcomes` (`cli.rs`) is the human-initiated pass the design calls the loop's best
+// fuel: did the merged work *survive*. It reads GitHub, never writes to it, and the two
+// classifiers below are the pure halves — the argv that produces their input is the caller's.
+
+/// A PR's terminal facts, once it stopped moving. Facts only, never a grade (ADR-0012):
+/// `merged: true` is what happened, and it carries no opinion about whether that was good.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrFinal {
+    pub state: String,
+    pub merged: bool,
+    pub merged_at: Option<String>,
+    pub closed_at: Option<String>,
+}
+
+/// `gh pr view --json state,mergedAt,closedAt,mergeCommit`, already reduced to its stdout.
+/// Whether the call succeeded at all is the caller's to read off the exit code first — this
+/// stays a parse over text, mirroring [`pr`]'s own split between spawn and classification.
+pub fn pr_final_state(gh_json: &str) -> Observed<PrFinal> {
+    let body = gh_json.trim();
+    if body.is_empty() {
+        return Observed::Unobservable(Reason::saying("gh pr view --json state,...: empty output"));
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Observed::Unobservable(Reason::saying(
+            "gh pr view --json state,mergedAt,closedAt,mergeCommit: unreadable JSON",
+        ));
+    };
+    let Some(state) = value.get("state").and_then(|s| s.as_str()) else {
+        return Observed::Unobservable(Reason::saying(
+            "gh pr view --json state,mergedAt,closedAt,mergeCommit: missing state",
+        ));
+    };
+    Observed::Present(PrFinal {
+        state: state.to_string(),
+        merged: state.eq_ignore_ascii_case("MERGED"),
+        merged_at: value
+            .get("mergedAt")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        closed_at: value
+            .get("closedAt")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    })
+}
+
+/// A line this module accepts as a commit sha rather than a path — hex, and long enough that a
+/// path made only of hex-looking segments (vanishingly unlikely, but not this module's problem
+/// to rule out further) is not what a `git log --format=%H --name-only` run actually emits.
+fn is_sha_line(line: &str) -> bool {
+    line.len() >= 7 && line.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The commit shas, from `git log --grep=Revert -i --format=%H --name-only <run's own diff
+/// window>`, whose touched files intersect `run_paths` — the Run's own diff, so a revert of
+/// somebody else's file never attributes here.
+///
+/// The output alternates a bare sha line with the file lines that commit touched; this parses
+/// that shape without assuming a blank separator, because git's own spacing around `--name-only`
+/// blocks is not part of the contract this module owns.
+pub fn reverts_touching(log_text: &str, run_paths: &[String]) -> Vec<String> {
+    let mut hits = Vec::new();
+    let mut current: Option<(&str, Vec<&str>)> = None;
+    for raw in log_text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if is_sha_line(line) {
+            if let Some((sha, paths)) = current.take()
+                && paths.iter().any(|p| run_paths.iter().any(|mine| mine == p))
+            {
+                hits.push(sha.to_string());
+            }
+            current = Some((line, Vec::new()));
+        } else if let Some((_, paths)) = current.as_mut() {
+            paths.push(line);
+        }
+    }
+    if let Some((sha, paths)) = current
+        && paths.iter().any(|p| run_paths.iter().any(|mine| mine == p))
+    {
+        hits.push(sha.to_string());
+    }
+    hits
+}
+
+/// `outcome.json`, written beside a Run's record by `grind outcomes` — a separate file, never
+/// `run.json`, so the sole-writer rule on `attempts[]` is never in the same room as this
+/// read-mostly pass. Facts, computed rather than classified: `reverted_by` is a list of shas,
+/// never a verdict.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunOutcome {
+    pub collected_at: String,
+    pub pr_state: String,
+    pub pr_merged: bool,
+    pub pr_merged_at: Option<String>,
+    pub pr_closed_at: Option<String>,
+    pub reverted_by: Vec<String>,
+    /// Follow-up issues filed against the Run's PR. Left empty on purpose: a `gh issue list
+    /// --search` scan proportionate to this unit would need to decide what "filed against"
+    /// means (linked how, by whom), and that is disproportionate machinery for the unit this
+    /// is — shipped as an empty, stable field so a later pass can fill it in without a shape
+    /// change.
+    pub followup_issues: Vec<u64>,
+}
+
 // --- the host item list's classifiers ---------------------------------------------------
 //
 // **Every one of these renders a fixed, item-specific diagnostic and never the raw stdout or
@@ -2377,6 +2486,84 @@ mod tests {
             panic!("a missing skill must be reported, never satisfied");
         };
         assert!(text.contains("reflect"), "{text}");
+    }
+
+    // --- the outcome collector -----------------------------------------------------------
+
+    #[test]
+    fn pr_final_state_reads_a_merged_pr() {
+        let body = r#"{"state":"MERGED","mergedAt":"2026-08-20T10:00:00Z","closedAt":"2026-08-20T10:00:00Z","mergeCommit":{"oid":"abc"}}"#;
+        assert_eq!(
+            pr_final_state(body),
+            Observed::Present(PrFinal {
+                state: "MERGED".to_string(),
+                merged: true,
+                merged_at: Some("2026-08-20T10:00:00Z".to_string()),
+                closed_at: Some("2026-08-20T10:00:00Z".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn pr_final_state_reads_a_closed_unmerged_pr_as_not_merged() {
+        let body = r#"{"state":"CLOSED","mergedAt":null,"closedAt":"2026-08-20T10:00:00Z"}"#;
+        assert_eq!(
+            pr_final_state(body),
+            Observed::Present(PrFinal {
+                state: "CLOSED".to_string(),
+                merged: false,
+                merged_at: None,
+                closed_at: Some("2026-08-20T10:00:00Z".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn pr_final_state_is_unobservable_over_empty_or_unreadable_output() {
+        assert!(matches!(pr_final_state(""), Observed::Unobservable(_)));
+        assert!(matches!(
+            pr_final_state("not json"),
+            Observed::Unobservable(_)
+        ));
+        assert!(matches!(pr_final_state("{}"), Observed::Unobservable(_)));
+    }
+
+    #[test]
+    fn reverts_touching_matches_commits_whose_files_intersect_the_run_diff() {
+        let log = "\
+deadbeef1
+src/observe.rs
+docs/adr/0001.md
+cafebabe2
+README.md
+";
+        let run_paths = vec!["src/observe.rs".to_string()];
+        assert_eq!(
+            reverts_touching(log, &run_paths),
+            vec!["deadbeef1".to_string()]
+        );
+    }
+
+    #[test]
+    fn reverts_touching_is_empty_when_nothing_overlaps() {
+        let log = "\
+deadbeef1
+README.md
+";
+        let run_paths = vec!["src/observe.rs".to_string()];
+        assert!(reverts_touching(log, &run_paths).is_empty());
+    }
+
+    #[test]
+    fn reverts_touching_reads_the_final_commit_block_with_no_trailing_blank_line() {
+        // The parser flushes on end-of-input, not only on the next sha line — a log that ends
+        // mid-block (no trailing newline shape) must not silently drop its last commit.
+        let log = "deadbeef1\nsrc/observe.rs";
+        let run_paths = vec!["src/observe.rs".to_string()];
+        assert_eq!(
+            reverts_touching(log, &run_paths),
+            vec!["deadbeef1".to_string()]
+        );
     }
 
     #[test]

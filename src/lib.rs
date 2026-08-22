@@ -15,6 +15,7 @@ pub mod attempt;
 pub mod cli;
 pub mod decide;
 pub mod job;
+pub mod learnings;
 pub mod observe;
 pub mod page;
 pub mod policy;

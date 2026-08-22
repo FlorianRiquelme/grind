@@ -15,6 +15,7 @@ use crate::attempt::{
 };
 use crate::decide::{self, Pass, PlanFacts, Tier, Tiers, Verdict};
 use crate::job::{self, Job, Refusal};
+use crate::learnings;
 use crate::observe::{self, Observation, Observed, Outcome as ItemOutcome, Reason};
 use crate::policy::{self, Budget, Next, Stop};
 use crate::rung::{self, ReturnStatus, Stage, StageReturn};
@@ -1043,20 +1044,20 @@ fn run_r_pass(
 ) -> Result<(), Refusal> {
     let stages_dir = run_dir.join("stages");
     let tiers = load_tiers(worktree);
+    // Derived fresh for both passes: prior same-repo Runs plus their outcome files. A bad
+    // record raises the tier floor mechanically — statistics, never taxonomy prose (ADR-0012).
+    let template_record = template_record_for(&record.job.target_repo, &record.run_id);
     let decision = match stage {
         Stage::Triage => {
             let plan_facts =
                 world::read_to_string(&stages_dir.join("plan").join("plan-facts.json"))
                     .ok()
                     .and_then(|text| serde_json::from_str::<PlanFacts>(&text).ok());
-            // `TrackRecord` is `None` for now: `grind outcomes` (a later phase, part 2's
-            // design) is the supplier that makes it non-trivial. `select_tier` already
-            // fails closed on `None` the same way it does on a missing `PlanFacts`.
             decide::select_tier(
                 Pass::Triage,
                 plan_facts.as_ref(),
                 None,
-                None,
+                Some(&template_record),
                 Tier::T0,
                 &tiers,
             )
@@ -1086,7 +1087,7 @@ fn run_r_pass(
                 Pass::DiffTriage,
                 None,
                 Some(&diff_facts),
-                None,
+                Some(&template_record),
                 floor,
                 &tiers,
             )
@@ -1160,6 +1161,47 @@ fn resolve_stage_model(record: &RunRecord, run_dir: &Path, stage: Stage) -> Opti
     }
 }
 
+/// The per-template lookback the two [R] passes fold into their tier call: every *other* Run on
+/// this host that targeted the same repo, read read-only through `view::RunView` — never the
+/// writer type — and derived on demand (the derivability rule: no separate store, the Records
+/// and their `outcome.json` files already answer this). `ci_failed` is `false` throughout for
+/// now: no per-Run CI fact is recorded yet, and degrade-don't-abort means the fold sees less
+/// history, never wrong history — a stale or absent `outcome.json` only means the tier floor is
+/// computed from less. `grind outcomes` is what makes the survival half non-trivial.
+fn template_record_for(target_repo: &str, this_run: &str) -> decide::TrackRecord {
+    let Some(home) = world::home() else {
+        return decide::TrackRecord::default();
+    };
+    let runs = job::runs_dir(&home);
+    let mut gathered: Vec<(bool, Option<String>)> = Vec::new();
+    for entry in world::list_dir(&runs) {
+        let Some(run_id) = entry.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if run_id == this_run {
+            continue;
+        }
+        let crate::view::Lookup::Here(found) = crate::view::load(&home, run_id) else {
+            continue;
+        };
+        if found.job.target_repo != target_repo {
+            continue;
+        }
+        let completed = found.state == "completed";
+        let outcome = world::read_to_string(&runs.join(run_id).join("outcome.json")).ok();
+        gathered.push((completed, outcome));
+    }
+    let facts: Vec<decide::RunOutcomeFacts> = gathered
+        .iter()
+        .map(|(completed, outcome)| decide::RunOutcomeFacts {
+            completed_unattended: *completed,
+            ci_failed: false,
+            outcome_json: outcome.as_deref(),
+        })
+        .collect();
+    decide::track_record_from(&facts)
+}
+
 /// Plan-only injected notes and lessons (unit B's `StageContext::notes`), read by the caller so
 /// the composition itself stays pure. `~/.grind/repos/<owner-name>/notes.md`, read as one
 /// hyphen-joined directory segment (`owner-name`, not `owner/name`) — deliberately not
@@ -1174,6 +1216,31 @@ fn notes_for(home: &Path, target_repo: &str) -> Option<String> {
         .join(format!("{owner}-{name}"))
         .join("notes.md");
     world::read_to_string(&path).ok()
+}
+
+/// Applicable `lessons.tsv` lines, appended under a short header to the Plan-stage notes text.
+/// Read from `~/.grind/learnings/lessons.tsv`, same absent-is-none pattern as `notes_for` — a
+/// Run must never refuse to plan for want of a lessons file. Matched **against the Job's
+/// declared hot paths plus the Anchor path**, not PlanFacts' forecast: nothing has run Plan yet,
+/// so this is the only forecast a pre-Plan match can key on (`learnings::applicable_lessons`
+/// does the actual keyword matching; this is only the read-and-call site).
+fn lessons_for(home: &Path, job: &Job) -> Option<String> {
+    let path = job::grind_dir(home).join("learnings").join("lessons.tsv");
+    let tsv = world::read_to_string(&path).ok()?;
+    let lessons = learnings::parse_lessons(&tsv);
+    let mut forecast_paths = job.declared_hot_paths.clone();
+    forecast_paths.push(job.anchor.clone());
+    let matched = learnings::applicable_lessons(&lessons, &forecast_paths);
+    if matched.is_empty() {
+        return None;
+    }
+    let mut text = String::from("Lessons matched against this Job's declared paths:\n");
+    for lesson in matched {
+        text.push_str("- ");
+        text.push_str(&lesson.statement);
+        text.push('\n');
+    }
+    Some(text)
 }
 
 /// One Attempt for one ladder rung: the stage's own session, dispatched fresh or resumed by
@@ -1209,9 +1276,18 @@ fn run_ladder_attempt(
         Mode::Resume
     };
     let model = resolve_stage_model(record, run_dir, stage);
-    let notes = (stage == Stage::Plan)
-        .then(|| notes_for(&home, &record.job.target_repo))
-        .flatten();
+    let notes = if stage == Stage::Plan {
+        let base = notes_for(&home, &record.job.target_repo);
+        let lessons = lessons_for(&home, &record.job);
+        match (base, lessons) {
+            (Some(base), Some(lessons)) => Some(format!("{base}\n\n{lessons}")),
+            (Some(base), None) => Some(base),
+            (None, Some(lessons)) => Some(lessons),
+            (None, None) => None,
+        }
+    } else {
+        None
+    };
     let stages_dir_str = run_dir.join("stages").display().to_string();
     let ctx = StageContext {
         stage,

@@ -143,10 +143,10 @@ pub fn route(req: &Request, home: &Path) -> Response {
     }
     let segments: Vec<&str> = req.segments.iter().map(String::as_str).collect();
     match segments.as_slice() {
-        [] => html(page::roster_page(&sorted_roster(
-            home,
-            req.query.as_deref(),
-        ))),
+        [] => html(page::roster_page(
+            &sorted_roster(home, req.query.as_deref()),
+            &view::proposal_queue(home),
+        )),
         ["f", "roster"] => html(page::roster_fragment(&sorted_roster(
             home,
             req.query.as_deref(),

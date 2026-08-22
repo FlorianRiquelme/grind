@@ -1012,6 +1012,51 @@ impl TrackRecord {
     }
 }
 
+/// One prior Run's facts, exactly as much as a Job-template lookback can honestly supply
+/// today: the completion and CI facts a Record already carries, plus whatever `grind outcomes`
+/// wrote beside that Run — text, not a parsed type, because a stale or hand-edited
+/// `outcome.json` degrades to *unread* here rather than aborting the fold (tolerant,
+/// degrade-don't-abort, the same rule `learnings.rs` states for foreign-ish formats).
+pub struct RunOutcomeFacts<'a> {
+    pub completed_unattended: bool,
+    pub ci_failed: bool,
+    pub outcome_json: Option<&'a str>,
+}
+
+/// The fold `template_record` names but does not itself call — **the caller-to-be is Triage in
+/// `supervisor.rs`**, which is expected to gather one [`RunOutcomeFacts`] per prior Run of the
+/// same Job template (the Record's own completion/CI facts, `outcome.json`'s text when
+/// `grind outcomes` has run for that Run) and fold them here. Kept pure and literal-tested so
+/// the wiring itself carries no logic to get wrong.
+///
+/// Reverted is read from `outcome.json`'s `reverted_by` alone; an unreadable or absent
+/// `outcome.json` degrades to *not reverted*, matching the design's own honesty note — a stale
+/// outcome file only means the tier floor is computed from less history, never from wrong
+/// history.
+pub fn track_record_from(outcomes: &[RunOutcomeFacts]) -> TrackRecord {
+    let mut record = TrackRecord {
+        runs: outcomes.len(),
+        ..TrackRecord::default()
+    };
+    for run in outcomes {
+        if run.completed_unattended {
+            record.unattended_completions += 1;
+        }
+        if run.ci_failed {
+            record.ci_failures += 1;
+        }
+        if run
+            .outcome_json
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+            .and_then(|value| value.get("reverted_by").cloned())
+            .is_some_and(|reverted_by| reverted_by.as_array().is_some_and(|a| !a.is_empty()))
+        {
+            record.reverted += 1;
+        }
+    }
+    record
+}
+
 /// The parsed contents of `docs/tiers.toml`: the weights, the thresholds and the per-tier model
 /// routing table. Carries the calibration in-repo so a threshold move is a reviewed diff, never
 /// a recompile-only change (the design's own stated reason for shipping it as data).
@@ -1619,6 +1664,52 @@ mod tier_tests {
     #[test]
     fn a_template_with_no_history_is_not_bad_history() {
         assert!(!TrackRecord::default().is_bad());
+    }
+
+    #[test]
+    fn track_record_from_folds_completion_ci_and_reverted_facts() {
+        let outcomes = [
+            RunOutcomeFacts {
+                completed_unattended: true,
+                ci_failed: false,
+                outcome_json: Some(r#"{"reverted_by":["deadbeef1"]}"#),
+            },
+            RunOutcomeFacts {
+                completed_unattended: false,
+                ci_failed: true,
+                outcome_json: Some(r#"{"reverted_by":[]}"#),
+            },
+            RunOutcomeFacts {
+                completed_unattended: true,
+                ci_failed: false,
+                outcome_json: None,
+            },
+        ];
+        let record = track_record_from(&outcomes);
+        assert_eq!(
+            record,
+            TrackRecord {
+                runs: 3,
+                unattended_completions: 2,
+                ci_failures: 1,
+                reverted: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn track_record_from_degrades_an_unreadable_outcome_json_to_not_reverted() {
+        let outcomes = [RunOutcomeFacts {
+            completed_unattended: true,
+            ci_failed: false,
+            outcome_json: Some("not json"),
+        }];
+        assert_eq!(track_record_from(&outcomes).reverted, 0);
+    }
+
+    #[test]
+    fn track_record_from_over_no_runs_is_the_default() {
+        assert_eq!(track_record_from(&[]), TrackRecord::default());
     }
 
     #[test]

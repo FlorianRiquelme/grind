@@ -12,9 +12,9 @@
 //! because the wall is working.
 
 use crate::attempt::{self, Attempt, Clearance};
-use crate::decide::{self, Stage, Verdict, VerifyContract, VerifyCoverage};
+use crate::decide::{self, Decision, Stage, Verdict, VerifyContract, VerifyCoverage};
 use crate::job::{self, Job};
-use crate::observe::{self, Observation, Observed, Reason};
+use crate::observe::{self, Observation, Observed, Reason, RunOutcome};
 use crate::policy;
 use crate::world;
 use serde::Deserialize;
@@ -121,6 +121,17 @@ pub struct Facts {
     /// every later surface (R3) — and it decides nothing, appearing only when it exists.
     pub cleared: Option<Clearance>,
     pub run_state: PathBuf,
+    /// The tier Decision Triage recorded, read fresh — `None` on a pre-cutover Run or one that
+    /// never reached the ladder.
+    pub triage_decision: Option<Decision>,
+    /// Diff-triage's own Decision, when the Run reached it. Escalation-only over
+    /// `triage_decision` (`decide::select_tier`'s own rule), never shown as a replacement.
+    pub diff_triage_decision: Option<Decision>,
+    /// `outcome.json`, when `grind outcomes` has run for this Run. Merged/closed/reverted
+    /// facts, never a grade.
+    pub outcome: Option<RunOutcome>,
+    /// Reflect's calibration row, when the pass wrote one.
+    pub calibration: Option<serde_json::Value>,
 }
 
 /// Gather them. **One construction**, reached from `cli`'s Handback and from the supervisor's
@@ -147,8 +158,13 @@ pub fn gather(home: &Path, run_id: &str) -> Option<Facts> {
         .then(|| policy::what_must_be_cleared(&found.attempts))
         .flatten();
     let cleared = found.clearances.last().cloned();
+    let run_dir = job::runs_dir(home).join(run_id);
     Some(Facts {
         run_state: record_path(home, run_id),
+        triage_decision: decision_of(&run_dir, "triage"),
+        diff_triage_decision: decision_of(&run_dir, "diff-triage"),
+        outcome: outcome_of(&run_dir),
+        calibration: calibration_of(&run_dir),
         found,
         observation,
         verdict,
@@ -194,6 +210,101 @@ pub fn load(home: &Path, run_id: &str) -> Lookup {
 
 pub fn record_path(home: &Path, run_id: &str) -> PathBuf {
     job::runs_dir(home).join(run_id).join("run.json")
+}
+
+// --- Grit surfaces, read fresh from a Run's own directory ------------------------------------
+//
+// Every function here follows `observe_fresh`'s discipline: read `world`, persist nothing. A
+// Decision, an Outcome and a proposal are facts a Run already left on disk — this module names
+// where to look and how to fold a bad or absent file into *nothing to show*, never a crash.
+
+/// `stages/<stage>/decision.json`, tolerant: absent or unparseable is `None` rather than an
+/// error, the same rule `run_r_pass` writes it under. A pre-cutover Run or a Run that never
+/// reached Diff-triage carries no such file, which is not damage.
+pub fn decision_of(run_dir: &Path, stage: &str) -> Option<Decision> {
+    let text =
+        world::read_to_string(&run_dir.join("stages").join(stage).join("decision.json")).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// `outcome.json`, written beside the record by `grind outcomes` — never `run.json`, and never
+/// read by anything that could save it back (issues #12, #27's rule applies here too).
+pub fn outcome_of(run_dir: &Path) -> Option<RunOutcome> {
+    let text = world::read_to_string(&run_dir.join("outcome.json")).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Reflect's calibration row, if the pass wrote one. Its shape is a `select_tier` replay
+/// against what Validate actually confirmed — reflect's own words, not a schema this base
+/// forces — so it is read as a bare JSON object and rendered as key/value facts rather than a
+/// typed struct: a field Reflect adds or drops must not turn *a row exists* into *unreadable*.
+pub fn calibration_of(run_dir: &Path) -> Option<serde_json::Value> {
+    let text = world::read_to_string(
+        &run_dir
+            .join("stages")
+            .join("reflect")
+            .join("calibration.json"),
+    )
+    .ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// One artifact in a Run's proposal queue: a drafted follow-up Job or a proposed skill diff,
+/// exactly as Reflect left it under `stages/reflect/`. Nothing stores this — [`proposals_in`]
+/// derives it fresh on every request (ADR-0013's derivability rule), the same shape the design
+/// names at line 160: a GET-only projection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProposalEntry {
+    /// `"job"` or `"diff"` — which of Reflect's two drafted-artifact kinds this is.
+    pub kind: &'static str,
+    pub path: PathBuf,
+    /// The artifact's own words, one line: a drafted Job's title, or a diff's first hunk
+    /// header — whichever the file yields — capped through [`one_line`] like every other
+    /// operator-facing string this module produces.
+    pub summary: String,
+}
+
+/// Reflect's SKILL.md names two proposal shapes by description rather than by filename — "a
+/// drafted issue body" and "a diff in the proposal queue, never a write to the skill" — so this
+/// reads `stages/reflect/jobs/` for the former and `stages/reflect/diffs/` for the latter: one
+/// subdirectory per kind, named for what it holds, so the scan never has to guess a file's kind
+/// from its extension. Absent directories yield nothing rather than an error.
+pub fn proposals_in(run_dir: &Path) -> Vec<ProposalEntry> {
+    let reflect_dir = run_dir.join("stages").join("reflect");
+    let mut found = Vec::new();
+    for (kind, sub) in [("job", "jobs"), ("diff", "diffs")] {
+        for path in world::list_dir(&reflect_dir.join(sub)) {
+            if world::is_dir(&path) {
+                continue;
+            }
+            let summary = world::read_to_string(&path)
+                .ok()
+                .map(|text| one_line(text.lines().find(|l| !l.trim().is_empty()).unwrap_or("")))
+                .unwrap_or_else(|| "(unreadable)".to_string());
+            found.push(ProposalEntry {
+                kind,
+                path: path.clone(),
+                summary,
+            });
+        }
+    }
+    found
+}
+
+/// The proposal queue across every Run on this host — a roster projection over
+/// [`proposals_in`], never a store of its own. Each entry keeps the run id it came from so the
+/// queue can point back at the Run that drafted it.
+pub fn proposal_queue(home: &Path) -> Vec<(String, ProposalEntry)> {
+    let mut found = Vec::new();
+    for entry in world::list_dir(&job::runs_dir(home)) {
+        let Some(run_id) = entry.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        for proposal in proposals_in(&entry) {
+            found.push((run_id.to_string(), proposal));
+        }
+    }
+    found
 }
 
 /// One row of the roster.
@@ -1175,6 +1286,151 @@ mod tests {
         // Attempt 4 ended after the record was created, and the recorded string is what
         // the row names — nothing synthesized.
         assert_eq!(row.last_activity, "2026-08-06T17:41:55+00:00");
+        crate::world::remove_tree(&home);
+    }
+
+    // --- Grit surfaces, read fresh from a Run's own directory ---------------------------------
+
+    fn decision_json() -> String {
+        serde_json::json!({
+            "tier": "t1",
+            "personas": ["correctness", "tests"],
+            "depth": {"reviewers": 1},
+            "model_per_stage": {"work": "claude-sonnet-5"},
+            "floor_from_plan": "t0",
+            "rationale": [
+                {"signal": "loc_changed", "value": "180", "weight": "t1"}
+            ]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_decision_is_read_fresh_and_absence_is_not_an_error() {
+        let run_dir = crate::world::temp_dir("view-decision");
+        crate::world::create_dir_all(&run_dir.join("stages").join("triage")).unwrap();
+        crate::world::write_atomic(
+            &run_dir.join("stages").join("triage").join("decision.json"),
+            &decision_json(),
+        )
+        .unwrap();
+
+        let found = decision_of(&run_dir, "triage").expect("the written decision");
+        assert_eq!(found.tier, decide::Tier::T1);
+        assert_eq!(found.rationale.len(), 1);
+
+        // A stage that never ran, and a Run that never reached the ladder at all: both absent,
+        // never an error.
+        assert!(decision_of(&run_dir, "diff-triage").is_none());
+        assert!(decision_of(Path::new("/nowhere/at/all"), "triage").is_none());
+        crate::world::remove_tree(&run_dir);
+    }
+
+    #[test]
+    fn a_malformed_decision_file_reads_as_absent_rather_than_a_crash() {
+        let run_dir = crate::world::temp_dir("view-decision-bad");
+        crate::world::create_dir_all(&run_dir.join("stages").join("triage")).unwrap();
+        crate::world::write_atomic(
+            &run_dir.join("stages").join("triage").join("decision.json"),
+            "{not json",
+        )
+        .unwrap();
+        assert!(decision_of(&run_dir, "triage").is_none());
+        crate::world::remove_tree(&run_dir);
+    }
+
+    #[test]
+    fn an_outcome_is_read_fresh_beside_the_record_and_absence_is_not_an_error() {
+        let run_dir = crate::world::temp_dir("view-outcome");
+        crate::world::create_dir_all(&run_dir).unwrap();
+        let outcome_json = serde_json::json!({
+            "collected_at": "2026-09-01T00:00:00+00:00",
+            "pr_state": "MERGED",
+            "pr_merged": true,
+            "pr_merged_at": "2026-08-20T00:00:00+00:00",
+            "pr_closed_at": null,
+            "reverted_by": [],
+            "followup_issues": []
+        })
+        .to_string();
+        crate::world::write_atomic(&run_dir.join("outcome.json"), &outcome_json).unwrap();
+
+        let found = outcome_of(&run_dir).expect("the written outcome");
+        assert!(found.pr_merged);
+        assert_eq!(found.pr_state, "MERGED");
+
+        assert!(outcome_of(Path::new("/nowhere/at/all")).is_none());
+        crate::world::remove_tree(&run_dir);
+    }
+
+    #[test]
+    fn a_calibration_row_is_read_fresh_and_absence_is_not_an_error() {
+        let run_dir = crate::world::temp_dir("view-calibration");
+        crate::world::create_dir_all(&run_dir.join("stages").join("reflect")).unwrap();
+        crate::world::write_atomic(
+            &run_dir
+                .join("stages")
+                .join("reflect")
+                .join("calibration.json"),
+            &serde_json::json!({"tier": "t1", "confirmed": "P1"}).to_string(),
+        )
+        .unwrap();
+
+        let found = calibration_of(&run_dir).expect("the written calibration row");
+        assert_eq!(found["tier"], "t1");
+        assert!(calibration_of(Path::new("/nowhere/at/all")).is_none());
+        crate::world::remove_tree(&run_dir);
+    }
+
+    #[test]
+    fn proposals_are_scanned_fresh_from_reflects_jobs_and_diffs_directories() {
+        let run_dir = crate::world::temp_dir("view-proposals");
+        let reflect = run_dir.join("stages").join("reflect");
+        crate::world::create_dir_all(&reflect.join("jobs")).unwrap();
+        crate::world::create_dir_all(&reflect.join("diffs")).unwrap();
+        crate::world::write_atomic(
+            &reflect.join("jobs").join("follow-up.md"),
+            "Fix the residual finding in observe.rs\nmore body\n",
+        )
+        .unwrap();
+        crate::world::write_atomic(
+            &reflect.join("diffs").join("wording.diff"),
+            "--- a/skills/run/review/SKILL.md\n+++ b/skills/run/review/SKILL.md\n",
+        )
+        .unwrap();
+
+        let mut found = proposals_in(&run_dir);
+        found.sort_by(|a, b| a.kind.cmp(b.kind));
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].kind, "diff");
+        assert!(found[0].summary.contains("--- a/skills"), "{found:?}");
+        assert_eq!(found[1].kind, "job");
+        assert!(found[1].summary.contains("Fix the residual finding"));
+
+        // A Run that never reflected has no proposal artifacts, never an error.
+        assert!(proposals_in(Path::new("/nowhere/at/all")).is_empty());
+        crate::world::remove_tree(&run_dir);
+    }
+
+    #[test]
+    fn the_proposal_queue_names_the_run_each_entry_came_from() {
+        let home = crate::world::temp_dir("view-proposal-queue");
+        let run_dir = job::runs_dir(&home).join("20260901-000000-snapper-40");
+        crate::world::create_dir_all(&run_dir.join("stages").join("reflect").join("jobs")).unwrap();
+        crate::world::write_atomic(
+            &run_dir
+                .join("stages")
+                .join("reflect")
+                .join("jobs")
+                .join("a.md"),
+            "drafted Job body\n",
+        )
+        .unwrap();
+
+        let found = proposal_queue(&home);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, "20260901-000000-snapper-40");
+        assert_eq!(found[0].1.kind, "job");
         crate::world::remove_tree(&home);
     }
 }
