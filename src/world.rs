@@ -533,12 +533,22 @@ mod tests {
         ((total / 60) as u32, (total % 60) as u32)
     }
 
+    /// Whether the `date` binary can be spawned at all here. Lets the zone tests below skip
+    /// only on an environment that lacks `date`, rather than on any `None` from
+    /// `local_hour_minute` — a `None` after a successful spawn is a real regression, not an
+    /// environment gap, and must fail loudly.
+    fn date_binary_available() -> bool {
+        Command::new("date").arg("+%H:%M").output().is_ok()
+    }
+
     #[test]
     fn local_hour_minute_reads_the_injected_zone_not_utc() {
-        let e1 = now_epoch();
-        let Some(got) = local_hour_minute(Some("GRD-3")) else {
+        if !date_binary_available() {
             return;
-        };
+        }
+        let e1 = now_epoch();
+        let got = local_hour_minute(Some("GRD-3"))
+            .expect("`date` spawned; a non-zero exit or unparseable stdout is a regression");
         let e2 = now_epoch();
         assert!(
             got == shifted(e1, 180) || got == shifted(e2, 180),
@@ -550,10 +560,12 @@ mod tests {
 
     #[test]
     fn local_hour_minute_at_zero_offset_pins_only_the_zone_moving() {
-        let e1 = now_epoch();
-        let Some(got) = local_hour_minute(Some("UTC0")) else {
+        if !date_binary_available() {
             return;
-        };
+        }
+        let e1 = now_epoch();
+        let got = local_hour_minute(Some("UTC0"))
+            .expect("`date` spawned; a non-zero exit or unparseable stdout is a regression");
         let e2 = now_epoch();
         assert!(
             got == shifted(e1, 0) || got == shifted(e2, 0),
