@@ -106,7 +106,9 @@ change carries a safety property, not for coverage's sake.
   both writes are comments. `QUEUE_LABEL` erased a triage fact to record a queue fact.
   `tests/topology.rs` carries the absence of every classifying flag.
 - **Grind is a scheduler, not a pipeline** (ADR-0001). Everything between plan and open PR
-  belongs to `lfg`. Don't reimplement stages it already runs.
+  belongs to `lfg`. Don't reimplement stages it already runs. *(Superseded 2026-08-22 by
+  ADR-0015, #92: Grind now owns its own ten-stage ladder — Grit — landing in phases. This
+  bullet is rewritten when the cutover Job lands; until then `lfg` still runs the Runs.)*
 - **The plugin version is pinned per Job and frozen per Run** (ADR-0002 as amended by #42,
   re-amended by #50, and amended a third time by #69). The Job names both the plugin and the
   version, and a reference without a literal `x.y.z` is refused at parse time — that shape is

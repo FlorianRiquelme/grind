@@ -1,0 +1,75 @@
+# Grit's tier calibration (issue #92, phase 1).
+#
+# The weights, thresholds and per-tier model routing `select_tier` (`src/decide.rs`) reads.
+# Shipped in-repo so a threshold move is a reviewed diff, never a recompile-only change —
+# calibration is something a human reads before it binds. This file is data for a
+# reviewer, not for `select_tier` itself to trust blindly: `tiers_from_toml` parses it
+# tolerantly and falls back to a compiled default — identical to every value below — for
+# anything it cannot read, so a corrupted or truncated copy of this file degrades to the
+# fail-closed defaults rather than to zero thresholds.
+#
+# Format `src/decide.rs`'s hand-rolled parser actually understands, and nothing more: flat
+# `key = value` lines under `[section]` headers, integers and quoted strings only, no arrays,
+# no table-of-tables — `[models.t0]` is one flat section name, not nested TOML. Keep additions
+# to this shape; a real `toml` crate is not a dependency ADR-0005 allows.
+#
+# `strong` and `fast` are routing classes, not model ids — which concrete model answers to
+# each class is host configuration, decided at wiring time, not here.
+
+[weights]
+risky_path_weight = 5
+content_signal_weight = 3
+
+[thresholds]
+loc_t1 = 80
+loc_t2 = 400
+loc_t3 = 800
+step_count_t1 = 4
+step_count_t2 = 12
+content_signal_t2 = 1
+content_signal_t3 = 3
+
+# Mechanical stages (work, simplify, fixes, ship) run fast at every tier. Judgment seats (plan,
+# plan-review, validate) run strong at every tier — a judgment seat never routes down. Review is
+# the one stage that moves: fast while the panel is small and class-matched (T0/T1), strong once
+# the panel is the reason the tier was raised (T2/T3).
+
+[models.t0]
+plan = "strong"
+plan-review = "strong"
+work = "fast"
+simplify = "fast"
+review = "fast"
+validate = "strong"
+fixes = "fast"
+ship = "fast"
+
+[models.t1]
+plan = "strong"
+plan-review = "strong"
+work = "fast"
+simplify = "fast"
+review = "fast"
+validate = "strong"
+fixes = "fast"
+ship = "fast"
+
+[models.t2]
+plan = "strong"
+plan-review = "strong"
+work = "fast"
+simplify = "fast"
+review = "strong"
+validate = "strong"
+fixes = "fast"
+ship = "fast"
+
+[models.t3]
+plan = "strong"
+plan-review = "strong"
+work = "fast"
+simplify = "fast"
+review = "strong"
+validate = "strong"
+fixes = "fast"
+ship = "fast"

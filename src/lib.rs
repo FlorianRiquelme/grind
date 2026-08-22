@@ -19,6 +19,7 @@ pub mod observe;
 pub mod page;
 pub mod policy;
 pub mod render;
+pub mod rung;
 pub mod script;
 pub mod serve;
 pub mod style;
