@@ -151,6 +151,10 @@ pub fn read_to_string(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+pub fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 pub fn write(path: &Path, contents: &str) -> Result<(), String> {
     fs::write(path, contents).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -448,4 +452,28 @@ pub fn temp_dir(tag: &str) -> PathBuf {
 #[cfg(test)]
 pub fn remove_tree(path: &Path) {
     let _ = fs::remove_dir_all(path);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_bytes_round_trips_what_was_written() {
+        let dir = temp_dir("read-bytes");
+        let path = dir.join("evidence.bin");
+        let raw = b"\x00\x01\xffbytes".to_vec();
+        fs::write(&path, &raw).expect("a scratch file");
+        assert_eq!(read_bytes(&path), Ok(raw));
+        remove_tree(&dir);
+    }
+
+    #[test]
+    fn a_missing_path_is_an_error_naming_the_path() {
+        let found = read_bytes(Path::new("/nowhere/that/exists/evidence.bin"));
+        let Err(said) = found else {
+            panic!("a missing file is an Err");
+        };
+        assert!(said.contains("/nowhere/that/exists/evidence.bin"), "{said}");
+    }
 }

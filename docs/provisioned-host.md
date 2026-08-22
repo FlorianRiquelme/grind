@@ -103,6 +103,11 @@ restart and calls `grind resume --all`, so a restart re-enters the Runs it cut o
 leaving them at `died` until a human looks. Nothing watches a supervisor while the host is up, and
 nothing needs to.
 
+`grind serve` is deliberately absent from this document and from `job::host_items()`: it is
+a reader a human launches when they want to look, not something the host owes. It holds no
+lock, owns no Run and writes nothing (ADR-0013) — an uninstalled or never-run Serve leaves
+the host exactly as provisioned, so there is no doctor check and no mark to carry.
+
 **The two platforms do not offer the same promise, and the difference is load-bearing.** linux
 fires at boot; darwin fires at **login**. Say *survives a restart* on linux and *survives a restart
 plus a login* on darwin, and do not let the shorter phrase stand for both.

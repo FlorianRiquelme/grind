@@ -49,6 +49,14 @@ is up, and a host that restarts re-enters the Runs that were cut off rather than
 the supervisor itself.
 _Avoid_: daemon, service, watcher
 
+**Serve**:
+The reader a human launches to watch Runs on this host — one process that serves the
+current Run state as pages until it is closed. It holds no lock, owns no Run and writes
+nothing; it dies without consequence because it was never responsible for anything. It is
+not resident and nothing watches it: an observer is not an owner, which is why Serve is
+not the daemon ADR-0011 refused (ADR-0013).
+_Avoid_: ui server, monitor, web app
+
 **Attempt**:
 One invocation of the agent within a Run, and the unit the Run's budget counts. A Run is
 bounded by how many Attempts do work, never by how long it takes or what it costs.
@@ -130,6 +138,14 @@ Job issue, over a single set of facts, differing only in where they send the hum
 shape is what the morning costs. The Record is its durable half; the rest is a projection and may
 compress.
 _Avoid_: digest, report, results, morning
+
+**Dashboard**:
+Run state projected onto a browser page by Serve — the roster of this host's Runs, and one
+page per Run. It reads the same files `grind status` reads, may compress like any
+projection, and adds no claim the record does not carry. Being read-only is its
+definition, not a limitation; and it does not travel, because Run state does not
+(ADR-0013).
+_Avoid_: console, control panel, admin
 
 **Verify entrypoint**:
 A repo's own generic answer to "how do I check this", adopted rather than invented, and

@@ -136,6 +136,18 @@ impl std::fmt::Display for Mode {
     }
 }
 
+/// One clearance the human recorded on a Blocked Run: when, and what changed in the world.
+///
+/// It lives here beside [`Attempt`] because this module is already the shared vocabulary
+/// between the record's private writer and its read-only reader — and because the re-entry
+/// composition consumes the note here. A shared-noun module for it would pull the writer and
+/// the readers back under one roof, which `tests/topology.rs` exists to refuse.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Clearance {
+    pub cleared_at: String,
+    pub note: String,
+}
+
 /// Everything an invocation is built from, all of it read from the record rather than the
 /// environment — so re-entering an in-flight Run never changes its conditions mid-pipeline.
 #[derive(Debug, Clone, Copy)]
@@ -176,9 +188,35 @@ pub fn dispatch(conditions: &Conditions, job: &Job) -> Invocation {
     build(conditions, Mode::Dispatch, dispatch_prompt(job))
 }
 
-/// Every later attempt, resuming the same session id.
-pub fn resume(conditions: &Conditions) -> Invocation {
-    build(conditions, Mode::Resume, REENTRY_PROMPT.to_string())
+/// Every later attempt, resuming the same session id. The latest clearance rides this
+/// prompt and only this one: Dispatch has no stop behind it, and CiBabysit bounds itself to
+/// one reaction and must not grow a second subject (R2).
+pub fn resume(conditions: &Conditions, cleared: Option<&Clearance>) -> Invocation {
+    build(conditions, Mode::Resume, reentry_prompt(cleared))
+}
+
+/// `REENTRY_PROMPT`, with the human's clearance composed after it when one exists.
+/// **Default is silence**, the same rule as `intent_line`: with no note the prompt is the
+/// constant, exactly — nothing is rendered where nothing was recorded.
+///
+/// The note is dated and framed as an account to check, never as current fact: the latest
+/// clearance rides **every** later Resume (R3), so on a Run that re-blocked after the note
+/// was recorded, an unconditional *trust it* would order the agent to prefer stale
+/// information over its own newer observation.
+fn reentry_prompt(cleared: Option<&Clearance>) -> String {
+    match cleared {
+        Some(clearance) => format!(
+            "{REENTRY_PROMPT}\n\nSince you stopped, the human reports (recorded {at}): \
+             {note}\n\nThat is their account of what changed in the world, from the moment \
+             it was recorded. Check it against what you now observe: do not spend turns \
+             re-probing an obstacle the note says is cleared and the world confirms — but \
+             where the world in front of you contradicts the note, trust what you observe \
+             and say so plainly.",
+            at = clearance.cleared_at,
+            note = clearance.note,
+        ),
+        None => REENTRY_PROMPT.to_string(),
+    }
 }
 
 /// The one bounded invocation a decided-and-failing CI buys. **The same builder** — there is no
@@ -704,7 +742,8 @@ mod tests {
         let conditions = conditions(None);
         for invocation in [
             dispatch(&conditions, &job()),
-            resume(&conditions),
+            resume(&conditions, None),
+            resume(&conditions, Some(&a_clearance("the wall moved"))),
             ci_babysit(&conditions),
         ] {
             assert_eq!(
@@ -905,7 +944,7 @@ mod tests {
         assert!(first.argv().contains(&"--session-id".to_string()));
         assert!(!first.argv().contains(&"--resume".to_string()));
 
-        for later in [resume(&conditions), ci_babysit(&conditions)] {
+        for later in [resume(&conditions, None), ci_babysit(&conditions)] {
             assert!(later.argv().contains(&"--resume".to_string()));
             assert!(!later.argv().contains(&"--session-id".to_string()));
             let at = later.argv().iter().position(|a| a == "--resume").unwrap();
@@ -940,7 +979,7 @@ mod tests {
         let conditions = conditions(Some("claude-opus-5"));
         for invocation in [
             dispatch(&conditions, &job()),
-            resume(&conditions),
+            resume(&conditions, None),
             ci_babysit(&conditions),
         ] {
             assert!(
@@ -1290,6 +1329,76 @@ mod tests {
         assert!(CI_BABYSIT_PROMPT.contains("one invocation"));
         assert!(CI_BABYSIT_PROMPT.contains("do not open a second PR"));
         assert!(CI_BABYSIT_PROMPT.contains("Never weaken, trim or skip a step of `just verify`"));
+    }
+
+    // --- the clearance note rides Resume and nothing else --------------------------------------
+
+    fn a_clearance(note: &str) -> Clearance {
+        Clearance {
+            cleared_at: "2026-08-21T19:00:00+00:00".to_string(),
+            note: note.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_clearance_note_rides_the_resume_prompt_and_never_dispatch_or_ci_babysit() {
+        // The safety property R6 names: the composed prompt reaches Resume invocations only.
+        // Asserted against the **built** invocations, in the spirit of the argv tests above.
+        let conditions = conditions(None);
+        let note = "the deploy key was rotated; the push will go through now";
+        let resumed = resume(&conditions, Some(&a_clearance(note)));
+        assert!(
+            resumed.prompt().starts_with(REENTRY_PROMPT),
+            "the note composes after the re-entry text, never instead of it:\n{}",
+            resumed.prompt()
+        );
+        assert!(
+            resumed
+                .prompt()
+                .contains("Since you stopped, the human reports"),
+            "{}",
+            resumed.prompt()
+        );
+        assert!(resumed.prompt().contains(note), "{}", resumed.prompt());
+        for other in [dispatch(&conditions, &job()), ci_babysit(&conditions)] {
+            assert!(
+                !other.prompt().contains(note),
+                "{:?} must not carry the note",
+                other.mode()
+            );
+            assert!(
+                !other.prompt().contains("the human reports"),
+                "{:?} must not grow a clearance paragraph",
+                other.mode()
+            );
+        }
+    }
+
+    #[test]
+    fn the_composed_clearance_is_dated_and_checked_against_the_world_rather_than_trusted_blind() {
+        // The latest note rides every later Resume (R3), so on a Run that re-blocked after
+        // the note was recorded, an unconditional *trust it* would order the agent to prefer
+        // stale information over its own newer observation. The date is what lets the agent
+        // weigh the account, and the framing asks it to verify, not obey.
+        let prompt = resume(&conditions(None), Some(&a_clearance("the wall moved")))
+            .prompt()
+            .to_string();
+        assert!(
+            prompt.contains("recorded 2026-08-21T19:00:00+00:00"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("what you now observe"), "{prompt}");
+        assert!(
+            !prompt.contains("Trust it over what you last saw"),
+            "the unconditional trust clause must not come back: {prompt}"
+        );
+    }
+
+    #[test]
+    fn no_note_composes_the_reentry_prompt_exactly() {
+        // Render nothing when no note exists — the prompt is the constant, byte for byte,
+        // so a Run that was never blocked re-enters exactly as it always has.
+        assert_eq!(resume(&conditions(None), None).prompt(), REENTRY_PROMPT);
     }
 
     // --- the Wait predicate -------------------------------------------------------------------

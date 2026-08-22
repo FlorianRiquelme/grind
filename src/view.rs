@@ -11,7 +11,7 @@
 //! that both readers parse the same bytes — not the compiler, which is blind to it precisely
 //! because the wall is working.
 
-use crate::attempt::{self, Attempt};
+use crate::attempt::{self, Attempt, Clearance};
 use crate::decide::{self, Stage, Verdict, VerifyContract, VerifyCoverage};
 use crate::job::{self, Job};
 use crate::observe::{self, Observation, Observed, Reason};
@@ -44,6 +44,10 @@ pub struct RunView {
     pub supervisor_pid: u32,
     pub supervisor_identity: Option<String>,
     pub attempts: Vec<Attempt>,
+    /// Absent in records written before the `cleared` verb existed, which is the same fact
+    /// as empty — see the writer's field for why that default is honest.
+    #[serde(default)]
+    pub clearances: Vec<Clearance>,
 }
 
 impl RunView {
@@ -87,6 +91,10 @@ pub struct Facts {
     /// What must be cleared, when the Run stopped for a human. The recorded state is consulted
     /// for this one fact — no fresh verdict can carry it — and never printed as a verdict.
     pub blocker: Option<String>,
+    /// The latest clearance, when the human has recorded one. Read unconditionally rather
+    /// than only on a blocked record: a fact about the world does not expire, so it rides
+    /// every later surface (R3) — and it decides nothing, appearing only when it exists.
+    pub cleared: Option<Clearance>,
     pub run_state: PathBuf,
 }
 
@@ -111,6 +119,7 @@ pub fn gather(home: &Path, run_id: &str) -> Option<Facts> {
     let blocker = (found.state == "blocked")
         .then(|| policy::what_must_be_cleared(&found.attempts))
         .flatten();
+    let cleared = found.clearances.last().cloned();
     Some(Facts {
         run_state: record_path(home, run_id),
         found,
@@ -120,6 +129,7 @@ pub fn gather(home: &Path, run_id: &str) -> Option<Facts> {
         coverage,
         furthest,
         blocker,
+        cleared,
     })
 }
 
@@ -171,6 +181,13 @@ pub struct RosterRow {
     /// because there is deliberately no `running` state to leave behind.
     pub supervisor_here: Observed<bool>,
     pub attempts: (usize, usize),
+    /// The Job issue's title, verbatim from the record.
+    pub job_title: String,
+    /// Spend summed across the Attempts the record carries.
+    pub spend: f64,
+    /// The later of the record's creation and the newest Attempt end the record carries —
+    /// recorded values only, never synthesized (KTD14).
+    pub last_activity: String,
 }
 
 /// Every Run on **this host**. Nothing syncs and nothing is portable; the only thing that
@@ -194,10 +211,25 @@ pub fn roster(home: &Path) -> Vec<RosterRow> {
                 branch: found.job.branch.clone(),
                 job_url: found.job.url.clone(),
                 attempts: found.attempt_counter(),
+                job_title: found.job.title.clone(),
+                spend: found.total_spend(),
+                last_activity: last_activity(&found.created_at, &found.attempts),
             });
         }
     }
     rows
+}
+
+/// The later of the record's creation and the newest Attempt end it carries. Every
+/// timestamp in a record is written by [`crate::world`] in one UTC spelling, so the order
+/// of the recorded strings *is* the order of the moments, and the later one is a plain
+/// string max. Only values the record carries compete here — an Attempt without an end
+/// contributes nothing and nothing is invented in its place (KTD14).
+fn last_activity(created_at: &str, attempts: &[Attempt]) -> String {
+    match attempts.iter().map(|a| a.ended_at.as_str()).max() {
+        Some(end) if end > created_at => end.to_string(),
+        _ => created_at.to_string(),
+    }
 }
 
 /// Liveness splits into supervisor presence and progress; this is the presence half.
@@ -658,6 +690,10 @@ mod tests {
         assert_eq!(found.denied_tools.len(), 7);
         assert_eq!(found.denial_count(), 1);
         assert!(
+            found.clearances.is_empty(),
+            "a record written before the `cleared` verb reads as empty, not as unreadable"
+        );
+        assert!(
             (found.total_spend() - 26.69).abs() < 0.001,
             "{}",
             found.total_spend()
@@ -1081,5 +1117,31 @@ mod tests {
             Lookup::NotHere
         ));
         assert!(roster(home).is_empty());
+    }
+
+    #[test]
+    fn a_roster_row_carries_the_job_the_spend_and_the_newest_recorded_moment() {
+        let home = crate::world::temp_dir("view-roster");
+        let run_dir = job::runs_dir(&home).join("20260806-122620-snapper-28");
+        crate::world::create_dir_all(&run_dir).unwrap();
+        crate::world::write_atomic(&run_dir.join("run.json"), DAY_ONE).unwrap();
+        // A neighbouring directory whose record does not parse costs its own row and
+        // never the board.
+        let junk = job::runs_dir(&home).join("20260807-000000-junk-01");
+        crate::world::create_dir_all(&junk).unwrap();
+        crate::world::write_atomic(&junk.join("run.json"), "{not a record").unwrap();
+
+        let rows = roster(&home);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(
+            row.job_title,
+            "Slice 1b: the agent surface and the ScreenSource seam"
+        );
+        assert!((row.spend - 26.69).abs() < 0.001, "{}", row.spend);
+        // Attempt 4 ended after the record was created, and the recorded string is what
+        // the row names — nothing synthesized.
+        assert_eq!(row.last_activity, "2026-08-06T17:41:55+00:00");
+        crate::world::remove_tree(&home);
     }
 }
