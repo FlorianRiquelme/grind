@@ -192,9 +192,12 @@ pub fn take_lock(home: &Path, target_repo: &str, branch: &str) -> Result<LockHan
     }
     match world::try_lock(&path) {
         TryLock::Acquired(handle) => Ok(handle),
-        // A collision. Another Run holds this branch.
+        // A collision: a live supervisor holds this branch. Named neutrally rather than as
+        // *another Run*, because for `resume` and `cleared` the holder can be the named
+        // Run's own supervisor, still running through a rate-limit sleep — and *another Run*
+        // sends the human hunting the roster for a collision that does not exist.
         TryLock::WouldBlock => Err(Refusal::saying(format!(
-            "another Run holds {target_repo} {branch} on this host"
+            "a running supervisor already holds {target_repo} {branch} on this host"
         ))),
         // Could not determine. Never folded into the refusal and never into proceeding —
         // collapsing the two relocates the exact bug the three-valued observation removes.
@@ -383,6 +386,18 @@ pub fn resume(run_id: &str) -> Result<Outcome, Refusal> {
     if !world::exists(&path) {
         return Err(Refusal::saying(format!("no Run `{run_id}` on this host")));
     }
+    let keyed = RunRecord::load(&path)?;
+
+    // A Run being re-entered by hand holds its branch exactly as a dispatched one does, and the
+    // original holder's lock died with its supervisor.
+    let _lock = take_lock(&home, &keyed.job.target_repo, &keyed.job.branch)?;
+
+    // Re-loaded under the lock, the same order `cleared` follows: `save` writes the whole
+    // record, so the copy it writes must have been read while no other writer could run — a
+    // clearance recorded between the first load and the lock would otherwise be erased by the
+    // save below. The first load serves only the existence refusal and the lock key, and the
+    // guard below runs on this fresh copy so a Run another supervisor finished in that window
+    // is not re-entered.
     let mut record = RunRecord::load(&path)?;
 
     // Option (a) from the review: widen the guard rather than add a second branch below it.
@@ -417,10 +432,6 @@ pub fn resume(run_id: &str) -> Result<Outcome, Refusal> {
         });
     }
 
-    // A Run being re-entered by hand holds its branch exactly as a dispatched one does, and the
-    // original holder's lock died with its supervisor.
-    let _lock = take_lock(&home, &record.job.target_repo, &record.job.branch)?;
-
     let pid = world::pid();
     record.supervisor_pid = pid;
     record.supervisor_identity = recorded_identity(pid);
@@ -451,7 +462,11 @@ pub fn cleared(run_id: &str, note: &str) -> Result<(), Refusal> {
     let mut record = RunRecord::load(&path)?;
     record_clearance(&mut record, note, world::now_iso())?;
     record.save(&path)?;
-    say(&run_dir, &format!("  clearance recorded: {}", note.trim()));
+    // Logged from the row that was actually stored, so the account and the record cannot
+    // say two different things about one note.
+    if let Some(row) = record.clearances().last() {
+        say(&run_dir, &format!("  clearance recorded: {}", row.note));
+    }
     Ok(())
 }
 
@@ -732,9 +747,8 @@ fn supervise(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, Refusal>
                 say(
                     run_dir,
                     &format!(
-                        "    stopped for a human — {what} was refused twice with no progress; \
-                     `grind cleared {id} \"<what changed>\"`, then `grind resume {id}`",
-                        id = record.run_id
+                        "    stopped for a human — {what} was refused twice with no progress; {}",
+                        crate::render::repair_hint(&record.run_id)
                     ),
                 );
             }
@@ -767,10 +781,7 @@ fn run_one_attempt(
         Mode::Dispatch => attempt::dispatch(&conditions, &record.job),
         // The latest clearance rides every Resume re-entry — a fact about the world does
         // not expire — and only Resume: CiBabysit bounds itself to one reaction.
-        Mode::Resume => attempt::resume(
-            &conditions,
-            record.clearances().last().map(|c| c.note.as_str()),
-        ),
+        Mode::Resume => attempt::resume(&conditions, record.clearances().last()),
         Mode::CiBabysit => attempt::ci_babysit(&conditions),
     };
 

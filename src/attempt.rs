@@ -188,23 +188,32 @@ pub fn dispatch(conditions: &Conditions, job: &Job) -> Invocation {
     build(conditions, Mode::Dispatch, dispatch_prompt(job))
 }
 
-/// Every later attempt, resuming the same session id. The latest clearance note rides this
+/// Every later attempt, resuming the same session id. The latest clearance rides this
 /// prompt and only this one: Dispatch has no stop behind it, and CiBabysit bounds itself to
 /// one reaction and must not grow a second subject (R2).
-pub fn resume(conditions: &Conditions, cleared: Option<&str>) -> Invocation {
+pub fn resume(conditions: &Conditions, cleared: Option<&Clearance>) -> Invocation {
     build(conditions, Mode::Resume, reentry_prompt(cleared))
 }
 
-/// `REENTRY_PROMPT`, with the human's clearance note composed after it when one exists.
+/// `REENTRY_PROMPT`, with the human's clearance composed after it when one exists.
 /// **Default is silence**, the same rule as `intent_line`: with no note the prompt is the
 /// constant, exactly — nothing is rendered where nothing was recorded.
-fn reentry_prompt(cleared: Option<&str>) -> String {
+///
+/// The note is dated and framed as an account to check, never as current fact: the latest
+/// clearance rides **every** later Resume (R3), so on a Run that re-blocked after the note
+/// was recorded, an unconditional *trust it* would order the agent to prefer stale
+/// information over its own newer observation.
+fn reentry_prompt(cleared: Option<&Clearance>) -> String {
     match cleared {
-        Some(note) => format!(
-            "{REENTRY_PROMPT}\n\nSince you stopped, the human reports: {note}\n\nThat is \
-             what changed in the world since your last observation. Trust it over what you \
-             last saw of the obstacle, and do not spend turns re-probing what it says is \
-             cleared."
+        Some(clearance) => format!(
+            "{REENTRY_PROMPT}\n\nSince you stopped, the human reports (recorded {at}): \
+             {note}\n\nThat is their account of what changed in the world, from the moment \
+             it was recorded. Check it against what you now observe: do not spend turns \
+             re-probing an obstacle the note says is cleared and the world confirms — but \
+             where the world in front of you contradicts the note, trust what you observe \
+             and say so plainly.",
+            at = clearance.cleared_at,
+            note = clearance.note,
         ),
         None => REENTRY_PROMPT.to_string(),
     }
@@ -734,7 +743,7 @@ mod tests {
         for invocation in [
             dispatch(&conditions, &job()),
             resume(&conditions, None),
-            resume(&conditions, Some("the wall moved")),
+            resume(&conditions, Some(&a_clearance("the wall moved"))),
             ci_babysit(&conditions),
         ] {
             assert_eq!(
@@ -1324,13 +1333,20 @@ mod tests {
 
     // --- the clearance note rides Resume and nothing else --------------------------------------
 
+    fn a_clearance(note: &str) -> Clearance {
+        Clearance {
+            cleared_at: "2026-08-21T19:00:00+00:00".to_string(),
+            note: note.to_string(),
+        }
+    }
+
     #[test]
     fn a_clearance_note_rides_the_resume_prompt_and_never_dispatch_or_ci_babysit() {
         // The safety property R6 names: the composed prompt reaches Resume invocations only.
         // Asserted against the **built** invocations, in the spirit of the argv tests above.
         let conditions = conditions(None);
         let note = "the deploy key was rotated; the push will go through now";
-        let resumed = resume(&conditions, Some(note));
+        let resumed = resume(&conditions, Some(&a_clearance(note)));
         assert!(
             resumed.prompt().starts_with(REENTRY_PROMPT),
             "the note composes after the re-entry text, never instead of it:\n{}",
@@ -1339,7 +1355,7 @@ mod tests {
         assert!(
             resumed
                 .prompt()
-                .contains("Since you stopped, the human reports:"),
+                .contains("Since you stopped, the human reports"),
             "{}",
             resumed.prompt()
         );
@@ -1356,6 +1372,26 @@ mod tests {
                 other.mode()
             );
         }
+    }
+
+    #[test]
+    fn the_composed_clearance_is_dated_and_checked_against_the_world_rather_than_trusted_blind() {
+        // The latest note rides every later Resume (R3), so on a Run that re-blocked after
+        // the note was recorded, an unconditional *trust it* would order the agent to prefer
+        // stale information over its own newer observation. The date is what lets the agent
+        // weigh the account, and the framing asks it to verify, not obey.
+        let prompt = resume(&conditions(None), Some(&a_clearance("the wall moved")))
+            .prompt()
+            .to_string();
+        assert!(
+            prompt.contains("recorded 2026-08-21T19:00:00+00:00"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("what you now observe"), "{prompt}");
+        assert!(
+            !prompt.contains("Trust it over what you last saw"),
+            "the unconditional trust clause must not come back: {prompt}"
+        );
     }
 
     #[test]

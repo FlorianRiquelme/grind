@@ -544,16 +544,22 @@ fn handback_verdict(
     if matches!(observation.checks_red, Observed::Present(true)) {
         said = format!("{said} — ${:.2} of repair spent", repair_spend(found));
     }
-    // The repair is two verbs, named in order beside what must be cleared: `cleared`
-    // records what changed, `resume` spends. Describing the way back is not a gate.
+    // The repair is named in order beside what must be cleared. Describing the way back is
+    // not a gate.
     if let Some(what) = blocker {
         said = format!(
-            "{said}  (a Blocker: {what} must be cleared — `grind cleared {id} \"<what \
-             changed>\"`, then `grind resume {id}`)",
-            id = found.run_id
+            "{said}  (a Blocker: {what} must be cleared — {})",
+            repair_hint(&found.run_id)
         );
     }
     said
+}
+
+/// The two-step repair, in order: `cleared` records what changed, `resume` spends. One
+/// composition for the verdict line and the supervisor's stop line alike, so the two
+/// surfaces cannot drift into different spellings of one command.
+pub fn repair_hint(run_id: &str) -> String {
+    format!("`grind cleared {run_id} \"<what changed>\"`, then `grind resume {run_id}`")
 }
 
 /// What the one bounded CI-babysit invocation cost, which is the whole of the repair budget.

@@ -66,9 +66,12 @@ fn two_worktrees_of_one_repo_on_one_branch_collide() {
 
     let refused = take_lock(&home, REPO, BRANCH).expect_err("the second Dispatch must be refused");
     assert!(
-        refused.to_string().contains("another Run holds"),
+        refused.to_string().contains("already holds"),
         "a collision must read as a collision: {refused}"
     );
+    // Named neutrally: for `resume` and `cleared` the holder can be the named Run's own
+    // supervisor, so the collision word must not send the human hunting for *another* Run.
+    assert!(!refused.to_string().contains("another Run"), "{refused}");
 
     let _ = holder.kill();
     let _ = holder.wait();
@@ -133,7 +136,7 @@ fn a_lock_that_cannot_be_opened_is_could_not_determine_and_never_a_collision() {
     let said = refused.to_string();
     assert!(said.contains("could not determine"), "{said}");
     assert!(
-        !said.contains("another Run holds"),
+        !said.contains("already holds"),
         "could-not-determine must never read as a collision: {said}"
     );
 }

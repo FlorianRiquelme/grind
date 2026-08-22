@@ -809,7 +809,7 @@ fn scenario_g_a_repeated_denial_with_no_progress_stops_for_a_human_and_resumes()
     let resumed_prompt = fs::read_to_string(box_.run_dir().join("attempt-4.prompt.txt"))
         .expect("the resumed attempt's prompt");
     assert!(
-        resumed_prompt.contains("Since you stopped, the human reports:"),
+        resumed_prompt.contains("Since you stopped, the human reports (recorded "),
         "{resumed_prompt}"
     );
     assert!(
