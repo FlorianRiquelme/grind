@@ -136,10 +136,65 @@ pub fn denied_for_reflect() -> Vec<String> {
     denials
 }
 
-/// `<run>-<stage>`, the session id a stage's own Attempt dispatches or resumes. Re-entry resumes
-/// the dying *stage's* session, never the Run's old mega-session.
+/// The session id a stage's own Attempt dispatches or resumes: a validly formatted UUID,
+/// deterministically derived from `(run_id, stage)`. `claude -p --session-id` only accepts a
+/// UUID, so the literal `<run>-<stage>` text this used to format died every dispatch at
+/// startup (#111); the derivation is FNV-1a over both parts — the same std-only hash
+/// [`crate::supervisor::skills_hash`] carries — because the supervisor must re-derive *the
+/// same* id on `--resume`, possibly days later, and an identity check (never a security
+/// boundary) takes no dependency. Version and variant bits are set, so the result parses as a
+/// UUID everywhere `--session-id` lands. Re-entry resumes the dying *stage's* session, never
+/// the Run's old mega-session.
 pub fn stage_session_id(run_id: &str, stage: rung::Stage) -> String {
-    format!("{run_id}-{stage}")
+    session_id_from(run_id, &stage.to_string())
+}
+
+/// Reflect's session id — the same derivation as a stage's, named `"reflect"` since
+/// [`rung::Stage`] deliberately has no variant for it (the design's own words).
+pub fn reflect_session_id(run_id: &str) -> String {
+    session_id_from(run_id, "reflect")
+}
+
+/// Two independent FNV-1a passes over `(run_id, name)` in both orders give 128 bits without
+/// a dependency; the zero-byte separator keeps `"ab"`+`"c"` and `"a"`+`"bc"` apart within a
+/// pass, and the differing seeds keep the two passes from echoing each other.
+fn session_id_from(run_id: &str, name: &str) -> String {
+    fn fnv1a(seed: u64, parts: [&str; 2]) -> u64 {
+        let mut hash = seed;
+        for part in parts {
+            for byte in part.bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash ^= 0; // a separator, so "ab"+"c" and "a"+"bc" hash differently
+        }
+        hash
+    }
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&fnv1a(0xcbf2_9ce4_8422_2325, [run_id, name]).to_be_bytes());
+    bytes[8..].copy_from_slice(&fnv1a(0x9e37_79b9_7f4a_7c15, [name, run_id]).to_be_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-\
+         {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
 }
 
 /// What a stage invocation needs beyond a session id and a binary path: the stage itself, its
@@ -236,7 +291,7 @@ pub fn reflect_resume(conditions: &StageConditions, skill_text: &str) -> Invocat
 }
 
 fn build_reflect(conditions: &StageConditions, skill_text: &str, mode: Mode) -> Invocation {
-    let session_id = format!("{}-reflect", conditions.run_id);
+    let session_id = reflect_session_id(conditions.run_id);
     let mut argv = vec![
         conditions.claude_bin.to_string(),
         "-p".to_string(),
@@ -1560,15 +1615,36 @@ mod tests {
     }
 
     #[test]
-    fn stage_session_ids_are_run_id_dash_stage_for_all_ten_stages() {
+    fn stage_session_ids_are_valid_uuids_deterministic_across_calls_and_distinct_per_stage() {
+        fn uuid_shaped(text: &str) -> bool {
+            let bytes = text.as_bytes();
+            if bytes.len() != 36 {
+                return false;
+            }
+            for (i, b) in bytes.iter().enumerate() {
+                let ok = match i {
+                    8 | 13 | 18 | 23 => *b == b'-',
+                    14 => *b == b'4',
+                    19 => matches!(b, b'8' | b'9' | b'a' | b'b'),
+                    _ => matches!(b, b'0'..=b'9' | b'a'..=b'f'),
+                };
+                if !ok {
+                    return false;
+                }
+            }
+            true
+        }
+        let mut seen = std::collections::HashSet::new();
         for stage in ALL_STAGES {
+            let id = stage_session_id("run-1", stage);
+            assert!(uuid_shaped(&id), "{stage}: {id} is not a valid UUID");
             assert_eq!(
                 stage_session_id("run-1", stage),
-                format!("run-1-{stage}"),
-                "{stage}"
+                id,
+                "{stage}: the supervisor must re-derive the same id on --resume"
             );
+            assert!(seen.insert(id), "{stage}: collides with another stage's id");
         }
-        assert_eq!(stage_session_id("run-1", rung::Stage::Work), "run-1-work");
     }
 
     #[test]
@@ -1579,7 +1655,10 @@ mod tests {
         let argv = invocation.argv();
         assert!(argv.contains(&"--session-id".to_string()));
         let at = argv.iter().position(|a| a == "--session-id").unwrap();
-        assert_eq!(argv[at + 1], "run-20260822-001-work");
+        assert_eq!(
+            argv[at + 1],
+            stage_session_id("run-20260822-001", rung::Stage::Work)
+        );
         assert!(!argv.contains(&"--resume".to_string()));
         assert!(!argv.contains(&"--plugin-dir".to_string()));
     }
@@ -1592,7 +1671,10 @@ mod tests {
         let argv = invocation.argv();
         assert!(argv.contains(&"--resume".to_string()));
         let at = argv.iter().position(|a| a == "--resume").unwrap();
-        assert_eq!(argv[at + 1], "run-20260822-001-review");
+        assert_eq!(
+            argv[at + 1],
+            stage_session_id("run-20260822-001", rung::Stage::Review)
+        );
         assert!(!argv.contains(&"--session-id".to_string()));
         assert!(!argv.contains(&"--plugin-dir".to_string()));
     }

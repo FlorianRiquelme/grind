@@ -788,7 +788,7 @@ fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
         claude_bin: &record.claude_bin,
         run_id: &record.run_id,
     };
-    let session_id = format!("{}-reflect", record.run_id);
+    let session_id = attempt::reflect_session_id(&record.run_id);
     let worktree = PathBuf::from(&record.worktree);
     // Bounded at one re-entry: a fresh dispatch, then at most one resume. Counted off the
     // recorded `StageEntry` rows rather than the transcript alone — a died-before-writing-a-
@@ -1816,10 +1816,17 @@ mod tests {
     #[test]
     fn a_new_records_session_id_is_the_plan_stages_own() {
         // Decision 4: a new record leaves the Run-level `session_id` as the Plan stage's id
-        // rather than a Run-wide mega-session — Plan is where the ladder always starts.
-        assert_eq!(
-            attempt::stage_session_id("20260806-122620-snapper-28", Stage::Plan),
-            "20260806-122620-snapper-28-plan"
+        // rather than a Run-wide mega-session — Plan is where the ladder always starts. The id
+        // itself is the derived UUID, pinned by attempt's own test; what matters here is that
+        // the derivation separates stages, so Plan's session is never Work's or Ship's.
+        let run = "20260806-122620-snapper-28";
+        let plan = attempt::stage_session_id(run, Stage::Plan);
+        assert_ne!(plan, attempt::stage_session_id(run, Stage::Work));
+        assert_ne!(plan, attempt::stage_session_id(run, Stage::Ship));
+        assert_ne!(
+            plan,
+            attempt::reflect_session_id(run),
+            "reflect is not a rung, but its session must still be its own"
         );
     }
 

@@ -21,6 +21,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use grind::{attempt, rung};
+
 const OWNER: &str = "FlorianRiquelme";
 const NAME: &str = "snapper";
 const BRANCH: &str = "feat/28-slice-1b-agent-surface-screensource-seam";
@@ -507,6 +509,7 @@ fn scenario_a_a_real_run_shape_with_the_literal_argv_of_every_attempt() {
     assert_eq!(code, Some(0), "stdout:\n{out}\nstderr:\n{err}");
 
     let record = box_.record();
+    let run_id = record["run_id"].as_str().expect("a run id").to_string();
     assert_eq!(record["state"], "completed", "stdout:\n{out}");
     let attempts = record["attempts"].as_array().expect("attempts");
     assert_eq!(attempts.len(), 5, "five attempts, as Run 1 took");
@@ -594,10 +597,15 @@ fn scenario_a_a_real_run_shape_with_the_literal_argv_of_every_attempt() {
     assert_eq!(reflect.len(), 1);
     assert!(reflect[0].contains(&"--session-id".to_string()));
     assert!(!reflect[0].contains(&"--plugin-dir".to_string()));
-    assert!(
-        reflect[0].iter().any(|a| a.ends_with("-reflect")),
-        "{:?}",
-        reflect[0]
+    // Reflect's own derived UUID — never a `<run>-reflect` suffix, which was not a UUID and
+    // died every dispatch at startup.
+    let reflect_at = reflect[0]
+        .iter()
+        .position(|a| a == "--session-id")
+        .expect("reflect opens its own session");
+    assert_eq!(
+        reflect[0][reflect_at + 1],
+        attempt::reflect_session_id(&run_id)
     );
 
     // Every attempt's raw landed on disk, including the ones that died and the silent one.
@@ -917,7 +925,7 @@ fn scenario_h_a_ladder_walk_completes_plan_then_triage_before_plan_review_ever_d
     );
     assert_eq!(
         stages[0]["session_id"].as_str().unwrap(),
-        format!("{run_id}-plan")
+        attempt::stage_session_id(&run_id, rung::Stage::Plan)
     );
 
     // Triage: zero-token, no session, costing none of Plan's or plan-review's attempts.
@@ -935,7 +943,7 @@ fn scenario_h_a_ladder_walk_completes_plan_then_triage_before_plan_review_ever_d
         assert_eq!(row["name"], "plan-review");
         assert_eq!(
             row["session_id"].as_str().unwrap(),
-            format!("{run_id}-plan-review")
+            attempt::stage_session_id(&run_id, rung::Stage::PlanReview)
         );
     }
 
@@ -965,7 +973,7 @@ fn scenario_h_a_ladder_walk_completes_plan_then_triage_before_plan_review_ever_d
     assert_eq!(argvs[1][first_review_at], "--session-id");
     assert_eq!(
         argvs[1][first_review_at + 1],
-        format!("{run_id}-plan-review")
+        attempt::stage_session_id(&run_id, rung::Stage::PlanReview)
     );
     for argv in &argvs[2..] {
         let at = argv
@@ -976,7 +984,10 @@ fn scenario_h_a_ladder_walk_completes_plan_then_triage_before_plan_review_ever_d
             argv[at], "--resume",
             "plan-review re-enters, never re-opens"
         );
-        assert_eq!(argv[at + 1], format!("{run_id}-plan-review"));
+        assert_eq!(
+            argv[at + 1],
+            attempt::stage_session_id(&run_id, rung::Stage::PlanReview)
+        );
     }
 }
 
