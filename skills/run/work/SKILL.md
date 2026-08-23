@@ -59,8 +59,9 @@ Reflect, a human) sees what was actually checked rather than what was claimed.
 ## Verify entrypoint
 
 Run the Job's declared verify entrypoint before this stage returns `complete`. A red result is
-recorded in the return and in `evidence.json` — it never silently blocks the return from being
-written, because Grind never gates (ADR-0003); it is a fact the Record carries forward to Fixes.
+recorded in `evidence.json` — never as an extra key on the return, which stays exactly
+`{"status": …}` — and it never silently blocks the return from being written, because Grind
+never gates (ADR-0003); it is a fact the Record carries forward to Fixes.
 
 ## Idempotent re-entry
 

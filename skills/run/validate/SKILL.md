@@ -11,7 +11,8 @@ runs, its job is narrow: turn a persona's claim into a fact someone can check.
 ## The return
 
 Your stages directory is named in the dispatch prompt. Write `<stages-dir>/validate.return.json`
-containing exactly `{"status": "complete"}` — strict serde, deny-unknown-fields, no other key.
+containing exactly `{"status": "complete"}`, or `{"status": "incomplete"}` when the stage could
+not finish — strict serde, deny-unknown-fields, no other key.
 Everything else is artifact files under `<stages-dir>/validate/`: the durable finding-by-finding
 verdicts belong there, not in the return.
 
