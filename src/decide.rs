@@ -857,7 +857,7 @@ impl std::fmt::Display for Tier {
 
 /// The nine-persona review library (ADR-0015's design, issue #92). Every persona exists whether
 /// or not it fires; `panel` decides who fires for a given diff.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Persona {
     Correctness,
@@ -1432,11 +1432,14 @@ pub fn select_tier(
 /// already reach the T1 band's low end on their own, and forcing a fourth persona to fire when
 /// nothing about the diff class-matches would be inventing a signal that is not there.
 ///
-/// **T3's cross-model panel** doubles `Correctness` (unconditionally — it always fired to get
-/// here) and `Security` (only if it fired) as the design's second-family seats, additively past
-/// the 9-persona cap. Which model actually staffs the second seat is a later phase's wiring
-/// concern; on a single-model host that seat's honest degeneration belongs in the Decision
-/// receipt at that point, not forced here where there is no host to read.
+/// **T3's second-family seats** (a doubled `Correctness`, and `Security` again when it fired)
+/// are *not* emitted here yet. The design's roster is a list of personas, and every entry in it
+/// maps one-to-one onto a session writing `<stages-dir>/review/<persona>/findings.json` — two
+/// seats named alike would write the same file, the second overwriting the first, and the lead's
+/// exists-vs-spawned reconciliation could not tell a dead seat from an overwritten one. Until
+/// the cross-model wiring phase gives the second seat an identity of its own (a `(persona,
+/// seat)` pair with distinct artifact names), a single-model host runs the unique roster: the
+/// doubling arrives together with the identity it needs.
 pub fn panel(tier: Tier, plan: Option<&PlanFacts>, diff: Option<&DiffFacts>) -> Vec<Persona> {
     if tier == Tier::T0 {
         return vec![Persona::Correctness];
@@ -1478,19 +1481,12 @@ pub fn panel(tier: Tier, plan: Option<&PlanFacts>, diff: Option<&DiffFacts>) -> 
         Tier::T3 => 9,
     };
 
-    let mut roster: Vec<Persona> = candidates
+    let roster: Vec<Persona> = candidates
         .into_iter()
         .filter(|(_, fires)| *fires)
         .map(|(persona, _)| persona)
         .take(cap)
         .collect();
-
-    if tier == Tier::T3 {
-        roster.push(Persona::Correctness);
-        if roster.contains(&Persona::Security) {
-            roster.push(Persona::Security);
-        }
-    }
 
     roster
 }
@@ -1730,7 +1726,7 @@ mod tier_tests {
     }
 
     #[test]
-    fn t3_doubles_correctness_always_and_security_only_when_it_fired() {
+    fn t3_roster_stays_unique_and_security_only_when_it_fired() {
         let with_security = DiffFacts {
             changed_loc: 5,
             risky_paths_hit: vec![RiskyPathKind::Crypto],
@@ -1739,25 +1735,20 @@ mod tier_tests {
             dep_manifest_touched: false,
         };
         let roster = panel(Tier::T3, None, Some(&with_security));
-        assert_eq!(
-            roster
-                .iter()
-                .filter(|p| **p == Persona::Correctness)
-                .count(),
-            2
-        );
+        assert!(roster.contains(&Persona::Correctness));
         assert_eq!(
             roster.iter().filter(|p| **p == Persona::Security).count(),
-            2
+            1
+        );
+        let unique = roster.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            unique.len(),
+            roster.len(),
+            "every roster entry maps one-to-one onto review/<persona>/findings.json — a \
+             duplicate seat would overwrite its sibling's file and defeat the lead's \
+             exists-vs-spawned reconciliation (#117)"
         );
 
-        let bad_record_only = TrackRecord {
-            runs: 3,
-            unattended_completions: 0,
-            ci_failures: 0,
-            reverted: 1,
-        };
-        assert!(bad_record_only.is_bad());
         let no_risky_diff = DiffFacts {
             changed_loc: 5,
             risky_paths_hit: vec![],
@@ -1767,16 +1758,9 @@ mod tier_tests {
         };
         let roster = panel(Tier::T3, None, Some(&no_risky_diff));
         assert_eq!(
-            roster
-                .iter()
-                .filter(|p| **p == Persona::Correctness)
-                .count(),
-            2
-        );
-        assert_eq!(
             roster.iter().filter(|p| **p == Persona::Security).count(),
             0,
-            "security never fired on this diff, so there is no seat to double"
+            "security never fired on this diff"
         );
     }
 
