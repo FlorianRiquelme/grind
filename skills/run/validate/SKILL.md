@@ -67,7 +67,11 @@ the citation, not on your patience with the prose.
    attacking.
 
 Write `<stages-dir>/validate/findings-validated.json`: one row per finding, its verdict, its
-citations, whether it was agreement-weighted or demoted, unchanged file/lines from Review.
+citations, whether it was agreement-weighted or demoted, and the finding's own `file`, `lines`,
+`severity` and `autofix_class` carried unchanged from Review. `autofix_class` especially: it is
+the key Fixes' eligibility logic reads (`gated_auto` applies directly, `advisory` never applies),
+so a row that drops it leaves Fixes guessing at a default instead of acting on what Review
+recorded.
 
 ## Never
 
