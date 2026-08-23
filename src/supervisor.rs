@@ -1155,16 +1155,17 @@ fn resolve_stage_model(record: &RunRecord, run_dir: &Path, stage: Stage) -> Opti
 /// The per-template lookback the two [R] passes fold into their tier call: every *other* Run on
 /// this host that targeted the same repo, read read-only through `view::RunView` — never the
 /// writer type — and derived on demand (the derivability rule: no separate store, the Records
-/// and their `outcome.json` files already answer this). `ci_failed` is `false` throughout for
-/// now: no per-Run CI fact is recorded yet, and degrade-don't-abort means the fold sees less
-/// history, never wrong history — a stale or absent `outcome.json` only means the tier floor is
-/// computed from less. `grind outcomes` is what makes the survival half non-trivial.
+/// already answer this). A prior Run counts as `ci_failed` when its record shows a
+/// [`Mode::CiBabysit`] attempt: policy only ever spends that mode via [`Next::SpendCiBudget`],
+/// which is entered when a check came back red, so *the budget was spent* *is* the fact — no
+/// new state, no migration. Degrade-don't-abort still holds: a stale or unreadable record only
+/// means the tier floor is computed from less history, never from wrong history.
 fn template_record_for(target_repo: &str, this_run: &str) -> decide::TrackRecord {
     let Some(home) = world::home() else {
         return decide::TrackRecord::default();
     };
     let runs = job::runs_dir(&home);
-    let mut gathered: Vec<(bool, Option<String>)> = Vec::new();
+    let mut gathered: Vec<(bool, bool, Option<String>)> = Vec::new();
     for entry in world::list_dir(&runs) {
         let Some(run_id) = entry.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -1179,18 +1180,28 @@ fn template_record_for(target_repo: &str, this_run: &str) -> decide::TrackRecord
             continue;
         }
         let completed = found.state == "completed";
+        let ci_failed = prior_run_spent_ci_budget(&found.attempts);
         let outcome = world::read_to_string(&runs.join(run_id).join("outcome.json")).ok();
-        gathered.push((completed, outcome));
+        gathered.push((completed, ci_failed, outcome));
     }
     let facts: Vec<decide::RunOutcomeFacts> = gathered
         .iter()
-        .map(|(completed, outcome)| decide::RunOutcomeFacts {
+        .map(|(completed, ci_failed, outcome)| decide::RunOutcomeFacts {
             completed_unattended: *completed,
-            ci_failed: false,
+            ci_failed: *ci_failed,
             outcome_json: outcome.as_deref(),
         })
         .collect();
     decide::track_record_from(&facts)
+}
+
+/// Whether a Run's recorded attempts show its one bounded CI-babysit round was spent.
+/// [`Mode::CiBabysit`] has exactly one entry point — [`Next::SpendCiBudget`], taken only when
+/// a check came back red — so the recorded mode is the whole derivation of *CI failed on this
+/// Run*, derived rather than stored (ADR-0013's shape: nothing new to persist, nothing to
+/// migrate, nothing to drift).
+fn prior_run_spent_ci_budget(attempts: &[Attempt]) -> bool {
+    attempts.iter().any(|a| a.mode == Mode::CiBabysit)
 }
 
 /// Plan-only injected notes and lessons (unit B's `StageContext::notes`), read by the caller so
@@ -1917,6 +1928,36 @@ mod tests {
             "the babysit round must ride the same routed model Ship's other attempts get"
         );
         world::remove_tree(&run_dir);
+    }
+
+    #[test]
+    fn a_prior_runs_ci_babysit_attempt_is_what_counts_it_as_a_ci_failure() {
+        // #105: `Mode::CiBabysit` has exactly one entry point — `Next::SpendCiBudget`, taken
+        // only when a check came back red — so a prior record showing the mode *is* the fact,
+        // derived from attempts already persisted rather than stored anew. The day-one
+        // fixture's last attempt is its ci-babysit round; a Run with none spent nothing.
+        let spent = day_one();
+        assert!(prior_run_spent_ci_budget(spent.attempts()));
+        let mut clean = day_one();
+        clean.attempts.clear();
+        assert!(!prior_run_spent_ci_budget(clean.attempts()));
+        let facts = [
+            decide::RunOutcomeFacts {
+                completed_unattended: true,
+                ci_failed: prior_run_spent_ci_budget(spent.attempts()),
+                outcome_json: None,
+            },
+            decide::RunOutcomeFacts {
+                completed_unattended: true,
+                ci_failed: prior_run_spent_ci_budget(clean.attempts()),
+                outcome_json: None,
+            },
+        ];
+        assert_eq!(
+            decide::track_record_from(&facts).ci_failures,
+            1,
+            "exactly the budget-spending Run counts as a CI failure"
+        );
     }
 
     #[test]
