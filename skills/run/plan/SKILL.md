@@ -5,7 +5,7 @@ description: The first rung of Grit's ladder. Writes the anchor-plan from the Jo
 
 # Plan
 
-Author the plan the machine checklist will grade. Everything this stage needs — the Job issue, its
+Author the plan Plan review's checklist will grade. Everything this stage needs — the Job issue, its
 template rows, and any lessons or target-repo notes injected at composition time — arrives already
 in the dispatch prompt. **Never go hunting for it**: no separate fetch of the issue, no re-deriving
 a row the prompt already states.
@@ -54,9 +54,10 @@ target-repo notes the dispatch prompt injected. Contains:
 - **Test-file paths** for every feature-bearing step — the path Work's evidence strategy will use,
   named now rather than discovered mid-Work.
 
-## The machine checklist this plan is graded by
+## The checklist this plan is graded by
 
-Plan review's own pure-Rust pass, run by the supervisor before any review session, checks:
+Plan review runs this checklist first, before any lens fires — the same six items its own
+skill states, so the two halves are a contract: change either and check the other. It checks:
 
 1. The plan file exists.
 2. `readiness:` parses and equals `implementation-ready`.
@@ -97,4 +98,4 @@ Plan review and, downstream of Grind entirely, to the human.
 
 ---
 
-*Author the plan the machine checklist will grade; state done so a machine could grade it.*
+*Author the plan Plan review's checklist will grade; state done so a machine could grade it.*

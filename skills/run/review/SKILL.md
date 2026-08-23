@@ -23,7 +23,9 @@ Every persona session receives the same three things and nothing else:
 - the diff (`git diff <handoff-sha>..HEAD`, or the range the dispatch prompt names)
 - the relevant plan units from `<stages-dir>/plan/anchor-plan.md` (the units the diff's touched paths
   map to — pass the whole plan when the mapping is ambiguous, never trim to the point of guessing)
-- that persona's own instruction file (`personas/<name>.md`)
+- that persona's own instruction file (`~/.grind/skills/run/review/personas/<name>.md` — the
+  installed skills root, never a path relative to the target worktree, where a bare
+  `personas/…` resolves only when the target repo happens to be grind itself)
 
 **Never the Run transcript. Never another persona's findings file.** This is the contract, not
 advice: a persona that has read a sibling's conclusion is no longer an independent seat, and a
@@ -37,8 +39,11 @@ findings history, never Refuted or Unfounded rows.
 One subagent session per persona in `decision.json`'s `personas` list, in the order the nine-persona
 library lists them (Correctness, Security, Concurrency, Schema, Surface, Tests, Performance,
 Consistency, Docs) — a stable order, never re-sorted by this stage. Each session runs report-only:
-Write and Edit denied, and no write-capable Bash form available, so "touches nothing" is a property
-of the sandbox and not a promise in the prompt.
+Write and Edit denied, and the enumerated write-capable Bash forms (`git commit`, `git add`, `mv`,
+`cp`, `rm`, `tee`, `sed -i`, …) denied with them. Shell redirection is **not** denied — it cannot
+be, since it is exactly how each persona writes its findings file — so the sandbox narrows the
+surface without closing it, and "touches nothing in the worktree" is a discipline this prompt
+states: every byte a persona writes lands under `<stages-dir>`, never under the worktree.
 
 Each conditional persona (every one but Correctness and Tests) states in its findings file the
 one-line reason it fired: the tier Decision selected it, and the justification restates the
@@ -119,7 +124,8 @@ the stage is done.
   work. A finding describes the diff. It never recommends blocking, withholding, or "not shipping"
   anything — the gate stays downstream at human merge (ADR-0003), and this stage has no opinion
   about it.
-- **Touch the worktree.** Report-only is a sandbox property here, not a prompt-level promise this
-  skill is trusted to keep on its own.
+- **Touch the worktree.** The sandbox denies Write, Edit and the enumerated Bash forms, but
+  redirection stays open because the findings files need it — so keeping every write under
+  `<stages-dir>` is this skill's own discipline, backed only partway by the denials.
 
 Report what the diff breaks, cite your checklist ID, touch nothing.

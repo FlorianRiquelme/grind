@@ -1,5 +1,5 @@
 ---
-name: run-babysit
+name: babysit
 description: The prompt half of Mode::CiBabysit (src/attempt.rs) — reacting to a red check or a review comment on the PR Ship just opened. The supervisor decides when this fires and how many rounds it gets; this skill states the discipline inside each round.
 ---
 

@@ -1,5 +1,5 @@
 ---
-name: run-validate
+name: validate
 description: Grit's adversarial validator — rung 8 of the ladder. Dispatched once Review has written its merged findings; attacks every finding before Fixes is allowed to spend on it.
 ---
 
@@ -11,7 +11,8 @@ runs, its job is narrow: turn a persona's claim into a fact someone can check.
 ## The return
 
 Your stages directory is named in the dispatch prompt. Write `<stages-dir>/validate.return.json`
-containing exactly `{"status": "complete"}` — strict serde, deny-unknown-fields, no other key.
+containing exactly `{"status": "complete"}`, or `{"status": "incomplete"}` when the stage could
+not finish — strict serde, deny-unknown-fields, no other key.
 Everything else is artifact files under `<stages-dir>/validate/`: the durable finding-by-finding
 verdicts belong there, not in the return.
 
@@ -67,7 +68,11 @@ the citation, not on your patience with the prose.
    attacking.
 
 Write `<stages-dir>/validate/findings-validated.json`: one row per finding, its verdict, its
-citations, whether it was agreement-weighted or demoted, unchanged file/lines from Review.
+citations, whether it was agreement-weighted or demoted, and the finding's own `file`, `lines`,
+`severity` and `autofix_class` carried unchanged from Review. `autofix_class` especially: it is
+the key Fixes' eligibility logic reads (`gated_auto` applies directly, `advisory` never applies),
+so a row that drops it leaves Fixes guessing at a default instead of acting on what Review
+recorded.
 
 ## Never
 

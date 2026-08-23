@@ -1,5 +1,5 @@
 ---
-name: run-fixes
+name: fixes
 description: Grit's fix stage — rung 9 of the ladder. Applies only what Validate confirmed, re-running the Job's verify entrypoint each round.
 ---
 

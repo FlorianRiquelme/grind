@@ -10,6 +10,13 @@ depth adapts by tier, from one combined-lens pass at T0/T1 up to a cross-model s
 stage never touches the target repo's worktree; it reads the plan and the repo and writes only
 under `<stages-dir>/plan-review/`.
 
+Grind computes the depth; this skill never re-derives it. Read
+`<stages-dir>/triage/decision.json` (`decide::Decision`) once, at the top — Diff-triage has not
+run yet, so Triage's is the Decision that exists: `tier` names the tier and `depth.reviewers`
+is exactly the seat count you run (1 at T0/T1, 2 at T2, 3 at T3). If the file is missing or
+fails to parse, that is a Blocker for the supervisor to clear, never a depth this skill invents
+from reading the plan itself — the same rule Review applies to its roster.
+
 ## The return
 
 Write `<stages-dir>/plan-review.return.json` containing **exactly**:
@@ -38,6 +45,22 @@ Under `<stages-dir>/plan-review/`:
 The revised plan checkpoint itself lands back at `<stages-dir>/plan/anchor-plan.md` — Work reads
 that path always, whether or not a revision happened, so it never has to know which version it got.
 
+## The plan checklist, first
+
+Before any lens fires, grade the plan against the six-item checklist plan/SKILL.md tells its
+author to write toward — the two skills state the same list, so the halves are a contract:
+change either and check the other.
+
+1. The plan file exists.
+2. `readiness:` parses and equals `implementation-ready`.
+3. The done predicate is present and stated so a machine could grade it.
+4. Every referenced path is repo-relative with an existing parent at the Handoff SHA.
+5. Every feature-bearing step names test-file paths.
+6. The declared base branch is present and the Handoff SHA sits on it.
+
+Each miss is a finding in `findings.json` like any other — described, bucketed, never a gate
+(ADR-0003).
+
 ## The six checks
 
 None of these is a gate. Each produces findings, never a pass/fail:
@@ -56,9 +79,13 @@ None of these is a gate. Each produces findings, never a pass/fail:
 
 ## Personas
 
-Two lenses, always: `personas/coherence.md` and `personas/feasibility.md`. Read the full file and
-pass it verbatim to the dispatched reviewer session — never paraphrase a persona from memory. At
-T2 a second independent reviewer session runs the same two lenses; at T3 a third seat runs on a
+Two lenses, always: `~/.grind/skills/run/plan-review/personas/coherence.md` and
+`~/.grind/skills/run/plan-review/personas/feasibility.md` — the installed skills root, the same
+tree the Run's frozen `skills_hash` covers; a bare `personas/…` resolves only when the target
+repo happens to be grind itself. Read the full file and
+pass it verbatim to the dispatched reviewer session — never paraphrase a persona from memory.
+`depth.reviewers` from the Decision is the seat count: each seat beyond the first is another
+independent reviewer session running the same two lenses, and the third seat (T3) runs on a
 second model family.
 
 Findings are bucketed `act-on | consider | noted | dismissed` by a steward session with rationale
