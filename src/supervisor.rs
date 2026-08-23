@@ -1354,10 +1354,15 @@ fn run_ship_babysit_attempt(
     worktree: &Path,
 ) -> Result<(), Refusal> {
     let session_id = attempt::stage_session_id(&record.run_id, Stage::Ship);
+    // #106: the stage-resolved model, not the raw Job pin slot — an unpinned Job's round
+    // must ride the same model `resolve_stage_model` routes Ship's other attempts to, or a
+    // mid-session engine change lands exactly on the round least able to afford one. A
+    // pinned Job resolves to the pin, so the freeze still beats the routing.
+    let model = resolve_stage_model(record, run_dir, Stage::Ship);
     let conditions = Conditions {
         claude_bin: &record.claude_bin,
         session_id: &session_id,
-        model: record.model.as_deref(),
+        model: model.as_deref(),
     };
     let invocation = attempt::ci_babysit(&conditions);
     let n = record.attempts().len() + 1;
@@ -1381,7 +1386,6 @@ fn run_ship_babysit_attempt(
     record.push_attempt(classified);
     Ok(())
 }
-
 /// How much of **one session's** transcript exists right now, in lines. A transcript that is not
 /// there yet is zero rather than a refusal: a fresh session has nothing to skip, and that is the
 /// same answer whether the session is the Run's old mega-session or one stage's own.
@@ -1880,6 +1884,37 @@ mod tests {
             resolve_stage_model(&record, &run_dir, Stage::Plan),
             None,
             "strong means the harness default: no --model flag"
+        );
+        world::remove_tree(&run_dir);
+    }
+    #[test]
+    fn an_unpinned_jobs_babysit_round_rides_the_stage_resolved_ship_model() {
+        // #106: the babysit round used to pass `record.model` straight through, so an
+        // unpinned Job's round ran the harness default while Ship itself ran the routed
+        // `fast` model — a mid-session engine change on the one round that continues a live
+        // session. The round now resolves through `resolve_stage_model(.., Stage::Ship)`,
+        // so this pins the value it hands the round: the routed `fast` model.
+        let mut record = day_one();
+        record.model = None;
+        let run_dir = world::temp_dir("babysit-model");
+        let decision = run_dir.join("stages").join("diff-triage");
+        world::create_dir_all(&decision).unwrap();
+        world::write(
+            &decision.join("decision.json"),
+            r#"{
+                "tier": "t1",
+                "personas": [],
+                "depth": {"reviewers": 1},
+                "model_per_stage": {"ship": "fast"},
+                "floor_from_plan": "t1",
+                "rationale": []
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_stage_model(&record, &run_dir, Stage::Ship).as_deref(),
+            Some("claude-sonnet-5"),
+            "the babysit round must ride the same routed model Ship's other attempts get"
         );
         world::remove_tree(&run_dir);
     }
