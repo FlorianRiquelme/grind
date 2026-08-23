@@ -101,6 +101,12 @@ resolves.
   the record instead of silent, the same freeze discipline the plugin pin used to carry under a
   different carrier.
 
+  Install mechanism, decided resolving [#103](https://github.com/FlorianRiquelme/grind/issues/103):
+  from a checkout of this repo, `just provision-skills <ssh-host>` — an `rsync --delete` of
+  `skills/run/` to the host's `~/.grind/skills/run/`, so the host's tree is exactly the repo's.
+  The deletion is not tidiness: a Dispatch freezes a hash of this tree onto the Run's record
+  (above), and a drifted copy is provenance that names skills the Run never read.
+
 ## Lifetime
 
 There is no Grind daemon (ADR-0011). The host owes exactly one thing: something that fires after a

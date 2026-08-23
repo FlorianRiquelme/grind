@@ -14,3 +14,9 @@ verify:
     # The ship check. *Compiles on Linux* and *the shipped artifact builds* are different
     # claims, and the failure #30 reproduced was a binary that refused to start.
     cargo zigbuild --release --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl
+
+# Install the stage skills onto a provisioned host over SSH (docs/provisioned-host.md,
+# resolving #103). `--delete` keeps the host's tree exactly the repo's, which matters because
+# a Dispatch freezes a hash of this tree — drifted copies make provenance lie.
+provision-skills host:
+    rsync -av --delete skills/run/ "{{host}}:.grind/skills/run/"

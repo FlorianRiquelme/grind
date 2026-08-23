@@ -67,6 +67,38 @@ are checked at dispatch, by `grind doctor`, or not at all — all listed in
 Building from source needs Rust 1.89+ and `cargo build`; `serde` is the only dependency. The
 shipped artifact, however, is a prebuilt musl static binary — Grind never builds on a host.
 
+## Installing it
+
+A host owes the list in [docs/provisioned-host.md](docs/provisioned-host.md); the short version,
+in order:
+
+1. **Binary** — never build on a host. Cross-build both musl triples from a checkout
+   (`cargo zigbuild --release --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl`,
+   or just let `just verify` do it) and copy the one matching the host's arch somewhere on its
+   `PATH`. `grind --version` answers *which copy is this* if in doubt.
+2. **Stage skills** — from the same checkout:
+
+   ```
+   just provision-skills <ssh-host>
+   ```
+
+   an `rsync --delete` of `skills/run/` onto the host's `~/.grind/skills/run/`, so Dispatch finds
+   all ten stages and freezes provenance against exactly this tree (#103).
+3. **Restart one-shot** — the launchd/systemd templates in [`dist/`](dist/) so a reboot re-enters
+   cut-off Runs; linux needs the `loginctl enable-linger` step or the unit is enabled and never
+   fires.
+4. **Credentials** — the six steps in docs/provisioned-host.md; step 6, a real push, is the only
+   one that proves the other five.
+5. **Check** — `grind doctor` on the host. Every checkable item should print `ok`; the remaining
+   rows are the ones no boolean can honestly answer.
+
+On the laptop that dispatches, also point `~/.claude/skills/enqueue` at this repo's copy so
+Enqueue tracks the checkout you edit:
+
+```
+ln -s <path-to-this-repo>/skills/enqueue ~/.claude/skills/enqueue
+```
+
 ## Repository map
 
 - `src/` — one crate. Pure modules return effects as values (`policy` returns the sleep, `render`
