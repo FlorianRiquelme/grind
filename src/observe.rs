@@ -924,7 +924,7 @@ pub fn observe_run(
 // --- the outcome collector ----------------------------------------------------------------
 //
 // `grind outcomes` (`cli.rs`) is the human-initiated pass the design calls the loop's best
-// fuel: did the merged work *survive*. It reads GitHub, never writes to it, and the two
+// fuel: did the merged work *survive*. It reads GitHub, never writes to it, and the
 // classifiers below are the pure halves — the argv that produces their input is the caller's.
 
 /// A PR's terminal facts, once it stopped moving. Facts only, never a grade (ADR-0012):
@@ -967,6 +967,20 @@ pub fn pr_final_state(gh_json: &str) -> Observed<PrFinal> {
             .and_then(|v| v.as_str())
             .map(str::to_string),
     })
+}
+
+/// The issue numbers, from `gh issue list --json number,title --search "<query>"`, already
+/// reduced to its stdout. Tolerant by construction: empty or malformed output parses as an
+/// empty list, and rows whose `number` is anything but an integer contribute nothing — a
+/// repo this pass cannot query leaves [`RunOutcome::followup_issues`] empty rather than
+/// failing it.
+pub fn followup_issues(gh_json: &str) -> Vec<u64> {
+    let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(gh_json.trim()) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| row.get("number").and_then(serde_json::Value::as_u64))
+        .collect()
 }
 
 /// A line this module accepts as a commit sha rather than a path — hex, and long enough that a
@@ -1022,11 +1036,10 @@ pub struct RunOutcome {
     pub pr_merged_at: Option<String>,
     pub pr_closed_at: Option<String>,
     pub reverted_by: Vec<String>,
-    /// Follow-up issues filed against the Run's PR. Left empty on purpose: a `gh issue list
-    /// --search` scan proportionate to this unit would need to decide what "filed against"
-    /// means (linked how, by whom), and that is disproportionate machinery for the unit this
-    /// is — shipped as an empty, stable field so a later pass can fill it in without a shape
-    /// change.
+    /// Follow-up issues referencing the Run's PR or filed against its changed paths since
+    /// the PR merged, read by `grind outcomes` through one `gh issue list --search` in the
+    /// Run's own worktree. Empty when the repo is unqueryable — never a failure of the
+    /// pass.
     pub followup_issues: Vec<u64>,
 }
 
@@ -2564,6 +2577,33 @@ README.md
             reverts_touching(log, &run_paths),
             vec!["deadbeef1".to_string()]
         );
+    }
+
+    #[test]
+    fn followup_issues_reads_the_numbers_from_a_normal_listing() {
+        let body = r#"[
+  {"number":12,"title":"follow-up: widen the gate"},
+  {"number":34,"title":"docs: mention the new flag"}
+]"#;
+        assert_eq!(followup_issues(body), vec![12, 34]);
+    }
+
+    #[test]
+    fn followup_issues_is_empty_over_empty_or_malformed_output() {
+        // Tolerant by construction: a repo this pass cannot query must leave the field
+        // empty, never fail the pass.
+        assert!(followup_issues("").is_empty());
+        assert!(followup_issues("[]").is_empty());
+        assert!(followup_issues("not json").is_empty());
+        assert!(followup_issues(r#"{"number":1}"#).is_empty());
+    }
+
+    #[test]
+    fn followup_issues_skips_rows_whose_number_is_not_a_number() {
+        // A row whose number arrived as anything but an integer contributes nothing rather
+        // than poisoning the rest of the listing.
+        let body = r#"[{"title":"no number"},{"number":null},{"number":7,"title":"real"}]"#;
+        assert_eq!(followup_issues(body), vec![7]);
     }
 
     #[test]
