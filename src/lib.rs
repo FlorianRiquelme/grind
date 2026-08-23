@@ -1,4 +1,4 @@
-//! Grind's base: one crate, fourteen modules at the crate root.
+//! Grind's base: one crate, twenty-one modules at the crate root.
 //!
 //! `world` is the sole namer of `std::process`, `std::fs` and `std::env`; `serve` is the
 //! sole namer of `std::net` (ADR-0007, amended by ADR-0014). Everything else is pure —
@@ -12,18 +12,23 @@
 //! carrier. `tests/topology.rs` is what notices.
 
 pub mod attempt;
+pub mod claude;
 pub mod cli;
 pub mod decide;
 pub mod job;
 pub mod learnings;
+pub mod native;
+pub mod net;
 pub mod observe;
 pub mod page;
 pub mod policy;
 pub mod render;
 pub mod rung;
+pub mod runner;
 pub mod script;
 pub mod serve;
 pub mod style;
 pub mod supervisor;
+pub mod tools;
 pub mod view;
 pub mod world;

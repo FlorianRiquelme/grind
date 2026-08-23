@@ -8,6 +8,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::claude;
 use crate::job;
 use crate::observe;
 use crate::page;
@@ -208,8 +209,8 @@ fn run_response(home: &Path, id: &str, fragment: bool) -> Response {
         found.supervisor_identity.as_deref(),
         &observe::process_start_stamp(&world::ps_start_stamp(found.supervisor_pid)),
     );
-    let live = view::live(
-        &view::transcript_path(home, &found.worktree, &found.session_id),
+    let live = claude::live(
+        &claude::transcript_path(home, &found.worktree, &found.session_id),
         world::now_epoch(),
     );
     let body = if fragment {
@@ -654,7 +655,7 @@ mod tests {
     #[test]
     fn the_oversized_head_is_rejected() {
         let mut bytes = b"GET / HTTP/1.1\r\nHost: h\r\nX-Pad: ".to_vec();
-        bytes.extend(std::iter::repeat(b'a').take(HEAD_LIMIT));
+        bytes.extend(std::iter::repeat_n(b'a', HEAD_LIMIT));
         bytes.extend_from_slice(b"\r\n\r\n");
         assert_eq!(parse_request(&bytes), Err(Status::BadRequest));
     }

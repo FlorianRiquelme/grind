@@ -1242,6 +1242,35 @@ pub fn claude_binary(executable: bool, resolved: Option<&str>) -> Observed<Outco
     satisfied("executable, and not a shim")
 }
 
+/// A provider API key is in the environment — **presence only**, never the values, and
+/// never a validity judgement: only an attempt to use a key can classify it. Both backends'
+/// readiness is reported regardless of which backend a Run selected (R9) — doctor takes no
+/// Job and the selection is a layout fact, not this list's.
+pub fn agent_key_present(openrouter: bool, openai: bool) -> Observed<Outcome> {
+    match (openrouter, openai) {
+        (true, true) => satisfied("OPENROUTER_API_KEY and OPENAI_API_KEY are both set"),
+        (true, false) => satisfied("OPENROUTER_API_KEY is set"),
+        (false, true) => satisfied("OPENAI_API_KEY is set"),
+        (false, false) => {
+            unsatisfied("neither OPENROUTER_API_KEY nor OPENAI_API_KEY is set in the environment")
+        }
+    }
+}
+
+/// The OpenAI-compatible endpoint answered a connection-level probe. `None` means the probe
+/// could not even be tried — no key in the environment resolves an [`crate::runner::Endpoint`]
+/// — which is could-not-observe, not unsatisfied: *no way to ask* and *the endpoint did not
+/// answer* are different facts about different things.
+pub fn endpoint_reachable(probed: Option<bool>) -> Observed<Outcome> {
+    match probed {
+        Some(true) => satisfied("the agent endpoint answers"),
+        Some(false) => unsatisfied("the agent endpoint did not answer a probe request"),
+        None => Observed::Unobservable(Reason::saying(
+            "no provider API key in the environment, so no endpoint could be probed",
+        )),
+    }
+}
+
 /// An executable resolves on `PATH`. No version floor is invented — an invented floor is a
 /// precondition that fails for no reason.
 pub fn on_path(tool: &str, completed: &Completed) -> Observed<Outcome> {

@@ -6,6 +6,8 @@
 //! a library (ADR-0007): `world` spawns, this module reads what came back, and every test here
 //! runs from string literals with no `git` invocation anywhere.
 
+use crate::runner;
+use crate::world;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -361,6 +363,37 @@ pub fn locks_dir(home: &Path) -> PathBuf {
     grind_dir(home).join("locks")
 }
 
+/// `~/.grind/agent` — the one-line backend declaration (ADR-0017), beside `bin/claude`:
+/// the same directory whose **layout is the declaration**, now carrying which adapter a
+/// Run executes. Absent means claude-code, the only backend there has ever been.
+pub fn agent_file(home: &Path) -> PathBuf {
+    grind_dir(home).join("agent")
+}
+
+/// The selection, read once at dispatch and snapshotted into the RunRecord (ADR-0017) —
+/// resume loads the record and proceeds on the snapshot without ever re-reading this file.
+///
+/// An absent file is the default selection, not an error: a host that never heard of
+/// backends has always run claude-code. Everything else that cannot be read is loud —
+/// an unreadable file, or a line that does not parse, refuses by naming the path and the
+/// problem, on the same register as an unreadable Job issue. A file with more than one
+/// non-blank line is refused rather than silently first-read, for the same reason.
+pub fn read_selection(home: &Path) -> Result<runner::Selection, String> {
+    let path = agent_file(home);
+    if !world::exists(&path) {
+        return Ok(runner::Selection::default());
+    }
+    let text = world::read_to_string(&path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let parsed = match lines.as_slice() {
+        [] => runner::Selection::parse_line(""),
+        [only] => runner::Selection::parse_line(only),
+        _ => Err(format!("expected one line, found {}", lines.len())),
+    };
+    parsed.map_err(|e| format!("{}: {e}", path.display()))
+}
+
 // --- the host item list -------------------------------------------------------------------
 //
 // One list, checked at two depths: presence before every Dispatch, the full list by
@@ -410,6 +443,12 @@ pub enum Check {
     SigningConfig,
     CommitterIdentity,
     OriginOverSsh,
+    /// A provider API key (`OPENROUTER_API_KEY` / `OPENAI_API_KEY`) is in the environment —
+    /// presence only; both backends' readiness is reported regardless of which is selected (R9).
+    AgentKeyPresent,
+    /// The OpenAI-compatible endpoint answers a connection-level probe (`net::probe_endpoint`,
+    /// R9). No key resolves the endpoint, so without one this check cannot even be tried.
+    EndpointReachable,
     /// No honest boolean exists. Rendered as unchecked, with no boolean beside it.
     NoBoolean,
 }
@@ -481,6 +520,18 @@ pub fn host_items() -> &'static [HostItem] {
             depth: Depth::Doctor,
             check: Check::BootOneShot,
             doc_anchor: "A restart one-shot calling `grind resume --all` is loaded.",
+        },
+        HostItem {
+            name: "agent api key",
+            depth: Depth::Doctor,
+            check: Check::AgentKeyPresent,
+            doc_anchor: "An agent API key is present in the environment.",
+        },
+        HostItem {
+            name: "agent endpoint reachable",
+            depth: Depth::Doctor,
+            check: Check::EndpointReachable,
+            doc_anchor: "The agent endpoint answers.",
         },
         HostItem {
             name: "credential: gh auth store",
@@ -1284,7 +1335,77 @@ mod tests {
             Path::new("/home/op/.grind/repos/owner/name")
         );
         assert_eq!(claude_bin(home), Path::new("/home/op/.grind/bin/claude"));
+        assert_eq!(agent_file(home), Path::new("/home/op/.grind/agent"));
         assert_eq!(runs_dir(home), Path::new("/home/op/.grind/runs"));
         assert_eq!(locks_dir(home), Path::new("/home/op/.grind/locks"));
+    }
+
+    // --- the agent selection ---------------------------------------------------------------
+
+    /// A throwaway home with `~/.grind/agent` laid out, removed when the test ends.
+    fn home_with_agent(line: &str) -> PathBuf {
+        let home = world::temp_dir("read-selection");
+        world::create_dir_all(&grind_dir(&home)).expect("a scratch .grind dir");
+        // A blank line is written too, so *absent file* and *empty file* stay separate
+        // scenarios.
+        world::write_atomic(&agent_file(&home), line).expect("a scratch agent file");
+        home
+    }
+
+    #[test]
+    fn an_absent_agent_file_is_the_default_selection() {
+        let home = world::temp_dir("read-selection");
+        let selection = read_selection(&home).expect("the default selection");
+        assert_eq!(selection.backend, runner::Backend::default());
+        assert_eq!(selection.endpoint_override, None);
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn an_empty_agent_file_is_the_default_selection() {
+        let home = home_with_agent("\n");
+        let selection = read_selection(&home).expect("the default selection");
+        assert_eq!(selection.backend, runner::Backend::default());
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn a_native_line_parses_to_the_backend_and_its_override() {
+        let home = home_with_agent("native https://example.invalid/v1\n");
+        let selection = read_selection(&home).expect("a parsed selection");
+        assert_eq!(selection.backend, runner::Backend::parse("native").unwrap());
+        assert_eq!(
+            selection.endpoint_override.as_deref(),
+            Some("https://example.invalid/v1")
+        );
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn an_unparseable_line_refuses_and_names_the_path() {
+        let home = home_with_agent("claude-code https://surprise.example\n");
+        let refusal = read_selection(&home).expect_err("must refuse");
+        assert!(
+            refusal.contains("claude-code takes no arguments"),
+            "{refusal}"
+        );
+        assert!(refusal.contains(".grind/agent"), "{refusal}");
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn an_unknown_backend_token_refuses_and_names_the_path() {
+        let home = home_with_agent("codex\n");
+        let refusal = read_selection(&home).expect_err("must refuse");
+        assert!(refusal.contains(".grind/agent"), "{refusal}");
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn more_than_one_line_refuses_rather_than_reading_the_first() {
+        let home = home_with_agent("native\ncodex\n");
+        let refusal = read_selection(&home).expect_err("must refuse");
+        assert!(refusal.contains("expected one line"), "{refusal}");
+        world::remove_tree(&home);
     }
 }

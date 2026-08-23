@@ -5,14 +5,13 @@
 //! a gate through the back door: something downstream acts on the code, and a finding starts
 //! blocking. There is deliberately no conversion from a verdict in existence anywhere in this
 //! module (ADR-0006's convention mode, aimed at the surface most exposed to it).
-//!
-//! Nothing here invokes an agent. A view built out of the thing that gets rate-limited is
-//! unavailable during exactly the stall it exists to explain.
-
+use crate::claude;
 use crate::decide;
 use crate::job::{self, Check, Depth, Refusal};
+use crate::net;
 use crate::observe::{self, Observed, Outcome};
 use crate::render::{self, DoctorLine, SingleRun};
+use crate::runner;
 use crate::supervisor;
 use crate::view::{self, Lookup};
 use crate::world;
@@ -364,8 +363,8 @@ fn status_one(run_id: &str) -> i32 {
             let signals = decide::signals_of(&observation);
             let promised = found.attempts.last().is_some_and(|a| a.done_promise);
             let verdict = decide::verdict(&signals, promised);
-            let live = view::live(
-                &view::transcript_path(&home, &found.worktree, &found.session_id),
+            let live = claude::live(
+                &claude::transcript_path(&home, &found.worktree, &found.session_id),
                 world::now_epoch(),
             );
             let here = view::supervisor_here(
@@ -639,6 +638,21 @@ fn check(home: &Path, clones: &[(String, PathBuf)], check: Check) -> Observed<Ou
             )),
             None => observe::unchecked("no declared clone to read an origin from"),
         },
+        // Presence only, and the values are never printed anywhere (ADR-0017): `world::var`
+        // answers *set or unset*, which is all this check is allowed to know.
+        Check::AgentKeyPresent => observe::agent_key_present(
+            world::var("OPENROUTER_API_KEY").is_ok(),
+            world::var("OPENAI_API_KEY").is_ok(),
+        ),
+        // Both backends' readiness, regardless of the selected backend (R9). The endpoint is
+        // resolved from the default base URL plus whatever key the environment offers; a key
+        // that resolves nothing leaves the probe untried, and `endpoint_reachable` says so.
+        Check::EndpointReachable => {
+            let probed = runner::Endpoint::resolve(None, None)
+                .ok()
+                .map(|endpoint| net::probe_endpoint(&endpoint));
+            observe::endpoint_reachable(probed)
+        }
         Check::NoBoolean => observe::unchecked(
             "performed during provisioning; every available check would be a guess",
         ),

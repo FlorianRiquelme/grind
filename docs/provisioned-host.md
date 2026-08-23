@@ -179,6 +179,16 @@ plus a login* on darwin, and do not let the shorter phrase stand for both.
   seconds after boot, silently. `KillMode=process` is what stops that, and
   `AbandonProcessGroup` is the launchd half of the same problem.
 
+- **An agent API key is present in the environment.** — *doctor* — `OPENROUTER_API_KEY`
+  or `OPENAI_API_KEY`, read at use and never recorded anywhere (ADR-0017). Presence is the
+  whole check: validity is only decidable mid-Run, where a dead key is an outcome like any
+  other (#37's ruling), so dispatch refuses only the keyless host.
+
+- **The agent endpoint answers.** — *doctor* — a connection-level probe of the selected
+  backend's `{base_url}/models` (ADR-0016): any HTTP status passes, a connect error fails.
+  Reachability, not authorization — the key check above owns presence. Reported for both
+  backends regardless of selection, so both stay selectable from one doctor run.
+
 ## Credentials
 
 [#37](https://github.com/FlorianRiquelme/grind/issues/37)'s six steps, verbatim in substance. All

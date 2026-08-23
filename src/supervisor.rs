@@ -13,12 +13,14 @@
 use crate::attempt::{
     self, Attempt, Clearance, Conditions, DENIED_TOOLS, Mode, StageConditions, StageContext,
 };
+use crate::claude;
 use crate::decide::{self, Pass, PlanFacts, Tier, Tiers, Verdict};
 use crate::job::{self, Job, Refusal};
 use crate::learnings;
-use crate::observe::{self, Observation, Observed, Outcome as ItemOutcome, Reason};
+use crate::observe::{self, Observation, Observed, Outcome as ItemOutcome};
 use crate::policy::{self, Budget, Next, Stop};
 use crate::rung::{self, ReturnStatus, Stage, StageReturn};
+use crate::runner::{self, Backend};
 use crate::world::{self, LockHandle, TryLock};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -140,6 +142,13 @@ struct RunRecord {
     /// record that predates Reflect existing.
     #[serde(default)]
     reflected: bool,
+    /// Which adapter executes this Run's stages, snapshotted at dispatch like every other
+    /// environment-varying condition (ADR-0017). P1 snapshots the default — selection wiring
+    /// lands next wave.
+    #[serde(default)]
+    backend: Backend,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint_override: Option<String>,
 }
 
 /// Frozen once, at dispatch — never re-resolved, for the same reason the plugin pin never was:
@@ -362,6 +371,11 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         )));
     }
 
+    // ADR-0017: the agent backend is declared by layout (`~/.grind/agent`) and snapshotted
+    // here, once. Resume loads this record and proceeds on the snapshot — it never re-reads
+    // the file. An unreadable or unparseable declaration refuses the Dispatch on the same
+    // register as every other incoherent input above.
+    let selection = job::read_selection(&home).map_err(Refusal::saying)?;
     let run_id = format!(
         "{}-{}-{}",
         world::now_stamp(),
@@ -394,6 +408,8 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         stages: Vec::new(),
         provenance: Some(provenance(&home)),
         reflected: false,
+        backend: selection.backend,
+        endpoint_override: selection.endpoint_override,
         job,
     };
     let run_dir = job::runs_dir(&home).join(&run_id);
@@ -812,12 +828,12 @@ fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
         Mode::Resume
     };
     let invocation = match mode {
-        Mode::Dispatch => attempt::reflect_dispatch(&conditions, &skill_text),
-        _ => attempt::reflect_resume(&conditions, &skill_text),
+        Mode::Dispatch => claude::reflect_dispatch(&conditions, &skill_text),
+        _ => claude::reflect_resume(&conditions, &skill_text),
     };
     let n = reflect_attempts + 1;
     say(run_dir, &format!("  [reflect] attempt {n} ({mode}) …"));
-    let raw = attempt::run(
+    let raw = claude::run(
         &invocation,
         // Reflect's cwd is the **run directory**, never the worktree — there is no repo tree
         // under this session for a Write/Edit denial to matter over.
@@ -1313,7 +1329,7 @@ fn run_ladder_attempt(
         claude_bin: &record.claude_bin,
         run_id: &record.run_id,
     };
-    let invocation = attempt::stage_invocation(&conditions, &ctx, mode, record.clearances().last());
+    let invocation = claude::stage_invocation(&conditions, &ctx, mode, record.clearances().last());
 
     let n = record.attempts().len() + 1;
     let started_at = world::now_iso();
@@ -1321,18 +1337,24 @@ fn run_ladder_attempt(
         run_dir,
         &format!("  [{started_at}] {stage} attempt {n} ({mode}) …"),
     );
-    let already_written = transcript_lines_for(worktree, &session_id);
-    let raw = attempt::run(
-        &invocation,
-        worktree,
-        &run_dir.join(format!("attempt-{n}.prompt.txt")),
-        &run_dir.join(format!("attempt-{n}.stdout.json")),
-        &run_dir.join(format!("attempt-{n}.stderr.log")),
-    )
-    .map_err(|reason| Refusal::saying(reason.to_string()))?;
-    let classified = raw
-        .classify(n, mode, &started_at, &world::now_iso())
-        .with_fanout(fanout_of_session(worktree, &session_id, already_written));
+    let denied = attempt::denied_for(stage);
+    let runner = runner::runner_for(
+        record.backend,
+        &record.claude_bin,
+        &home,
+        record.endpoint_override.clone(),
+    );
+    let spec = runner::RunSpec {
+        invocation: &invocation,
+        cwd: worktree,
+        run_dir,
+        attempt_n: n,
+        session_id: &session_id,
+        worktree: &record.worktree,
+        model: model.as_deref(),
+        denied_globs: &denied,
+    };
+    let classified = runner.run(&spec);
     let cost_usd = classified.total_cost_usd;
     let turns = classified.num_turns;
     record.push_attempt(classified);
@@ -1366,7 +1388,7 @@ fn run_ladder_attempt(
 
 /// Ship's one bounded CI-babysit round, continuing **Ship's own session** (`<run>-ship`) rather
 /// than a fresh stage composition — there is no stage-shaped babysit prompt to build, so this
-/// reuses the existing [`attempt::ci_babysit`] builder exactly as the legacy path does, pointed
+/// reuses the existing [`claude::ci_babysit`] builder exactly as the legacy path does, pointed
 /// at the stage session instead of the Run-level one.
 fn run_ship_babysit_attempt(
     record: &mut RunRecord,
@@ -1384,25 +1406,35 @@ fn run_ship_babysit_attempt(
         session_id: &session_id,
         model: model.as_deref(),
     };
-    let invocation = attempt::ci_babysit(&conditions);
+    let invocation = claude::ci_babysit(&conditions);
     let n = record.attempts().len() + 1;
     let started_at = world::now_iso();
     say(
         run_dir,
         &format!("  [{started_at}] attempt {n} (ci-babysit) …"),
     );
-    let already_written = transcript_lines_for(worktree, &session_id);
-    let raw = attempt::run(
-        &invocation,
-        worktree,
-        &run_dir.join(format!("attempt-{n}.prompt.txt")),
-        &run_dir.join(format!("attempt-{n}.stdout.json")),
-        &run_dir.join(format!("attempt-{n}.stderr.log")),
-    )
-    .map_err(|reason| Refusal::saying(reason.to_string()))?;
-    let classified = raw
-        .classify(n, Mode::CiBabysit, &started_at, &world::now_iso())
-        .with_fanout(fanout_of_session(worktree, &session_id, already_written));
+    let home = world::home().ok_or_else(|| Refusal::saying("$HOME is unset"))?;
+    let denied: Vec<String> = attempt::DENIED_TOOLS
+        .iter()
+        .map(|glob| glob.to_string())
+        .collect();
+    let runner = runner::runner_for(
+        record.backend,
+        &record.claude_bin,
+        &home,
+        record.endpoint_override.clone(),
+    );
+    let spec = runner::RunSpec {
+        invocation: &invocation,
+        cwd: worktree,
+        run_dir,
+        attempt_n: n,
+        session_id: &session_id,
+        worktree: &record.worktree,
+        model: model.as_deref(),
+        denied_globs: &denied,
+    };
+    let classified = runner.run(&spec);
     record.push_attempt(classified);
     Ok(())
 }
@@ -1415,31 +1447,10 @@ fn transcript_lines_for(worktree: &Path, session_id: &str) -> usize {
     let Some(home) = world::home() else {
         return 0;
     };
-    let transcript =
-        crate::view::transcript_path(&home, &worktree.display().to_string(), session_id);
+    let transcript = claude::transcript_path(&home, &worktree.display().to_string(), session_id);
     match world::read_to_string(&transcript) {
         Ok(text) => text.lines().count(),
         Err(_) => 0,
-    }
-}
-
-/// The fan-out arithmetic over one named session's transcript, over the lines appended since
-/// `already_written`.
-fn fanout_of_session(
-    worktree: &Path,
-    session_id: &str,
-    already_written: usize,
-) -> Observed<(u64, u64)> {
-    let Some(home) = world::home() else {
-        return Observed::Unobservable(Reason::saying("$HOME is unset"));
-    };
-    let transcript =
-        crate::view::transcript_path(&home, &worktree.display().to_string(), session_id);
-    match world::read_to_string(&transcript) {
-        Ok(text) => crate::view::fanout_since(&text, already_written),
-        Err(said) => Observed::Unobservable(Reason::saying(&format!(
-            "the transcript could not be read: {said}"
-        ))),
     }
 }
 

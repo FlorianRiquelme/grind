@@ -302,6 +302,14 @@ pub fn args() -> Vec<String> {
     std::env::args().skip(1).collect()
 }
 
+/// Read one named environment variable. Host facts remain `$HOME`-only (ADR-0008);
+/// this exists for provider credentials, which are read-at-use values that are never
+/// recorded anywhere (ADR-0017) — the agent harness resolves them fresh per attempt
+/// instead of letting them enter the RunRecord.
+pub fn var(name: &str) -> Result<String, String> {
+    std::env::var(name).map_err(|_| format!("{name} not set"))
+}
+
 /// This binary's own path, so a boot one-shot re-enters with the copy that is running rather
 /// than with whatever `PATH` resolves to under a service manager's environment.
 pub fn current_exe() -> Option<PathBuf> {
