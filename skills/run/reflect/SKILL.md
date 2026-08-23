@@ -85,7 +85,12 @@ Run's quality (ADR-0012).
 **Drafted follow-up Jobs.** Read the Run's residuals — Fixes rounds that ran out with Confirmed
 findings still open, judgement calls Babysit drafted as comments, anything Reflect itself surfaces
 that is real work and not a lesson — and draft each as a **complete issue body**: the JOB-TEMPLATE
-rows filled, a done predicate stated so a machine could grade it, a Handoff SHA proposed. Park it
+rows filled, a done predicate stated so a machine could grade it, a Handoff SHA proposed. The
+**Anchor artifact row is a path, never prose** — slash-separated segments of letters, digits,
+`.`, `_` and `-`; `job::from_issue_json` refuses anything else, and dispatch refuses a path
+absent from the worktree at the Handoff SHA. A row reading "this issue body (…)" is exactly what
+makes a drafted Job undispatchable. A small Job that warrants no plan doc still needs a real
+committed artifact here: anchor on the most specific committed file the work concerns. Park it
 in `<stages-dir>/reflect/jobs/`, one file per draft. **Nothing dispatches it and nothing selects
 it** — the human stays the only
 trigger, same as every other Dispatch (ADR-0001, ADR-0012). What changes is the marginal cost of
