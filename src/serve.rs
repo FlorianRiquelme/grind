@@ -155,6 +155,11 @@ pub fn route(req: &Request, home: &Path) -> Response {
         ["f", "runs", id] => run_response(home, id, true),
         ["f", "runs", id, "log"] => log_delta(home, id, req.query.as_deref()),
         ["raw", "runs", id, file] => raw_file(home, id, file),
+        ["raw", "runs", id, "stages", "reflect", kind, name]
+            if matches!(*kind, "jobs" | "diffs") =>
+        {
+            raw_reflect(home, id, kind, name)
+        }
         ["style.css"] => asset("text/css; charset=utf-8", crate::style::CSS),
         ["script.js"] => asset("text/javascript; charset=utf-8", crate::script::JS),
         _ => plain(Status::NotFound),
@@ -283,6 +288,26 @@ fn evidence_allowed(file: &str) -> bool {
             .and_then(|rest| rest.strip_suffix(suffix))
             .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
     })
+}
+
+/// A Reflect artifact under `stages/reflect/jobs/` or `stages/reflect/diffs/`, verbatim
+/// (issue #109) — the proposal-queue projection lists these paths, so the raw route must
+/// be able to serve them. The prefix rule is explicit and scoped: only those two
+/// directories, exactly one filename deep. `parse_request`'s [`fs_safe`] gate has already
+/// refused `.`, `..`, absolute components, and every byte outside `[A-Za-z0-9._-]` in each
+/// segment, so the joined path cannot escape the run directory; anything that slips past
+/// the route arm reads as not-here and leaks nothing.
+fn raw_reflect(home: &Path, id: &str, kind: &str, name: &str) -> Response {
+    let path = job::runs_dir(home)
+        .join(id)
+        .join("stages")
+        .join("reflect")
+        .join(kind)
+        .join(name);
+    match world::read_bytes(&path) {
+        Ok(bytes) => text(bytes, Vec::new()),
+        Err(_) => plain(Status::NotFound),
+    }
 }
 
 /// A rendered HTML page: fresh, never cached.
@@ -953,6 +978,103 @@ mod tests {
         );
         assert_eq!(resp.status, Status::NotFound);
         assert_eq!(resp.body, b"no such page\n");
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn a_reflect_job_draft_serves_verbatim_from_the_proposal_queue() {
+        let home = scratch("serve-raw-job");
+        let jobs = job::runs_dir(&home)
+            .join("abc")
+            .join("stages")
+            .join("reflect")
+            .join("jobs");
+        world::create_dir_all(&jobs).unwrap();
+        world::write_atomic(&jobs.join("follow-up.md"), "# drafted issue body\n").unwrap();
+        let resp = route(
+            &parse_request(&get("/raw/runs/abc/stages/reflect/jobs/follow-up.md")).unwrap(),
+            &home,
+        );
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(resp.content_type, "text/plain; charset=utf-8");
+        assert_eq!(resp.cache, Cache::NoStore);
+        assert_eq!(resp.body, b"# drafted issue body\n");
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn a_reflect_skill_diff_serves_verbatim_too() {
+        let home = scratch("serve-raw-diff");
+        let diffs = job::runs_dir(&home)
+            .join("abc")
+            .join("stages")
+            .join("reflect")
+            .join("diffs");
+        world::create_dir_all(&diffs).unwrap();
+        world::write_atomic(
+            &diffs.join("skill.patch"),
+            "--- a/SKILL.md\n+++ b/SKILL.md\n",
+        )
+        .unwrap();
+        let resp = route(
+            &parse_request(&get("/raw/runs/abc/stages/reflect/diffs/skill.patch")).unwrap(),
+            &home,
+        );
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(resp.body, b"--- a/SKILL.md\n+++ b/SKILL.md\n");
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn traversal_through_the_reflect_prefix_never_reaches_the_filesystem() {
+        // The parser refuses dot segments per-segment before routing; the prefix rule
+        // adds nothing that could reopen that hole.
+        for target in [
+            "/raw/runs/abc/stages/reflect/jobs/../secrets.env",
+            "/raw/runs/abc/stages/reflect/jobs/%2e%2e/secrets.env",
+            "/raw/runs/abc/stages/reflect/jobs/a%2Fb",
+        ] {
+            assert_eq!(
+                parse_request(&get(target)),
+                Err(Status::NotFound),
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_post_against_a_reflect_artifact_is_method_not_allowed() {
+        let bytes =
+            b"POST /raw/runs/abc/stages/reflect/jobs/follow-up.md HTTP/1.1\r\nHost: h\r\n\r\n";
+        let resp = route(&parse_request(bytes).unwrap(), Path::new("/tmp"));
+        assert_eq!(resp.status, Status::MethodNotAllowed);
+        assert_eq!(resp.extra, vec![("Allow", "GET".to_string())]);
+    }
+
+    #[test]
+    fn every_reflect_prefix_near_miss_reads_as_not_here() {
+        let home = scratch("serve-raw-miss");
+        let reflect = job::runs_dir(&home)
+            .join("abc")
+            .join("stages")
+            .join("reflect");
+        world::create_dir_all(&reflect.join("other")).unwrap();
+        world::create_dir_all(&reflect.join("jobs").join("sub")).unwrap();
+        world::write_atomic(&reflect.join("other").join("x.md"), "planted").unwrap();
+        world::write_atomic(&reflect.join("jobs").join("sub").join("deep.md"), "planted").unwrap();
+        // Other stages stay dark, as do other directories under stages/reflect, deeper
+        // nesting inside an allowed directory, and an absent file in an allowed one.
+        for target in [
+            "/raw/runs/abc/stages/plan/jobs/x.md",
+            "/raw/runs/abc/stages/skills/diffs/x.patch",
+            "/raw/runs/abc/stages/reflect/other/x.md",
+            "/raw/runs/abc/stages/reflect/jobs/sub/deep.md",
+            "/raw/runs/abc/stages/reflect/jobs/gone.md",
+        ] {
+            let resp = route(&parse_request(&get(target)).unwrap(), &home);
+            assert_eq!(resp.status, Status::NotFound, "{target}");
+            assert_eq!(resp.body, b"no such page\n", "{target}");
+        }
         world::remove_tree(&home);
     }
 
