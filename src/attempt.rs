@@ -104,8 +104,10 @@ const PANEL_BASH_FORMS: [&str; 10] = [
 /// The denial set for one of the ten ladder stages. **The base list always, verbatim, never
 /// filtered** — widening only, never narrowing. Report-only stages (`PlanReview`, `Review`,
 /// `Validate`) additionally deny `Write` and `Edit`; the two fan-out panels (`Review`,
-/// `Validate`) further deny the write-capable Bash forms above, since a panel session's sandbox
-/// — not its prompt — is what makes "touches nothing" true. `Plan`, `Triage`, `Work`,
+/// `Validate`) further deny the write-capable Bash forms above. The denials narrow the surface
+/// without closing it: shell redirection is not deniable — it is how a panel session writes its
+/// findings files — so "touches nothing" is the prompt's stated discipline with the sandbox
+/// behind it, never a sandbox guarantee alone. `Plan`, `Triage`, `Work`,
 /// `Simplify`, `DiffTriage`, `Fixes` and `Ship` carry the base list only: they are the stages
 /// that write the worktree (or, for the two in-process `[R]` passes, write nothing at all).
 pub fn denied_for(stage: rung::Stage) -> Vec<String> {
