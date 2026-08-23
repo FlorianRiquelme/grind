@@ -246,6 +246,13 @@ fn outcome_line(home: &Path, run_id: &str, found: &view::RunView) -> String {
     );
     let reverted_by = observe::reverts_touching(&log.stdout, &run_paths);
 
+    let followups = followup_issues(
+        worktree,
+        pr.number,
+        &run_paths,
+        pr_final.merged_at.as_deref(),
+    );
+
     let outcome = observe::RunOutcome {
         collected_at: world::now_iso(),
         pr_state: pr_final.state.clone(),
@@ -253,7 +260,7 @@ fn outcome_line(home: &Path, run_id: &str, found: &view::RunView) -> String {
         pr_merged_at: pr_final.merged_at.clone(),
         pr_closed_at: pr_final.closed_at.clone(),
         reverted_by: reverted_by.clone(),
-        followup_issues: Vec::new(),
+        followup_issues: followups,
     };
     let path = job::runs_dir(home).join(run_id).join("outcome.json");
     let Ok(json) = serde_json::to_string_pretty(&outcome) else {
@@ -261,13 +268,58 @@ fn outcome_line(home: &Path, run_id: &str, found: &view::RunView) -> String {
     };
     match world::write_atomic(&path, &json) {
         Ok(()) => format!(
-            "updated    {run_id}: {} merged={} reverted_by={}",
+            "updated    {run_id}: {} merged={} reverted_by={} issues={}",
             outcome.pr_state,
             outcome.pr_merged,
-            reverted_by.len()
+            reverted_by.len(),
+            outcome.followup_issues.len()
         ),
         Err(said) => format!("skipped    {run_id}: {said}"),
     }
+}
+
+/// Follow-up issues referencing the Run's PR or filed against its changed paths since the
+/// merge, through one `gh issue list --search` run in the Run's own worktree so `gh`
+/// resolves the repo from that checkout's remote. Tolerant both ways — a repo that cannot
+/// be queried (no remote, `gh` failing, unreadable output) leaves the field empty and
+/// never fails the pass.
+fn followup_issues(
+    worktree: &Path,
+    pr_number: u64,
+    run_paths: &[String],
+    merged_at: Option<&str>,
+) -> Vec<u64> {
+    let remote = world::run(
+        &words(&["git", "remote", "get-url", "origin"]),
+        Some(worktree),
+    );
+    if remote.code != Some(0) {
+        return Vec::new();
+    }
+    // One search over both facts the design names: issues mentioning the PR's number and
+    // issues naming one of its changed paths, bounded to those filed since the merge day.
+    let mut terms = vec![pr_number.to_string()];
+    terms.extend(run_paths.iter().map(|p| format!("\"{p}\"")));
+    let mut search = terms.join(" OR ");
+    if let Some(day) = merged_at.and_then(|stamp| stamp.get(..10)) {
+        search.push_str(&format!(" created:>={day}"));
+    }
+    let out = world::run(
+        &words(&[
+            "gh",
+            "issue",
+            "list",
+            "--json",
+            "number,title",
+            "--search",
+            &search,
+        ]),
+        Some(worktree),
+    );
+    if out.code != Some(0) {
+        return Vec::new();
+    }
+    observe::followup_issues(&out.stdout)
 }
 
 // --- status ------------------------------------------------------------------------------------
