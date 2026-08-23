@@ -10,6 +10,16 @@ reopen the exact stage-count-vs-budget arithmetic the ladder was sized to close.
 dispatch the supervisor makes once a Run's Record reaches Completed or Uncorroborated, reading
 only what that Run already left behind.
 
+## Where you are
+
+Unlike a ladder stage, this dispatch carries no context block — this skill text is the whole
+prompt — so the paths are stated here instead. Your cwd is the finished Run's own directory
+(`~/.grind/runs/<run-id>/`), never a worktree. `<stages-dir>` is `./stages`. The raw attempt
+transcripts to mine are this run directory's own files. The proposal queue is two
+subdirectories the dashboard reads by exactly these names (`view::proposals_in` — a contract:
+change either half and check the other): `<stages-dir>/reflect/jobs/`, one file per drafted
+follow-up Job, and `<stages-dir>/reflect/diffs/`, one file per proposed skill diff.
+
 ## The return
 
 Write `<stages-dir>/reflect.return.json` containing exactly one of `{"status": "complete"}`,
@@ -33,7 +43,8 @@ lenses anyway:
 ## Three readonly lenses, blind to each other
 
 Spawn three fresh subagent sessions over the finished Run's raw attempt transcripts
-(`~/.grind/runs/<run-id>/`, read-only — none of these sessions writes to the tree or opens a PR).
+(this run directory — your cwd — read-only; none of these sessions writes to a tree or opens a
+PR).
 Each asks one question and returns structured candidates, never prose:
 
 - **Judgment** — where in this Run did a stage substitute a guess for an observable fact it could
@@ -75,14 +86,15 @@ Run's quality (ADR-0012).
 findings still open, judgement calls Babysit drafted as comments, anything Reflect itself surfaces
 that is real work and not a lesson — and draft each as a **complete issue body**: the JOB-TEMPLATE
 rows filled, a done predicate stated so a machine could grade it, a Handoff SHA proposed. Park it
-in the proposal queue. **Nothing dispatches it and nothing selects it** — the human stays the only
+in `<stages-dir>/reflect/jobs/`, one file per draft. **Nothing dispatches it and nothing selects
+it** — the human stays the only
 trigger, same as every other Dispatch (ADR-0001, ADR-0012). What changes is the marginal cost of
 the next unit of work: reading a draft instead of writing one from scratch.
 
 ## Never edit an installed skill in place
 
 Every proposed change to a skill file — mechanical wording or substantive rewrite — is a **drafted
-diff in the proposal queue**, never a write to the skill as it sits on disk. A Run's frozen
+diff in `<stages-dir>/reflect/diffs/`**, never a write to the skill as it sits on disk. A Run's frozen
 provenance names a skills-directory hash; an in-place edit forks what a host runs from what the
 repo says, which is the same failure the retired plugin pin made when a cache moved out from under
 a Run mid-flight. Land skill edits the ordinary way — a reviewed commit to this repo — never as a

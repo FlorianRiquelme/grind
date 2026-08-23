@@ -72,7 +72,10 @@ None of these is a gate. Each produces findings, never a pass/fail:
 
 ## Personas
 
-Two lenses, always: `personas/coherence.md` and `personas/feasibility.md`. Read the full file and
+Two lenses, always: `~/.grind/skills/run/plan-review/personas/coherence.md` and
+`~/.grind/skills/run/plan-review/personas/feasibility.md` — the installed skills root, the same
+tree the Run's frozen `skills_hash` covers; a bare `personas/…` resolves only when the target
+repo happens to be grind itself. Read the full file and
 pass it verbatim to the dispatched reviewer session — never paraphrase a persona from memory. At
 T2 a second independent reviewer session runs the same two lenses; at T3 a third seat runs on a
 second model family.

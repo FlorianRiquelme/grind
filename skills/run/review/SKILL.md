@@ -23,7 +23,9 @@ Every persona session receives the same three things and nothing else:
 - the diff (`git diff <handoff-sha>..HEAD`, or the range the dispatch prompt names)
 - the relevant plan units from `<stages-dir>/plan/anchor-plan.md` (the units the diff's touched paths
   map to — pass the whole plan when the mapping is ambiguous, never trim to the point of guessing)
-- that persona's own instruction file (`personas/<name>.md`)
+- that persona's own instruction file (`~/.grind/skills/run/review/personas/<name>.md` — the
+  installed skills root, never a path relative to the target worktree, where a bare
+  `personas/…` resolves only when the target repo happens to be grind itself)
 
 **Never the Run transcript. Never another persona's findings file.** This is the contract, not
 advice: a persona that has read a sibling's conclusion is no longer an independent seat, and a
