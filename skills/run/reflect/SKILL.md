@@ -1,5 +1,5 @@
 ---
-name: run-reflect
+name: reflect
 description: Dispatched once, after a finished Run reaches a terminal observation — never a rung on the ladder, never counted against the Attempt budget. Mines the Run's own raw transcripts for lessons and routes each one to code, template, skill, or Rejected-with-reason.
 ---
 

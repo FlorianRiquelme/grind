@@ -1,5 +1,5 @@
 ---
-name: run-ship
+name: ship
 description: Grit's final rung — commits, pushes to the Job's declared branch, opens the PR against the declared base, and renders the Run's decision trail into the body. Then Mode::CiBabysit (see skills/run/babysit/SKILL.md) reacts to whatever CI says.
 ---
 

@@ -1,5 +1,5 @@
 ---
-name: run-validate
+name: validate
 description: Grit's adversarial validator — rung 8 of the ladder. Dispatched once Review has written its merged findings; attacks every finding before Fixes is allowed to spend on it.
 ---
 
