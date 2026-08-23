@@ -1021,6 +1021,16 @@ fn load_tiers(worktree: &Path) -> Tiers {
         Err(_) => Tiers::default(),
     }
 }
+/// The Plan stage's own `plan-facts.json`, read tolerantly for both [R] passes. Absent or
+/// unparseable reads as `None`: at Triage that fails closed inside `select_tier` (plan is the
+/// pass's required fact); at Diff-triage it merely degrades the panel — Performance seats off
+/// `declared_hot_paths` and Docs off `forecast_paths`, so a missing file seats neither —
+/// because plan is not Diff-triage's required fact.
+fn load_plan_facts(stages_dir: &Path) -> Option<PlanFacts> {
+    world::read_to_string(&stages_dir.join("plan").join("plan-facts.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<PlanFacts>(&text).ok())
+}
 
 /// Run one of the two zero-token in-process passes: `select_tier` over durable facts, writing
 /// `decision.json` and the stage's own return. Consumes **no Attempt** — the `StageEntry` this
@@ -1040,10 +1050,7 @@ fn run_r_pass(
     let template_record = template_record_for(&record.job.target_repo, &record.run_id);
     let decision = match stage {
         Stage::Triage => {
-            let plan_facts =
-                world::read_to_string(&stages_dir.join("plan").join("plan-facts.json"))
-                    .ok()
-                    .and_then(|text| serde_json::from_str::<PlanFacts>(&text).ok());
+            let plan_facts = load_plan_facts(&stages_dir);
             decide::select_tier(
                 Pass::Triage,
                 plan_facts.as_ref(),
@@ -1074,9 +1081,10 @@ fn run_r_pass(
                 .and_then(|text| serde_json::from_str::<decide::Decision>(&text).ok())
                 .map(|d| d.tier)
                 .unwrap_or(Tier::T2);
+            let plan_facts = load_plan_facts(&stages_dir);
             decide::select_tier(
                 Pass::DiffTriage,
-                None,
+                plan_facts.as_ref(),
                 Some(&diff_facts),
                 Some(&template_record),
                 floor,
@@ -1091,7 +1099,8 @@ fn run_r_pass(
     world::create_dir_all(&dir).map_err(Refusal::saying)?;
     let decision_json = serde_json::to_string_pretty(&decision)
         .map_err(|e| Refusal::saying(format!("could not serialise the {name} decision: {e}")))?;
-    world::write(&dir.join("decision.json"), &(decision_json + "\n")).map_err(Refusal::saying)?;
+    world::write_atomic(&dir.join("decision.json"), &(decision_json + "\n"))
+        .map_err(Refusal::saying)?;
 
     let ret = StageReturn {
         status: ReturnStatus::Complete,
@@ -1099,7 +1108,7 @@ fn run_r_pass(
     };
     let ret_json = serde_json::to_string(&ret)
         .map_err(|e| Refusal::saying(format!("could not serialise the {name} return: {e}")))?;
-    world::write(&stages_dir.join(format!("{name}.return.json")), &ret_json)
+    world::write_atomic(&stages_dir.join(format!("{name}.return.json")), &ret_json)
         .map_err(Refusal::saying)?;
 
     say(
