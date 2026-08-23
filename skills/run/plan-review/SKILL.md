@@ -38,6 +38,22 @@ Under `<stages-dir>/plan-review/`:
 The revised plan checkpoint itself lands back at `<stages-dir>/plan/anchor-plan.md` — Work reads
 that path always, whether or not a revision happened, so it never has to know which version it got.
 
+## The plan checklist, first
+
+Before any lens fires, grade the plan against the six-item checklist plan/SKILL.md tells its
+author to write toward — the two skills state the same list, so the halves are a contract:
+change either and check the other.
+
+1. The plan file exists.
+2. `readiness:` parses and equals `implementation-ready`.
+3. The done predicate is present and stated so a machine could grade it.
+4. Every referenced path is repo-relative with an existing parent at the Handoff SHA.
+5. Every feature-bearing step names test-file paths.
+6. The declared base branch is present and the Handoff SHA sits on it.
+
+Each miss is a finding in `findings.json` like any other — described, bucketed, never a gate
+(ADR-0003).
+
 ## The six checks
 
 None of these is a gate. Each produces findings, never a pass/fail:
