@@ -14,6 +14,8 @@
 //! | empty_response_fails_loudly | — (R6: never a clean stop) |
 //! | text_protocol_with_nudge | success_done.sh, text-wire equivalent |
 //! | http_429_is_rate_limited | rate_limited.sh (`rate_limited:true`) |
+//! | a_completed_stage_without_the_sentinel_promises_nothing | — (issue #139: an ending
+//!   is never synthesized into a Run-level promise) |
 //!
 //! Library-level parity suffices here; the full-binary native e2e stays out of scope
 //! this wave.
@@ -308,7 +310,7 @@ fn happy_native_tools_completes_with_usage_and_transcript() {
             }),
         ])),
         Reply::Sse(sse(vec![chunk(
-            json!({"content": "All work complete."}),
+            json!({"content": "All work complete. <promise>DONE</promise>"}),
             Some("stop"),
             None,
         )])),
@@ -324,7 +326,10 @@ fn happy_native_tools_completes_with_usage_and_transcript() {
     assert!(!attempt.rate_limited);
     assert!(attempt.parse_ok);
     assert_eq!(attempt.subtype, None);
-    assert_eq!(attempt.result_tail, "All work complete.");
+    assert_eq!(
+        attempt.result_tail,
+        "All work complete. <promise>DONE</promise>"
+    );
     assert_eq!(attempt.num_turns, Some(2));
     // R8: the provider's usage rides through verbatim.
     assert_eq!(
@@ -469,7 +474,7 @@ fn text_protocol_nudges_prose_then_completes_on_done_sentinel() {
         )])),
         // Turn 3: the only legal text-mode termination.
         Reply::Sse(sse(vec![chunk(
-            json!({"content": "<done>The brief is written and verified.</done>"}),
+            json!({"content": "<done>The brief is written and verified. <promise>DONE</promise></done>"}),
             Some("stop"),
             None,
         )])),
@@ -505,8 +510,14 @@ fn text_protocol_nudges_prose_then_completes_on_done_sentinel() {
         .iter()
         .find(|(name, _)| name == "final")
         .expect("Final logged");
-    assert_eq!(final_value["text"], "The brief is written and verified.");
-    assert_eq!(attempt.result_tail, "The brief is written and verified.");
+    assert_eq!(
+        final_value["text"],
+        "The brief is written and verified. <promise>DONE</promise>"
+    );
+    assert_eq!(
+        attempt.result_tail,
+        "The brief is written and verified. <promise>DONE</promise>"
+    );
 
     // Server-side: the corrective exchange quotes the prose back, and Text mode
     // omits the tools parameter entirely (ADR-0018).
@@ -570,5 +581,35 @@ fn http_429_classifies_as_rate_limited() {
     assert!(
         reason.contains("429"),
         "the status survives into the record: {reason}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario f — a stage that merely completes speaks no Run-level promise (#139)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_completed_stage_without_the_sentinel_promises_nothing() {
+    let (run_dir, cwd) = scratch("no-promise");
+    let server = Server::start(vec![Reply::Sse(sse(vec![chunk(
+        json!({"content": "Stage artifacts are on disk; the ladder may advance."}),
+        Some("stop"),
+        None,
+    )]))]);
+
+    let attempt = drive_attempt(&server, &run_dir, &cwd, 1);
+
+    // The defect behind issue #139: a clean ending is a fact about the loop, not a
+    // claim about the work. Synthesizing a promise from it asked the Run-level
+    // verdict after stage one and terminated the ladder as Uncorroborated.
+    assert!(!attempt.is_error, "{:?}", attempt.terminal_reason);
+    assert!(
+        !attempt.done_promise,
+        "a Run-level promise must be spoken by the agent, never inferred from an ending"
+    );
+    assert_eq!(attempt.exit_code, Some(0));
+    assert_eq!(
+        attempt.result_tail,
+        "Stage artifacts are on disk; the ladder may advance."
     );
 }
