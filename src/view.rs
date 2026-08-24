@@ -425,6 +425,38 @@ pub(crate) fn one_line(text: &str) -> String {
     }
 }
 
+// --- the live view, the shared observation currency ------------------------------------------
+//
+// `Live` describes what a Run is doing right now, and **both adapters produce it**: `claude::live`
+// reads Claude Code's own JSONL out of `~/.claude/projects/`, `native::live` reads the
+// `messages-N.jsonl` the native loop writes under the Run's own directory. It lived in `claude`
+// while that was the only reader, which made `cli`/`serve` construct a `claude::Live` to describe
+// a native Run — the read side is where it belongs, beside the `RunView` it is rendered next to.
+// Nothing here reads a transcript; the adapters do, and hand back these values.
+
+/// One fanned-out subagent, as the transcript shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fanout {
+    pub description: String,
+}
+
+/// What a Run's transcript can say. Five values, each degrading on its own — an unreadable
+/// transcript costs these their values and never the whole command.
+#[derive(Debug)]
+pub struct Live {
+    pub transcript: PathBuf,
+    pub now_skill: Observed<String>,
+    pub last_words: Vec<String>,
+    /// The last assistant message, flattened to one line: the live answer to *what is it
+    /// doing right now*, observed from the transcript. Never a verdict input — ADR-0003
+    /// caps this field at describing what happened (issue #82).
+    pub assistant_now: Observed<String>,
+    pub fanout: Observed<Vec<Fanout>>,
+    /// Seconds since the newest write across the parent transcript **and every subagent
+    /// transcript**. The quietest healthy phase of a pipeline must not read as stuck.
+    pub freshness: Observed<u64>,
+}
+
 /// Observe a Run's durable artifacts fresh. **Reads and never writes** — this path observes and
 /// persists nothing, which is the whole difference from the script's `cmd_status`.
 pub fn observe_fresh(
@@ -445,7 +477,7 @@ mod tests {
     // The transcript matchers moved verbatim to `runner::claude`; every assertion below is
     // unchanged and simply names them through the new path.
     use crate::claude::{
-        Fanout, assistant_now, fanout, fanout_counts, fanout_since, last_words, live, now_skill,
+        assistant_now, fanout, fanout_counts, fanout_since, last_words, live, now_skill,
         transcript_path,
     };
 

@@ -228,7 +228,7 @@ fn run_response(home: &Path, id: &str, fragment: bool) -> Response {
 /// newest `messages-*.jsonl` write; every other field stays honestly `Unobservable` until
 /// `native::live` learns to parse transcript content, which is out of scope here (pending P3
 /// dogfooding evidence). A claude-code Run is unaffected — this is `claude::live` unchanged.
-fn live_for(home: &Path, run_id: &str, found: &view::RunView) -> claude::Live {
+fn live_for(home: &Path, run_id: &str, found: &view::RunView) -> view::Live {
     match found.backend {
         runner::Backend::ClaudeCode => claude::live(
             &claude::transcript_path(home, &found.worktree, &found.session_id),
@@ -240,7 +240,7 @@ fn live_for(home: &Path, run_id: &str, found: &view::RunView) -> claude::Live {
                 .iter()
                 .filter_map(|path| world::mtime(path))
                 .collect();
-            claude::Live {
+            view::Live {
                 transcript: run_dir,
                 now_skill: native_unread(),
                 assistant_now: native_unread(),
@@ -252,7 +252,7 @@ fn live_for(home: &Path, run_id: &str, found: &view::RunView) -> claude::Live {
     }
 }
 
-/// Shared by every `claude::Live` field a native Run cannot yet answer content-wise. A named
+/// Shared by every [`view::Live`] field a native Run cannot yet answer content-wise. A named
 /// helper rather than four repeated literals, so the one thing worth saying about all of them —
 /// *pending, not overlooked* — cannot drift between fields.
 fn native_unread<T>() -> Observed<T> {

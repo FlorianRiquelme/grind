@@ -926,7 +926,7 @@ pub fn observe_run(
 //
 // `claude::live` reads a claude-code Run's own transcript file. A native Run writes no such
 // file — `NativeAdapter::run` leaves `messages-N.jsonl` under the Run's own directory instead
-// — so every field of `claude::Live` degraded to `Unobservable` at once for every native Run,
+// — so every field of `view::Live` degraded to `Unobservable` at once for every native Run,
 // and `grind status` still exited *Answered* over a blank live panel (#135's own review
 // finding). A complete `native::live` that parses that transcript's *content* into
 // `assistant_now` / `last_words` / `now_skill` is out of scope here — it is gated on P3

@@ -14,7 +14,7 @@ use crate::attempt::{
 use crate::observe::{Observed, Reason};
 use crate::rung;
 use crate::runner::{Backend, RunSpec, StageRunner};
-use crate::view::one_line;
+use crate::view::{Fanout, Live, one_line};
 use crate::world;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -575,29 +575,6 @@ fn tail(text: &str, characters: usize) -> String {
 }
 
 // --- the live view, read from an undocumented format -----------------------------------------
-
-/// One fanned-out subagent, as the transcript shows it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Fanout {
-    pub description: String,
-}
-
-/// What the transcript can say. Five values, each degrading on its own — an unreadable
-/// transcript costs these their values and never the whole command.
-#[derive(Debug)]
-pub struct Live {
-    pub transcript: PathBuf,
-    pub now_skill: Observed<String>,
-    pub last_words: Vec<String>,
-    /// The last assistant message, flattened to one line: the live answer to *what is it
-    /// doing right now*, observed from the transcript. Never a verdict input — ADR-0003
-    /// caps this field at describing what happened (issue #82).
-    pub assistant_now: Observed<String>,
-    pub fanout: Observed<Vec<Fanout>>,
-    /// Seconds since the newest write across the parent transcript **and every subagent
-    /// transcript**. The quietest healthy phase of a pipeline must not read as stuck.
-    pub freshness: Observed<u64>,
-}
 
 /// Claude Code writes a session's transcript under a slug of the directory it ran in.
 ///
