@@ -48,9 +48,15 @@ log line. This is the ADR-0008 shape applied to secrets: the environment is the 
 the same way `$HOME` is, and a Run record that leaked a bearer token would turn every `run.json`
 into a credential store with worse retention than any vault.
 
-The record therefore snapshots **backend + optional `endpoint_override`** and nothing else. A
+The record therefore snapshots **the declaration and never the credential**. As first accepted
+that was backend + optional `endpoint_override`; the amendment below adds the declared model
+classes and wire mode, on the same terms and for the same reason. What stays out is the key. A
 re-entry under a different environment is visible (the key check fails loudly in doctor, R9)
 rather than silently substituted.
+
+The line worth holding is not the field count — that grows whenever the layout declares one more
+policy knob — but the distinction: a *declaration* is a fact about the host that the Run must
+carry forward unchanged, while a *credential* is read at use and never written down.
 
 ## The snapshot is the Run's constitution
 

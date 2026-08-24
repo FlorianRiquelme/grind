@@ -303,44 +303,58 @@ pub(crate) fn glob_matches(pattern: &str, candidate: &str) -> bool {
 /// Split a compound shell command the way the documented matcher does, before per-subcommand
 /// glob matching — then widen the candidate set past what a plain separator split sees.
 ///
-/// Splitting on `&&`/`;`/`|`/etc. alone misses three shapes that still reach a shell:
-/// `echo $(gh pr merge 123)` and `` `git push --force origin main` `` hide the forbidden verb
-/// inside a substitution or subshell, and `GIT_DIR=. gh pr merge 123` hides it behind a leading
-/// `NAME=value` assignment so the candidate no longer *starts with* `gh`. Both gaps are closed
-/// by adding candidates, never by removing one: the inside of every `$( )`, backtick span and
-/// `( )` subshell becomes its own candidate (recursively re-run through this same pipeline, so
-/// a substitution nested inside another is still found), and each candidate additionally has any
-/// leading assignment tokens stripped. More candidates can only mean more refusals, never a
-/// false allow, which is the direction widening is allowed to move in.
+/// Splitting on `&&`/`;`/`|`/etc. alone misses shapes that still reach a shell: `echo $(gh pr
+/// merge 123)` and `` `git push --force origin main` `` hide the forbidden verb inside a
+/// substitution or subshell, and anything sitting in front of the verb — a leading `NAME=value`
+/// assignment, an option-taking wrapper (`nice -n 5`, `env -i`, `timeout 30`), a nested shell
+/// (`sh -c '...'`), or a stack of these — hides it behind tokens a front-anchored glob never
+/// looks past. Every gap is closed by adding candidates, never by removing one: more candidates
+/// can only mean more refusals, never a false allow, which is the only direction widening this
+/// set is allowed to move in.
 ///
-/// A second gap (fix 4): `Bash(sh -c*)`, `Bash(bash -c*)` and `Bash(eval*)` are themselves
-/// front-anchored, so *any* prefix on the outer command defeats them — `env bash -c '...'`,
-/// `/bin/sh -c '...'` and `command eval '...'` all reach a nested shell without `sh`, `bash` or
-/// `eval` ever sitting at the front of a subcommand. Three more normalizations close this, each
-/// **purely additive** for the same reason as the two above — they only ever widen the
-/// candidate set, so they can only turn an allow into a refusal, never the reverse:
+/// **The general fix, replacing three earlier rounds of front-anchoring patches:** every
+/// candidate contributes every one of its own token-boundary suffixes as a further candidate.
+/// `nice -n 5 gh pr merge 123` yields `-n 5 gh pr merge 123`, `5 gh pr merge 123`,
+/// `gh pr merge 123`, `pr merge 123`, `merge 123` and `123` — and `gh pr merge 123` is exactly
+/// what `Bash(gh pr merge*)` already matches. This makes the front-anchoring of every glob
+/// irrelevant at token boundaries: no matter what sits in front of the verb, some suffix starts
+/// exactly at it. Round one re-anchored a flag that had moved off the verb; round two named the
+/// wrapper (`env`, `sh -c`, `bash -c`, `eval`); round three would have had to name the wrapper's
+/// own options (`nice -n 5`, `env -i`, `timeout 30`, ...) one at a time forever. Token-suffix
+/// generation closes the family instead of its next member, so a future wrapper never needs
+/// enumerating. It **replaces the old wrapper-name list and leading-assignment stripper
+/// outright** — both were special cases of dropping some leading tokens, which this does for
+/// every leading token, not just the ones on a name list.
+///
+/// Two normalizations from the prior round still earn their place alongside token suffixes,
+/// because neither is a special case of dropping leading tokens:
 ///
 /// 1. **Quoted-span extraction.** A nested shell has to pass its payload as a string, so the
 ///    inside of every `'...'` and `"..."` span becomes its own candidate too (queued back
 ///    through this same pipeline, so a quoted span containing a further substitution or wrapper
 ///    is still unwound). `env bash -c 'gh pr merge 123'` yields the candidate `gh pr merge 123`
-///    directly — already refused by `Bash(gh pr merge*)` — no matter what the wrapper is called
-///    or how deeply it is spelled. This is the general move: it needs no list of wrapper names.
+///    directly, no matter how the outer wrapper is spelled — token suffixes alone would not find
+///    this, because the payload sits inside a string, not at a token boundary of the outer
+///    command.
 /// 2. **Basename normalization.** A candidate whose first token contains `/` also yields a
 ///    variant with that token reduced to its basename, so `/bin/sh -c '...'` also presents as
-///    `sh -c '...'`, which the existing front-anchored glob matches directly.
-/// 3. **Leading-wrapper stripping**, for the handful of commands that take the wrapped command
-///    as their own argument list rather than as a string, so there is no quote for (1) to find:
-///    `env`, `command`, `nohup`, `nice`, `stdbuf` and `setsid`, and `time`. Stripping the wrapper
-///    token (and, for `env`, any `NAME=value` tokens riding after it) re-queues the remainder as
-///    its own candidate, so `env gh pr merge 123` — which carries no quotes and no path for (2)
-///    to trim — still surfaces `gh pr merge 123` at the front.
+///    `sh -c '...'`, which the existing front-anchored glob matches directly. Suffix dropping
+///    alone cannot produce this: it only removes whole leading tokens, never rewrites the token
+///    left at the front.
 ///
-/// Together these accept two documented false refusals: a quoted span that happens to spell a
-/// denied command as a string literal rather than as an invocation (`git commit -m "git push
-/// --force"` is now refused, because the quoted text matches `Bash(git push*--force*)`), and any
-/// spelling of an outer wrapper this file did not think to name. Both are acceptable for a
-/// barrier of this kind — the same trade `Bash(git -C*)` and `Bash(git push*:*)` already make.
+/// Also still folded in: the inside of every `$( )`, backtick span and `( )` subshell becomes its
+/// own candidate, recursively re-run through this same pipeline so a substitution nested inside
+/// another is still found.
+///
+/// **Bounded, not unbounded.** Suffix generation costs work proportional to (tokens considered) ×
+/// (piece length), so the number of a piece's leading tokens that each start their own candidate
+/// is capped at [`MAX_SUFFIX_TOKENS`] — see its own doc for why that cap is safe.
+///
+/// This accepts a documented false refusal, unchanged from the prior round: a quoted span that
+/// happens to spell a denied command as a string literal rather than as an invocation (`git
+/// commit -m "git push --force"` is refused, because the quoted text matches `Bash(git
+/// push*--force*)`). Acceptable for a barrier of this kind — the same trade `Bash(git -C*)` and
+/// `Bash(git push*:*)` already make.
 ///
 /// **This is not a shell parser and is not trying to become one.** It has no notion of escaping
 /// or comments, so a quoted separator inside `sh -c '...'` can still fragment a candidate early —
@@ -367,21 +381,55 @@ pub(crate) fn subcommands_of(command: &str) -> Vec<String> {
             let trimmed = piece.trim().to_string();
             queue.extend(extract_spans(&trimmed));
             queue.extend(extract_quoted(&trimmed));
-            // The plain trimmed piece stays a candidate regardless — stripping only adds a
-            // second candidate on top, so a future glob with no fixed prefix cannot lose a
-            // match this already had. Each of `trimmed` and its assignment-stripped variant
-            // also contributes a basename-normalized variant, and either may unwrap a leading
-            // wrapper command, whose remainder is queued to run back through this same pipeline.
-            let stripped = strip_leading_assignments(&trimmed);
-            push_with_basename(&mut candidates, &trimmed);
-            queue.extend(strip_leading_wrapper(&trimmed));
-            if stripped != trimmed {
-                push_with_basename(&mut candidates, &stripped);
-                queue.extend(strip_leading_wrapper(&stripped));
+            // Every token-boundary suffix of the piece — dropping no leading tokens, one, two,
+            // and so on — becomes its own candidate, each with its own basename-normalized
+            // variant. This is what makes the old wrapper-name list and assignment stripper
+            // redundant: dropping *any* prefix of leading tokens finds the verb regardless of
+            // what sits in front of it.
+            for suffix in token_suffixes(&trimmed) {
+                push_with_basename(&mut candidates, &suffix);
             }
         }
     }
     candidates
+}
+
+/// Bound on how many of a piece's leading tokens each contribute their own token-suffix
+/// candidate in [`subcommands_of`]. Suffix generation costs work proportional to (tokens
+/// considered) × (piece length) — every candidate is a fresh substring — so this keeps one gated
+/// tool call bounded rather than quadratic in an arbitrarily long command line (a full `cargo`
+/// invocation, a long commit message, both realistic).
+///
+/// 64 is far deeper than any real wrapper stack: `nice`, `stdbuf`, `setsid`, `env` and `timeout`
+/// chained together is under ten tokens before the wrapped verb, so nothing this barrier is
+/// meant to catch is affected by the cap. The accepted cost is symmetric with this module's other
+/// disclaimer: a forbidden verb padded behind more leading tokens than the cap allows is not
+/// found by suffix dropping alone — the same kind of gap already accepted for a determined
+/// adversary constructing shell syntax by hand, not for an unthinking or accidental invocation.
+const MAX_SUFFIX_TOKENS: usize = 64;
+
+/// Every token-boundary suffix of `piece`, up to [`MAX_SUFFIX_TOKENS`] of them: `piece` itself
+/// (dropping no leading tokens), then the piece with its first token dropped, then its first two
+/// dropped, and so on. The general replacement for the old wrapper-name list and
+/// leading-assignment stripper: both special-cased *which* leading tokens to drop (`env`, `nice`,
+/// a `NAME=value` pair); this drops every possible prefix of leading tokens instead, so no
+/// wrapper — however it is spelled, however many options it takes — needs naming for its
+/// remainder to surface as a candidate.
+fn token_suffixes(piece: &str) -> Vec<String> {
+    let mut starts = Vec::with_capacity(MAX_SUFFIX_TOKENS);
+    let mut in_token = false;
+    for (i, ch) in piece.char_indices() {
+        if ch.is_whitespace() {
+            in_token = false;
+        } else if !in_token {
+            in_token = true;
+            starts.push(i);
+            if starts.len() == MAX_SUFFIX_TOKENS {
+                break;
+            }
+        }
+    }
+    starts.into_iter().map(|i| piece[i..].to_string()).collect()
 }
 
 /// Push `candidate`, plus — when its first whitespace-delimited token contains a `/` — a second
@@ -396,43 +444,6 @@ fn push_with_basename(candidates: &mut Vec<String>, candidate: &str) {
     if first.contains('/') {
         let base = first.rsplit('/').next().unwrap_or(first);
         candidates.push(format!("{base}{rest}"));
-    }
-}
-
-/// Leading commands that take the wrapped command as their own argument list rather than as a
-/// string — so quoted-span extraction finds no quotes to unwind. `env` alone also accepts
-/// `NAME=value` tokens ahead of the wrapped command.
-const LEADING_WRAPPERS: [&str; 7] = [
-    "env", "command", "nohup", "nice", "stdbuf", "setsid", "time",
-];
-
-/// If `command` starts with one of [`LEADING_WRAPPERS`], the remainder after that token (and,
-/// for `env`, after any `NAME=value` tokens following it) — otherwise `None`. The remainder is
-/// re-queued in [`subcommands_of`] rather than trusted as a final candidate, so a stack of
-/// wrappers (`nohup env bash -c '...'`) unwinds one layer per pass.
-fn strip_leading_wrapper(command: &str) -> Option<String> {
-    let trimmed = command.trim_start();
-    let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
-    let head = &trimmed[..end];
-    if !LEADING_WRAPPERS.contains(&head) {
-        return None;
-    }
-    let mut rest = trimmed[end..].trim_start();
-    if head == "env" {
-        loop {
-            let tok_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-            let token = &rest[..tok_end];
-            if is_assignment_token(token) {
-                rest = rest[tok_end..].trim_start();
-            } else {
-                break;
-            }
-        }
-    }
-    if rest.is_empty() {
-        None
-    } else {
-        Some(rest.to_string())
     }
 }
 
@@ -527,37 +538,6 @@ fn balanced_parens(text: &str, open: usize) -> Option<(String, usize)> {
         i += 1;
     }
     None
-}
-
-/// Strip leading `NAME=value` assignment tokens (`GIT_DIR=. gh pr merge 123` ->
-/// `gh pr merge 123`), so a prefix-anchored glob still sees the verb at the front.
-fn strip_leading_assignments(command: &str) -> String {
-    let mut rest = command.trim_start();
-    loop {
-        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let token = &rest[..end];
-        if is_assignment_token(token) {
-            rest = rest[end..].trim_start();
-        } else {
-            break;
-        }
-    }
-    rest.to_string()
-}
-
-/// `NAME=...`: a non-empty leading identifier (letters, digits, underscore; not starting with a
-/// digit) followed by `=`. Shell assignment syntax, not general `=` use — `gh api -X DELETE` is
-/// untouched because `-X` is not an identifier.
-fn is_assignment_token(token: &str) -> bool {
-    let Some((name, _)) = token.split_once('=') else {
-        return false;
-    };
-    !name.is_empty()
-        && name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Char-boundary-safe truncation with a `…[truncated N bytes]` suffix.
@@ -744,6 +724,13 @@ mod tests {
         // prefix on the outer command used to defeat them outright. Gated against the real
         // `attempt::DENIED_TOOLS` list, since the point is that the matcher now finds these
         // regardless of which glob ends up doing the refusing.
+        //
+        // Fix 5 folds in the round-three bypass: an option-taking wrapper (`nice -n 5`,
+        // `stdbuf -o0`, `setsid -f`, `env -i`, `env -u FOO`, `timeout 30`) was allowed straight
+        // through because `strip_leading_wrapper` only ever removed the wrapper's own token,
+        // never its options or operands, so the remainder never reached the front. Token-suffix
+        // expansion in `subcommands_of` closes this generally rather than by naming `timeout`
+        // and re-anchoring on yet another wrapper's flag shape.
         let all_denials: Vec<String> = crate::attempt::DENIED_TOOLS
             .iter()
             .map(|g| g.to_string())
@@ -755,6 +742,14 @@ mod tests {
             "env gh pr merge 123",
             "nohup sh -c 'git push --force origin main'",
             "sh -c \"gh pr merge 123\"",
+            "nice -n 5 gh pr merge 123",
+            "stdbuf -o0 gh pr merge 123",
+            "setsid -f gh pr merge 123",
+            "env -i gh pr merge 123",
+            "env -u FOO gh pr merge 123",
+            "timeout 30 gh pr merge 123",
+            "env -i bash -c 'gh pr merge 123'",
+            "gh pr merge 123",
         ] {
             let decision = gate(
                 &all_denials,
@@ -782,6 +777,7 @@ mod tests {
             "git status",
             "gh pr view 135",
             "cargo test --lib runner::tools",
+            "cargo test --all",
             "echo done",
             // The new normalizations must not turn an ordinary invocation of a wrapper, a
             // path-qualified binary or a quoted string into a false denial.

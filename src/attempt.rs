@@ -570,7 +570,7 @@ mod tests {
         // spelling per row is what let the whole list read complete while
         // `git push origin --force` went straight through: git accepts the flag anywhere, and
         // a table that only ever types it in one position never asks.
-        let table: [(&str, &[&str]); 20] = [
+        let table: [(&str, &[&str]); 21] = [
             (
                 "merge via gh pr merge",
                 &["gh pr merge 123 --squash", "gh pr merge --squash 123"],
@@ -691,6 +691,22 @@ mod tests {
                     "env gh pr merge 123",
                     "nohup sh -c 'git push --force origin main'",
                     "sh -c \"gh pr merge 123\"",
+                    "env -i bash -c 'gh pr merge 123'",
+                ],
+            ),
+            (
+                "an option-taking wrapper's own flags and operands sitting between the wrapper \
+                 and the verb, which used to defeat fix 4's wrapper-name list outright (fix 5) \
+                 — closed by token-suffix expansion in `tools::subcommands_of` rather than by \
+                 naming `timeout` and every other option shape",
+                &[
+                    "nice -n 5 gh pr merge 123",
+                    "stdbuf -o0 gh pr merge 123",
+                    "setsid -f gh pr merge 123",
+                    "env -i gh pr merge 123",
+                    "env -u FOO gh pr merge 123",
+                    "timeout 30 gh pr merge 123",
+                    "gh pr merge 123",
                 ],
             ),
         ];
@@ -730,6 +746,9 @@ mod tests {
             "/usr/bin/git status",
             "nohup cargo build --release &",
             "echo 'hello world'",
+            // Nor must fix 5's token-suffix expansion: a long ordinary invocation is still just
+            // an ordinary invocation, wherever its tokens fall.
+            "cargo test --all",
         ] {
             assert!(!is_denied(allowed), "{allowed:?} must not be denied");
         }
