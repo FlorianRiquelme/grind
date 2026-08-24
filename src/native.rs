@@ -362,9 +362,11 @@ struct AttemptFacts<'a> {
 /// itself), exit 0/1, and rate-limit detection asked of the shared classifier over a
 /// payload carrying the error text — policy parity without duplicating needles.
 ///
-/// `total_cost_usd` is `Some(0.0)`, never `None`: unlike the claude-code path, where
-/// an absent JSON field is genuinely ambiguous between "renamed key" and "true zero",
-/// the native loop authoritatively knows it recorded no cost. `None` here would make
+/// `total_cost_usd` carries the run's summed `usage.cost` when the endpoint reported
+/// one (`accumulate_usage` folds each turn's per-request cost into the total), and is
+/// otherwise `Some(0.0)` — never `None`: unlike the claude-code path, where an absent
+/// JSON field is genuinely ambiguous between "renamed key" and "true zero", the native
+/// loop authoritatively knows it recorded no cost. `None` here would make
 /// `Attempt::is_wait()` false for every native Attempt regardless of `num_turns`,
 /// which lets a first-turn rate limit spend the attempt budget and keeps
 /// `trailing_waits` permanently at 0 — the Run 2 failure ADR-0002/0004 exist to
@@ -394,7 +396,14 @@ fn synthesize(facts: AttemptFacts) -> Attempt {
         api_error_status: None,
         terminal_reason,
         num_turns: Some(facts.turns_used as u64),
-        total_cost_usd: Some(0.0),
+        total_cost_usd: Some(
+            facts
+                .usage
+                .as_ref()
+                .and_then(|u| u.get("cost"))
+                .and_then(|c| c.as_f64())
+                .unwrap_or(0.0),
+        ),
         usage: facts.usage,
         permission_denials: facts.denials,
         done_promise,
@@ -1003,7 +1012,7 @@ mod tests {
             ended_at: "e",
             turns_used: 7,
             ending: Ending::Completed("shipped it".into()),
-            usage: Some(json!({"prompt_tokens": 10})),
+            usage: Some(json!({"prompt_tokens": 10, "cost": 0.03183387})),
             denials: vec![],
         });
         assert_eq!(attempt.exit_code, Some(0));
@@ -1012,7 +1021,7 @@ mod tests {
         assert_eq!(attempt.subtype, None);
         assert!(attempt.done_promise);
         assert!(!attempt.rate_limited);
-        assert_eq!(attempt.total_cost_usd, Some(0.0));
+        assert_eq!(attempt.total_cost_usd, Some(0.031_833_87));
         assert_eq!(attempt.num_turns, Some(7));
         assert_eq!(attempt.usage.as_ref().unwrap()["prompt_tokens"], 10);
         assert_eq!(attempt.result_tail, "shipped it");
@@ -1038,6 +1047,24 @@ mod tests {
             attempt.is_wait(),
             "a first-turn rate limit must not spend the attempt budget"
         );
+    }
+
+    #[test]
+    fn an_attempt_that_spent_is_never_a_wait() {
+        // The property the old hardcoded Some(0.0) protected, stated positively: real
+        // spend means the model answered, so the Attempt did work even at one turn.
+        let attempt = synthesize(AttemptFacts {
+            n: 1,
+            mode: Mode::Dispatch,
+            started_at: "s",
+            ended_at: "e",
+            turns_used: 1,
+            ending: Ending::Completed("shipped it".into()),
+            usage: Some(json!({"prompt_tokens": 10, "cost": 0.03183387})),
+            denials: vec![],
+        });
+        assert_eq!(attempt.total_cost_usd, Some(0.031_833_87));
+        assert!(!attempt.is_wait());
     }
 
     #[test]
