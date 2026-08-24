@@ -56,6 +56,12 @@ pub enum TranscriptEvent {
     ProtocolSelected { mode: ProtoMode, reason: String },
     /// The attempt's final answer text (also carried by Attempt.result_tail).
     Final { text: String },
+    /// Which stage's skill the prompt that opened this attempt declared, read off the
+    /// prompt's own frontmatter. Every other variant here records a *wire* event, so
+    /// nothing in the transcript could answer *which rung is running* — the one question
+    /// `grind status`'s `now` line asks, and the reason a native Run answered nothing there.
+    /// A prompt declaring no name logs no line: the field degrades on its own.
+    SkillDeclared { skill: String },
 }
 
 impl TranscriptEvent {

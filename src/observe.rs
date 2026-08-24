@@ -922,26 +922,23 @@ pub fn observe_run(
     }
 }
 
-// --- the native backend's freshness floor ------------------------------------------------
+// --- the native backend's freshness -------------------------------------------------------
 //
-// `claude::live` reads a claude-code Run's own transcript file. A native Run writes no such
-// file — `NativeAdapter::run` leaves `messages-N.jsonl` under the Run's own directory instead
-// — so every field of `view::Live` degraded to `Unobservable` at once for every native Run,
-// and `grind status` still exited *Answered* over a blank live panel (#135's own review
-// finding). A complete `native::live` that parses that transcript's *content* into
-// `assistant_now` / `last_words` / `now_skill` is out of scope here — it is gated on P3
-// dogfooding evidence, and this floor parses nothing. It supplies only `freshness`, because
-// that is the one field a human actually uses to decide whether a Run is stuck: everything
-// else stays honestly `Unobservable` until something reads the content.
+// `claude::live` reads a claude-code Run's own transcript file, and derives its freshness from
+// that file's mtime plus every subagent file's. A native Run writes no such file —
+// `NativeAdapter::run` leaves `messages-N.jsonl` under the Run's own directory instead, one per
+// attempt — so the newest write is a max across files rather than one file's mtime. `native::live`
+// reads the rest of the view out of those files' content; this is the arithmetic it asks for, kept
+// here because it is pure over times and belongs beside the other observation primitives.
 
 /// Freshness for a `Backend::Native` Run: seconds since the newest write across the Run
 /// directory's `messages-*.jsonl` files, the same shape `claude::live`'s own `freshness` field
 /// already carries (present-with-a-count, or could-not-observe — never zero for *nothing to
 /// read*).
 ///
-/// `mtimes` is the caller's door to `world::list_with_extension` + `world::mtime` over the Run
-/// directory; this stays pure over the values so the newest-wins and empty-is-unobservable
-/// rules are testable from literals with no filesystem.
+/// `mtimes` is [`crate::native::live`]'s door to `world::list_with_extension` + `world::mtime`
+/// over the Run directory; this stays pure over the values so the newest-wins and
+/// empty-is-unobservable rules are testable from literals with no filesystem.
 pub fn native_freshness(mtimes: &[SystemTime], now_epoch: u64) -> Observed<u64> {
     match mtimes.iter().max() {
         Some(newest) => Observed::Present(seconds_since_epoch(*newest, now_epoch)),
