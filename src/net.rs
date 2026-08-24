@@ -7,11 +7,18 @@
 use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::io::BufReader;
+use std::io::Read;
 use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::runner::Endpoint;
+
+/// Idle-read bound, not a total-request bound: a legitimate stream may run minutes,
+/// but every individual read off the socket must land within this long or the peer is
+/// stalled rather than slow, and the per-run supervisor thread must not hang on it
+/// forever with nothing visible in `grind status`.
+const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// One pooled sync client. Connect timeout 30s; NO overall timeout — a streaming
 /// response may legitimately run minutes.
@@ -23,6 +30,7 @@ impl ChatClient {
     pub fn new() -> Self {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(30))
+            .timeout_read(IDLE_READ_TIMEOUT)
             .build();
         Self { agent }
     }
@@ -53,30 +61,51 @@ impl ChatClient {
             });
         }
 
-        let mut assembler = SseAssembler::new();
-        let mut reader = BufReader::new(resp.into_reader());
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let n = reader
-                .read_line(&mut line)
-                .map_err(|e| NetError::Stream(format!("stream read failed: {e}")))?;
-            if n == 0 {
-                break; // server closed; some providers skip [DONE]
-            }
-            let line = line.trim_end_matches(['\n', '\r']);
-            match classify_sse_line(line) {
-                SseLine::Keepalive | SseLine::Ignored => continue,
-                SseLine::Done => break,
-                SseLine::Data(payload) => {
-                    let chunk: Value = serde_json::from_str(payload)
-                        .map_err(|e| NetError::Stream(format!("bad chunk: {e}: {payload}")))?;
-                    assembler.feed_chunk(&chunk)?;
-                }
+        read_sse_stream(resp.into_reader())
+    }
+}
+
+/// Ceiling on one SSE line's byte length. `BufRead::read_line` grows its buffer until
+/// a newline arrives, so a peer that never sends one would otherwise exhaust memory
+/// before parsing ever runs — mirrors serve.rs's `HEAD_LIMIT` counter-pattern.
+const MAX_SSE_LINE: usize = 1 << 20;
+
+/// Drive the read-line/classify/feed loop over any byte stream and assemble the turn.
+/// Split out of [`ChatClient::post_chat`] so the bounded-line and truncated-stream
+/// behavior is testable from an in-memory `Cursor`, with no socket involved.
+fn read_sse_stream<R: Read>(reader: R) -> Result<ChatTurn, NetError> {
+    let mut assembler = SseAssembler::new();
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        // A fresh `take` per call: the cap bounds this one line, never the stream's
+        // cumulative length, so a long healthy stream is never cut off partway through.
+        let n = (&mut reader)
+            .take(MAX_SSE_LINE as u64)
+            .read_line(&mut line)
+            .map_err(|e| NetError::Stream(format!("stream read failed: {e}")))?;
+        if n == 0 {
+            break; // server closed; some providers skip [DONE]
+        }
+        if n >= MAX_SSE_LINE && !line.ends_with('\n') {
+            return Err(NetError::Stream(format!(
+                "SSE line exceeded {MAX_SSE_LINE} bytes without a line terminator"
+            )));
+        }
+        let line = line.trim_end_matches(['\n', '\r']);
+        match classify_sse_line(line) {
+            SseLine::Keepalive | SseLine::Ignored => continue,
+            SseLine::Done => break,
+            SseLine::Data(payload) => {
+                let chunk: Value = serde_json::from_str(payload).map_err(|e| {
+                    NetError::Stream(format!("bad chunk: {e}: {}", truncate_body(payload)))
+                })?;
+                assembler.feed_chunk(&chunk)?;
             }
         }
-        assembler.finish()
     }
+    assembler.finish()
 }
 
 impl Default for ChatClient {
@@ -274,6 +303,15 @@ impl SseAssembler {
         if self.pending.is_empty() && self.content.trim().is_empty() {
             return Err(NetError::EmptyResponse);
         }
+        if self.finish_reason.is_none() {
+            // Content or tool calls arrived, but the stream never carried a
+            // finish_reason before EOF — the connection dropped mid-turn. Never a
+            // clean stop (R6): a completed Run must not be recorded over a
+            // truncated one.
+            return Err(NetError::Stream(
+                "stream ended without a finish_reason (truncated response)".to_string(),
+            ));
+        }
         Ok(ChatTurn {
             content: self.content,
             tool_calls: self.pending.into_values().collect(),
@@ -339,6 +377,10 @@ mod tests {
             ]}}]
         }))
         .unwrap();
+        asm.feed_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        }))
+        .unwrap();
         let turn = asm.finish().unwrap();
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].name, "read_file");
@@ -368,6 +410,10 @@ mod tests {
             ]}}]
         }))
         .unwrap();
+        asm.feed_chunk(&json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        }))
+        .unwrap();
         let turn = asm.finish().unwrap();
         let names: Vec<&str> = turn.tool_calls.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["bash", "read_file", "write_file"]);
@@ -380,21 +426,21 @@ mod tests {
             ": OPENROUTER PROCESSING",
             "",
             ": keepalive",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}",
             "",
             "data: [DONE]",
         ])
         .unwrap();
         let turn = asm.finish().unwrap();
         assert_eq!(turn.content, "hi");
-        assert_eq!(turn.finish_reason, None);
+        assert_eq!(turn.finish_reason.as_deref(), Some("stop"));
     }
 
     #[test]
     fn lines_without_data_prefix_are_ignored() {
         let asm = feed_lines(&[
             "event: ping",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}",
             "data: [DONE]",
         ])
         .unwrap();
@@ -487,6 +533,22 @@ mod tests {
     }
 
     #[test]
+    fn truncated_stream_without_finish_reason_is_rejected() {
+        // Content arrived, then the peer dropped the connection before any
+        // finish_reason chunk ever showed up — a truncated response must never be
+        // recorded as a completed turn (P0 / R6).
+        let err =
+            feed_lines(&["data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}"])
+                .unwrap()
+                .finish()
+                .unwrap_err();
+        assert!(
+            matches!(&err, NetError::Stream(m) if m.contains("finish_reason")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn empty_response_is_flagged() {
         // Whitespace-only content with no tool calls still counts as empty (R6).
         let asm = feed_lines(&[
@@ -526,5 +588,57 @@ mod tests {
         let truncated = truncate_body(&multibyte);
         assert!(truncated.contains("…[truncated 800 bytes]"));
         assert!(truncated.starts_with(&"é".repeat(256)));
+    }
+
+    #[test]
+    fn malformed_chunk_error_truncates_the_payload() {
+        // Sibling of the HTTP-error path (line 42/`truncate_body`): an unbounded
+        // provider payload must never reach `run.json` untruncated via this error
+        // message either.
+        let huge_garbage = "x".repeat(4000); // not valid JSON, and far past MAX
+        let stream = format!("data: {huge_garbage}\n");
+        let err = read_sse_stream(std::io::Cursor::new(stream.into_bytes())).unwrap_err();
+        match err {
+            NetError::Stream(msg) => {
+                assert!(
+                    msg.len() < 1000,
+                    "error message must be bounded, was {} bytes",
+                    msg.len()
+                );
+                assert!(msg.contains("truncated"), "{msg}");
+            }
+            other => panic!("expected NetError::Stream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_sse_line_without_terminator_is_rejected() {
+        // A peer that never sends a newline must not be able to grow the read
+        // buffer without bound — bounded via MAX_SSE_LINE, mirroring serve.rs's
+        // HEAD_LIMIT counter-pattern.
+        let unterminated = "y".repeat(MAX_SSE_LINE + 10);
+        let err = read_sse_stream(std::io::Cursor::new(unterminated.into_bytes())).unwrap_err();
+        assert!(
+            matches!(&err, NetError::Stream(m) if m.contains("exceeded")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_healthy_stream_is_not_cut_off_by_the_line_bound() {
+        // The per-line take() must be recreated each call, not accumulated across
+        // the whole stream. Two lines, each safely under MAX_SSE_LINE on its own but
+        // summing past it, prove the cap is per-line rather than cumulative.
+        let chunk_size = MAX_SSE_LINE * 3 / 4;
+        let padding = "a".repeat(chunk_size);
+        let stream = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{padding}\"}}}}]}}\n\
+             data: {{\"choices\":[{{\"delta\":{{\"content\":\"{padding}\"}}}}]}}\n\
+             data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\
+             data: [DONE]\n"
+        );
+        let turn = read_sse_stream(std::io::Cursor::new(stream.into_bytes())).unwrap();
+        assert_eq!(turn.content.len(), padding.len() * 2);
+        assert_eq!(turn.finish_reason.as_deref(), Some("stop"));
     }
 }

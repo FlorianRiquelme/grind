@@ -156,10 +156,21 @@ change carries a safety property, not for coverage's sake.
   Bash(git push*--mirror*)
   Bash(git push*--prune*)
   Bash(gh api*DELETE*)
+  Bash(sh -c*)
+  Bash(bash -c*)
+  Bash(eval*)
   ```
 
   They rely on two documented matcher facts: a `*` may appear anywhere in the pattern, not only
   at the end, and a rule is matched against each subcommand after splitting on `&&`, `;` and `|`.
+  The native backend's own matcher (`tools::subcommands_of`) additionally folds the inside of
+  every `$( )`, backtick span and `( )` subshell into its own extra candidate, and strips a
+  leading `NAME=value` assignment token off every candidate — `echo $(gh pr merge 123)`,
+  `` `git push --force origin main` `` and `GIT_DIR=. gh pr merge 123` all reached a shell
+  without the verb ever appearing at the front of a subcommand the plain split saw. This is
+  still not a shell parser: it has no notion of quoting or escaping, so it narrows the bypass
+  rather than closing it, and it only ever adds candidates — never fewer, so it can only refuse
+  more, not less.
 
   **The first twelve each anchor their flag immediately after the verb, and git accepts the flag
   anywhere.** `git push origin --force`, `git push origin main --force`,
@@ -182,6 +193,16 @@ change carries a safety property, not for coverage's sake.
   `gh api` DELETE, which a Run has no reason to issue; branch deletion is already covered by the
   git globs, so this closes the API door rather than a git one. All are acceptable false refusals
   for a barrier of this kind.
+
+  The last three are broad for a different reason: they refuse an *outer command* rather than a
+  git or gh verb. `Bash(sh -c*)`, `Bash(bash -c*)` and `Bash(eval*)` each hand a forbidden
+  command to a nested shell as a single string argument or evaluate it in-process — none of the
+  twenty-six globs above it name the outer invocation, only what it wraps, so
+  `sh -c "git push --force origin main"` went straight through every one of them. Refusing every
+  `sh -c`, `bash -c` and `eval` is the same whack-a-mole refusal `git -C`/`git -c` already make,
+  moved to the one remaining place a fixed verb cannot be anchored: `sh -c "ls"` and
+  `eval "true"` are ordinary and now refused too, an acceptable false refusal for a barrier of
+  this kind.
 
   `-f` is spelled ` -f` and ` -f ` rather than `-f`, because `-f` as a bare substring appears
   inside ordinary branch names and the broad glob would refuse the push. `-D` is not: it is

@@ -48,7 +48,7 @@ functions; they do not become network regions and net does not grow filesystem h
 
 | Option | Verdict | Trade-off |
 |---|---|---|
-| **`ureq` 2.x, sync, rustls (~a dozen crates)** | **Chosen** | Blocking API matches the supervisor's own shape — `policy` returns `Next::SleepThenReenter(Duration)` precisely so the loop is the only thing that blocks, and a blocking client keeps that true without an executor. Connection pooling amortizes TLS across turns. **Cost:** the dependency weight ADR-0005 ruled out, now paid once and fenced inside one module. |
+| **`ureq` 2.x, sync, rustls (64 new crates)** | **Chosen** | Blocking API matches the supervisor's own shape — `policy` returns `Next::SleepThenReenter(Duration)` precisely so the loop is the only thing that blocks, and a blocking client keeps that true without an executor. Connection pooling amortizes TLS across turns. **Cost:** the dependency weight ADR-0005 ruled out, now paid once and fenced inside one module. |
 | Subprocess `curl` per request | Rejected | Zero dependencies, and evidence killed it: the POC's turn loop is one HTTPS round trip per model turn, so curl-per-request pays a fresh TCP + TLS handshake *every turn* of *every stage* — a fixed tax on each of dozens of calls, plus argv-quoting of the request body through a shell surface for no gain. Pooling is the whole point of owning the socket. |
 | Async runtime (tokio + reqwest/hyper) | Rejected | An executor, a timer, and a task ecosystem to stream SSE that one blocking loop consumes line by line. Nothing in grind is concurrent at this seam — one stage, one stream, sequential turns — so async buys latency grind cannot use and adds a second concurrency model beside the thread-based supervisor. |
 
@@ -93,9 +93,10 @@ probing.
 
 ## Costs
 
-- Roughly a dozen crates enter the lockfile once, permanently, even if `native` is never
-  selected. The fence is the mitigation: `cargo tree` shows the weight, the module shows the
-  surface.
+- The lockfile went from 12 packages to 76 — 64 new crates, including `ring`, `rustls`, the
+  ICU/idna tree, `flate2` and a build-time `cc`, all linked into a prebuilt musl static binary
+  — once, permanently, even if `native` is never selected. The fence is the mitigation:
+  `cargo tree` shows the weight, the module shows the surface.
 - `ureq`'s pooled agent holds sockets open across turns. A stage that dies between turns leaks
   the pool into process exit — harmless today, worth remembering if adapters ever share a
   long-lived process differently.
@@ -116,8 +117,5 @@ probing.
 [ADR-0017](0017-the-agent-backend-is-declared-by-layout-and-snapshotted-at-dispatch.md) places the
 selection and credential rules this stack serves;
 [ADR-0018](0018-tool-calling-is-capability-adaptive.md) consumes `NetError`'s taxonomy as the
-trigger for protocol latching. Separate decisions, same ticket (#135); all three are terms of the
-one epic.
--calling-is-capability-adaptive.md) consumes `NetError`'s taxonomy as the
 trigger for protocol latching. Separate decisions, same ticket (#135); all three are terms of the
 one epic.

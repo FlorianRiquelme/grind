@@ -261,14 +261,22 @@ fn next_action(
 }
 
 /// Does this error look like the endpoint rejecting a native tools array?
-/// An HTTP 4xx body naming tools/tool_use, or an abnormal finish while tools
-/// were sent (upstreams that fail mid-stream rather than at admission time).
+/// An HTTP 4xx body naming tools/tool_use, or an abnormal finish that itself names
+/// tools or a bare upstream error (upstreams that fail mid-stream rather than at
+/// admission time). An ordinary `finish_reason` like `"length"` or
+/// `"content_filter"` is also `AbnormalFinish` but names nothing about tools, so it
+/// must not latch Text — that would pin the whole Run to the text protocol on the
+/// strength of one long reply.
 fn tools_rejected(err: &NetError) -> bool {
     match err {
         NetError::Http { status, body } => {
             (400..500).contains(status) && body.to_lowercase().contains("tool")
         }
-        NetError::AbnormalFinish { .. } => true,
+        NetError::AbnormalFinish { finish, native } => {
+            let f = finish.to_lowercase();
+            let n = native.as_deref().unwrap_or("").to_lowercase();
+            f.contains("tool") || n.contains("tool") || f == "error" || n == "error"
+        }
         _ => false,
     }
 }
@@ -312,9 +320,16 @@ struct AttemptFacts<'a> {
 
 /// Map the loop's outcome onto the record's currency, mirroring
 /// `claude::classify`'s conventions: `parse_ok` always true (the loop spoke for
-/// itself), `total_cost_usd` None (P3 decides pricing), exit 0/1, and rate-limit
-/// detection asked of the shared classifier over a payload carrying the error text
-/// — policy parity without duplicating needles.
+/// itself), exit 0/1, and rate-limit detection asked of the shared classifier over a
+/// payload carrying the error text — policy parity without duplicating needles.
+///
+/// `total_cost_usd` is `Some(0.0)`, never `None`: unlike the claude-code path, where
+/// an absent JSON field is genuinely ambiguous between "renamed key" and "true zero",
+/// the native loop authoritatively knows it recorded no cost. `None` here would make
+/// `Attempt::is_wait()` false for every native Attempt regardless of `num_turns`,
+/// which lets a first-turn rate limit spend the attempt budget and keeps
+/// `trailing_waits` permanently at 0 — the Run 2 failure ADR-0002/0004 exist to
+/// prevent.
 fn synthesize(facts: AttemptFacts) -> Attempt {
     let (exit_code, is_error, done_promise, spoken) = match facts.ending {
         Ending::Completed(text) => (Some(0), false, true, text),
@@ -340,7 +355,7 @@ fn synthesize(facts: AttemptFacts) -> Attempt {
         api_error_status: None,
         terminal_reason,
         num_turns: Some(facts.turns_used as u64),
-        total_cost_usd: None,
+        total_cost_usd: Some(0.0),
         usage: facts.usage,
         permission_denials: facts.denials,
         done_promise,
@@ -348,6 +363,62 @@ fn synthesize(facts: AttemptFacts) -> Attempt {
         result_tail,
         fanout: Observed::Unobservable(Reason::saying("the native loop spawns no subagents")),
     }
+}
+
+/// Fold one turn's usage object into the run's running total. An OpenAI-compatible
+/// stream's `usage` is per-request, not cumulative, so a plain overwrite would leave
+/// the Attempt holding only the final turn's tokens (R8: usage from every response
+/// belongs on the Attempt, not just the transcript). Every numeric leaf — including
+/// ones nested under an object such as `prompt_tokens_details` — is summed; a
+/// non-numeric leaf keeps the latest turn's value.
+fn accumulate_usage(acc: Option<Value>, turn: &Value) -> Value {
+    match acc {
+        Some(mut existing) => {
+            merge_usage(&mut existing, turn);
+            existing
+        }
+        None => turn.clone(),
+    }
+}
+
+fn merge_usage(acc: &mut Value, turn: &Value) {
+    match turn {
+        Value::Object(t) => {
+            if !acc.is_object() {
+                *acc = json!({});
+            }
+            let a = acc.as_object_mut().expect("just ensured object");
+            for (k, v) in t {
+                match a.get_mut(k) {
+                    Some(existing) => merge_usage(existing, v),
+                    None => {
+                        a.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        Value::Number(n) => {
+            *acc = match (acc.as_i64(), n.as_i64()) {
+                (Some(a), Some(b)) => json!(a + b),
+                _ => json!(acc.as_f64().unwrap_or(0.0) + n.as_f64().unwrap_or(0.0)),
+            };
+        }
+        other => *acc = other.clone(),
+    }
+}
+
+/// A denial's structured form, in the vocabulary `policy::denied_invocations` and
+/// `render.rs` actually read (`tool_name`, `tool_input.command`) — not the
+/// `tool`/`layer` keys those readers ignore, which rendered every native denial as
+/// the identity string `"?()"` and made policy compare two different denials as the
+/// same repeated invocation. `gate_layer`/`reason` ride along as additive keys.
+fn denial_json(report: &tools::GateReport, arguments_json: &str) -> Value {
+    json!({
+        "tool_name": report.tool,
+        "tool_input": serde_json::from_str::<Value>(arguments_json).unwrap_or(Value::Null),
+        "gate_layer": layer_name(report.layer),
+        "reason": report.reason,
+    })
 }
 
 fn layer_name(layer: GateLayer) -> &'static str {
@@ -367,13 +438,28 @@ fn layer_name(layer: GateLayer) -> &'static str {
 struct Transcript {
     path: PathBuf,
     attempt_n: usize,
+    /// The first append failure, if any. `world::append_line`'s own contract says a
+    /// log that cannot be written is not worth abandoning a Run over and the caller
+    /// may ignore it — so this never panics. It is remembered rather than dropped
+    /// outright so it can ride along in `terminal_reason` when the attempt is
+    /// already failing.
+    append_failed: std::cell::RefCell<Option<String>>,
 }
 
 impl Transcript {
-    /// Append failures are unrecoverable local IO — loud, like spawn failure.
+    /// Never panics: a disk-write failure here must not take down the per-run
+    /// supervisor before `record.push_attempt` ever runs.
     fn log(&self, event: &TranscriptEvent) {
+        // `encode()` returns the bare JSON line; `append_line`'s own `writeln!` is
+        // what supplies the single trailing newline.
         if let Err(e) = world::append_line(&self.path, &event.encode()) {
-            panic!("attempt {}: transcript append failed: {e}", self.attempt_n);
+            let mut slot = self.append_failed.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(format!(
+                    "attempt {}: transcript append failed: {e}",
+                    self.attempt_n
+                ));
+            }
         }
     }
 }
@@ -387,16 +473,33 @@ struct TurnOutcome {
     latch: Option<(ProtoMode, String)>,
 }
 
+/// Swap `messages[0]` to the given mode's system prompt, in place. Pulled out as its
+/// own pure step so the actual bug — the swap happening after the reply is already in
+/// hand rather than before the retry that needs it goes out — is unit-testable with
+/// no I/O: call it, then read `messages[0]` back.
+fn install_system(
+    messages: &mut [Value],
+    mode: ProtoMode,
+    system_for: impl Fn(ProtoMode) -> Value,
+) {
+    messages[0] = system_for(mode);
+}
+
 /// Drive one conversation turn through the per-turn retry budget. Retries sleep
 /// linearly; a tools-array refusal from an unlatched Native start latches Text
-/// (fresh budget on the new wire) instead of burning retries.
+/// (fresh budget on the new wire) instead of burning retries. The latch installs
+/// the Text system prompt into `messages[0]` *before* the retry request goes out —
+/// swapping it only after the reply is already in hand would send that reply to a
+/// model that was never told `<tool>`/`<done>` exist, guaranteeing a spurious
+/// `ProtocolNudge` on every text-latched run's first Text reply.
 fn drive_turn(
     client: &ChatClient,
     ep: &Endpoint,
-    messages: &[Value],
+    messages: &mut [Value],
     tools_wire: &Value,
     start_mode: ProtoMode,
     latched_before: bool,
+    system_for: &dyn Fn(ProtoMode) -> Value,
 ) -> Result<TurnOutcome, String> {
     let mut mode = start_mode;
     let mut latched = latched_before;
@@ -424,6 +527,7 @@ fn drive_turn(
                     mode = ProtoMode::Text;
                     latched = true;
                     failures = 0;
+                    install_system(messages, ProtoMode::Text, system_for);
                 }
                 Action::Backoff(delay) => {
                     world::sleep(delay);
@@ -469,6 +573,7 @@ impl StageRunner for crate::runner::NativeAdapter {
         let transcript = Transcript {
             path: spec.run_dir.join(format!("messages-{n}.jsonl")),
             attempt_n: n,
+            append_failed: std::cell::RefCell::new(None),
         };
         let system_for = |mode: ProtoMode| json!({"role": "system", "content": system_prompt(&spec.cwd.display().to_string(), &defs, mode)});
 
@@ -488,7 +593,7 @@ impl StageRunner for crate::runner::NativeAdapter {
         ];
 
         let mut turns_used = 0usize;
-        let mut usage_last: Option<Value> = None;
+        let mut usage_total: Option<Value> = None;
         let mut denials: Vec<Value> = Vec::new();
 
         let ending = loop {
@@ -500,10 +605,11 @@ impl StageRunner for crate::runner::NativeAdapter {
             let outcome = match drive_turn(
                 &client,
                 &endpoint,
-                &messages,
+                &mut messages,
                 &tools_wire,
                 proto.unwrap_or(ProtoMode::Native),
                 proto.is_some(),
+                &system_for,
             ) {
                 Ok(outcome) => outcome,
                 Err(reason) => break Ending::Failed(format!("turn {turns_used} failed: {reason}")),
@@ -521,9 +627,9 @@ impl StageRunner for crate::runner::NativeAdapter {
                     ),
                 };
                 proto = Some(selected);
-                if selected != ProtoMode::Native {
-                    messages[0] = system_for(selected);
-                }
+                // The Text system prompt, when this attempt latches, was already
+                // installed inside `drive_turn` before the retry that produced this
+                // very outcome went out — nothing left to swap here.
                 transcript.log(&TranscriptEvent::ProtocolSelected {
                     mode: selected,
                     reason,
@@ -531,7 +637,7 @@ impl StageRunner for crate::runner::NativeAdapter {
             }
 
             if let Some(usage) = outcome.turn.usage.clone() {
-                usage_last = Some(usage.clone());
+                usage_total = Some(accumulate_usage(usage_total.take(), &usage));
                 transcript.log(&TranscriptEvent::Usage(usage));
             }
 
@@ -596,11 +702,7 @@ impl StageRunner for crate::runner::NativeAdapter {
                 };
                 let output = match tools::gate(spec.denied_globs, raw) {
                     GateDecision::Denied(report) => {
-                        denials.push(json!({
-                            "tool": report.tool,
-                            "layer": layer_name(report.layer),
-                            "reason": report.reason,
-                        }));
+                        denials.push(denial_json(&report, &call.arguments_json));
                         truncate_denial(report.layer, &report.reason)
                     }
                     GateDecision::Allowed(raw) => registry.execute(&raw).output,
@@ -613,6 +715,16 @@ impl StageRunner for crate::runner::NativeAdapter {
             }
         };
 
+        // A transcript-append failure is folded into an already-failing attempt's
+        // reason rather than raised through a new channel; it never turns a
+        // completion into a failure on its own.
+        let ending = match (ending, transcript.append_failed.borrow().as_ref()) {
+            (Ending::Failed(reason), Some(append_err)) => {
+                Ending::Failed(format!("{reason}; {append_err}"))
+            }
+            (other, _) => other,
+        };
+
         synthesize(AttemptFacts {
             n,
             mode: spec.invocation.mode(),
@@ -620,7 +732,7 @@ impl StageRunner for crate::runner::NativeAdapter {
             ended_at: &world::now_iso(),
             turns_used,
             ending,
-            usage: usage_last,
+            usage: usage_total,
             denials,
         })
     }
@@ -722,10 +834,10 @@ mod tests {
     }
 
     #[test]
-    fn abnormal_finish_while_tools_were_sent_latches_but_text_never_does() {
+    fn abnormal_finish_naming_tools_latches_but_text_never_does() {
         let err = NetError::AbnormalFinish {
-            finish: "stop".into(),
-            native: Some("length".into()),
+            finish: "tool_calls".into(),
+            native: None,
         };
         assert_eq!(
             next_action(&err, ProtoMode::Native, false, 0, 3, 2),
@@ -733,6 +845,21 @@ mod tests {
         );
         assert_eq!(
             next_action(&err, ProtoMode::Text, true, 0, 3, 2),
+            Action::Backoff(Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn abnormal_finish_for_an_ordinary_length_cutoff_backs_off_instead_of_latching() {
+        // finish_reason="length" (max tokens) names nothing about tools; latching
+        // Text on it would pin the whole Run to text on the strength of one long
+        // reply (P1 regression).
+        let err = NetError::AbnormalFinish {
+            finish: "length".into(),
+            native: None,
+        };
+        assert_eq!(
+            next_action(&err, ProtoMode::Native, false, 0, 3, 2),
             Action::Backoff(Duration::from_secs(2))
         );
     }
@@ -782,11 +909,47 @@ mod tests {
         assert_eq!(attempt.subtype, None);
         assert!(attempt.done_promise);
         assert!(!attempt.rate_limited);
-        assert_eq!(attempt.total_cost_usd, None);
+        assert_eq!(attempt.total_cost_usd, Some(0.0));
         assert_eq!(attempt.num_turns, Some(7));
         assert_eq!(attempt.usage.as_ref().unwrap()["prompt_tokens"], 10);
         assert_eq!(attempt.result_tail, "shipped it");
         assert!(matches!(attempt.fanout, Observed::Unobservable(_)));
+    }
+
+    #[test]
+    fn a_single_turn_rate_limited_native_attempt_is_a_wait() {
+        // total_cost_usd must be the honest Some(0.0), not None, or is_wait() is
+        // false for every native Attempt regardless of num_turns (P1 regression).
+        let attempt = synthesize(AttemptFacts {
+            n: 1,
+            mode: Mode::Dispatch,
+            started_at: "s",
+            ended_at: "e",
+            turns_used: 1,
+            ending: Ending::Failed("HTTP 429: rate limit exceeded, resets at 17:00".into()),
+            usage: None,
+            denials: vec![],
+        });
+        assert!(attempt.rate_limited);
+        assert!(
+            attempt.is_wait(),
+            "a first-turn rate limit must not spend the attempt budget"
+        );
+    }
+
+    #[test]
+    fn a_multi_turn_completed_native_attempt_is_never_a_wait() {
+        let attempt = synthesize(AttemptFacts {
+            n: 1,
+            mode: Mode::Dispatch,
+            started_at: "s",
+            ended_at: "e",
+            turns_used: 5,
+            ending: Ending::Completed("shipped it".into()),
+            usage: Some(json!({"prompt_tokens": 10})),
+            denials: vec![],
+        });
+        assert!(!attempt.is_wait());
     }
 
     #[test]
@@ -912,6 +1075,100 @@ mod tests {
                 .unwrap()
                 .starts_with("<tool_result call=\"bash\">")
         );
+    }
+
+    // --- denial identity (R7) ----------------------------------------------------
+
+    #[test]
+    fn a_denied_bash_call_carries_the_vocabulary_policy_and_render_read() {
+        let report = tools::GateReport {
+            layer: GateLayer::DeniedGlob,
+            tool: "bash".to_string(),
+            reason: "matched a denied-tool glob".to_string(),
+        };
+        let denial = denial_json(&report, r#"{"command":"git push --force origin main"}"#);
+        assert_eq!(denial["tool_name"], "bash");
+        assert_eq!(
+            denial["tool_input"]["command"],
+            "git push --force origin main"
+        );
+        assert_eq!(denial["gate_layer"], "denied_glob");
+        assert_eq!(denial["reason"], "matched a denied-tool glob");
+    }
+
+    // --- usage accumulation (R8) --------------------------------------------------
+
+    #[test]
+    fn usage_accumulates_across_turns_instead_of_keeping_only_the_last() {
+        let first = json!({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15});
+        let second = json!({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10});
+        let total = accumulate_usage(Some(accumulate_usage(None, &first)), &second);
+        assert_eq!(total["prompt_tokens"], 17);
+        assert_eq!(total["completion_tokens"], 8);
+        assert_eq!(total["total_tokens"], 25);
+    }
+
+    #[test]
+    fn usage_accumulation_sums_nested_numeric_leaves_too() {
+        let first = json!({"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": 2}});
+        let second = json!({"prompt_tokens": 4, "prompt_tokens_details": {"cached_tokens": 1}});
+        let total = accumulate_usage(Some(first), &second);
+        assert_eq!(total["prompt_tokens"], 14);
+        assert_eq!(total["prompt_tokens_details"]["cached_tokens"], 3);
+    }
+
+    // --- text-latch system-prompt timing (P2) -------------------------------------
+
+    #[test]
+    fn install_system_replaces_only_the_leading_message_with_the_new_modes_prompt() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "native prompt"}),
+            json!({"role": "user", "content": "go"}),
+        ];
+        install_system(
+            &mut messages,
+            ProtoMode::Text,
+            |mode| json!({"role": "system", "content": format!("prompt for {mode:?}")}),
+        );
+        assert_eq!(messages[0]["content"], "prompt for Text");
+        assert_eq!(messages[1]["content"], "go", "only index 0 changes");
+    }
+
+    // `install_system`'s call site — the `Action::LatchText` arm of `drive_turn` — is
+    // reached only through `next_action`, whose own coverage above
+    // (`tools_array_rejection_latches_text_immediately_even_at_the_last_failure`,
+    // `abnormal_finish_naming_tools_latches_but_text_never_does`) already pins down
+    // exactly when a latch fires. Together the two prove the fix: the prompt swap
+    // happens (this test), and it happens on precisely the latch action next_action
+    // decided on (that coverage) — with neither test opening a socket.
+
+    // --- transcript newline framing -----------------------------------------------
+
+    #[test]
+    fn transcript_log_writes_exactly_one_newline_per_line() {
+        let dir = world::temp_dir("native-transcript-newline");
+        let transcript = Transcript {
+            path: dir.join("messages-1.jsonl"),
+            attempt_n: 1,
+            append_failed: std::cell::RefCell::new(None),
+        };
+        transcript.log(&TranscriptEvent::Final {
+            text: "first".to_string(),
+        });
+        transcript.log(&TranscriptEvent::Final {
+            text: "second".to_string(),
+        });
+        let contents = world::read_to_string(&transcript.path).expect("read transcript");
+        assert_eq!(
+            contents.matches('\n').count(),
+            2,
+            "one newline per line, no more"
+        );
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("first") && !lines[0].is_empty());
+        assert!(lines[1].contains("second"));
+        world::remove_tree(&dir);
     }
 
     #[test]

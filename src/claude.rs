@@ -37,26 +37,42 @@ impl StageRunner for crate::runner::ClaudeCodeAdapter {
         // running, so the file is quiescent and the last line is whole. A fresh session has
         // nothing to skip; that is zero lines.
         let already_written = transcript_lines(&self.home, spec.worktree, spec.session_id);
-        let raw = run(
+        let outcome = run(
             spec.invocation,
             spec.cwd,
             &spec.run_dir.join(format!("attempt-{n}.prompt.txt")),
             &spec.run_dir.join(format!("attempt-{n}.stdout.json")),
             &spec.run_dir.join(format!("attempt-{n}.stderr.log")),
-        )
-        .unwrap_or_else(|reason| {
-            // Unrecoverable local IO: today's supervisor turned this into a Refusal that
-            // aborted the Run without recording an Attempt. The seam is infallible by design,
-            // so the same unrecoverable shape surfaces loudly here instead.
-            panic!("attempt {n}: {reason}")
-        });
-        raw.classify(n, spec.invocation.mode(), &started_at, &world::now_iso())
-            .with_fanout(fanout_of(
-                &self.home,
-                spec.worktree,
-                spec.session_id,
-                already_written,
-            ))
+        );
+        let ended_at = world::now_iso();
+        let attempt = match outcome {
+            Ok(raw) => raw.classify(n, spec.invocation.mode(), &started_at, &ended_at),
+            Err(reason) => {
+                // Unrecoverable local IO before the child ever ran — the prompt write or the
+                // spawn itself failed (a full disk, or a `claude_bin` that is not executable).
+                // The seam is infallible by design, so this cannot unwind the supervisor the
+                // way a panic would: it is routed through the same classifier every other
+                // failed attempt goes through, with no stdout/stderr to read back, so
+                // `parse_ok` comes back false and `exit_code` stays absent. That is
+                // deliberate — `Attempt::is_wait` requires `parse_ok`, so this is never
+                // mistaken for a Wait that spends nothing and loops forever.
+                classify(
+                    &reason.to_string(),
+                    "",
+                    None,
+                    n,
+                    spec.invocation.mode(),
+                    &started_at,
+                    &ended_at,
+                )
+            }
+        };
+        attempt.with_fanout(fanout_of(
+            &self.home,
+            spec.worktree,
+            spec.session_id,
+            already_written,
+        ))
     }
 }
 
@@ -946,4 +962,56 @@ pub fn fanout_counts(text: &str) -> Observed<(u64, u64)> {
         return nothing_recognised(text, "fan-out spawn");
     }
     Observed::Present((total, returned))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attempt::Invocation;
+    use crate::runner::{ClaudeCodeAdapter, RunSpec};
+
+    /// R2's own claim is byte-for-byte parity with the pre-cutover supervisor on the
+    /// claude-code path — but the pre-cutover supervisor turned an unwritable prompt or an
+    /// unspawnable `claude_bin` into a `Refusal` it unwound cleanly from, never a process
+    /// abort. A run_dir that does not exist makes `world::write` fail on the very first thing
+    /// `run()` does — before any child is ever spawned — so this exercises exactly that path
+    /// without needing a real full disk or a broken binary.
+    #[test]
+    fn run_synthesizes_a_failed_attempt_instead_of_panicking_on_unwritable_prompt() {
+        let invocation = Invocation::build(
+            vec!["claude".to_string(), "-p".to_string()],
+            "prompt text".to_string(),
+            Mode::Dispatch,
+        );
+        let adapter = ClaudeCodeAdapter {
+            claude_bin: "claude".to_string(),
+            home: PathBuf::from("/nonexistent-home-for-claude-adapter-test"),
+        };
+        let run_dir = PathBuf::from("/nonexistent-dir-for-claude-adapter-test/run-1");
+        let spec = RunSpec {
+            invocation: &invocation,
+            cwd: Path::new("."),
+            run_dir: &run_dir,
+            attempt_n: 1,
+            session_id: "session-1",
+            worktree: "/nonexistent-worktree-for-claude-adapter-test",
+            model: None,
+            denied_globs: &[],
+        };
+
+        // Must not panic: the seam is infallible by design, and a panic here would abort the
+        // supervisor mid-ladder with no Attempt ever pushed.
+        let attempt = StageRunner::run(&adapter, &spec);
+
+        assert!(
+            !attempt.parse_ok,
+            "unrecoverable local IO never produced a parseable payload"
+        );
+        assert_eq!(attempt.exit_code, None, "no child was ever spawned");
+        assert!(
+            !attempt.is_wait(),
+            "parse_ok == false must never read as a Wait — that clause is what keeps a crash \
+             from looping for free (CLAUDE.md)"
+        );
+    }
 }

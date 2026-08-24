@@ -529,6 +529,19 @@ fn declared_clones(home: &Path) -> Vec<(String, PathBuf)> {
 }
 
 fn check(home: &Path, clones: &[(String, PathBuf)], check: Check) -> Observed<Outcome> {
+    check_with_probe(home, clones, check, net::probe_endpoint)
+}
+
+/// `check`'s real body, with the network probe injected — so the wiring test below can walk
+/// every host item, `EndpointReachable` included, without a live socket ever leaving the
+/// process. `check` itself always wires in the real `net::probe_endpoint`; only the test
+/// substitutes it.
+fn check_with_probe(
+    home: &Path,
+    clones: &[(String, PathBuf)],
+    check: Check,
+    probe: impl Fn(&runner::Endpoint) -> bool,
+) -> Observed<Outcome> {
     match check {
         Check::DeclaredClone => {
             let Some((declared, path)) = clones.first() else {
@@ -644,19 +657,38 @@ fn check(home: &Path, clones: &[(String, PathBuf)], check: Check) -> Observed<Ou
             world::var("OPENROUTER_API_KEY").is_ok(),
             world::var("OPENAI_API_KEY").is_ok(),
         ),
-        // Both backends' readiness, regardless of the selected backend (R9). The endpoint is
-        // resolved from the default base URL plus whatever key the environment offers; a key
-        // that resolves nothing leaves the probe untried, and `endpoint_reachable` says so.
+        // Both backends' readiness, regardless of which is declared (R9). Doctor takes no Job,
+        // so this reads the **declared** selection at `~/.grind/agent` — never a "selected"
+        // one — and probes its declared base URL (the default when no override is declared),
+        // never the hardcoded default regardless of what is declared: the base-url token
+        // exists to support self-hosting, and probing the default defeats that. An unreadable
+        // or unparseable agent file is unobservable rather than guessed at, on the same
+        // reasoning as every other doctor row; a key that resolves nothing leaves the probe
+        // untried either way, and `endpoint_reachable` says so.
         Check::EndpointReachable => {
-            let probed = runner::Endpoint::resolve(None, None)
-                .ok()
-                .map(|endpoint| net::probe_endpoint(&endpoint));
-            observe::endpoint_reachable(probed)
+            observe::endpoint_reachable(probe_declared_endpoint(job::read_selection(home), probe))
         }
         Check::NoBoolean => observe::unchecked(
             "performed during provisioning; every available check would be a guess",
         ),
     }
+}
+
+/// The base URL `EndpointReachable` probes is the **declared** selection's override (the
+/// default when none is declared) — never the hardcoded default regardless of what is
+/// declared, and never a guess when the declaration itself could not be read: an unreadable or
+/// unparseable `~/.grind/agent` short-circuits to `None` before the probe closure is ever
+/// called, rather than falling back to probing the default as if that had been declared. Split
+/// out so that property is testable from a literal `Result`.
+fn probe_declared_endpoint(
+    selection: Result<runner::Selection, String>,
+    probe: impl Fn(&runner::Endpoint) -> bool,
+) -> Option<bool> {
+    selection.ok().and_then(|selection| {
+        runner::Endpoint::resolve(selection.endpoint_override.as_deref(), None)
+            .ok()
+            .map(|endpoint| probe(&endpoint))
+    })
 }
 
 fn config(key: &str) -> world::Completed {
@@ -775,12 +807,30 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_agent_declaration_never_guesses_the_endpoint() {
+        // "doctor must never guess": an unreadable or unparseable `~/.grind/agent` must not
+        // fall back to probing the default base URL as though that had been declared — it
+        // must not probe at all, so the closure below must never run.
+        let probed = probe_declared_endpoint(
+            Err("could not read /nowhere/.grind/agent: permission denied".to_string()),
+            |_endpoint| panic!("must never probe when the declared selection could not be read"),
+        );
+        assert_eq!(probed, None);
+    }
+
+    #[test]
     fn the_driver_answers_for_every_item_on_the_list() {
         // Without this wiring the host requirements have no home: `job` ships the list and its
         // classifiers, and nothing else walks it.
+        //
+        // `check_with_probe` with a fake probe, never `check`: `EndpointReachable` is on this
+        // list, and `check` wires in the real `net::probe_endpoint`, a live 5-second outbound
+        // request whenever this test's process happens to carry a provider key. The fake never
+        // touches a socket, so this test's answer cannot depend on what is in the environment
+        // it happens to run in.
         let home = Path::new("/nowhere/that/exists");
         for item in job::host_items() {
-            let outcome = check(home, &[], item.check);
+            let outcome = check_with_probe(home, &[], item.check, |_endpoint| false);
             if item.depth == Depth::Step {
                 assert!(
                     matches!(outcome, Observed::Present(Outcome::Unchecked(_))),

@@ -14,6 +14,12 @@ pub const MAX_TOOL_OUTPUT: usize = 8 * 1024;
 /// The standard toolkit, in definition order.
 const STANDARD_NAMES: [&str; 3] = ["bash", "read_file", "write_file"];
 
+/// Provider credentials the supervisor's own environment carries so it can call the model at
+/// all (`runner::Endpoint`). The native backend hands the `bash` tool's shell to that same
+/// model, which can read files and receive prompt injection from the target repo, so these two
+/// are scrubbed from the child before it spawns rather than trusted not to be echoed back.
+const CREDENTIAL_ENV_VARS: [&str; 2] = ["OPENROUTER_API_KEY", "OPENAI_API_KEY"];
+
 /// OpenAI function-schema description of one tool.
 #[derive(Clone, Debug)]
 pub struct ToolDef {
@@ -77,9 +83,10 @@ impl ToolRegistry {
         let field = |key: &str| parsed[key].as_str().unwrap_or_default().to_string();
         let (full, exit) = match call.name.as_str() {
             "bash" => {
-                let completed = world::run(
+                let completed = world::run_scrubbed(
                     &["sh".to_string(), "-c".to_string(), field("command")],
                     Some(self.workdir.as_path()),
+                    &CREDENTIAL_ENV_VARS,
                 );
                 let exit = completed.code;
                 (format_completed(completed), exit)
@@ -262,7 +269,12 @@ fn resolves_within(raw: &str) -> bool {
 
 /// Claude Code's deny-glob matcher, as documented at `attempt::DENIED_TOOLS`:
 /// full-string match, `*` the only wildcard, byte-exact otherwise.
-fn glob_matches(pattern: &str, candidate: &str) -> bool {
+///
+/// `pub(crate)` because this is now the **only** copy: `attempt`'s test module used to carry a
+/// hand-written duplicate to check the forbidden-spelling table against, and nothing bound the
+/// two, so they could drift while `just verify` stayed green. `attempt`'s tests import this one
+/// instead, so the table validates the matcher grind actually runs.
+pub(crate) fn glob_matches(pattern: &str, candidate: &str) -> bool {
     fn rec(p: &[u8], c: &[u8]) -> bool {
         match p.first() {
             None => c.is_empty(),
@@ -273,17 +285,151 @@ fn glob_matches(pattern: &str, candidate: &str) -> bool {
     rec(pattern.as_bytes(), candidate.as_bytes())
 }
 
-/// Split a compound shell command the way the documented matcher does, before
-/// per-subcommand glob matching.
-fn subcommands_of(command: &str) -> Vec<String> {
-    let mut pieces = vec![command.to_string()];
-    for separator in ["|&", "&&", "||", ";", "|", "&", "\n"] {
-        pieces = pieces
-            .iter()
-            .flat_map(|p| p.split(separator).map(str::to_string).collect::<Vec<_>>())
-            .collect();
+/// Split a compound shell command the way the documented matcher does, before per-subcommand
+/// glob matching — then widen the candidate set past what a plain separator split sees.
+///
+/// Splitting on `&&`/`;`/`|`/etc. alone misses three shapes that still reach a shell:
+/// `echo $(gh pr merge 123)` and `` `git push --force origin main` `` hide the forbidden verb
+/// inside a substitution or subshell, and `GIT_DIR=. gh pr merge 123` hides it behind a leading
+/// `NAME=value` assignment so the candidate no longer *starts with* `gh`. Both gaps are closed
+/// by adding candidates, never by removing one: the inside of every `$( )`, backtick span and
+/// `( )` subshell becomes its own candidate (recursively re-run through this same pipeline, so
+/// a substitution nested inside another is still found), and each candidate additionally has any
+/// leading assignment tokens stripped. More candidates can only mean more refusals, never a
+/// false allow, which is the direction widening is allowed to move in.
+///
+/// **This is not a shell parser and is not trying to become one.** It has no notion of quoting,
+/// escaping or comments, so a quoted separator inside `sh -c '...'` can still fragment a
+/// candidate early — the glob still matches the fragment carrying the verb, but a determined
+/// adversary constructing shell syntax by hand has more room here than the matcher closes. It
+/// narrows the bypass surface documented above; it does not claim to eliminate it.
+pub(crate) fn subcommands_of(command: &str) -> Vec<String> {
+    let mut queue = vec![command.to_string()];
+    let mut seen: Vec<String> = Vec::new();
+    let mut candidates = Vec::new();
+    while let Some(current) = queue.pop() {
+        if seen.contains(&current) {
+            continue;
+        }
+        seen.push(current.clone());
+        let mut pieces = vec![current.clone()];
+        for separator in ["|&", "&&", "||", ";", "|", "&", "\n"] {
+            pieces = pieces
+                .iter()
+                .flat_map(|p| p.split(separator).map(str::to_string).collect::<Vec<_>>())
+                .collect();
+        }
+        for piece in pieces {
+            let trimmed = piece.trim().to_string();
+            queue.extend(extract_spans(&trimmed));
+            // The plain trimmed piece stays a candidate regardless — stripping only adds a
+            // second candidate on top, so a future glob with no fixed prefix cannot lose a
+            // match this already had.
+            let stripped = strip_leading_assignments(&trimmed);
+            candidates.push(trimmed.clone());
+            if stripped != trimmed {
+                candidates.push(stripped);
+            }
+        }
     }
-    pieces.into_iter().map(|p| p.trim().to_string()).collect()
+    candidates
+}
+
+/// The inside of every `$( ... )`, backtick `` `...` `` and bare `( ... )` span in `text`,
+/// outermost only (an inner span reaches the queue on its own next pass in [`subcommands_of`]).
+/// Unbalanced or unterminated spans are skipped rather than guessed at.
+fn extract_spans(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'(') {
+            match balanced_parens(text, i + 1) {
+                Some((inner, end)) => {
+                    spans.push(inner);
+                    i = end;
+                    continue;
+                }
+                None => i += 1,
+            }
+        } else if bytes[i] == b'(' {
+            match balanced_parens(text, i) {
+                Some((inner, end)) => {
+                    spans.push(inner);
+                    i = end;
+                    continue;
+                }
+                None => i += 1,
+            }
+        } else if bytes[i] == b'`' {
+            match text[i + 1..].find('`') {
+                Some(offset) => {
+                    let end = i + 1 + offset;
+                    spans.push(text[i + 1..end].to_string());
+                    i = end + 1;
+                    continue;
+                }
+                None => i += 1,
+            }
+        } else {
+            i += 1;
+        }
+    }
+    spans
+}
+
+/// `open` must index the `(` byte itself. Returns the text strictly between that `(` and its
+/// matching `)` (nesting counted, not quote-aware), plus the byte index just past the `)`.
+fn balanced_parens(text: &str, open: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    debug_assert_eq!(bytes.get(open), Some(&b'('));
+    let mut depth: i32 = 0;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((text[open + 1..i].to_string(), i + 1));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Strip leading `NAME=value` assignment tokens (`GIT_DIR=. gh pr merge 123` ->
+/// `gh pr merge 123`), so a prefix-anchored glob still sees the verb at the front.
+fn strip_leading_assignments(command: &str) -> String {
+    let mut rest = command.trim_start();
+    loop {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let token = &rest[..end];
+        if is_assignment_token(token) {
+            rest = rest[end..].trim_start();
+        } else {
+            break;
+        }
+    }
+    rest.to_string()
+}
+
+/// `NAME=...`: a non-empty leading identifier (letters, digits, underscore; not starting with a
+/// digit) followed by `=`. Shell assignment syntax, not general `=` use — `gh api -X DELETE` is
+/// untouched because `-X` is not an identifier.
+fn is_assignment_token(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Char-boundary-safe truncation with a `…[truncated N bytes]` suffix.
@@ -359,22 +505,65 @@ mod tests {
 
     #[test]
     fn real_denied_tools_entries_refuse_their_shell_commands() {
-        // Entries lifted verbatim from attempt::DENIED_TOOLS.
+        // All 29 entries of `attempt::DENIED_TOOLS`, each against the exact evasion spelling
+        // its own comment names as the form people and agents most often type — flag-first and
+        // flag-last, verb-first and verb-displaced. A prior gap here left 16 of 26 globs
+        // exercised only by the membership test below, never against a real shell string.
         for (glob, command) in [
             ("Bash(gh pr merge*)", "gh pr merge 123"),
             ("Bash(gh pr merge*)", "gh pr merge --squash 7"),
             ("Bash(git push --force*)", "git push --force origin main"),
             ("Bash(git push -f*)", "git push -f origin main"),
+            ("Bash(git reset --hard*)", "git reset --hard HEAD~3"),
+            ("Bash(git rebase*)", "git rebase main"),
+            ("Bash(git checkout main*)", "git checkout main"),
+            ("Bash(git branch -D*)", "git branch -D feat/x"),
+            (
+                "Bash(git push --delete*)",
+                "git push --delete origin feat/x",
+            ),
+            ("Bash(git push*+*)", "git push origin +feat/x:main"),
+            ("Bash(git -C*)", "git -C /elsewhere status"),
+            ("Bash(git switch main*)", "git switch main"),
+            (
+                "Bash(gh api*merge*)",
+                "gh api repos/o/r/pulls/1/merge -X PUT",
+            ),
+            ("Bash(git push*--force*)", "git push origin --force"),
+            ("Bash(git push*--force*)", "git push origin main --force"),
+            ("Bash(git push*--force*)", "git push -u origin main --force"),
+            (
+                "Bash(git push*--delete*)",
+                "git push origin --delete feat/x",
+            ),
+            ("Bash(git push*:*)", "git push origin :feat/x"),
             ("Bash(git push* -f)", "git push -u origin fix -f"),
+            ("Bash(git push* -f)", "git push origin -f"),
             ("Bash(git push* -f *)", "git push -u origin fix -f now"),
             ("Bash(git reset*--hard*)", "git reset HEAD~3 --hard"),
-            ("Bash(git -C*)", "git -C /elsewhere status"),
-            ("Bash(git -c*)", "git -c x.y=z rebase"),
-            ("Bash(git switch main*)", "git switch main"),
+            ("Bash(git branch* -D*)", "git branch feat/x -D"),
+            (
+                "Bash(git branch*--delete*)",
+                "git branch --delete --force feat/x",
+            ),
+            (
+                "Bash(git*--force-with-lease*)",
+                "git push origin --force-with-lease",
+            ),
+            ("Bash(git -c*)", "git -c x rebase"),
+            ("Bash(git*update-ref*)", "git update-ref -d refs/heads/x"),
+            ("Bash(git push*--mirror*)", "git push --mirror origin"),
+            ("Bash(git push*--prune*)", "git push --prune origin"),
             (
                 "Bash(gh api*DELETE*)",
                 "gh api -X DELETE repos/o/r/git/refs/heads/x",
             ),
+            // The shell-indirection trio from fix 2: none of the 26 globs above name `sh`,
+            // `bash` or `eval` themselves, so a nested shell was the one gap a wider matcher
+            // could not close and only a new glob could.
+            ("Bash(sh -c*)", "sh -c 'git push --force origin main'"),
+            ("Bash(bash -c*)", "bash -c 'gh pr merge 123'"),
+            ("Bash(eval*)", "eval 'git reset --hard HEAD~3'"),
         ] {
             let decision = gate(
                 &denied_globs(&[glob]),
@@ -387,6 +576,36 @@ mod tests {
                 denied_layer(decision),
                 GateLayer::DeniedGlob,
                 "{glob} must refuse `{command}`"
+            );
+        }
+    }
+
+    #[test]
+    fn substitutions_subshells_and_leading_env_assignments_no_longer_hide_the_verb() {
+        // The three constructions fix 2 names: command substitution, a backtick span, and a
+        // leading `NAME=value` assignment token in front of the forbidden verb. Gated against
+        // the real `attempt::DENIED_TOOLS` list, not a single hand-picked glob, since the
+        // point is that the *matcher* now finds these, not that some glob happens to.
+        let all_denials: Vec<String> = crate::attempt::DENIED_TOOLS
+            .iter()
+            .map(|g| g.to_string())
+            .collect();
+        for command in [
+            "echo $(gh pr merge 123)",
+            "echo `git push --force origin main`",
+            "GIT_DIR=. gh pr merge 123",
+        ] {
+            let decision = gate(
+                &all_denials,
+                call(
+                    "bash",
+                    &serde_json::json!({ "command": command }).to_string(),
+                ),
+            );
+            assert_eq!(
+                denied_layer(decision),
+                GateLayer::DeniedGlob,
+                "`{command}` must be denied"
             );
         }
     }
@@ -452,15 +671,30 @@ mod tests {
     }
 
     #[test]
-    fn bare_name_globs_match_tool_names_directly_like_write_edit_do() {
-        // `attempt::denied_for` pushes plain `Write`/`Edit` entries; mirror that shape.
+    fn write_file_is_refused_under_report_only_denials_and_left_alone_at_work() {
+        // `Bash(...)` globs never apply to `write_file` — this walks the bare-name branch,
+        // matched straight against `raw.name`. `write_file` is the native toolkit's own name
+        // for the writer `Write`/`Edit` name on the claude-code side, so the real
+        // `attempt::denied_for` list for a report-only stage must carry `write_file` itself
+        // (not just `Write`/`Edit`) for this to refuse under `backend: native`.
+        let review_denials = crate::attempt::denied_for(crate::rung::Stage::Review);
         let decision = gate(
-            &denied_globs(&["Write", "Edit"]),
+            &review_denials,
             call("write_file", r#"{"path": "a.md", "content": "x"}"#),
         );
-        // Our toolkit spells it `write_file`, so the Claude-Code name does not hit...
+        assert_eq!(denied_layer(decision), GateLayer::DeniedGlob);
+
+        // A worktree-writing stage's own denial set carries no `Write`/`Edit`/`write_file`
+        // entry at all, so the same call stays allowed there.
+        let work_denials = crate::attempt::denied_for(crate::rung::Stage::Work);
+        let decision = gate(
+            &work_denials,
+            call("write_file", r#"{"path": "a.md", "content": "x"}"#),
+        );
         allowed_layer(decision);
-        // ...but a grind-side bare glob over our own names does, wildcards included.
+
+        // A grind-side bare glob over our own names also works, wildcards included —
+        // independent of what `denied_for` happens to push.
         for glob in ["write_file", "write_*"] {
             let decision = gate(
                 &denied_globs(&[glob]),
@@ -577,6 +811,49 @@ mod tests {
         fn drop(&mut self) {
             crate::world::remove_tree(&self.0);
         }
+    }
+
+    /// Sets one environment variable for the test's duration and clears it on drop, even on
+    /// panic — via `world::set_var_for_test`/`remove_var_for_test` rather than `std::env`
+    /// directly, so `std::env` stays named in `world` alone (`tests/topology.rs`).
+    struct EnvVarGuard(&'static str);
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            crate::world::set_var_for_test(name, value);
+            Self(name)
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            crate::world::remove_var_for_test(self.0);
+        }
+    }
+
+    #[test]
+    fn bash_never_sees_the_supervisors_provider_credentials() {
+        // The concrete leak fix 3 closes: a provider key sits in the supervisor's own
+        // environment so it can call the model at all, and the native `bash` tool used to
+        // hand that whole environment to a shell the model drives.
+        let _guard = EnvVarGuard::set("OPENROUTER_API_KEY", "sk-leak-me-not");
+        let wd = TempWorkdir::new("scrub-env");
+        let registry = ToolRegistry::standard(wd.0.clone());
+        let outcome = registry.execute(&call(
+            "bash",
+            r#"{"command": "printenv OPENROUTER_API_KEY"}"#,
+        ));
+        assert!(
+            !outcome.output.contains("sk-leak-me-not"),
+            "the credential must never reach the child: {}",
+            outcome.output
+        );
+        assert_eq!(
+            outcome.exit,
+            Some(1),
+            "printenv exits non-zero when the named var is unset: {}",
+            outcome.output
+        );
     }
 
     #[test]

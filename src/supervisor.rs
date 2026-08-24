@@ -295,9 +295,28 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
     let job = job::from_issue_json(&issue.stdout)?;
     world::print_line(&format!("Job #{}: {}", job.issue, job.title));
 
+    // ADR-0017: the agent backend is declared by layout (`~/.grind/agent`) and snapshotted
+    // here, once, before any other host-readiness check reads it — the two readiness checks
+    // right below need to know which backend they are answering for. Resume loads the record
+    // this dispatch writes and proceeds on that snapshot; it never re-reads this file. An
+    // unreadable or unparseable declaration refuses the Dispatch on the same register as every
+    // other incoherent input here: a Job that cannot be read has not been assessed.
+    let selection = job::read_selection(&home).map_err(Refusal::saying)?;
+
     // Presence only, local, free, no network — a host missing its clone or its `claude` fails
-    // at second zero rather than three hours in.
-    refuse_unless_host_ready(&home, &job)?;
+    // at second zero rather than three hours in. Backend-aware: a native-only host declares no
+    // `claude` binary and must not be refused for lacking one its selected backend never runs.
+    refuse_unless_host_ready(&home, &job, selection.backend)?;
+
+    // A provisioning refusal on the same register as the one above and the dirty-worktree
+    // refusal below — never an ADR-0003 quality gate. A native Dispatch with no provider
+    // credential cannot make its first attempt, so refusing now, before the lock, the worktree
+    // or a single attempt, is the could-not-answer register R9 asks for, rather than the Run
+    // spending its whole attempt budget failing identically (Run 2's shape, one layer over).
+    // `Endpoint::resolve` only checks presence (`world::var`, no network); the resolved
+    // `Endpoint` carries the key and is dropped immediately below, never reaching the record or
+    // any serialized form.
+    refuse_unless_native_ready(selection.backend, selection.endpoint_override.as_deref())?;
 
     let repo_path = job::repo_path(&home, &job.target_repo);
     let claude_bin = job::claude_bin(&home);
@@ -371,11 +390,6 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         )));
     }
 
-    // ADR-0017: the agent backend is declared by layout (`~/.grind/agent`) and snapshotted
-    // here, once. Resume loads this record and proceeds on the snapshot — it never re-reads
-    // the file. An unreadable or unparseable declaration refuses the Dispatch on the same
-    // register as every other incoherent input above.
-    let selection = job::read_selection(&home).map_err(Refusal::saying)?;
     let run_id = format!(
         "{}-{}-{}",
         world::now_stamp(),
@@ -1474,8 +1488,8 @@ fn announce(run_dir: &Path, record: &RunRecord, observation: &Observation, verdi
 
 // --- dispatch's own steps ------------------------------------------------------------------
 
-fn refuse_unless_host_ready(home: &Path, job: &Job) -> Result<(), Refusal> {
-    for item in job::dispatch_subset() {
+fn refuse_unless_host_ready(home: &Path, job: &Job, backend: Backend) -> Result<(), Refusal> {
+    for item in required_dispatch_items(backend) {
         let found = check_presence(home, job, item.check);
         match found {
             Observed::Present(ItemOutcome::Satisfied(_))
@@ -1492,6 +1506,43 @@ fn refuse_unless_host_ready(home: &Path, job: &Job) -> Result<(), Refusal> {
         }
     }
     Ok(())
+}
+
+/// The dispatch subset, narrowed to what this Dispatch's declared backend actually needs.
+/// `claude binary` is `Backend::ClaudeCode`'s requirement, never `Backend::Native`'s — a
+/// native-only host carries no `bin/claude` and dispatching onto it must not be refused for a
+/// binary its backend never runs. Every other dispatch-depth item is backend-agnostic, so this
+/// is the one filter rather than a per-backend list.
+fn required_dispatch_items(backend: Backend) -> Vec<&'static job::HostItem> {
+    job::dispatch_subset()
+        .into_iter()
+        .filter(|item| !(item.check == job::Check::ClaudeBinary && backend == Backend::Native))
+        .collect()
+}
+
+/// A provisioning refusal, same register as `refuse_unless_host_ready` — never an ADR-0003
+/// quality gate. Split from the impure resolve so the decision is testable from a literal
+/// `Result` without touching real environment state (the same hermeticity reasoning as the
+/// doctor endpoint probe). The `Endpoint` itself is dropped at the call site below, immediately
+/// — only whether it resolved crosses into this function.
+fn refuse_unless_native_ready_from(
+    backend: Backend,
+    resolved: Result<(), String>,
+) -> Result<(), Refusal> {
+    if backend != Backend::Native {
+        return Ok(());
+    }
+    resolved.map_err(|e| Refusal::saying(format!("agent: {e}")))
+}
+
+fn refuse_unless_native_ready(
+    backend: Backend,
+    endpoint_override: Option<&str>,
+) -> Result<(), Refusal> {
+    refuse_unless_native_ready_from(
+        backend,
+        runner::Endpoint::resolve(endpoint_override, None).map(|_endpoint| ()),
+    )
 }
 
 /// The presence half of the dispatch-depth item list — local, free, no network, run by
@@ -1773,6 +1824,70 @@ fn say(run_dir: &Path, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_backend_does_not_require_the_claude_binary() {
+        let items = required_dispatch_items(Backend::Native);
+        assert!(
+            !items.iter().any(|i| i.check == job::Check::ClaudeBinary),
+            "a native-only host must not be refused for lacking `claude`"
+        );
+    }
+
+    #[test]
+    fn claude_code_backend_still_requires_the_claude_binary() {
+        let items = required_dispatch_items(Backend::ClaudeCode);
+        assert!(items.iter().any(|i| i.check == job::Check::ClaudeBinary));
+    }
+
+    #[test]
+    fn narrowing_by_backend_drops_no_other_item() {
+        // Every other dispatch-depth item is backend-agnostic: only `claude binary` may be
+        // filtered, and only for `Backend::Native`.
+        assert_eq!(
+            required_dispatch_items(Backend::ClaudeCode).len(),
+            job::dispatch_subset().len()
+        );
+        assert_eq!(
+            required_dispatch_items(Backend::Native).len(),
+            job::dispatch_subset().len() - 1
+        );
+    }
+
+    #[test]
+    fn claude_code_needs_no_native_credential_preflight() {
+        // Backend != Native short-circuits before the (would-be) resolve result is even
+        // consulted, so an `Err` here proves the branch, not a real environment read.
+        assert_eq!(
+            refuse_unless_native_ready_from(
+                Backend::ClaudeCode,
+                Err("would refuse if this were consulted".to_string())
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_native_backend_with_no_credential_refuses_dispatch() {
+        let refusal = refuse_unless_native_ready_from(
+            Backend::Native,
+            Err("no OPENROUTER_API_KEY / OPENAI_API_KEY in environment".to_string()),
+        );
+        let said = refusal.expect_err("no credential must refuse").to_string();
+        assert!(
+            said.contains("agent:"),
+            "refusal must name its register: {said}"
+        );
+        assert!(said.contains("OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn a_native_backend_with_a_credential_proceeds() {
+        assert_eq!(
+            refuse_unless_native_ready_from(Backend::Native, Ok(())),
+            Ok(())
+        );
+    }
 
     #[test]
     fn a_branch_with_slashes_locks_as_one_file_under_the_locks_directory() {

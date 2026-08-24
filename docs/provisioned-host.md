@@ -182,12 +182,20 @@ plus a login* on darwin, and do not let the shorter phrase stand for both.
 - **An agent API key is present in the environment.** — *doctor* — `OPENROUTER_API_KEY`
   or `OPENAI_API_KEY`, read at use and never recorded anywhere (ADR-0017). Presence is the
   whole check: validity is only decidable mid-Run, where a dead key is an outcome like any
-  other (#37's ruling), so dispatch refuses only the keyless host.
+  other (#37's ruling), so dispatch refuses only the keyless host — a `native` Dispatch with
+  neither key in the environment refuses before the lock, the worktree or a single attempt,
+  rather than spending its whole attempt budget failing identically.
 
-- **The agent endpoint answers.** — *doctor* — a connection-level probe of the selected
-  backend's `{base_url}/models` (ADR-0016): any HTTP status passes, a connect error fails.
-  Reachability, not authorization — the key check above owns presence. Reported for both
-  backends regardless of selection, so both stay selectable from one doctor run.
+- **The agent endpoint answers.** — *doctor* — a connection-level probe of `{base_url}/models`
+  (ADR-0016), where `{base_url}` is the **declared** backend's base URL: doctor takes no Job,
+  so there is no *selected* backend to probe, only whatever `~/.grind/agent` declares — the
+  override token on its line when one is declared, the default endpoint when none is. Probing
+  the hardcoded default regardless of what is declared would defeat the override's own
+  purpose, which is self-hosting. An unreadable or unparseable declaration is unobservable
+  rather than guessed at: doctor never falls back to the default as though that had been
+  declared. Any HTTP status passes, a connect error fails — reachability, not authorization;
+  the key check above owns presence. Reported for both backends regardless of which is
+  declared, so both stay selectable from one doctor run.
 
 ## Credentials
 

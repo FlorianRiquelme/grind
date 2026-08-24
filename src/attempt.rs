@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 /// Weakening the list is **intent**, and no carrier defends against intent. What is typeable is
 /// the narrower, omission-shaped property below: every invocation carries them. The contents
 /// stay prose, in `CLAUDE.md`, where they already are.
-pub const DENIED_TOOLS: [&str; 26] = [
+pub const DENIED_TOOLS: [&str; 29] = [
     "Bash(gh pr merge*)",
     "Bash(git push --force*)",
     "Bash(git push -f*)",
@@ -81,23 +81,46 @@ pub const DENIED_TOOLS: [&str; 26] = [
     // Branch deletion one door over: `gh api -X DELETE repos/o/r/git/refs/heads/x` removes a
     // remote branch through the API the `gh pr merge`/`gh api*merge*` globs leave open.
     "Bash(gh api*DELETE*)",
+    // --- indirection through a nested shell, rather than off the front of one verb ---------
+    //
+    // Every glob above matches a `git`/`gh` invocation appearing as its own subcommand.
+    // `sh -c '...'` and `bash -c '...'` hand the whole forbidden command to a *nested* shell as
+    // one string argument, and `eval '...'` does the same in-process — none of the globs above
+    // name the outer command, only what it wraps, so `sh -c "git push --force origin main"`
+    // went straight through. (Command substitution and a leading `NAME=value` assignment are
+    // the sibling gaps; those are closed by widening the matcher itself in
+    // `tools::subcommands_of`, not by a glob, because there is no fixed verb to anchor one on.)
+    // All three are broad by the same trade the twelve position-independent globs above already
+    // make: `sh -c "ls"` and `eval "true"` are ordinary and now refused too, an acceptable false
+    // refusal for a barrier of this kind.
+    "Bash(sh -c*)",
+    "Bash(bash -c*)",
+    "Bash(eval*)",
 ];
 
 /// The denial set for one of the ten ladder stages. **The base list always, verbatim, never
 /// filtered** — widening only, never narrowing. Report-only stages (`PlanReview`, `Review`,
-/// `Validate`) additionally deny `Write` and `Edit`; the two fan-out panels (`Review`,
-/// `Validate`) further deny the write-capable Bash forms above. The denials narrow the surface
-/// without closing it: shell redirection is not deniable — it is how a panel session writes its
-/// findings files — so "touches nothing" is the prompt's stated discipline with the sandbox
-/// behind it, never a sandbox guarantee alone. `Plan`, `Triage`, `Work`,
+/// `Validate`) additionally deny `Write`, `Edit` and `write_file`; the two fan-out panels
+/// (`Review`, `Validate`) further deny the write-capable Bash forms above. The denials narrow
+/// the surface without closing it: shell redirection is not deniable — it is how a panel
+/// session writes its findings files — so "touches nothing" is the prompt's stated discipline
+/// with the sandbox behind it, never a sandbox guarantee alone. `Plan`, `Triage`, `Work`,
 /// `Simplify`, `DiffTriage`, `Fixes` and `Ship` carry the base list only: they are the stages
 /// that write the worktree (or, for the two in-process `[R]` passes, write nothing at all).
+///
+/// `write_file` rides alongside `Write`/`Edit` rather than replacing them: those two are the
+/// names the claude-code adapter's own matcher recognises, `write_file` is the name the native
+/// toolkit spells its writer (`tools::ToolRegistry`), and `tools::gate`'s bare-name branch
+/// matches a glob against the raw tool name — so a list that named only `Write`/`Edit` gated
+/// one adapter and left the other's writer open on these three report-only stages. One list,
+/// same meaning on both adapters; the entry Claude Code never matches is harmless there.
 pub fn denied_for(stage: rung::Stage) -> Vec<String> {
     use rung::Stage::{PlanReview, Review, Validate};
     let mut denials: Vec<String> = DENIED_TOOLS.iter().map(|s| s.to_string()).collect();
     if matches!(stage, PlanReview | Review | Validate) {
         denials.push("Write".to_string());
         denials.push("Edit".to_string());
+        denials.push("write_file".to_string());
     }
     if matches!(stage, Review | Validate) {
         denials.extend(PANEL_BASH_FORMS.iter().map(|s| s.to_string()));
@@ -520,34 +543,13 @@ mod tests {
         assert!(!invocation.argv().contains(&"--model".to_string()));
     }
 
-    /// A minimal reimplementation of the two facts CLAUDE.md's `DENIED_TOOLS` section states
-    /// about Claude Code's own deny-glob matcher: `*` may appear anywhere in the pattern (start,
-    /// middle or end), and matching is per-subcommand after splitting the full command line on
-    /// `&&`, `||`, `;`, `|`, `|&`, `&` and newlines. **This tests our own understanding of that
-    /// matcher, not the matcher itself** — the real one lives in Claude Code and cannot be
-    /// imported here, so a bug in this reimplementation would pass silently. Keep it dumb:
-    /// full-string match, `*` the only wildcard, no other glob syntax.
-    fn glob_matches(pattern: &str, candidate: &str) -> bool {
-        fn rec(p: &[u8], c: &[u8]) -> bool {
-            match p.first() {
-                None => c.is_empty(),
-                Some(b'*') => rec(&p[1..], c) || (!c.is_empty() && rec(p, &c[1..])),
-                Some(head) => c.first() == Some(head) && rec(&p[1..], &c[1..]),
-            }
-        }
-        rec(pattern.as_bytes(), candidate.as_bytes())
-    }
-
-    fn subcommands_of(command: &str) -> Vec<String> {
-        let mut pieces = vec![command.to_string()];
-        for separator in ["|&", "&&", "||", ";", "|", "&", "\n"] {
-            pieces = pieces
-                .iter()
-                .flat_map(|p| p.split(separator).map(str::to_string).collect::<Vec<_>>())
-                .collect();
-        }
-        pieces.into_iter().map(|p| p.trim().to_string()).collect()
-    }
+    // `glob_matches` and `subcommands_of` used to be a from-scratch reimplementation here,
+    // maintained by hand alongside the real matcher `tools::gate` runs — two copies nothing
+    // bound, so `just verify` stayed green while they drifted. They are now imported from
+    // `tools`, the module whose copy is the native backend's **entire** enforcement barrier
+    // (nothing sits behind it), so this table validates the matcher grind actually runs rather
+    // than a parallel guess at what Claude Code's own matcher does.
+    use crate::tools::{glob_matches, subcommands_of};
 
     fn is_denied(command: &str) -> bool {
         subcommands_of(command).iter().any(|sub| {
@@ -568,7 +570,7 @@ mod tests {
         // spelling per row is what let the whole list read complete while
         // `git push origin --force` went straight through: git accepts the flag anywhere, and
         // a table that only ever types it in one position never asks.
-        let table: [(&str, &[&str]); 18] = [
+        let table: [(&str, &[&str]); 19] = [
             (
                 "merge via gh pr merge",
                 &["gh pr merge 123 --squash", "gh pr merge --squash 123"],
@@ -670,6 +672,15 @@ mod tests {
                     "gh api --method DELETE repos/o/r/git/refs/heads/feat/x",
                 ],
             ),
+            (
+                "shell indirection through a nested sh/bash/eval that hides the verb from a \
+                 prefix-anchored glob",
+                &[
+                    "sh -c 'git push --force origin main'",
+                    "bash -c 'gh pr merge 123'",
+                    "eval 'git reset --hard HEAD~3'",
+                ],
+            ),
         ];
         for (name, spellings) in table {
             for candidate in spellings {
@@ -679,6 +690,10 @@ mod tests {
         // Denials are per-subcommand after splitting on shell operators, so a prefix like `cd`
         // ahead of the forbidden verb must not let it through.
         assert!(is_denied("cd /tmp && git push --force origin main"));
+        // Command substitution and a leading env-var assignment must not hide the verb either.
+        assert!(is_denied("echo $(gh pr merge 123)"));
+        assert!(is_denied("echo `git push --force origin main`"));
+        assert!(is_denied("GIT_DIR=. gh pr merge 123"));
     }
 
     #[test]

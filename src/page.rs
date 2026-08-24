@@ -615,13 +615,12 @@ fn attempt_list(run_id: &str, found: &RunView) -> String {
             .filter(|r| !r.is_empty())
             .map(|r| format!("<div class=\"g-asub\">{}</div>", esc(&r)))
             .unwrap_or_default();
+        let evidence = evidence_links(run_id, a.n, found.backend);
         out.push_str(&format!(
             "<div class=\"g-a\"><div class=\"g-aline\"><span class=\"g-idx\">#{}</span>\
 <span class=\"g-verdict {vcls}\">{word}</span><span class=\"g-dur\">{}{}</span></div>\
 {reason}\
-<div class=\"g-ev\"><a class=\"g-link\" href=\"/raw/runs/{}/attempt-{}.prompt.txt\">prompt.txt</a>\
-<a class=\"g-link\" href=\"/raw/runs/{}/attempt-{}.stdout.json\">stdout.json</a>\
-<a class=\"g-link\" href=\"/raw/runs/{}/attempt-{}.stderr.log\">stderr.log</a></div></div>",
+{evidence}</div>",
             a.n,
             if dur.is_empty() {
                 String::new()
@@ -633,18 +632,32 @@ fn attempt_list(run_id: &str, found: &RunView) -> String {
             } else {
                 String::new()
             },
-            esc(run_id),
-            a.n,
-            esc(run_id),
-            a.n,
-            esc(run_id),
-            a.n
         ));
     }
     if out.is_empty() {
         out = "<div class=\"g-a g-dim\">nothing recorded</div>".to_string();
     }
     out
+}
+
+/// What one attempt's row links to, which depends on what that Run's backend actually wrote
+/// to disk (issue found in review: `RunView.backend` was added by #135 and read nowhere).
+/// `ClaudeCodeAdapter::run` writes the three `attempt-N.*` files; `NativeAdapter::run` writes
+/// only `messages-N.jsonl` in the run dir — rendering the claude-code trio for a native attempt
+/// links three files that were never written. This is a pure renderer with no filesystem
+/// access, so it names what each backend writes rather than checking what exists.
+fn evidence_links(run_id: &str, n: usize, backend: crate::runner::Backend) -> String {
+    let run_id = esc(run_id);
+    match backend {
+        crate::runner::Backend::ClaudeCode => format!(
+            "<div class=\"g-ev\"><a class=\"g-link\" href=\"/raw/runs/{run_id}/attempt-{n}.prompt.txt\">prompt.txt</a>\
+<a class=\"g-link\" href=\"/raw/runs/{run_id}/attempt-{n}.stdout.json\">stdout.json</a>\
+<a class=\"g-link\" href=\"/raw/runs/{run_id}/attempt-{n}.stderr.log\">stderr.log</a></div>"
+        ),
+        crate::runner::Backend::Native => format!(
+            "<div class=\"g-ev\"><a class=\"g-link\" href=\"/raw/runs/{run_id}/messages-{n}.jsonl\">messages.jsonl</a></div>"
+        ),
+    }
 }
 
 fn last_words_block(live: &Live) -> String {
@@ -1265,5 +1278,38 @@ mod tests {
         let html = roster_page(&[], &proposals);
         assert!(html.contains("proposal queue"), "{html}");
         assert!(html.contains("wording tweak"), "{html}");
+    }
+
+    // --- evidence links follow the Run's backend, not a fixed claude-code shape --------------
+
+    #[test]
+    fn a_claude_code_run_links_the_three_files_that_adapter_writes() {
+        let found = day_one();
+        assert_eq!(found.backend, crate::runner::Backend::ClaudeCode);
+        let html = attempt_list("id", &found);
+        assert!(html.contains("attempt-1.prompt.txt"), "{html}");
+        assert!(html.contains("attempt-1.stdout.json"), "{html}");
+        assert!(html.contains("attempt-1.stderr.log"), "{html}");
+        assert!(!html.contains("messages-1.jsonl"), "{html}");
+    }
+
+    #[test]
+    fn a_native_run_links_only_the_messages_transcript_it_actually_writes() {
+        let mut found = day_one();
+        found.backend = crate::runner::Backend::Native;
+        let html = attempt_list("id", &found);
+        assert!(html.contains("messages-1.jsonl"), "{html}");
+        assert!(
+            !html.contains("attempt-1.prompt.txt"),
+            "the native adapter never writes this file: {html}"
+        );
+        assert!(
+            !html.contains("attempt-1.stdout.json"),
+            "the native adapter never writes this file: {html}"
+        );
+        assert!(
+            !html.contains("attempt-1.stderr.log"),
+            "the native adapter never writes this file: {html}"
+        );
     }
 }

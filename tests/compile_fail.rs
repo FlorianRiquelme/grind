@@ -77,8 +77,11 @@ fn scratch_crate(name: &str) -> PathBuf {
     root
 }
 
-/// Recursive copy: the library root's module tree includes subdirectories (`src/runner/`
-/// since #135), and a flat copy stopped compiling the day the first one appeared.
+/// Recursive copy, kept general rather than flat: `tests/topology.rs` enforces that `src/`
+/// carries no subdirectories at all (the privacy guarantee ADR-0007 documents depends on
+/// every module being a crate-root sibling), but nothing here should have to assume that
+/// invariant holds forever to keep compiling — a future module tree gaining a subdirectory
+/// should fail `tests/topology.rs` loudly, not silently stop being copied here too.
 fn copy_tree(src: &Path, dest: &Path) {
     fs::create_dir_all(dest).expect("a scratch directory");
     for entry in fs::read_dir(src).expect("read src/").flatten() {

@@ -78,6 +78,22 @@ pub enum TryLock {
 /// hypothetical seam with one production impl and one test impl, both in Rust, and the actual
 /// spawn path exercised by neither (ADR-0007).
 pub fn run(argv: &[String], cwd: Option<&Path>) -> Completed {
+    run_scrubbed(argv, cwd, &[])
+}
+
+/// `run`, plus `command.env_remove(v)` for each of `drop_vars` before the child ever spawns.
+///
+/// The native backend's `bash` tool is the first thing that requires an LLM provider
+/// credential (`OPENROUTER_API_KEY` / `OPENAI_API_KEY`) in the supervisor's own environment,
+/// and it hands a shell to a model that can read files and receive prompt injection from the
+/// target repo. A child spawned with `run` inherits that credential and can print it —
+/// `env`, `echo $OPENROUTER_API_KEY` — straight into the transcript the next request replays.
+/// No deny glob can cover that: it names no forbidden verb.
+///
+/// Scoped removal rather than `env_clear()`: a stage's shell legitimately needs `PATH`,
+/// `HOME`, and the ambient git/gh environment to do ordinary work, and clearing all of it
+/// would break every other tool call to close one credential's leak.
+pub fn run_scrubbed(argv: &[String], cwd: Option<&Path>, drop_vars: &[&str]) -> Completed {
     let Some((program, rest)) = argv.split_first() else {
         return Completed {
             stdout: String::new(),
@@ -89,6 +105,9 @@ pub fn run(argv: &[String], cwd: Option<&Path>) -> Completed {
     command.args(rest);
     if let Some(dir) = cwd {
         command.current_dir(dir);
+    }
+    for var in drop_vars {
+        command.env_remove(var);
     }
     match command.output() {
         Ok(out) => Completed {
@@ -502,6 +521,23 @@ pub fn temp_dir(tag: &str) -> PathBuf {
 #[cfg(test)]
 pub fn remove_tree(path: &Path) {
     let _ = fs::remove_dir_all(path);
+}
+
+/// Test-only environment mutation. Exists so a test in another module (`tools`'s
+/// credential-scrubbing test) can set up its fixture without naming `std::env` itself —
+/// `world` stays the sole namer even from test code, the same reason [`temp_dir`] exists rather
+/// than a test elsewhere calling `std::env::temp_dir` directly.
+#[cfg(test)]
+pub fn set_var_for_test(name: &str, value: &str) {
+    // SAFETY: test-only, and no production code path ever calls this.
+    unsafe { std::env::set_var(name, value) };
+}
+
+/// The inverse of [`set_var_for_test`].
+#[cfg(test)]
+pub fn remove_var_for_test(name: &str) {
+    // SAFETY: test-only, and no production code path ever calls this.
+    unsafe { std::env::remove_var(name) };
 }
 
 #[cfg(test)]

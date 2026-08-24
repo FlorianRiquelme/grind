@@ -59,11 +59,13 @@ pub enum TranscriptEvent {
 }
 
 impl TranscriptEvent {
-    /// Encode one event as a full JSONL line (trailing newline included).
+    /// Encode one event as a single JSONL line, **without** a trailing newline: the writer
+    /// (`world::append_line`) already appends one via `writeln!`, so appending here too made
+    /// every `messages-N.jsonl` line double-spaced. Both current readers filter blank lines,
+    /// so nothing broke — but the format was wrong, and a future reader that does not filter
+    /// would see spurious empty lines.
     pub fn encode(&self) -> String {
-        let mut line = serde_json::to_string(self).expect("TranscriptEvent serializes");
-        line.push('\n');
-        line
+        serde_json::to_string(self).expect("TranscriptEvent serializes")
     }
 }
 
@@ -150,11 +152,26 @@ impl Selection {
 /// Where one attempt's network conversation goes. Resolved per attempt from the
 /// environment and selection snapshot; NEVER serialized anywhere — keys are secrets
 /// and the record records resolved paths, not credentials (ADR-0008).
-#[derive(Clone, Debug)]
+///
+/// `Debug` is hand-written rather than derived: a derive prints `api_key` verbatim, and a
+/// single future `{ep:?}` in an error message would carry the raw key into `terminal_reason`
+/// — which lands in `run.json` and the dashboard. Redacting here means every future caller
+/// gets the safe behavior for free rather than having to remember not to print this struct.
+#[derive(Clone)]
 pub struct Endpoint {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+}
+
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Endpoint")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .field("model", &self.model)
+            .finish()
+    }
 }
 
 /// Default OpenAI-compatible endpoint: OpenRouter first, OpenAI by base-url swap
@@ -240,5 +257,46 @@ pub fn runner_for(
             home: home.to_path_buf(),
         }),
         Backend::Native => Box::new(NativeAdapter { endpoint_override }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A derived `Debug` would print `api_key` verbatim, and this struct's own doc comment
+    /// says the key is "NEVER serialized anywhere" — a single future `{ep:?}` in an error
+    /// message would break that silently. The hand-written impl is what actually keeps the
+    /// promise.
+    #[test]
+    fn endpoint_debug_never_prints_the_api_key() {
+        let ep = Endpoint {
+            base_url: "https://example.test/v1".to_string(),
+            api_key: "sk-super-secret-value".to_string(),
+            model: "some/model".to_string(),
+        };
+        let printed = format!("{ep:?}");
+        assert!(
+            !printed.contains("sk-super-secret-value"),
+            "the api key leaked into Debug output: {printed}"
+        );
+        assert!(printed.contains("<redacted>"), "{printed}");
+        // The non-secret fields are still useful for diagnosis.
+        assert!(printed.contains("https://example.test/v1"), "{printed}");
+        assert!(printed.contains("some/model"), "{printed}");
+    }
+
+    /// `world::append_line` already writes its own trailing newline via `writeln!`, so
+    /// `encode()` must not add a second one — that was making every `messages-N.jsonl` line
+    /// double-spaced.
+    #[test]
+    fn encode_does_not_append_its_own_newline() {
+        let event = TranscriptEvent::Final {
+            text: "done".to_string(),
+        };
+        let line = event.encode();
+        assert!(!line.ends_with('\n'), "{line:?}");
+        // Still a single valid JSON value on that one line.
+        let _: serde_json::Value = serde_json::from_str(&line).expect("encode produced JSON");
     }
 }
