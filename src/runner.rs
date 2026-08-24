@@ -179,6 +179,32 @@ impl std::fmt::Debug for Endpoint {
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_MODEL: &str = "deepseek/deepseek-chat-v3.1";
 
+/// Which key pays for the endpoint being dialled — the pure half of [`Endpoint::resolve`], so
+/// the refusal below is testable from literals with no environment.
+///
+/// The two keys are not interchangeable. `OPENROUTER_API_KEY` names its own host, so it pairs
+/// with the default. `OPENAI_API_KEY` does not: pairing it with the *default* base url would
+/// send an OpenAI secret to openrouter.ai on every turn of every attempt — a credential
+/// disclosed to a third party the operator never chose, and a 401 they cannot explain. An
+/// explicitly declared endpoint is the operator saying where the key goes, so that is honored;
+/// the silent default is refused instead of guessed.
+fn key_for(
+    openrouter: Option<String>,
+    openai: Option<String>,
+    endpoint_declared: bool,
+) -> Result<String, String> {
+    match (openrouter, openai) {
+        (Some(key), _) => Ok(key),
+        (None, Some(key)) if endpoint_declared => Ok(key),
+        (None, Some(_)) => Err(format!(
+            "only OPENAI_API_KEY is set and no endpoint is declared, so the key would be sent \
+             to {DEFAULT_BASE_URL} — declare the endpoint on the `~/.grind/agent` line \
+             (`native <base-url>`) so the key reaches the provider it belongs to"
+        )),
+        (None, None) => Err("no OPENROUTER_API_KEY / OPENAI_API_KEY in environment".to_string()),
+    }
+}
+
 impl Endpoint {
     /// Resolve per attempt from the environment and the selection snapshot. Keys are
     /// read-at-use via `world::var` and never serialized anywhere (ADR-0017).
@@ -186,9 +212,11 @@ impl Endpoint {
         endpoint_override: Option<&str>,
         model_override: Option<&str>,
     ) -> Result<Self, String> {
-        let api_key = crate::world::var("OPENROUTER_API_KEY")
-            .or_else(|_| crate::world::var("OPENAI_API_KEY"))
-            .map_err(|_| "no OPENROUTER_API_KEY / OPENAI_API_KEY in environment".to_string())?;
+        let api_key = key_for(
+            crate::world::var("OPENROUTER_API_KEY").ok(),
+            crate::world::var("OPENAI_API_KEY").ok(),
+            endpoint_override.is_some(),
+        )?;
         Ok(Self {
             base_url: endpoint_override.unwrap_or(DEFAULT_BASE_URL).to_string(),
             api_key,
@@ -298,5 +326,45 @@ mod tests {
         assert!(!line.ends_with('\n'), "{line:?}");
         // Still a single valid JSON value on that one line.
         let _: serde_json::Value = serde_json::from_str(&line).expect("encode produced JSON");
+    }
+
+    #[test]
+    fn an_openrouter_key_pays_for_the_default_endpoint() {
+        assert_eq!(
+            key_for(Some("or-key".into()), None, false),
+            Ok("or-key".into())
+        );
+        // It also pays for a declared one — the operator said where it goes.
+        assert_eq!(
+            key_for(Some("or-key".into()), Some("oa-key".into()), true),
+            Ok("or-key".into())
+        );
+    }
+
+    #[test]
+    fn an_openai_key_alone_refuses_the_default_endpoint_rather_than_misrouting() {
+        let refused = key_for(None, Some("oa-key".into()), false).expect_err("a refusal");
+        assert!(
+            refused.contains(DEFAULT_BASE_URL),
+            "the refusal names where the key would have gone: {refused}"
+        );
+        assert!(
+            !refused.contains("oa-key"),
+            "a refusal must never quote the secret: {refused}"
+        );
+    }
+
+    #[test]
+    fn an_openai_key_pays_for_an_endpoint_the_operator_declared() {
+        assert_eq!(
+            key_for(None, Some("oa-key".into()), true),
+            Ok("oa-key".into())
+        );
+    }
+
+    #[test]
+    fn no_key_at_all_is_its_own_refusal() {
+        let refused = key_for(None, None, true).expect_err("a refusal");
+        assert!(refused.contains("no OPENROUTER_API_KEY"), "{refused}");
     }
 }
