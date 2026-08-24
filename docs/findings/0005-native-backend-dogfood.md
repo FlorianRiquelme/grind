@@ -16,7 +16,10 @@ tools, two different models:
 | True spend | $0.048594 | $0.000000 (uncharged while cloaked) |
 
 **Everything between the wire and one completed stage works. The ladder does not, and the cause is
-one boolean.** The transport, the streaming parser, capability probing, tool calling, the layout
+one boolean.** (Both of the first two findings below were fixed the same day, by
+[#145](https://github.com/FlorianRiquelme/grind/pull/145) and
+[#144](https://github.com/FlorianRiquelme/grind/pull/144); what follows records the Runs as they
+ran.) The transport, the streaming parser, capability probing, tool calling, the layout
 declaration, the dispatch snapshot, the provenance freeze, the stage-return contract and the
 `view::Live` reader all did exactly what they were built to do, on a backend that had never run
 before. Then the Run terminated after its first rung, because the native adapter reports a
@@ -36,6 +39,7 @@ could not see: they exercise one stage at a time, and the defect only exists bet
 | Provenance | `binary_version 0.1.0`, `skills_hash ef17554580a19b6a`, frozen at dispatch on both |
 | Tool denials | 0 |
 | Fan-out | `could not observe` on both — correct; the native loop has no tool that spawns a subagent |
+| Reflect | Run B only: ran, exhausted 32 of 32 turns, produced no artifact, recorded `complete` |
 
 ## The blocker: a finished stage is reported as a finished Run
 
@@ -151,6 +155,44 @@ validate the call, nudge once, log the nudge.
 Attempt 2 produced zero empty-name calls and Run B produced zero across a whole completed stage,
 so this is a weak-model amplifier rather than a defect that bites every backend — an argument
 about priority, not correctness.
+
+## Reflect burned its whole budget and the record calls it complete
+
+Run B's record, after the Run terminated:
+
+```
+plan      complete   turns=14   artifacts=[stages/plan/anchor-plan.md, stages/plan/plan-facts.json]
+reflect   complete   turns=32   artifacts=[]
+```
+
+Reflect used **32 of 32 turns** — exactly `native::MAX_TURNS` — and produced nothing: no
+`reflect.return.json`, no proposal drafts, no calibration row. Its last transcript entry is a
+`tool_result` mid-investigation. It was still orienting at turn 23 and ran out.
+
+The status comes from the reflect `StageEntry` in `supervisor.rs`:
+
+```rust
+status: if classified.done_promise || classified.parse_ok {
+```
+
+On claude-code, `parse_ok` is a real signal: a session that dies mid-stream produces no parseable
+result JSON. On native it is a constant — `native.rs` documents `parse_ok` as "always true (the
+loop spoke for itself)", which is defensible on its own terms and makes the disjunction
+unconditionally true. The `else` branch is unreachable on this backend.
+
+The ladder path is unaffected, and the contrast is the proof: Run A's Plan was correctly recorded
+`incomplete` on the same turn exhaustion, because a ladder stage's status is read from its own
+`.return.json` on disk. Only Reflect infers status from the attempt's synthesized fields.
+
+This one bites hardest for the reason findings 0001–0004 keep returning to: the record's honesty is
+the product. `reflect: complete, artifacts: []` asserts a stage succeeded where a human looks to
+find out what the Run learned, and nothing catches it — `reflected` is set before dispatch
+(deliberately, `supervisor.rs:821`), so a failed Reflect is simply lost. Filed as
+[#146](https://github.com/FlorianRiquelme/grind/issues/146).
+
+A separate question this raises rather than answers: 32 turns to read a codebase and draft
+follow-up Jobs was not enough on this Run. Whether `MAX_TURNS` should differ for Reflect wants its
+own evidence.
 
 ## The two models, with the harness held constant
 
