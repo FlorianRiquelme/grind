@@ -7,9 +7,9 @@
 //! shared vocabulary both adapters consume.
 
 use crate::attempt::{
-    Attempt, Clearance, Conditions, DENIED_TOOLS, Invocation, Mode, StageConditions, StageContext,
-    denied_for, denied_for_reflect, is_rate_limited, mentions_limit, normalise, reflect_session_id,
-    stage_session_id, text_at,
+    Attempt, Clearance, Conditions, DENIED_TOOLS, DONE_PROMISE, Invocation, Mode, StageConditions,
+    StageContext, denied_for, denied_for_reflect, is_rate_limited, mentions_limit, normalise,
+    reflect_session_id, stage_session_id, text_at,
 };
 use crate::observe::{Observed, Reason};
 use crate::rung;
@@ -519,7 +519,7 @@ pub fn classify(
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default(),
-        done_promise: result.contains("<promise>DONE</promise>"),
+        done_promise: result.contains(DONE_PROMISE),
         // The payload's own verdict first. The raw-streams fold runs only when the payload
         // cannot speak — it never parsed, or the child exited non-zero without the payload
         // itself carrying the 429 — so a healthy attempt is never rate-limited by noise on

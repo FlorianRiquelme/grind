@@ -304,6 +304,12 @@ impl Invocation {
     }
 }
 
+/// The Run-level termination sentinel. A promise is a claim about the work, **spoken by the
+/// agent in its own final text** — never inferred from an adapter's control flow (issue #139:
+/// the native loop's synthesized promise ended every Run one rung into its ladder). Every
+/// adapter reads it out of the words the agent said and nowhere else.
+pub(crate) const DONE_PROMISE: &str = "<promise>DONE</promise>";
+
 /// One attempt as the record holds it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Attempt {

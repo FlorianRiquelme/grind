@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::attempt::{Attempt, Mode, is_rate_limited};
+use crate::attempt::{Attempt, DONE_PROMISE, Mode, is_rate_limited};
 use crate::net::{ChatClient, ChatTurn, NetError, ToolCallSpec};
 use crate::observe::{self, Observed, Reason};
 use crate::tools::{self, GateDecision, GateLayer, RawCall, ToolDef, ToolRegistry};
@@ -404,10 +404,16 @@ struct AttemptFacts<'a> {
 /// `trailing_waits` permanently at 0 — the Run 2 failure ADR-0002/0004 exist to
 /// prevent.
 fn synthesize(facts: AttemptFacts) -> Attempt {
-    let (exit_code, is_error, done_promise, spoken) = match facts.ending {
-        Ending::Completed(text) => (Some(0), false, true, text),
-        Ending::Failed(reason) => (Some(1), true, false, reason),
+    let (exit_code, is_error, spoken) = match facts.ending {
+        Ending::Completed(text) => (Some(0), false, text),
+        Ending::Failed(reason) => (Some(1), true, reason),
     };
+    // The promise is spoken, never synthesized. A Run-level claim must come out of the
+    // agent's own final text — the same sentinel claude::classify reads
+    // (`attempt::DONE_PROMISE`) — or a stage that merely completes ends the whole Run one
+    // rung into its ladder, uncorroborated (issue #139). An ending is a fact about this
+    // loop; a promise is a claim about the work.
+    let done_promise = !is_error && spoken.contains(DONE_PROMISE);
     let terminal_reason = is_error.then(|| spoken.clone());
     let count = spoken.chars().count();
     let result_tail: String = spoken
@@ -1415,13 +1421,45 @@ mod tests {
         assert!(!attempt.is_error);
         assert!(attempt.parse_ok);
         assert_eq!(attempt.subtype, None);
-        assert!(attempt.done_promise);
+        // "shipped it" speaks no Run-level sentinel: a completed stage promises nothing
+        // (issue #139).
+        assert!(!attempt.done_promise);
         assert!(!attempt.rate_limited);
         assert_eq!(attempt.total_cost_usd, Some(0.031_833_87));
         assert_eq!(attempt.num_turns, Some(7));
         assert_eq!(attempt.usage.as_ref().unwrap()["prompt_tokens"], 10);
         assert_eq!(attempt.result_tail, "shipped it");
         assert!(matches!(attempt.fanout, Observed::Unobservable(_)));
+    }
+
+    #[test]
+    fn the_done_promise_is_spoken_by_the_agent_never_synthesized_from_the_ending() {
+        let promised = synthesize(AttemptFacts {
+            n: 1,
+            mode: Mode::Dispatch,
+            started_at: "s",
+            ended_at: "e",
+            turns_used: 9,
+            ending: Ending::Completed("PR is open, stopping here. <promise>DONE</promise>".into()),
+            usage: None,
+            denials: vec![],
+        });
+        assert!(promised.done_promise);
+
+        // A stage that completes without speaking the sentinel — plan, say, whose
+        // return names neither PR nor commits — promises nothing, so the supervisor
+        // walks on to the next rung instead of asking whether the whole Run is over.
+        let unpromised = synthesize(AttemptFacts {
+            n: 1,
+            mode: Mode::Dispatch,
+            started_at: "s",
+            ended_at: "e",
+            turns_used: 7,
+            ending: Ending::Completed("plan written and verified.".into()),
+            usage: None,
+            denials: vec![],
+        });
+        assert!(!unpromised.done_promise);
     }
 
     #[test]
