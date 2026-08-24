@@ -11,8 +11,8 @@ tools, two different models:
 | Run id | `20260824-155324-grind-138` | `20260824-160445-grind-138` |
 | Declaration | `native` (bare) | `native model=stealth/ox-alpha` |
 | Model resolved | `deepseek/deepseek-chat-v3.1` (`DEFAULT_MODEL`) | `stealth/ox-alpha` |
-| Recorded state | `died` (killed by hand mid-attempt 2) | `uncorroborated` |
-| Plan stage | `incomplete`, 32 turns | **`complete`, 14 turns** |
+| Recorded state | `died` (killed by hand during a working attempt 2) | `uncorroborated` |
+| Plan stage | `incomplete`, 32 turns (attempt 1) | **`complete`, 14 turns** |
 | True spend | $0.048594 | $0.000000 (uncharged while cloaked) |
 
 **Everything between the wire and one completed stage works. The ladder does not, and the cause is
@@ -27,7 +27,7 @@ could not see: they exercise one stage at a time, and the defect only exists bet
 
 | | |
 |---|---|
-| What happened | Run A livelocked in Plan and was killed; Run B completed Plan, then terminated one rung into a ten-rung ladder |
+| What happened | Run A livelocked in Plan on attempt 1, was re-entered, and was killed during a working attempt 2; Run B completed Plan, then terminated one rung into a ten-rung ladder |
 | What the record says | A: `died`, `plan: incomplete` · B: `uncorroborated(["PR open", "commits ahead", "PR head matches Job branch", "PR base matches declared branch"])`, `plan: complete` |
 | PR opened | none, by either Run |
 | Commits | none, by either Run — both worktrees left clean |
@@ -137,21 +137,20 @@ The record had to be opened to disprove the banner.
 
 ## Malformed tool calls are consumed silently
 
-Run A's 49 assistant turns produced:
+Run A's **attempt 1** produced 63 tool calls, of which **17 arrived as
+`{"name": "", "arguments": "\"\""}`**. The loop consumed each as a turn against the 32-turn budget
+and emitted no `ProtocolNudge` — the mechanism that exists for exactly this (a reply that did not
+conform, corrected once and logged so drift rates stay measurable). A quarter of the budget went
+to nothing, invisibly, and the attempt ended on `turn budget exhausted (32)`.
 
-| call name | count |
-|---|---|
-| `bash` | 57 |
-| *(empty name)* | **17** |
-| `read_file` | 4 |
-| `write_file` | 2 |
+The gap has a second shape. Attempt 2 issued a `write_file` carrying only `content` and **no
+`path`**, which is required. So the defect is not only *the name is empty* — it is that a call
+missing required arguments is disposed of without the model being told. Both want the same fix:
+validate the call, nudge once, log the nudge.
 
-Seventeen calls arrived as `{"name": "", "arguments": "\"\""}`. The loop consumed each as a turn,
-against a 32-turn budget, and emitted no `ProtocolNudge` — the mechanism that exists for exactly
-this (a reply that did not conform, corrected once and logged so drift rates stay measurable).
-Run B produced zero of them, so this is a weak-model amplifier rather than a defect that bites
-every backend; but a third of one attempt's turn budget spent on nothing, invisibly, is worth a
-nudge and a transcript line.
+Attempt 2 produced zero empty-name calls and Run B produced zero across a whole completed stage,
+so this is a weak-model amplifier rather than a defect that bites every backend — an argument
+about priority, not correctness.
 
 ## The two models, with the harness held constant
 
@@ -163,11 +162,19 @@ skills, identical three-tool registry, identical prompts, one variable.
 only through its exit status, and grind surfaces exactly that — the tool result the model received
 was `exit: 1\nstdout:\n\nstderr:\n`. It then tried `echo $?` four times, which cannot work: each
 `bash` call is its own process, so `$?` reports the fresh shell's status and never the previous
-call's. It never wrote a plan, hit `turn budget exhausted (32)`, and the supervisor re-entered at
-the stage that died — correctly — whereupon the second attempt began repeating the first. Killed
-by hand after $0.049. 94% of that spend was prompt tokens (214,991 prompt against 2,024
-completion): a 32-turn loop re-sends the whole conversation every turn, so on a small context
-window the cost is dominated by re-reading, not by thinking.
+call's. Attempt 1 never wrote a plan and ended on `turn budget exhausted (32)`, with only 17
+distinct calls among 46 named ones. 94% of the spend was prompt tokens (214,991 prompt against
+2,024 completion): a 32-turn loop re-sends the whole conversation every turn, so on a small
+context window the cost is dominated by re-reading, not by thinking.
+
+**Re-entry then worked, and the Run was killed anyway.** The supervisor re-entered at the stage
+that died, and attempt 2 came back a different shape: 17 named calls, 15 of them distinct, **zero
+malformed**, and it wrote `stages/plan/anchor-plan.md`. It was making progress when it was killed
+by hand after a cumulative $0.049 — a judgement call taken on attempt 1's evidence and not
+re-checked against attempt 2's, so **whether deepseek would have completed Plan on re-entry is
+unmeasured**. The finding that survives is about the supervisor rather than the model: a
+turn-budget death is attempt-local, and ADR-0004's re-entry converted a livelock into a working
+attempt without intervention.
 
 **`stealth/ox-alpha` completed Plan in 14 turns**, 13 of which carried tool calls, with zero
 repeats and zero malformed calls. It met the same `exit: 1` ambiguity on the same command and
