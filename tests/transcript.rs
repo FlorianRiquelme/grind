@@ -5,7 +5,7 @@
 //! inside `src/` would trip `tests/topology.rs`. Git carries no mtimes either, so the fixture's
 //! times are set at run time — which is the honest way to test a freshness reading anyway.
 
-use grind::view::{newest_write, transcript_path};
+use grind::claude::{newest_write, transcript_path};
 use std::fs::{self, FileTimes};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};

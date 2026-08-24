@@ -5,18 +5,18 @@
 //! a gate through the back door: something downstream acts on the code, and a finding starts
 //! blocking. There is deliberately no conversion from a verdict in existence anywhere in this
 //! module (ADR-0006's convention mode, aimed at the surface most exposed to it).
-//!
-//! Nothing here invokes an agent. A view built out of the thing that gets rate-limited is
-//! unavailable during exactly the stall it exists to explain.
-
+use crate::claude;
 use crate::decide;
 use crate::job::{self, Check, Depth, Refusal};
+use crate::net;
 use crate::observe::{self, Observed, Outcome};
 use crate::render::{self, DoctorLine, SingleRun};
+use crate::runner;
 use crate::supervisor;
 use crate::view::{self, Lookup};
 use crate::world;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Whether the command could answer the question it was asked. **Not how the Run is doing.**
 enum Observability {
@@ -364,10 +364,7 @@ fn status_one(run_id: &str) -> i32 {
             let signals = decide::signals_of(&observation);
             let promised = found.attempts.last().is_some_and(|a| a.done_promise);
             let verdict = decide::verdict(&signals, promised);
-            let live = view::live(
-                &view::transcript_path(&home, &found.worktree, &found.session_id),
-                world::now_epoch(),
-            );
+            let live = live_for(&home, run_id, &found);
             let here = view::supervisor_here(
                 found.supervisor_identity.as_deref(),
                 &observe::process_start_stamp(&world::ps_start_stamp(found.supervisor_pid)),
@@ -401,6 +398,47 @@ fn observe_for(found: &view::RunView) -> observe::Observation {
         &found.job.base_branch,
         world::now_iso(),
     )
+}
+
+/// The live view, branching on the Run's snapshotted backend (#135). `claude::live` reads a
+/// single transcript file a claude-code Run writes; a native Run writes no such file —
+/// `NativeAdapter::run` leaves `messages-N.jsonl` under the Run's own directory instead — so
+/// reading that path there degraded every field to `Unobservable` at once while `grind status`
+/// still exited *Answered* over a blank panel. This reads only `freshness` for a native Run,
+/// off the newest `messages-*.jsonl` write; every other field stays honestly `Unobservable`
+/// until `native::live` learns to parse transcript content, which is out of scope here (pending
+/// P3 dogfooding evidence). A claude-code Run is unaffected — this is `claude::live` unchanged.
+fn live_for(home: &Path, run_id: &str, found: &view::RunView) -> claude::Live {
+    match found.backend {
+        runner::Backend::ClaudeCode => claude::live(
+            &claude::transcript_path(home, &found.worktree, &found.session_id),
+            world::now_epoch(),
+        ),
+        runner::Backend::Native => {
+            let run_dir = job::runs_dir(home).join(run_id);
+            let mtimes: Vec<SystemTime> = world::list_with_extension(&run_dir, "jsonl")
+                .iter()
+                .filter_map(|path| world::mtime(path))
+                .collect();
+            claude::Live {
+                transcript: run_dir,
+                now_skill: native_unread(),
+                assistant_now: native_unread(),
+                last_words: vec![String::new(); 3],
+                fanout: native_unread(),
+                freshness: observe::native_freshness(&mtimes, world::now_epoch()),
+            }
+        }
+    }
+}
+
+/// Shared by every `claude::Live` field a native Run cannot yet answer content-wise. A named
+/// helper rather than four repeated literals, so the one thing worth saying about all of them —
+/// *pending, not overlooked* — cannot drift between fields.
+fn native_unread<T>() -> Observed<T> {
+    Observed::Unobservable(observe::Reason::saying(
+        "native backend: transcript content is not read yet (pending P3 dogfooding evidence, #135)",
+    ))
 }
 
 // --- serve -------------------------------------------------------------------------------------
@@ -530,6 +568,19 @@ fn declared_clones(home: &Path) -> Vec<(String, PathBuf)> {
 }
 
 fn check(home: &Path, clones: &[(String, PathBuf)], check: Check) -> Observed<Outcome> {
+    check_with_probe(home, clones, check, net::probe_endpoint)
+}
+
+/// `check`'s real body, with the network probe injected — so the wiring test below can walk
+/// every host item, `EndpointReachable` included, without a live socket ever leaving the
+/// process. `check` itself always wires in the real `net::probe_endpoint`; only the test
+/// substitutes it.
+fn check_with_probe(
+    home: &Path,
+    clones: &[(String, PathBuf)],
+    check: Check,
+    probe: impl Fn(&runner::Endpoint) -> bool,
+) -> Observed<Outcome> {
     match check {
         Check::DeclaredClone => {
             let Some((declared, path)) = clones.first() else {
@@ -639,10 +690,44 @@ fn check(home: &Path, clones: &[(String, PathBuf)], check: Check) -> Observed<Ou
             )),
             None => observe::unchecked("no declared clone to read an origin from"),
         },
+        // Presence only, and the values are never printed anywhere (ADR-0017): `world::var`
+        // answers *set or unset*, which is all this check is allowed to know.
+        Check::AgentKeyPresent => observe::agent_key_present(
+            world::var("OPENROUTER_API_KEY").is_ok(),
+            world::var("OPENAI_API_KEY").is_ok(),
+        ),
+        // Both backends' readiness, regardless of which is declared (R9). Doctor takes no Job,
+        // so this reads the **declared** selection at `~/.grind/agent` — never a "selected"
+        // one — and probes its declared base URL (the default when no override is declared),
+        // never the hardcoded default regardless of what is declared: the base-url token
+        // exists to support self-hosting, and probing the default defeats that. An unreadable
+        // or unparseable agent file is unobservable rather than guessed at, on the same
+        // reasoning as every other doctor row; a key that resolves nothing leaves the probe
+        // untried either way, and `endpoint_reachable` says so.
+        Check::EndpointReachable => {
+            observe::endpoint_reachable(probe_declared_endpoint(job::read_selection(home), probe))
+        }
         Check::NoBoolean => observe::unchecked(
             "performed during provisioning; every available check would be a guess",
         ),
     }
+}
+
+/// The base URL `EndpointReachable` probes is the **declared** selection's override (the
+/// default when none is declared) — never the hardcoded default regardless of what is
+/// declared, and never a guess when the declaration itself could not be read: an unreadable or
+/// unparseable `~/.grind/agent` short-circuits to `None` before the probe closure is ever
+/// called, rather than falling back to probing the default as if that had been declared. Split
+/// out so that property is testable from a literal `Result`.
+fn probe_declared_endpoint(
+    selection: Result<runner::Selection, String>,
+    probe: impl Fn(&runner::Endpoint) -> bool,
+) -> Option<bool> {
+    selection.ok().and_then(|selection| {
+        runner::Endpoint::resolve(selection.endpoint_override.as_deref(), None)
+            .ok()
+            .map(|endpoint| probe(&endpoint))
+    })
 }
 
 fn config(key: &str) -> world::Completed {
@@ -674,6 +759,60 @@ fn print_err(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DAY_ONE: &str = include_str!("../tests/fixtures/record/day-one.json");
+
+    /// The day-one fixture, with `backend` overridden — a record written before selection
+    /// existed carries neither field and defaults to `ClaudeCode`, so a literal string edit is
+    /// how the other backend gets exercised without hand-building the whole record shape.
+    fn found_with_backend(backend: &str) -> view::RunView {
+        let mut value: serde_json::Value = serde_json::from_str(DAY_ONE).unwrap();
+        value["backend"] = serde_json::json!(backend);
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn a_claude_code_run_is_unaffected_by_the_native_branch() {
+        // No filesystem to touch: the fixture's worktree/session do not exist on this box, and
+        // `live_for` must still take exactly the `claude::live` path it always did, over the
+        // same transcript path, rather than routing through the native branch's freshness scan.
+        let found = found_with_backend("claude-code");
+        let home = Path::new("/nowhere/that/exists");
+        let live = live_for(home, &found.run_id, &found);
+        assert_eq!(
+            live.transcript,
+            claude::transcript_path(home, &found.worktree, &found.session_id)
+        );
+        // Unaffected also means unaffected in *how* it fails: the same shape a broken
+        // claude-code transcript path always produced, not the native branch's four
+        // fixed-reason "pending P3" strings.
+        assert!(matches!(live.freshness, Observed::Unobservable(_)));
+        assert!(matches!(live.now_skill, Observed::Unobservable(_)));
+    }
+
+    #[test]
+    fn a_native_run_with_a_messages_file_reports_freshness_rather_than_unobservable() {
+        let found = found_with_backend("native");
+        let home = world::temp_dir("cli-live-for-native");
+        let run_dir = job::runs_dir(&home).join(&found.run_id);
+        world::create_dir_all(&run_dir).expect("a scratch run directory");
+        world::write(&run_dir.join("messages-1.jsonl"), "{\"event\":\"turn\"}\n")
+            .expect("a scratch messages file");
+
+        let live = live_for(&home, &found.run_id, &found);
+        assert!(
+            matches!(live.freshness, Observed::Present(_)),
+            "{:?}",
+            live.freshness
+        );
+        // Every other field stays honestly pending — this floor parses no transcript content.
+        assert!(matches!(live.now_skill, Observed::Unobservable(_)));
+        assert!(matches!(live.assistant_now, Observed::Unobservable(_)));
+        assert!(matches!(live.fanout, Observed::Unobservable(_)));
+        assert_eq!(live.last_words, vec![String::new(); 3]);
+
+        world::remove_tree(&home);
+    }
 
     #[test]
     fn the_exit_code_reports_whether_status_could_answer_and_never_how_the_run_is_doing() {
@@ -761,12 +900,30 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_agent_declaration_never_guesses_the_endpoint() {
+        // "doctor must never guess": an unreadable or unparseable `~/.grind/agent` must not
+        // fall back to probing the default base URL as though that had been declared — it
+        // must not probe at all, so the closure below must never run.
+        let probed = probe_declared_endpoint(
+            Err("could not read /nowhere/.grind/agent: permission denied".to_string()),
+            |_endpoint| panic!("must never probe when the declared selection could not be read"),
+        );
+        assert_eq!(probed, None);
+    }
+
+    #[test]
     fn the_driver_answers_for_every_item_on_the_list() {
         // Without this wiring the host requirements have no home: `job` ships the list and its
         // classifiers, and nothing else walks it.
+        //
+        // `check_with_probe` with a fake probe, never `check`: `EndpointReachable` is on this
+        // list, and `check` wires in the real `net::probe_endpoint`, a live 5-second outbound
+        // request whenever this test's process happens to carry a provider key. The fake never
+        // touches a socket, so this test's answer cannot depend on what is in the environment
+        // it happens to run in.
         let home = Path::new("/nowhere/that/exists");
         for item in job::host_items() {
-            let outcome = check(home, &[], item.check);
+            let outcome = check_with_probe(home, &[], item.check, |_endpoint| false);
             if item.depth == Depth::Step {
                 assert!(
                     matches!(outcome, Observed::Present(Outcome::Unchecked(_))),

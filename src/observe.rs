@@ -15,6 +15,7 @@ use crate::decide::{ContentKind, DiffFacts, RiskyPathKind};
 use crate::world::Completed;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::time::SystemTime;
 
 /// Observed absent. Distinct from [`UNOBSERVABLE_MARK`] wherever a human reads it — reading a
 /// blind supervisor's silence as a fact is how an operator goes back to sleep.
@@ -921,6 +922,43 @@ pub fn observe_run(
     }
 }
 
+// --- the native backend's freshness floor ------------------------------------------------
+//
+// `claude::live` reads a claude-code Run's own transcript file. A native Run writes no such
+// file — `NativeAdapter::run` leaves `messages-N.jsonl` under the Run's own directory instead
+// — so every field of `claude::Live` degraded to `Unobservable` at once for every native Run,
+// and `grind status` still exited *Answered* over a blank live panel (#135's own review
+// finding). A complete `native::live` that parses that transcript's *content* into
+// `assistant_now` / `last_words` / `now_skill` is out of scope here — it is gated on P3
+// dogfooding evidence, and this floor parses nothing. It supplies only `freshness`, because
+// that is the one field a human actually uses to decide whether a Run is stuck: everything
+// else stays honestly `Unobservable` until something reads the content.
+
+/// Freshness for a `Backend::Native` Run: seconds since the newest write across the Run
+/// directory's `messages-*.jsonl` files, the same shape `claude::live`'s own `freshness` field
+/// already carries (present-with-a-count, or could-not-observe — never zero for *nothing to
+/// read*).
+///
+/// `mtimes` is the caller's door to `world::list_with_extension` + `world::mtime` over the Run
+/// directory; this stays pure over the values so the newest-wins and empty-is-unobservable
+/// rules are testable from literals with no filesystem.
+pub fn native_freshness(mtimes: &[SystemTime], now_epoch: u64) -> Observed<u64> {
+    match mtimes.iter().max() {
+        Some(newest) => Observed::Present(seconds_since_epoch(*newest, now_epoch)),
+        None => Observed::Unobservable(Reason::saying(
+            "no messages-*.jsonl write under the Run directory to read a time from",
+        )),
+    }
+}
+
+fn seconds_since_epoch(at: SystemTime, now_epoch: u64) -> u64 {
+    let then = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now_epoch.saturating_sub(then)
+}
+
 // --- the outcome collector ----------------------------------------------------------------
 //
 // `grind outcomes` (`cli.rs`) is the human-initiated pass the design calls the loop's best
@@ -1240,6 +1278,35 @@ pub fn claude_binary(executable: bool, resolved: Option<&str>) -> Observed<Outco
         return unsatisfied("~/.grind/bin/claude resolves to a wrapper shim");
     }
     satisfied("executable, and not a shim")
+}
+
+/// A provider API key is in the environment — **presence only**, never the values, and
+/// never a validity judgement: only an attempt to use a key can classify it. Both backends'
+/// readiness is reported regardless of which backend a Run selected (R9) — doctor takes no
+/// Job and the selection is a layout fact, not this list's.
+pub fn agent_key_present(openrouter: bool, openai: bool) -> Observed<Outcome> {
+    match (openrouter, openai) {
+        (true, true) => satisfied("OPENROUTER_API_KEY and OPENAI_API_KEY are both set"),
+        (true, false) => satisfied("OPENROUTER_API_KEY is set"),
+        (false, true) => satisfied("OPENAI_API_KEY is set"),
+        (false, false) => {
+            unsatisfied("neither OPENROUTER_API_KEY nor OPENAI_API_KEY is set in the environment")
+        }
+    }
+}
+
+/// The OpenAI-compatible endpoint answered a connection-level probe. `None` means the probe
+/// could not even be tried — no key in the environment resolves an [`crate::runner::Endpoint`]
+/// — which is could-not-observe, not unsatisfied: *no way to ask* and *the endpoint did not
+/// answer* are different facts about different things.
+pub fn endpoint_reachable(probed: Option<bool>) -> Observed<Outcome> {
+    match probed {
+        Some(true) => satisfied("the agent endpoint answers"),
+        Some(false) => unsatisfied("the agent endpoint did not answer a probe request"),
+        None => Observed::Unobservable(Reason::saying(
+            "no provider API key in the environment, so no endpoint could be probed",
+        )),
+    }
 }
 
 /// An executable resolves on `PATH`. No version floor is invented — an invented floor is a
@@ -2617,5 +2684,32 @@ README.md
             Observed::Unobservable(Reason::saying("constructed")),
         ];
         assert_eq!(arms.len(), 3);
+    }
+
+    // --- native_freshness ------------------------------------------------------------------
+
+    #[test]
+    fn native_freshness_reads_the_newest_of_several_mtimes() {
+        let now = 1_785_000_000u64;
+        let older = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(now - 500);
+        let newest = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(now - 20);
+        // Order in the slice must not matter — the newest wins regardless of listing order.
+        assert_eq!(
+            native_freshness(&[older, newest], now),
+            Observed::Present(20)
+        );
+        assert_eq!(
+            native_freshness(&[newest, older], now),
+            Observed::Present(20)
+        );
+    }
+
+    #[test]
+    fn native_freshness_over_no_files_is_could_not_observe_not_zero() {
+        // An empty list must never read as *just wrote*: nothing was read at all, which is a
+        // fact about the check, not about the Run's freshness.
+        let found = native_freshness(&[], 1_785_000_000);
+        assert!(matches!(found, Observed::Unobservable(_)), "{found:?}");
+        assert_ne!(found, Observed::Present(0));
     }
 }

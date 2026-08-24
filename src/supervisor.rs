@@ -13,12 +13,14 @@
 use crate::attempt::{
     self, Attempt, Clearance, Conditions, DENIED_TOOLS, Mode, StageConditions, StageContext,
 };
+use crate::claude;
 use crate::decide::{self, Pass, PlanFacts, Tier, Tiers, Verdict};
 use crate::job::{self, Job, Refusal};
 use crate::learnings;
-use crate::observe::{self, Observation, Observed, Outcome as ItemOutcome, Reason};
+use crate::observe::{self, Observation, Observed, Outcome as ItemOutcome};
 use crate::policy::{self, Budget, Next, Stop};
 use crate::rung::{self, ReturnStatus, Stage, StageReturn};
+use crate::runner::{self, Backend};
 use crate::world::{self, LockHandle, TryLock};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -140,6 +142,25 @@ struct RunRecord {
     /// record that predates Reflect existing.
     #[serde(default)]
     reflected: bool,
+    /// Which adapter executes this Run's stages, snapshotted at dispatch like every other
+    /// environment-varying condition (ADR-0017). P1 snapshots the default — selection wiring
+    /// lands next wave.
+    #[serde(default)]
+    backend: Backend,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint_override: Option<String>,
+    /// The rest of the layout-declared selection (ADR-0017, extended): the host's model
+    /// classes and a declared wire mode, snapshotted at dispatch alongside `backend` and
+    /// `endpoint_override` for the same reason — every policy knob a Run will ever need is
+    /// in the record by the time the first attempt starts. `None` on every record written
+    /// before the grammar grew these keys, which is the honest *undeclared* answer, not a
+    /// blank one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fast_model_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    strong_model_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proto_override: Option<runner::ProtoMode>,
 }
 
 /// Frozen once, at dispatch — never re-resolved, for the same reason the plugin pin never was:
@@ -185,6 +206,23 @@ impl RunRecord {
         let body = serde_json::to_string_pretty(self)
             .map_err(|e| Refusal::saying(format!("could not serialise Run state: {e}")))?;
         world::write_atomic(path, &(body + "\n")).map_err(Refusal::saying)
+    }
+
+    /// The one seam call (R1), bundling this Run's frozen backend selection so every call
+    /// site — ladder attempts, Ship's babysit round, and Reflect — constructs it identically
+    /// rather than repeating the same four-field clone three times.
+    fn runner(&self, home: &Path) -> Box<dyn runner::StageRunner> {
+        runner::runner_for(
+            self.backend,
+            &self.claude_bin,
+            home,
+            runner::NativeConfig {
+                endpoint_override: self.endpoint_override.clone(),
+                fast_model: self.fast_model_override.clone(),
+                strong_model: self.strong_model_override.clone(),
+                proto_override: self.proto_override,
+            },
+        )
     }
 }
 
@@ -286,9 +324,35 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
     let job = job::from_issue_json(&issue.stdout)?;
     world::print_line(&format!("Job #{}: {}", job.issue, job.title));
 
+    // ADR-0017: the agent backend is declared by layout (`~/.grind/agent`) and snapshotted
+    // here, once, before any other host-readiness check reads it — the two readiness checks
+    // right below need to know which backend they are answering for. Resume loads the record
+    // this dispatch writes and proceeds on that snapshot; it never re-reads this file. An
+    // unreadable or unparseable declaration refuses the Dispatch on the same register as every
+    // other incoherent input here: a Job that cannot be read has not been assessed.
+    let selection = job::read_selection(&home).map_err(Refusal::saying)?;
+
     // Presence only, local, free, no network — a host missing its clone or its `claude` fails
-    // at second zero rather than three hours in.
-    refuse_unless_host_ready(&home, &job)?;
+    // at second zero rather than three hours in. Backend-aware: a native-only host declares no
+    // `claude` binary and must not be refused for lacking one its selected backend never runs.
+    refuse_unless_host_ready(&home, &job, selection.backend)?;
+
+    // A provisioning refusal on the same register as the one above and the dirty-worktree
+    // refusal below — never an ADR-0003 quality gate. A native Dispatch with no provider
+    // credential cannot make its first attempt, so refusing now, before the lock, the worktree
+    // or a single attempt, is the could-not-answer register R9 asks for, rather than the Run
+    // spending its whole attempt budget failing identically (Run 2's shape, one layer over).
+    // `Endpoint::resolve` only checks presence (`world::var`, no network); the resolved
+    // `Endpoint` carries the key and is dropped immediately below, never reaching the record or
+    // any serialized form.
+    refuse_unless_native_ready(selection.backend, selection.endpoint_override.as_deref())?;
+
+    // A provisioning refusal on the same register as the two above, never an ADR-0003
+    // quality gate: with Unit 1 in place grind no longer injects a claude-code alias into
+    // the native path, so an operator's own `model: claude-…` pin can never make a first
+    // attempt against an OpenAI-compatible endpoint — refusing now names the incoherence
+    // rather than spending the whole attempt budget failing identically on every stage.
+    refuse_claude_pin_on_native(selection.backend, job.model.as_deref())?;
 
     let repo_path = job::repo_path(&home, &job.target_repo);
     let claude_bin = job::claude_bin(&home);
@@ -394,6 +458,11 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         stages: Vec::new(),
         provenance: Some(provenance(&home)),
         reflected: false,
+        backend: selection.backend,
+        endpoint_override: selection.endpoint_override,
+        fast_model_override: selection.fast_model,
+        strong_model_override: selection.strong_model,
+        proto_override: selection.proto_override,
         job,
     };
     let run_dir = job::runs_dir(&home).join(&run_id);
@@ -812,26 +881,40 @@ fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
         Mode::Resume
     };
     let invocation = match mode {
-        Mode::Dispatch => attempt::reflect_dispatch(&conditions, &skill_text),
-        _ => attempt::reflect_resume(&conditions, &skill_text),
+        Mode::Dispatch => claude::reflect_dispatch(&conditions, &skill_text),
+        _ => claude::reflect_resume(&conditions, &skill_text),
     };
     let n = reflect_attempts + 1;
     say(run_dir, &format!("  [reflect] attempt {n} ({mode}) …"));
-    let raw = attempt::run(
-        &invocation,
-        // Reflect's cwd is the **run directory**, never the worktree — there is no repo tree
-        // under this session for a Write/Edit denial to matter over.
+    // Unit 4: routed through the same seam the ladder and Ship's babysit round use, rather
+    // than calling `claude::run` directly — a native Run previously executed reflect on
+    // claude-code silently, and a native-only host skipped it outright with nothing saying
+    // why (there was no claude binary to spawn). Reflect is still never an Attempt (no
+    // `push_attempt`) and still budget-exempt; only *how it runs* changes.
+    //
+    // Reflect's cwd is the **run directory**, never the worktree — there is no repo tree
+    // under this session for a Write/Edit denial to matter over — so the transcript-slug
+    // string handed as `worktree` is the run directory's own, matching whatever directory
+    // the child actually ran in. The model rides `Class(Strong)`: claude-code's own
+    // `build_reflect` never passes `--model` regardless of any Job pin, so `Strong` (no
+    // flag / the host's declared strong model) is reflect's one and only model, unchanged
+    // by this routing.
+    let denied = attempt::denied_for_reflect();
+    let reflect_model = runner::StageModel::Class(runner::ModelClass::Strong);
+    let run_dir_str = run_dir.display().to_string();
+    let runner = record.runner(&home);
+    let spec = runner::RunSpec {
+        invocation: &invocation,
+        cwd: run_dir,
         run_dir,
-        &run_dir.join(format!("reflect-{n}.prompt.txt")),
-        &run_dir.join(format!("reflect-{n}.stdout.json")),
-        &run_dir.join(format!("reflect-{n}.stderr.log")),
-    );
-    let Ok(raw) = raw else {
-        say(run_dir, "    note: reflect could not be spawned — skipping");
-        return;
+        attempt_n: n,
+        session_id: &session_id,
+        worktree: &run_dir_str,
+        model: &reflect_model,
+        denied_globs: &denied,
+        file_label: runner::FileLabel::Reflect,
     };
-    let started_at = world::now_iso();
-    let classified = raw.classify(n, mode, &started_at, &world::now_iso());
+    let classified = runner.run(&spec);
     record.push_stage_entry(rung::StageEntry {
         name: "reflect".to_string(),
         session_id,
@@ -1133,18 +1216,24 @@ fn run_r_pass(
     Ok(())
 }
 
-/// Which model class (`decide::Decision::model_per_stage`) resolves to for one stage, per the
-/// plan's decision 2. **The Job's `Model` row, when present, pins every stage** and short-circuits
-/// the class lookup entirely — the freeze beats the routing. Absent that, Plan runs before any
-/// Decision exists and is always routed `strong` (the harness default, no `--model` flag); every
-/// later stage reads its class off Diff-triage's decision when it exists, else Triage's, else
-/// falls back to `strong` — the same fail-closed direction `select_tier` itself takes.
-fn resolve_stage_model(record: &RunRecord, run_dir: &Path, stage: Stage) -> Option<String> {
+/// Which model *class* (`decide::Decision::model_per_stage`) resolves to for one stage, per
+/// the plan's decision 2 — never a concrete id: a model id is a provider fact (`vendor/model`
+/// on native, a plain alias on claude-code), and the class is grind's own routing intent,
+/// resolved to a concrete id by each adapter (`StageModel::claude_code_arg`,
+/// `StageModel::native_id`) rather than by this function (Unit 1: a fast-routed stage sending
+/// the claude-code alias to an OpenAI-compatible endpoint burned three retries on every attempt).
+/// **The Job's `Model` row, when present, pins every stage** and short-circuits the class lookup
+/// entirely — the freeze beats the routing. Absent that, Plan runs before any Decision exists
+/// and is always routed `strong`; every later stage reads its class off Diff-triage's decision
+/// when it exists, else Triage's, else falls back to `strong` — the same fail-closed direction
+/// `select_tier` itself takes.
+fn resolve_stage_model(record: &RunRecord, run_dir: &Path, stage: Stage) -> runner::StageModel {
+    use runner::{ModelClass, StageModel};
     if let Some(pinned) = &record.model {
-        return Some(pinned.clone());
+        return StageModel::Pinned(pinned.clone());
     }
     if stage == Stage::Plan {
-        return None;
+        return StageModel::Class(ModelClass::Strong);
     }
     let stages_dir = run_dir.join("stages");
     let decision = world::read_to_string(&stages_dir.join("diff-triage").join("decision.json"))
@@ -1156,8 +1245,8 @@ fn resolve_stage_model(record: &RunRecord, run_dir: &Path, stage: Stage) -> Opti
         .and_then(|d| d.model_per_stage.get(&stage.to_string()).cloned())
         .unwrap_or_else(|| "strong".to_string());
     match class.as_str() {
-        "fast" => Some("claude-sonnet-5".to_string()),
-        _ => None,
+        "fast" => StageModel::Class(ModelClass::Fast),
+        _ => StageModel::Class(ModelClass::Strong),
     }
 }
 
@@ -1286,7 +1375,13 @@ fn run_ladder_attempt(
     } else {
         Mode::Resume
     };
-    let model = resolve_stage_model(record, run_dir, stage);
+    let stage_model = resolve_stage_model(record, run_dir, stage);
+    // The claude-code argv is built unconditionally regardless of which backend actually
+    // executes it (P1's shape: the seam normalizes *execution*, not composition) — so the
+    // class-to-alias mapping lives on `StageModel` itself (Unit 1) and is asked here, the one
+    // place that still needs a concrete claude-code `--model` argument (or none) rather than
+    // grind's own routing class.
+    let claude_model_arg = stage_model.claude_code_arg();
     let notes = if stage == Stage::Plan {
         let base = notes_for(&home, &record.job.target_repo);
         let lessons = lessons_for(&home, &record.job);
@@ -1306,14 +1401,14 @@ fn run_ladder_attempt(
         stages_dir: &stages_dir_str,
         worktree: &record.worktree,
         job: &record.job,
-        model: model.as_deref(),
+        model: claude_model_arg.as_deref(),
         notes: notes.as_deref(),
     };
     let conditions = StageConditions {
         claude_bin: &record.claude_bin,
         run_id: &record.run_id,
     };
-    let invocation = attempt::stage_invocation(&conditions, &ctx, mode, record.clearances().last());
+    let invocation = claude::stage_invocation(&conditions, &ctx, mode, record.clearances().last());
 
     let n = record.attempts().len() + 1;
     let started_at = world::now_iso();
@@ -1321,18 +1416,20 @@ fn run_ladder_attempt(
         run_dir,
         &format!("  [{started_at}] {stage} attempt {n} ({mode}) …"),
     );
-    let already_written = transcript_lines_for(worktree, &session_id);
-    let raw = attempt::run(
-        &invocation,
-        worktree,
-        &run_dir.join(format!("attempt-{n}.prompt.txt")),
-        &run_dir.join(format!("attempt-{n}.stdout.json")),
-        &run_dir.join(format!("attempt-{n}.stderr.log")),
-    )
-    .map_err(|reason| Refusal::saying(reason.to_string()))?;
-    let classified = raw
-        .classify(n, mode, &started_at, &world::now_iso())
-        .with_fanout(fanout_of_session(worktree, &session_id, already_written));
+    let denied = attempt::denied_for(stage);
+    let runner = record.runner(&home);
+    let spec = runner::RunSpec {
+        invocation: &invocation,
+        cwd: worktree,
+        run_dir,
+        attempt_n: n,
+        session_id: &session_id,
+        worktree: &record.worktree,
+        model: &stage_model,
+        denied_globs: &denied,
+        file_label: runner::FileLabel::Attempt,
+    };
+    let classified = runner.run(&spec);
     let cost_usd = classified.total_cost_usd;
     let turns = classified.num_turns;
     record.push_attempt(classified);
@@ -1357,7 +1454,7 @@ fn run_ladder_attempt(
         session_id,
         status,
         artifact_paths,
-        model,
+        model: claude_model_arg,
         cost_usd,
         turns,
     });
@@ -1366,7 +1463,7 @@ fn run_ladder_attempt(
 
 /// Ship's one bounded CI-babysit round, continuing **Ship's own session** (`<run>-ship`) rather
 /// than a fresh stage composition — there is no stage-shaped babysit prompt to build, so this
-/// reuses the existing [`attempt::ci_babysit`] builder exactly as the legacy path does, pointed
+/// reuses the existing [`claude::ci_babysit`] builder exactly as the legacy path does, pointed
 /// at the stage session instead of the Run-level one.
 fn run_ship_babysit_attempt(
     record: &mut RunRecord,
@@ -1378,31 +1475,38 @@ fn run_ship_babysit_attempt(
     // must ride the same model `resolve_stage_model` routes Ship's other attempts to, or a
     // mid-session engine change lands exactly on the round least able to afford one. A
     // pinned Job resolves to the pin, so the freeze still beats the routing.
-    let model = resolve_stage_model(record, run_dir, Stage::Ship);
+    let stage_model = resolve_stage_model(record, run_dir, Stage::Ship);
+    let claude_model_arg = stage_model.claude_code_arg();
     let conditions = Conditions {
         claude_bin: &record.claude_bin,
         session_id: &session_id,
-        model: model.as_deref(),
+        model: claude_model_arg.as_deref(),
     };
-    let invocation = attempt::ci_babysit(&conditions);
+    let invocation = claude::ci_babysit(&conditions);
     let n = record.attempts().len() + 1;
     let started_at = world::now_iso();
     say(
         run_dir,
         &format!("  [{started_at}] attempt {n} (ci-babysit) …"),
     );
-    let already_written = transcript_lines_for(worktree, &session_id);
-    let raw = attempt::run(
-        &invocation,
-        worktree,
-        &run_dir.join(format!("attempt-{n}.prompt.txt")),
-        &run_dir.join(format!("attempt-{n}.stdout.json")),
-        &run_dir.join(format!("attempt-{n}.stderr.log")),
-    )
-    .map_err(|reason| Refusal::saying(reason.to_string()))?;
-    let classified = raw
-        .classify(n, Mode::CiBabysit, &started_at, &world::now_iso())
-        .with_fanout(fanout_of_session(worktree, &session_id, already_written));
+    let home = world::home().ok_or_else(|| Refusal::saying("$HOME is unset"))?;
+    let denied: Vec<String> = attempt::DENIED_TOOLS
+        .iter()
+        .map(|glob| glob.to_string())
+        .collect();
+    let runner = record.runner(&home);
+    let spec = runner::RunSpec {
+        invocation: &invocation,
+        cwd: worktree,
+        run_dir,
+        attempt_n: n,
+        session_id: &session_id,
+        worktree: &record.worktree,
+        model: &stage_model,
+        denied_globs: &denied,
+        file_label: runner::FileLabel::Attempt,
+    };
+    let classified = runner.run(&spec);
     record.push_attempt(classified);
     Ok(())
 }
@@ -1415,31 +1519,10 @@ fn transcript_lines_for(worktree: &Path, session_id: &str) -> usize {
     let Some(home) = world::home() else {
         return 0;
     };
-    let transcript =
-        crate::view::transcript_path(&home, &worktree.display().to_string(), session_id);
+    let transcript = claude::transcript_path(&home, &worktree.display().to_string(), session_id);
     match world::read_to_string(&transcript) {
         Ok(text) => text.lines().count(),
         Err(_) => 0,
-    }
-}
-
-/// The fan-out arithmetic over one named session's transcript, over the lines appended since
-/// `already_written`.
-fn fanout_of_session(
-    worktree: &Path,
-    session_id: &str,
-    already_written: usize,
-) -> Observed<(u64, u64)> {
-    let Some(home) = world::home() else {
-        return Observed::Unobservable(Reason::saying("$HOME is unset"));
-    };
-    let transcript =
-        crate::view::transcript_path(&home, &worktree.display().to_string(), session_id);
-    match world::read_to_string(&transcript) {
-        Ok(text) => crate::view::fanout_since(&text, already_written),
-        Err(said) => Observed::Unobservable(Reason::saying(&format!(
-            "the transcript could not be read: {said}"
-        ))),
     }
 }
 
@@ -1463,8 +1546,8 @@ fn announce(run_dir: &Path, record: &RunRecord, observation: &Observation, verdi
 
 // --- dispatch's own steps ------------------------------------------------------------------
 
-fn refuse_unless_host_ready(home: &Path, job: &Job) -> Result<(), Refusal> {
-    for item in job::dispatch_subset() {
+fn refuse_unless_host_ready(home: &Path, job: &Job, backend: Backend) -> Result<(), Refusal> {
+    for item in required_dispatch_items(backend) {
         let found = check_presence(home, job, item.check);
         match found {
             Observed::Present(ItemOutcome::Satisfied(_))
@@ -1481,6 +1564,63 @@ fn refuse_unless_host_ready(home: &Path, job: &Job) -> Result<(), Refusal> {
         }
     }
     Ok(())
+}
+
+/// The dispatch subset, narrowed to what this Dispatch's declared backend actually needs.
+/// `claude binary` is `Backend::ClaudeCode`'s requirement, never `Backend::Native`'s — a
+/// native-only host carries no `bin/claude` and dispatching onto it must not be refused for a
+/// binary its backend never runs. Every other dispatch-depth item is backend-agnostic, so this
+/// is the one filter rather than a per-backend list.
+fn required_dispatch_items(backend: Backend) -> Vec<&'static job::HostItem> {
+    job::dispatch_subset()
+        .into_iter()
+        .filter(|item| !(item.check == job::Check::ClaudeBinary && backend == Backend::Native))
+        .collect()
+}
+
+/// A provisioning refusal, same register as `refuse_unless_host_ready` — never an ADR-0003
+/// quality gate. Split from the impure resolve so the decision is testable from a literal
+/// `Result` without touching real environment state (the same hermeticity reasoning as the
+/// doctor endpoint probe). The `Endpoint` itself is dropped at the call site below, immediately
+/// — only whether it resolved crosses into this function.
+fn refuse_unless_native_ready_from(
+    backend: Backend,
+    resolved: Result<(), String>,
+) -> Result<(), Refusal> {
+    if backend != Backend::Native {
+        return Ok(());
+    }
+    resolved.map_err(|e| Refusal::saying(format!("agent: {e}")))
+}
+
+fn refuse_unless_native_ready(
+    backend: Backend,
+    endpoint_override: Option<&str>,
+) -> Result<(), Refusal> {
+    refuse_unless_native_ready_from(
+        backend,
+        runner::Endpoint::resolve(endpoint_override, None).map(|_endpoint| ()),
+    )
+}
+
+/// Unit 3: a provisioning refusal, same register as the two above — never an ADR-0003
+/// quality gate. With grind no longer injecting a claude-code alias into the native path
+/// (Unit 1), the only way a Claude-shaped model id reaches the native wire is an operator's
+/// own `model:` pin, and it can never resolve there. Narrow on purpose: only a pin
+/// **starting with** `claude-` is refused — `gpt-4o` and similar are legitimate ids for an
+/// OpenAI-compatible endpoint and must keep working, so this is not "anything without a
+/// `/`".
+fn refuse_claude_pin_on_native(backend: Backend, model: Option<&str>) -> Result<(), Refusal> {
+    if backend != Backend::Native {
+        return Ok(());
+    }
+    match model {
+        Some(pin) if pin.starts_with("claude-") => Err(Refusal::saying(format!(
+            "agent: the Job pins model {pin:?}, a Claude alias, but this host's declared \
+             backend is native — an OpenAI-compatible endpoint cannot resolve it"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// The presence half of the dispatch-depth item list — local, free, no network, run by
@@ -1764,6 +1904,112 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_backend_does_not_require_the_claude_binary() {
+        let items = required_dispatch_items(Backend::Native);
+        assert!(
+            !items.iter().any(|i| i.check == job::Check::ClaudeBinary),
+            "a native-only host must not be refused for lacking `claude`"
+        );
+    }
+
+    #[test]
+    fn claude_code_backend_still_requires_the_claude_binary() {
+        let items = required_dispatch_items(Backend::ClaudeCode);
+        assert!(items.iter().any(|i| i.check == job::Check::ClaudeBinary));
+    }
+
+    #[test]
+    fn narrowing_by_backend_drops_no_other_item() {
+        // Every other dispatch-depth item is backend-agnostic: only `claude binary` may be
+        // filtered, and only for `Backend::Native`.
+        assert_eq!(
+            required_dispatch_items(Backend::ClaudeCode).len(),
+            job::dispatch_subset().len()
+        );
+        assert_eq!(
+            required_dispatch_items(Backend::Native).len(),
+            job::dispatch_subset().len() - 1
+        );
+    }
+
+    #[test]
+    fn claude_code_needs_no_native_credential_preflight() {
+        // Backend != Native short-circuits before the (would-be) resolve result is even
+        // consulted, so an `Err` here proves the branch, not a real environment read.
+        assert_eq!(
+            refuse_unless_native_ready_from(
+                Backend::ClaudeCode,
+                Err("would refuse if this were consulted".to_string())
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_native_backend_with_no_credential_refuses_dispatch() {
+        let refusal = refuse_unless_native_ready_from(
+            Backend::Native,
+            Err("no OPENROUTER_API_KEY / OPENAI_API_KEY in environment".to_string()),
+        );
+        let said = refusal.expect_err("no credential must refuse").to_string();
+        assert!(
+            said.contains("agent:"),
+            "refusal must name its register: {said}"
+        );
+        assert!(said.contains("OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn a_native_backend_with_a_credential_proceeds() {
+        assert_eq!(
+            refuse_unless_native_ready_from(Backend::Native, Ok(())),
+            Ok(())
+        );
+    }
+
+    // --- Unit 3: refusing a Claude-shaped pin on the native backend --------------------------
+
+    #[test]
+    fn a_claude_alias_pin_refuses_dispatch_on_the_native_backend() {
+        let refusal = refuse_claude_pin_on_native(Backend::Native, Some("claude-sonnet-5"))
+            .expect_err("a Claude alias cannot resolve on an OpenAI-compatible endpoint");
+        let said = refusal.to_string();
+        assert!(
+            said.contains("agent:"),
+            "refusal must name its register: {said}"
+        );
+        assert!(said.contains("claude-sonnet-5"), "{said}");
+    }
+
+    #[test]
+    fn a_non_claude_pin_proceeds_on_the_native_backend() {
+        // "gpt-4o" and similar are legitimate OpenAI-compatible ids — the check is narrowly
+        // "starts with claude-", never "has no slash".
+        assert_eq!(
+            refuse_claude_pin_on_native(Backend::Native, Some("gpt-4o")),
+            Ok(())
+        );
+        assert_eq!(
+            refuse_claude_pin_on_native(Backend::Native, Some("deepseek/deepseek-chat-v3.1")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn an_unpinned_job_proceeds_on_the_native_backend() {
+        assert_eq!(refuse_claude_pin_on_native(Backend::Native, None), Ok(()));
+    }
+
+    #[test]
+    fn a_claude_alias_pin_is_untouched_on_the_claude_code_backend() {
+        // The claude-code backend is exactly what a Claude alias is for.
+        assert_eq!(
+            refuse_claude_pin_on_native(Backend::ClaudeCode, Some("claude-sonnet-5")),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn a_branch_with_slashes_locks_as_one_file_under_the_locks_directory() {
         // Every branch this project dispatches contains a slash, so the raw key would name a
         // directory that does not exist and the open would fail before any lock was attempted.
@@ -1888,7 +2134,7 @@ mod tests {
         for stage in [Stage::Plan, Stage::Work, Stage::Ship] {
             assert_eq!(
                 resolve_stage_model(&record, &run_dir, stage),
-                Some("claude-opus-9".to_string()),
+                runner::StageModel::Pinned("claude-opus-9".to_string()),
                 "{stage} must take the Job's pinned model"
             );
         }
@@ -1900,8 +2146,13 @@ mod tests {
         let mut record = day_one();
         record.model = None;
         let run_dir = world::temp_dir("resolve-model-plan");
+        let resolved = resolve_stage_model(&record, &run_dir, Stage::Plan);
         assert_eq!(
-            resolve_stage_model(&record, &run_dir, Stage::Plan),
+            resolved,
+            runner::StageModel::Class(runner::ModelClass::Strong)
+        );
+        assert_eq!(
+            resolved.claude_code_arg(),
             None,
             "strong means the harness default: no --model flag"
         );
@@ -1932,9 +2183,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_stage_model(&record, &run_dir, Stage::Ship).as_deref(),
-            Some("claude-sonnet-5"),
-            "the babysit round must ride the same routed model Ship's other attempts get"
+            resolve_stage_model(&record, &run_dir, Stage::Ship),
+            runner::StageModel::Class(runner::ModelClass::Fast),
+            "the babysit round must ride the same routed class Ship's other attempts get"
         );
         world::remove_tree(&run_dir);
     }
@@ -2101,6 +2352,16 @@ mod tests {
             skills_hash: "deadbeef".to_string(),
         });
         written.reflected = true;
+        // The layout-declared selection, set explicitly. Every one of these is
+        // `skip_serializing_if = "Option::is_none"`, so leaving them at their defaults would
+        // emit nothing and this carrier would pass while the reader was missing them — the
+        // drift it exists to catch, hidden by the very attribute that keeps legacy records
+        // parsing. An optional field on the writer needs a value here to be covered at all.
+        written.backend = Backend::Native;
+        written.endpoint_override = Some("http://localhost:8000/v1".to_string());
+        written.fast_model_override = Some("stealth/ox-alpha".to_string());
+        written.strong_model_override = Some("deepseek/deepseek-chat-v3.1".to_string());
+        written.proto_override = Some(runner::ProtoMode::Text);
         let bytes = serde_json::to_string(&written).expect("serialise");
         let read: crate::view::RunView = serde_json::from_str(&bytes)
             .expect("the reader must accept every field the writer emits");
@@ -2121,6 +2382,11 @@ mod tests {
             written.provenance.map(|p| p.skills_hash)
         );
         assert_eq!(read.reflected, written.reflected);
+        assert_eq!(read.backend, written.backend);
+        assert_eq!(read.endpoint_override, written.endpoint_override);
+        assert_eq!(read.fast_model_override, written.fast_model_override);
+        assert_eq!(read.strong_model_override, written.strong_model_override);
+        assert_eq!(read.proto_override, written.proto_override);
     }
 
     #[test]

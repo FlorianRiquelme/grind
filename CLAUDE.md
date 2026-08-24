@@ -156,10 +156,56 @@ change carries a safety property, not for coverage's sake.
   Bash(git push*--mirror*)
   Bash(git push*--prune*)
   Bash(gh api*DELETE*)
+  Bash(sh -c*)
+  Bash(bash -c*)
+  Bash(eval*)
   ```
 
   They rely on two documented matcher facts: a `*` may appear anywhere in the pattern, not only
   at the end, and a rule is matched against each subcommand after splitting on `&&`, `;` and `|`.
+  The native backend's own matcher (`tools::subcommands_of`) additionally folds the inside of
+  every `$( )`, backtick span and `( )` subshell into its own extra candidate — `echo $(gh pr
+  merge 123)` and `` `git push --force origin main` `` reached a shell without the verb ever
+  appearing at the front of a subcommand the plain split saw. This is still not a shell parser:
+  it has no notion of escaping, so it narrows the bypass rather than closing it, and it only ever
+  adds candidates — never fewer, so it can only refuse more, not less.
+
+  Three rounds of front-anchoring patches followed the same defect to three different spellings:
+  a flag that had moved off the verb (`git push origin --force`), a wrapper name in front of it
+  (`env bash -c 'gh pr merge 123'`, `/bin/sh -c '...'`), and then the wrapper's own options and
+  operands sitting between the wrapper and the verb (`nice -n 5 gh pr merge 123`, `env -i gh pr
+  merge 123`, `timeout 30 gh pr merge 123` — none of these were caught, because the second
+  round's fix stripped only the wrapper's own token, never what followed it). Naming `timeout`
+  and every future option shape would have been a fourth round of the same patch.
+
+  `tools::subcommands_of` closes the family instead: **every candidate contributes every one of
+  its own token-boundary suffixes as a further candidate.** `nice -n 5 gh pr merge 123` yields
+  `-n 5 gh pr merge 123`, `5 gh pr merge 123`, `gh pr merge 123`, `pr merge 123`, `merge 123` and
+  `123` — and `gh pr merge 123` is exactly what `Bash(gh pr merge*)` already matches. No matter
+  what sits in front of the verb — an assignment, a wrapper name, a wrapper's own flags, a stack
+  of all three — some suffix starts exactly at it, so the front-anchoring of every glob above
+  stops mattering at token boundaries. This **replaces** the old wrapper-name list and the
+  leading-assignment stripper outright: both were special cases of dropping some leading tokens,
+  which suffix generation now does for every leading token, not just the ones a list happened to
+  name. Two normalizations from the prior round still earn their place, because neither is a
+  special case of dropping leading tokens: the inside of every `'...'` and `"..."` span still
+  becomes its own candidate too (a nested shell passes its payload as a string, so `env bash -c
+  'gh pr merge 123'` yields `gh pr merge 123` directly, however the outer wrapper is spelled —
+  suffix dropping alone would not find a payload sitting inside a string rather than at a token
+  boundary), and a candidate whose first token contains `/` still also yields a basename variant,
+  so `/bin/sh -c '...'` still also presents as `sh -c '...'` (suffix dropping only removes whole
+  tokens; it never rewrites the token left at the front). All of this is additive in the same
+  direction as the substitution/subshell folding above: candidates only ever accumulate, so
+  widening can turn an allow into a refusal but never the reverse.
+
+  Suffix generation costs work proportional to tokens considered times piece length, so the
+  number of a piece's leading tokens that each start their own candidate is capped
+  (`tools::MAX_SUFFIX_TOKENS`, 64) — a real wrapper stack is under ten tokens deep before the
+  wrapped verb, so the cap only bounds the cost of a long ordinary command line (a full `cargo`
+  invocation) and never affects anything this barrier is meant to catch. One false refusal is
+  accepted, unchanged from the prior round: a quoted string that happens to spell a denied
+  command as a literal rather than as an invocation (`git commit -m "git push --force"` is
+  refused, since the quoted text matches `Bash(git push*--force*)`).
 
   **The first twelve each anchor their flag immediately after the verb, and git accepts the flag
   anywhere.** `git push origin --force`, `git push origin main --force`,
@@ -182,6 +228,16 @@ change carries a safety property, not for coverage's sake.
   `gh api` DELETE, which a Run has no reason to issue; branch deletion is already covered by the
   git globs, so this closes the API door rather than a git one. All are acceptable false refusals
   for a barrier of this kind.
+
+  The last three are broad for a different reason: they refuse an *outer command* rather than a
+  git or gh verb. `Bash(sh -c*)`, `Bash(bash -c*)` and `Bash(eval*)` each hand a forbidden
+  command to a nested shell as a single string argument or evaluate it in-process — none of the
+  twenty-six globs above it name the outer invocation, only what it wraps, so
+  `sh -c "git push --force origin main"` went straight through every one of them. Refusing every
+  `sh -c`, `bash -c` and `eval` is the same whack-a-mole refusal `git -C`/`git -c` already make,
+  moved to the one remaining place a fixed verb cannot be anchored: `sh -c "ls"` and
+  `eval "true"` are ordinary and now refused too, an acceptable false refusal for a barrier of
+  this kind.
 
   `-f` is spelled ` -f` and ` -f ` rather than `-f`, because `-f` as a bare substring appears
   inside ordinary branch names and the broad glob would refuse the push. `-D` is not: it is

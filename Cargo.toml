@@ -9,11 +9,15 @@ description = "A queue, a supervisor and a record around headless runs of its ow
 publish = false
 
 # ADR-0005: serde is the only dependency the base takes, read as the family — JSON is the
-# reason the dependency exists at all. No dev-dependencies: the compile-fail carrier shells
-# out to `rustc` itself rather than taking `trybuild`.
+# reason the dependency exists at all. Amended for the harness module only by ADR-0016,
+# which adds `ureq` below (sync HTTP for the agent harness; see src/net.rs).
+# No dev-dependencies: the compile-fail carrier shells out to `rustc` itself rather than
+# taking `trybuild`.
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# ADR-0016: the one sanctioned network dependency, confined to src/net.rs.
+ureq = "2"
 
 # A library plus a thin binary. In a binary crate `dead_code` is rooted at `main` and `pub`
 # does not exempt an item, so every module landing before its consumer would fail

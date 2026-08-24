@@ -35,50 +35,65 @@ fn deps_dir() -> PathBuf {
         .to_path_buf()
 }
 
-fn newest_rlib(deps: &Path, crate_name: &str) -> PathBuf {
-    let prefix = format!("lib{crate_name}-");
-    let mut found: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(deps)
+fn newest_rlib_per_crate(deps: &Path) -> Vec<(String, PathBuf)> {
+    let mut newest: Vec<(String, std::time::SystemTime, PathBuf)> = fs::read_dir(deps)
         .expect("read the deps directory")
         .flatten()
         .map(|e| e.path())
-        .filter(|p| {
-            p.extension().is_some_and(|e| e == "rlib")
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(&prefix))
-        })
+        .filter(|p| p.extension().is_some_and(|e| e == "rlib"))
         .filter_map(|p| {
+            let name = p.file_name()?.to_str()?.to_string();
+            let stem = name.strip_prefix("lib")?.strip_suffix(".rlib")?;
+            let base = stem
+                .split_once('-')
+                .map_or(stem, |(base, _)| base)
+                .to_string();
+            if base == "grind" {
+                return None; // the scratch crate *is* grind; never extern itself
+            }
             fs::metadata(&p)
                 .and_then(|m| m.modified())
                 .ok()
-                .map(|t| (t, p))
+                .map(|t| (base, t, p))
         })
         .collect();
-    found.sort();
-    found
-        .pop()
-        .unwrap_or_else(|| panic!("no {crate_name} rlib under {}", deps.display()))
-        .1
+    // Name groups together, newest first inside a group; the dedup below keeps the first —
+    // the newest — rlib of each crate.
+    newest.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    newest.dedup_by(|a, b| a.0 == b.0);
+    newest
+        .into_iter()
+        .map(|(base, _, path)| (base, path))
+        .collect()
 }
 
 /// A copy of `src/` under the target directory, ready to be damaged.
 fn scratch_crate(name: &str) -> PathBuf {
     let root = deps_dir().join("grind-compile-fail").join(name);
     let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).expect("a scratch crate");
-    for entry in fs::read_dir(manifest_dir().join("src"))
-        .expect("read src/")
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "rs") {
-            let name = path.file_name().expect("a file name");
-            fs::copy(&path, root.join(name)).expect("copy a module");
-        }
-    }
+    copy_tree(&manifest_dir().join("src"), &root);
     // `main.rs` is the binary's, not the library's, and it would be a second crate root.
     let _ = fs::remove_file(root.join("main.rs"));
     root
+}
+
+/// Recursive copy, kept general rather than flat: `tests/topology.rs` enforces that `src/`
+/// carries no subdirectories at all (the privacy guarantee ADR-0007 documents depends on
+/// every module being a crate-root sibling), but nothing here should have to assume that
+/// invariant holds forever to keep compiling — a future module tree gaining a subdirectory
+/// should fail `tests/topology.rs` loudly, not silently stop being copied here too.
+fn copy_tree(src: &Path, dest: &Path) {
+    fs::create_dir_all(dest).expect("a scratch directory");
+    for entry in fs::read_dir(src).expect("read src/").flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().expect("a file name");
+            copy_tree(&path, &dest.join(name));
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            let name = path.file_name().expect("a file name");
+            fs::copy(&path, dest.join(name)).expect("copy a module");
+        }
+    }
 }
 
 fn read(root: &Path, module: &str) -> String {
@@ -98,7 +113,8 @@ fn add_sibling_module(root: &Path, module: &str, source: &str) {
 
 fn compile(root: &Path) -> Output {
     let deps = deps_dir();
-    Command::new("rustc")
+    let mut command = Command::new("rustc");
+    command
         .arg("--edition=2024")
         .arg("--crate-type=lib")
         .arg("--crate-name=grind")
@@ -106,14 +122,16 @@ fn compile(root: &Path) -> Output {
         .arg("--out-dir")
         .arg(root.join("out"))
         .arg("-L")
-        .arg(format!("dependency={}", deps.display()))
-        .arg("--extern")
-        .arg(format!("serde={}", newest_rlib(&deps, "serde").display()))
-        .arg("--extern")
-        .arg(format!(
-            "serde_json={}",
-            newest_rlib(&deps, "serde_json").display()
-        ))
+        .arg(format!("dependency={}", deps.display()));
+    // Every crate the library names must resolve: the newest rlib of each stands in when
+    // several versions sit in deps/. Derived as a set, so the harness never has to name
+    // crates one by one as the module tree grows.
+    for (name, path) in newest_rlib_per_crate(&deps) {
+        command
+            .arg("--extern")
+            .arg(format!("{name}={}", path.display()));
+    }
+    command
         .arg(root.join("lib.rs"))
         .output()
         .expect("run rustc")

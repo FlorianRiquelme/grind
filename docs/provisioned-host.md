@@ -179,6 +179,34 @@ plus a login* on darwin, and do not let the shorter phrase stand for both.
   seconds after boot, silently. `KillMode=process` is what stops that, and
   `AbandonProcessGroup` is the launchd half of the same problem.
 
+- **An agent API key is present in the environment.** — *doctor* — `OPENROUTER_API_KEY`
+  or `OPENAI_API_KEY`, read at use and never recorded anywhere (ADR-0017). Presence is the
+  whole check: validity is only decidable mid-Run, where a dead key is an outcome like any
+  other (#37's ruling), so dispatch refuses only the keyless host — a `native` Dispatch with
+  neither key in the environment refuses before the lock, the worktree or a single attempt,
+  rather than spending its whole attempt budget failing identically.
+
+- **The agent endpoint answers.** — *doctor* — a connection-level probe of `{base_url}/models`
+  (ADR-0016), where `{base_url}` is the **declared** backend's base URL: doctor takes no Job,
+  so there is no *selected* backend to probe, only whatever `~/.grind/agent` declares — the
+  override token on its line when one is declared, the default endpoint when none is. Probing
+  the hardcoded default regardless of what is declared would defeat the override's own
+  purpose, which is self-hosting. An unreadable or unparseable declaration is unobservable
+  rather than guessed at: doctor never falls back to the default as though that had been
+  declared. Any HTTP status passes, a connect error fails — reachability, not authorization;
+  the key check above owns presence. Reported for both backends regardless of which is
+  declared, so both stay selectable from one doctor run.
+
+The line's grammar extends past the backend and the bare base-url token (ADR-0017, amended):
+`model=`, `fast=` and `strong=` declare which model id each of grind's own `fast`/`strong`
+routing classes resolves to on the native backend — `fast=`/`strong=` override `model=`
+individually — and `proto=native`/`proto=text` declares the wire mode outright, skipping the
+probe that would otherwise cost one failed request per attempt on an upstream (`stealth/ox-alpha`,
+observed) that cannot execute native tool calls at all. Neither key is a doctor check
+of its own: the two checks above already cover what a native Dispatch needs before its first
+Attempt, and a declared model id or protocol is only as good as the Attempt that actually
+calls the endpoint with it.
+
 ## Credentials
 
 [#37](https://github.com/FlorianRiquelme/grind/issues/37)'s six steps, verbatim in substance. All

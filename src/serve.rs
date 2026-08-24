@@ -8,9 +8,12 @@ use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::claude;
 use crate::job;
 use crate::observe;
+use crate::observe::Observed;
 use crate::page;
+use crate::runner;
 use crate::view;
 use crate::world;
 
@@ -208,16 +211,54 @@ fn run_response(home: &Path, id: &str, fragment: bool) -> Response {
         found.supervisor_identity.as_deref(),
         &observe::process_start_stamp(&world::ps_start_stamp(found.supervisor_pid)),
     );
-    let live = view::live(
-        &view::transcript_path(home, &found.worktree, &found.session_id),
-        world::now_epoch(),
-    );
+    let live = live_for(home, id, &found);
     let body = if fragment {
         page::run_fragment(id, &facts, &live, &here)
     } else {
         page::run_page(id, &facts, &live, &here)
     };
     html(body)
+}
+
+/// The live view, branching on the Run's snapshotted backend (#135). `claude::live` reads a
+/// single transcript file a claude-code Run writes; a native Run writes no such file —
+/// `NativeAdapter::run` leaves `messages-N.jsonl` under the Run's own directory instead — so
+/// reading that path there degraded every field to `Unobservable` at once, and the dashboard
+/// still rendered as if it had answered. This reads only `freshness` for a native Run, off the
+/// newest `messages-*.jsonl` write; every other field stays honestly `Unobservable` until
+/// `native::live` learns to parse transcript content, which is out of scope here (pending P3
+/// dogfooding evidence). A claude-code Run is unaffected — this is `claude::live` unchanged.
+fn live_for(home: &Path, run_id: &str, found: &view::RunView) -> claude::Live {
+    match found.backend {
+        runner::Backend::ClaudeCode => claude::live(
+            &claude::transcript_path(home, &found.worktree, &found.session_id),
+            world::now_epoch(),
+        ),
+        runner::Backend::Native => {
+            let run_dir = job::runs_dir(home).join(run_id);
+            let mtimes: Vec<SystemTime> = world::list_with_extension(&run_dir, "jsonl")
+                .iter()
+                .filter_map(|path| world::mtime(path))
+                .collect();
+            claude::Live {
+                transcript: run_dir,
+                now_skill: native_unread(),
+                assistant_now: native_unread(),
+                last_words: vec![String::new(); 3],
+                fanout: native_unread(),
+                freshness: observe::native_freshness(&mtimes, world::now_epoch()),
+            }
+        }
+    }
+}
+
+/// Shared by every `claude::Live` field a native Run cannot yet answer content-wise. A named
+/// helper rather than four repeated literals, so the one thing worth saying about all of them —
+/// *pending, not overlooked* — cannot drift between fields.
+fn native_unread<T>() -> Observed<T> {
+    Observed::Unobservable(observe::Reason::saying(
+        "native backend: transcript content is not read yet (pending P3 dogfooding evidence, #135)",
+    ))
 }
 
 /// The `supervisor.log` delta (KTD9): `o` bytes in, at most [`LOG_CAP`] bytes out, the
@@ -279,14 +320,30 @@ fn raw_file(home: &Path, id: &str, file: &str) -> Response {
 
 fn evidence_allowed(file: &str) -> bool {
     const WHOLE: [&str; 3] = ["run.json", "supervisor.log", "resume.log"];
-    const SUFFIXES: [&str; 3] = [".prompt.txt", ".stdout.json", ".stderr.log"];
+    /// What the claude-code adapter writes per invocation, for both file labels.
+    const SPAWNED: [&str; 3] = [".prompt.txt", ".stdout.json", ".stderr.log"];
     if WHOLE.contains(&file) {
         return true;
     }
-    SUFFIXES.iter().any(|suffix| {
-        file.strip_prefix("attempt-")
-            .and_then(|rest| rest.strip_suffix(suffix))
-            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    // One `<prefix><digits><suffix>` rule, applied to every name an adapter actually writes.
+    // The list grew twice and the route did not follow either time: the native adapter writes
+    // `messages-N.jsonl` instead of the claude trio — and the dashboard links it — while reflect
+    // now runs through the seam too and writes the `reflect-` pair. Every one of those links
+    // resolved to a 404 on a route whose whole job is serving the evidence behind them.
+    const NUMBERED: [(&str, &[&str]); 4] = [
+        ("attempt-", &SPAWNED),
+        ("reflect-", &SPAWNED),
+        ("messages-", &[".jsonl"]),
+        ("reflect-messages-", &[".jsonl"]),
+    ];
+    NUMBERED.iter().any(|(prefix, suffixes)| {
+        suffixes.iter().any(|suffix| {
+            file.strip_prefix(prefix)
+                .and_then(|rest| rest.strip_suffix(suffix))
+                .is_some_and(|digits| {
+                    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+                })
+        })
     })
 }
 
@@ -654,7 +711,7 @@ mod tests {
     #[test]
     fn the_oversized_head_is_rejected() {
         let mut bytes = b"GET / HTTP/1.1\r\nHost: h\r\nX-Pad: ".to_vec();
-        bytes.extend(std::iter::repeat(b'a').take(HEAD_LIMIT));
+        bytes.extend(std::iter::repeat_n(b'a', HEAD_LIMIT));
         bytes.extend_from_slice(b"\r\n\r\n");
         assert_eq!(parse_request(&bytes), Err(Status::BadRequest));
     }
@@ -921,6 +978,14 @@ mod tests {
             "attempt-12.prompt.txt",
             "attempt-12.stdout.json",
             "attempt-12.stderr.log",
+            // Reflect runs through the seam too, and the native adapter writes its own
+            // transcripts instead of the claude trio. The dashboard links these; the route
+            // must serve them.
+            "reflect-3.prompt.txt",
+            "reflect-3.stdout.json",
+            "reflect-3.stderr.log",
+            "messages-7.jsonl",
+            "reflect-messages-3.jsonl",
         ] {
             world::write_atomic(&run_dir.join(name), "evidence bytes\n").unwrap();
             let target = format!("/raw/runs/abc/{name}");
@@ -944,6 +1009,11 @@ mod tests {
             "attempt-x.stdout",
             "attempt-.prompt.txt",
             "attempt-1x.stderr.log",
+            "messages-.jsonl",
+            "messages-x.jsonl",
+            "messages-1.jsonl.bak",
+            "reflect-.prompt.txt",
+            "reflect-messages-x.jsonl",
             "Attempt-1.prompt.txt",
             "attempt-1.prompt.txt.bak",
             "secrets.env",

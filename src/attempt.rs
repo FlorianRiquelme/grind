@@ -4,12 +4,11 @@
 //! The rule's one asterisk — a pure builder and a pure classifier around two `world` calls,
 //! neither cleanly pure nor cleanly I/O (ADR-0007).
 
+use crate::claude::PANEL_BASH_FORMS;
 use crate::job::Job;
-use crate::observe::{Observed, Reason};
+use crate::observe::Observed;
 use crate::rung;
-use crate::world;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 /// A Run must never merge its own PR, discard the human's history, or rewrite a pushed branch.
 /// Denials are inherited by subagents and are **not** overridden by `bypassPermissions`
@@ -23,7 +22,7 @@ use std::path::Path;
 /// Weakening the list is **intent**, and no carrier defends against intent. What is typeable is
 /// the narrower, omission-shaped property below: every invocation carries them. The contents
 /// stay prose, in `CLAUDE.md`, where they already are.
-pub const DENIED_TOOLS: [&str; 26] = [
+pub const DENIED_TOOLS: [&str; 29] = [
     "Bash(gh pr merge*)",
     "Bash(git push --force*)",
     "Bash(git push -f*)",
@@ -82,40 +81,46 @@ pub const DENIED_TOOLS: [&str; 26] = [
     // Branch deletion one door over: `gh api -X DELETE repos/o/r/git/refs/heads/x` removes a
     // remote branch through the API the `gh pr merge`/`gh api*merge*` globs leave open.
     "Bash(gh api*DELETE*)",
-];
-
-/// Write-capable Bash forms denied on the two fan-out panels (`Review`, `Validate`) and on
-/// Reflect: none of the three ever touches a worktree, and denying `Write`/`Edit` alone does not
-/// reach a shell command that mutates one the same way. `git push*` is denied outright — a panel
-/// or Reflect never pushes.
-const PANEL_BASH_FORMS: [&str; 10] = [
-    "Bash(git commit*)",
-    "Bash(git add*)",
-    "Bash(git apply*)",
-    "Bash(git stash*)",
-    "Bash(mv *)",
-    "Bash(cp *)",
-    "Bash(rm *)",
-    "Bash(tee *)",
-    "Bash(sed -i*)",
-    "Bash(git push*)",
+    // --- indirection through a nested shell, rather than off the front of one verb ---------
+    //
+    // Every glob above matches a `git`/`gh` invocation appearing as its own subcommand.
+    // `sh -c '...'` and `bash -c '...'` hand the whole forbidden command to a *nested* shell as
+    // one string argument, and `eval '...'` does the same in-process — none of the globs above
+    // name the outer command, only what it wraps, so `sh -c "git push --force origin main"`
+    // went straight through. (Command substitution and a leading `NAME=value` assignment are
+    // the sibling gaps; those are closed by widening the matcher itself in
+    // `tools::subcommands_of`, not by a glob, because there is no fixed verb to anchor one on.)
+    // All three are broad by the same trade the twelve position-independent globs above already
+    // make: `sh -c "ls"` and `eval "true"` are ordinary and now refused too, an acceptable false
+    // refusal for a barrier of this kind.
+    "Bash(sh -c*)",
+    "Bash(bash -c*)",
+    "Bash(eval*)",
 ];
 
 /// The denial set for one of the ten ladder stages. **The base list always, verbatim, never
 /// filtered** — widening only, never narrowing. Report-only stages (`PlanReview`, `Review`,
-/// `Validate`) additionally deny `Write` and `Edit`; the two fan-out panels (`Review`,
-/// `Validate`) further deny the write-capable Bash forms above. The denials narrow the surface
-/// without closing it: shell redirection is not deniable — it is how a panel session writes its
-/// findings files — so "touches nothing" is the prompt's stated discipline with the sandbox
-/// behind it, never a sandbox guarantee alone. `Plan`, `Triage`, `Work`,
+/// `Validate`) additionally deny `Write`, `Edit` and `write_file`; the two fan-out panels
+/// (`Review`, `Validate`) further deny the write-capable Bash forms above. The denials narrow
+/// the surface without closing it: shell redirection is not deniable — it is how a panel
+/// session writes its findings files — so "touches nothing" is the prompt's stated discipline
+/// with the sandbox behind it, never a sandbox guarantee alone. `Plan`, `Triage`, `Work`,
 /// `Simplify`, `DiffTriage`, `Fixes` and `Ship` carry the base list only: they are the stages
 /// that write the worktree (or, for the two in-process `[R]` passes, write nothing at all).
+///
+/// `write_file` rides alongside `Write`/`Edit` rather than replacing them: those two are the
+/// names the claude-code adapter's own matcher recognises, `write_file` is the name the native
+/// toolkit spells its writer (`tools::ToolRegistry`), and `tools::gate`'s bare-name branch
+/// matches a glob against the raw tool name — so a list that named only `Write`/`Edit` gated
+/// one adapter and left the other's writer open on these three report-only stages. One list,
+/// same meaning on both adapters; the entry Claude Code never matches is harmless there.
 pub fn denied_for(stage: rung::Stage) -> Vec<String> {
     use rung::Stage::{PlanReview, Review, Validate};
     let mut denials: Vec<String> = DENIED_TOOLS.iter().map(|s| s.to_string()).collect();
     if matches!(stage, PlanReview | Review | Validate) {
         denials.push("Write".to_string());
         denials.push("Edit".to_string());
+        denials.push("write_file".to_string());
     }
     if matches!(stage, Review | Validate) {
         denials.extend(PANEL_BASH_FORMS.iter().map(|s| s.to_string()));
@@ -223,236 +228,6 @@ pub struct StageConditions<'a> {
     pub run_id: &'a str,
 }
 
-/// Resumed mid-stage, told to pick up its own return rather than the Run's — the stage-level
-/// sibling of [`REENTRY_PROMPT`]. Each stage owns its own session, so "the pipeline" of the old
-/// prompt narrows to "this stage".
-pub const STAGE_REENTRY_PROMPT: &str = "You were interrupted mid-stage and have just been resumed.
-
-Re-read this stage's own return file and the working tree to establish what you had already
-done, then continue this stage from where it left off. Do not restart work this stage already
-completed, and do not redo a stage the ladder has already advanced past.
-
-Everything in the original instruction still applies — especially: never weaken, trim or
-skip a step of `just verify` to make it pass.";
-
-/// The first Attempt for a stage, opening that stage's own session.
-pub fn stage_dispatch(conditions: &StageConditions, ctx: &StageContext) -> Invocation {
-    build_stage(conditions, ctx, Mode::Dispatch, stage_dispatch_prompt(ctx))
-}
-
-/// A later Attempt for a stage, resuming that stage's own session — never the Run's.
-pub fn stage_resume(
-    conditions: &StageConditions,
-    ctx: &StageContext,
-    cleared: Option<&Clearance>,
-) -> Invocation {
-    build_stage(
-        conditions,
-        ctx,
-        Mode::Resume,
-        stage_resume_prompt(ctx, cleared),
-    )
-}
-
-/// The composition unit C's loop calls once it has decided a stage's next Attempt is Dispatch or
-/// Resume. `Mode::CiBabysit` never routes here: Ship's babysit round continues `<run>-ship`'s own
-/// session through the existing [`ci_babysit`] builder, not a fresh stage composition — there is
-/// no stage-shaped babysit prompt to build.
-pub fn stage_invocation(
-    conditions: &StageConditions,
-    ctx: &StageContext,
-    mode: Mode,
-    cleared: Option<&Clearance>,
-) -> Invocation {
-    match mode {
-        Mode::Dispatch => stage_dispatch(conditions, ctx),
-        Mode::Resume => stage_resume(conditions, ctx, cleared),
-        Mode::CiBabysit => {
-            unreachable!("babysit continues Ship's session via `ci_babysit`, never a fresh stage")
-        }
-    }
-}
-
-/// Reflect's first Attempt, opening `<run>-reflect`. Not a rung — [`rung::Stage`] has no
-/// variant for it (the design's own words: *deliberately not an eleventh stage*) — so it never
-/// goes through [`stage_invocation`]; the supervisor calls this directly once a terminal
-/// observation lands. Dispatched with the **run directory** as cwd rather than the worktree
-/// (unit C's job), so there is no repo tree under the session for a `Write`/`Edit` denial to
-/// matter over — its worktree protection is [`denied_for_reflect`]'s write-capable Bash-form
-/// denials instead.
-pub fn reflect_dispatch(conditions: &StageConditions, skill_text: &str) -> Invocation {
-    build_reflect(conditions, skill_text, Mode::Dispatch)
-}
-
-/// A later Attempt for Reflect, resuming `<run>-reflect` — bounded to one re-entry by the
-/// supervisor, never by this builder.
-pub fn reflect_resume(conditions: &StageConditions, skill_text: &str) -> Invocation {
-    build_reflect(conditions, skill_text, Mode::Resume)
-}
-
-fn build_reflect(conditions: &StageConditions, skill_text: &str, mode: Mode) -> Invocation {
-    let session_id = reflect_session_id(conditions.run_id);
-    let mut argv = vec![
-        conditions.claude_bin.to_string(),
-        "-p".to_string(),
-        "--output-format".to_string(),
-        "json".to_string(),
-        "--permission-mode".to_string(),
-        "bypassPermissions".to_string(),
-    ];
-    match mode {
-        Mode::Dispatch => {
-            argv.push("--session-id".to_string());
-            argv.push(session_id);
-        }
-        Mode::Resume | Mode::CiBabysit => {
-            argv.push("--resume".to_string());
-            argv.push(session_id);
-        }
-    }
-    argv.push("--disallowedTools".to_string());
-    argv.extend(denied_for_reflect());
-    Invocation {
-        argv,
-        prompt: skill_text.to_string(),
-        mode,
-    }
-}
-
-fn build_stage(
-    conditions: &StageConditions,
-    ctx: &StageContext,
-    mode: Mode,
-    prompt: String,
-) -> Invocation {
-    let session_id = stage_session_id(conditions.run_id, ctx.stage);
-    let mut argv = vec![
-        conditions.claude_bin.to_string(),
-        "-p".to_string(),
-        "--output-format".to_string(),
-        "json".to_string(),
-        "--permission-mode".to_string(),
-        "bypassPermissions".to_string(),
-    ];
-    if let Some(model) = ctx.model {
-        argv.push("--model".to_string());
-        argv.push(model.to_string());
-    }
-    match mode {
-        Mode::Dispatch => {
-            argv.push("--session-id".to_string());
-            argv.push(session_id);
-        }
-        Mode::Resume | Mode::CiBabysit => {
-            argv.push("--resume".to_string());
-            argv.push(session_id);
-        }
-    }
-    // No `--plugin-dir`: a stage invocation names no plugin.
-    // No `--max-budget-usd`: ADR-0010, spend is recorded, never bounded.
-    argv.push("--disallowedTools".to_string());
-    argv.extend(denied_for(ctx.stage));
-    Invocation { argv, prompt, mode }
-}
-
-/// The skill text verbatim, then a bounded context block naming what the skill's own prose
-/// cannot know until dispatch: where this Run's returns and artifacts go, which worktree it
-/// runs in, and the Job rows the skill leans on (branch, base branch, verify entrypoint, done
-/// predicate, Anchor). Plan alone also carries injected notes/lessons.
-fn stage_dispatch_prompt(ctx: &StageContext) -> String {
-    format!(
-        "{skill}\n\n---\n\n{context}{notes}",
-        skill = ctx.skill_text,
-        context = stage_context_block(ctx),
-        notes = plan_notes_block(ctx),
-    )
-}
-
-/// The same bundle, with the stage-level re-entry paragraph (and, when one was recorded, the
-/// latest clearance note) composed after the context block.
-fn stage_resume_prompt(ctx: &StageContext, cleared: Option<&Clearance>) -> String {
-    format!(
-        "{skill}\n\n---\n\n{context}\n\n{reentry}{clearance}{notes}",
-        skill = ctx.skill_text,
-        context = stage_context_block(ctx),
-        reentry = STAGE_REENTRY_PROMPT,
-        clearance = stage_clearance_paragraph(cleared),
-        notes = plan_notes_block(ctx),
-    )
-}
-
-/// **Default is silence**, the same rule the mega-session's `reentry_prompt` follows: with no
-/// note the paragraph renders as nothing, and the latest clearance is framed as an account to
-/// check against what the stage now observes, never as current fact to trust blind.
-fn stage_clearance_paragraph(cleared: Option<&Clearance>) -> String {
-    match cleared {
-        Some(clearance) => format!(
-            "\n\nSince you stopped, the human reports (recorded {at}): {note}\n\nThat is their \
-             account of what changed in the world, from the moment it was recorded. Check it \
-             against what you now observe: do not spend turns re-probing an obstacle the note \
-             says is cleared and the world confirms — but where the world in front of you \
-             contradicts the note, trust what you observe and say so plainly.",
-            at = clearance.cleared_at,
-            note = clearance.note,
-        ),
-        None => String::new(),
-    }
-}
-
-fn stage_context_block(ctx: &StageContext) -> String {
-    format!(
-        "Stage:             {stage}
-Stages directory:  {stages_dir}
-Worktree:          {worktree}
-Job branch:        {branch}
-Job base branch:   {base_branch}
-Verify entrypoint: {verify}
-Done predicate:    {done}
-Anchor artifact:   {anchor}
-
-Every return and artifact this stage writes belongs under the stages directory named above,
-never elsewhere.",
-        stage = ctx.stage,
-        stages_dir = ctx.stages_dir,
-        worktree = ctx.worktree,
-        branch = ctx.job.branch,
-        base_branch = ctx.job.base_branch,
-        verify = ctx.job.verify_entrypoint,
-        done = ctx.job.done_predicate,
-        anchor = ctx.job.anchor,
-    )
-}
-
-/// **Default is silence**, Plan-only: every other stage leaves `notes` `None` and this renders
-/// nothing for it regardless of what is passed, since only Plan's dispatch prompt injects notes
-/// and lessons the caller gathered ahead of composition.
-fn plan_notes_block(ctx: &StageContext) -> String {
-    match (ctx.stage, ctx.notes) {
-        (rung::Stage::Plan, Some(notes)) => format!("\n\nNotes and lessons for this Run:\n{notes}"),
-        _ => String::new(),
-    }
-}
-
-/// The one prompt the script could not supply, because it has no CI-babysit path.
-///
-/// Reacting to a red check is the one situation where rebasing onto a moved base and
-/// force-pushing an amended fix are the *idiomatic* repairs — so an unwarned agent spends its
-/// single bounded invocation colliding with a barrier that will refuse it anyway. The
-/// operations are named here for that reason, not because naming them is what stops them.
-pub const CI_BABYSIT_PROMPT: &str = "The pipeline finished and the PR is open, but a check on it \
-came back red. You have exactly one invocation to react to that and nothing else.
-
-Read the failing checks on the PR for this branch, find the cause, fix it on this branch and
-push. Do not redo finished work, do not open a second PR, and do not touch anything the failing
-checks did not point at.
-
-Never weaken, trim or skip a step of `just verify` to make a check go green — a gutted gate is
-worse than one that fails honestly. If the check cannot be made green, say so plainly in the PR
-body and leave the step intact.
-
-Do not merge the PR, force-push, rebase, hard-reset or delete the branch. These are refused at
-the tool layer and attempting them spends this invocation for nothing.";
-
 /// Which of the three shapes an invocation is. Recorded per attempt, so a spent CI budget is
 /// visible as itself rather than as an ordinary re-entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,95 +294,14 @@ impl Invocation {
     pub fn mode(&self) -> Mode {
         self.mode
     }
-}
 
-/// The one bounded invocation a decided-and-failing CI buys, continuing whichever stage session
-/// the caller names via `conditions.session_id` (Ship's, per `run_ship_babysit_attempt`).
-pub fn ci_babysit(conditions: &Conditions) -> Invocation {
-    let mut argv = vec![
-        conditions.claude_bin.to_string(),
-        "-p".to_string(),
-        "--output-format".to_string(),
-        "json".to_string(),
-        "--permission-mode".to_string(),
-        "bypassPermissions".to_string(),
-    ];
-    if let Some(model) = conditions.model {
-        argv.push("--model".to_string());
-        argv.push(model.to_string());
+    /// The crate-side constructor. The argv builders themselves now live in
+    /// [`crate::claude`]; routing them through this keeps the invariant they document
+    /// enforceable — code outside this crate still cannot hold an `Invocation` whose argv
+    /// skipped the denial list.
+    pub(crate) fn build(argv: Vec<String>, prompt: String, mode: Mode) -> Invocation {
+        Invocation { argv, prompt, mode }
     }
-    argv.push("--resume".to_string());
-    argv.push(conditions.session_id.to_string());
-    // No `--plugin-dir`: a stage invocation names no plugin (ADR-0015 retired the pin once
-    // nothing was left to invoke it). No `--max-budget-usd`: ADR-0010, spend is recorded,
-    // never bounded.
-    argv.push("--disallowedTools".to_string());
-    argv.extend(DENIED_TOOLS.iter().map(|glob| glob.to_string()));
-    Invocation {
-        argv,
-        prompt: CI_BABYSIT_PROMPT.to_string(),
-        mode: Mode::CiBabysit,
-    }
-}
-
-/// What a child left behind, **after** it landed on disk.
-///
-/// Private fields, and [`run`] is the only constructor. The invariant does not rest on that
-/// alone: `world` redirects both streams to their files *before* the child is spawned and hands
-/// back only an exit code, so the parent cannot see a byte of the child's output without
-/// reading the file it already wrote. *Parse before write* is not a thing to remember.
-pub struct RawAttempt {
-    stdout: String,
-    /// Read back from disk alongside stdout, for the same reason: a child the rate limit
-    /// killed before it emitted any JSON leaves its verdict on stderr, and classifying only
-    /// stdout would record that death as an ordinary one.
-    stderr: String,
-    code: Option<i32>,
-}
-
-impl RawAttempt {
-    pub fn classify(&self, n: usize, mode: Mode, started_at: &str, ended_at: &str) -> Attempt {
-        classify(
-            &self.stdout,
-            &self.stderr,
-            self.code,
-            n,
-            mode,
-            started_at,
-            ended_at,
-        )
-    }
-}
-
-/// Spawn the child, having already committed its output to disk. The prompt is written first
-/// for the same reason: every death is diagnosable from Run state alone, without opening a
-/// transcript.
-pub fn run(
-    invocation: &Invocation,
-    cwd: &Path,
-    prompt_path: &Path,
-    stdout_path: &Path,
-    stderr_path: &Path,
-) -> Result<RawAttempt, Reason> {
-    world::write(prompt_path, invocation.prompt())
-        .map_err(|e| Reason::saying(&format!("could not write the prompt: {e}")))?;
-    let code = world::spawn_recorded(
-        invocation.argv(),
-        cwd,
-        invocation.prompt(),
-        stdout_path,
-        stderr_path,
-    )
-    .map_err(|e| Reason::saying(&format!("could not spawn `claude`: {e}")))?;
-    // Read back what is already on disk, rather than what the parent buffered. Both streams:
-    // the classifier needs stderr to see a limit that killed the child before any JSON.
-    let stdout = world::read_to_string(stdout_path).unwrap_or_default();
-    let stderr = world::read_to_string(stderr_path).unwrap_or_default();
-    Ok(RawAttempt {
-        stdout,
-        stderr,
-        code,
-    })
 }
 
 /// One attempt as the record holds it.
@@ -699,155 +393,14 @@ pub fn trailing_waits(attempts: &[Attempt]) -> usize {
     attempts.iter().rev().take_while(|a| a.is_wait()).count()
 }
 
-/// The pure classifier over a raw triple.
-///
-/// **`subtype` is not the outcome.** It read `success` on all five of Run 1's attempts including
-/// the three that died, and on all six of Run 2's rate-limited ones. `terminal_reason` and the
-/// API error status are the discriminators.
-///
-/// **The payload is recovered tolerantly, and the raw streams speak when it cannot.** Strict
-/// whole-string parsing flips `parse_ok` false over a single stray byte around the payload,
-/// and then a rate limit delivered amid noise classifies as a crash — an immediate Reenter
-/// burning attempts against an hours-long wall. So [`parse_payload`] falls back before giving
-/// up, and when the payload never rendered a verdict (`parse_ok` false) or the child exited
-/// non-zero without the payload itself carrying the 429, the same normalised needle set folds
-/// over the stdout tail and the stderr — where a limit that killed the child before any JSON
-/// leaves its verdict. A false positive sleeps instead of burning attempts: the safe
-/// direction, the same one that makes an unparseable Attempt never a Wait.
-pub fn classify(
-    stdout: &str,
-    stderr: &str,
-    code: Option<i32>,
-    n: usize,
-    mode: Mode,
-    started_at: &str,
-    ended_at: &str,
-) -> Attempt {
-    let parsed = parse_payload(stdout);
-    let parse_ok = parsed.is_some();
-    let value = parsed.unwrap_or(serde_json::Value::Null);
-
-    // Absent is not the same fact as present-and-empty: `result.get` distinguishes a key that
-    // never arrived (a renamed or dropped field in an otherwise well-formed payload) from one
-    // that arrived null or empty. Folding the two together with `.unwrap_or_default()` is how
-    // a finished Run's DONE promise, sitting under a renamed key, read as `done_promise: false`
-    // indistinguishable from a session that truly said nothing.
-    let result_present = value.get("result").is_some();
-    let result = text_at(&value, "result").unwrap_or_default();
-    let is_error = value
-        .get("is_error")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(!parse_ok);
-
-    // The stdout half of the rate-limit haystack, computed once: the payload's `result` when
-    // one arrived, the raw stdout otherwise — the same slice the record keeps as its tail,
-    // so no second pass over the stream is needed.
-    let stream_tail = tail(
-        if parse_ok && result_present {
-            &result
-        } else {
-            stdout
-        },
-        1500,
-    );
-
-    Attempt {
-        n,
-        mode,
-        started_at: started_at.to_string(),
-        ended_at: ended_at.to_string(),
-        exit_code: code,
-        is_error,
-        parse_ok,
-        // `subtype` already carries a synthetic value for one kind of drift
-        // (`unparseable-output`, when the whole payload did not parse); a missing `result` key
-        // gets its own synthetic value here rather than folding into that one. A single
-        // `Attempt` has no room for a new field without breaking the record's shape everywhere
-        // it is built by hand (ADR-0006's point about widening a record's vocabulary), and
-        // collapsing both drifts into one string would make a payload that parsed cleanly but
-        // renamed a field indistinguishable, in the operator-facing announce line, from a
-        // payload that never parsed at all — its own loss of information.
-        subtype: if !parse_ok {
-            Some("unparseable-output".to_string())
-        } else if !result_present {
-            Some("result-field-missing".to_string())
-        } else {
-            text_at(&value, "subtype")
-        },
-        stop_reason: text_at(&value, "stop_reason"),
-        api_error_status: text_at(&value, "api_error_status"),
-        terminal_reason: text_at(&value, "terminal_reason"),
-        num_turns: value.get("num_turns").and_then(|v| v.as_u64()),
-        total_cost_usd: value.get("total_cost_usd").and_then(|v| v.as_f64()),
-        usage: value.get("usage").cloned(),
-        permission_denials: value
-            .get("permission_denials")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default(),
-        done_promise: result.contains("<promise>DONE</promise>"),
-        // The payload's own verdict first. The raw-streams fold runs only when the payload
-        // cannot speak — it never parsed, or the child exited non-zero without the payload
-        // itself carrying the 429 — so a healthy attempt is never rate-limited by noise on
-        // its stderr. `stream_tail` is the stdout half of that fold, the same tail the
-        // record keeps for diagnosis.
-        rate_limited: is_rate_limited(&value)
-            || ((!parse_ok || code.is_some_and(|c| c != 0))
-                && mentions_limit(&normalise(&format!("{stream_tail} {stderr}")))),
-        // The tail is kept whether or not the response parsed, so an unreadable child still
-        // leaves something diagnosable. A missing `result` key takes the same fallback as an
-        // unparseable payload, for the same reason: there is nothing under that key to show
-        // either way, and the raw stdout is the only thing left to look at.
-        result_tail: stream_tail,
-        // Could not observe until somebody reads the transcript, which is `supervisor`'s job
-        // before it pushes the Attempt. A path that forgets records *could not observe* rather
-        // than `(0, 0)`, which is the honest direction for an omission.
-        fanout: Observed::Unobservable(Reason::saying("the transcript was not read")),
-    }
-}
-
-/// The payload, recovered tolerantly.
-///
-/// Strict whole-string parsing first — the shape a healthy child emits. Around it, the
-/// recorded failure mode is **noise**: a wrapper's banner, a warning line, a stray byte, and
-/// then a rate limit delivered amid that noise would classify as a crash and burn attempts
-/// against an hours-long wall. So before declaring the stream unparseable: retry on the
-/// widest `{`..`}` span (the payload with junk around it), then take the last line that
-/// parses as a JSON object (a payload after other output). Only a stream with no recoverable
-/// object at all returns `None`, which `classify` records as `unparseable-output` with the
-/// raw tail kept.
-fn parse_payload(stdout: &str) -> Option<serde_json::Value> {
-    if let Ok(value) = serde_json::from_str(stdout) {
-        return Some(value);
-    }
-    if let (Some(start), Some(end)) = (stdout.find('{'), stdout.rfind('}'))
-        && start < end
-        && let Ok(value) = serde_json::from_str(&stdout[start..=end])
-    {
-        return Some(value);
-    }
-    stdout.lines().rev().find_map(|line| {
-        serde_json::from_str(line.trim())
-            .ok()
-            .filter(serde_json::Value::is_object)
-    })
-}
-
 /// A field as text, whether the child sent a string, a number or a boolean. `api_error_status`
 /// arrives as a JSON **number** in Run 2's recorded triple and as a string elsewhere.
-fn text_at(value: &serde_json::Value, key: &str) -> Option<String> {
+pub(crate) fn text_at(value: &serde_json::Value, key: &str) -> Option<String> {
     match value.get(key)? {
         serde_json::Value::Null => None,
         serde_json::Value::String(s) => Some(s.clone()),
         other => Some(other.to_string()),
     }
-}
-
-fn tail(text: &str, characters: usize) -> String {
-    let count = text.chars().count();
-    text.chars()
-        .skip(count.saturating_sub(characters))
-        .collect()
 }
 
 /// Rate limits, from a **normalised haystack**.
@@ -881,7 +434,7 @@ pub fn is_rate_limited(value: &serde_json::Value) -> bool {
 
 /// The needle set over an already-normalised haystack — shared by the payload path above and
 /// by `classify`'s fold over the raw streams, so both ask exactly one question.
-fn mentions_limit(normalised: &str) -> bool {
+pub(crate) fn mentions_limit(normalised: &str) -> bool {
     const NEEDLES: [&str; 8] = [
         "ratelimit",
         "usagelimit",
@@ -895,7 +448,7 @@ fn mentions_limit(normalised: &str) -> bool {
     NEEDLES.iter().any(|needle| normalised.contains(needle))
 }
 
-fn normalise(text: &str) -> String {
+pub(crate) fn normalise(text: &str) -> String {
     text.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect::<String>()
@@ -906,6 +459,11 @@ fn normalise(text: &str) -> String {
 mod tests {
     use super::*;
 
+    // The builders and classifier moved verbatim to `runner::claude`; every assertion below
+    // is unchanged and simply names them through the new path.
+    use crate::claude::{
+        CI_BABYSIT_PROMPT, ci_babysit, classify, stage_dispatch, stage_invocation, stage_resume,
+    };
     const RUN2_RATE_LIMITED: &str = include_str!("../tests/fixtures/run2/rate-limited.stdout.json");
     const RUN1_ATTEMPT_1: &str = include_str!("../tests/fixtures/run1/attempt-1.stdout.json");
     const RUN1_ATTEMPT_2: &str = include_str!("../tests/fixtures/run1/attempt-2.stdout.json");
@@ -985,34 +543,13 @@ mod tests {
         assert!(!invocation.argv().contains(&"--model".to_string()));
     }
 
-    /// A minimal reimplementation of the two facts CLAUDE.md's `DENIED_TOOLS` section states
-    /// about Claude Code's own deny-glob matcher: `*` may appear anywhere in the pattern (start,
-    /// middle or end), and matching is per-subcommand after splitting the full command line on
-    /// `&&`, `||`, `;`, `|`, `|&`, `&` and newlines. **This tests our own understanding of that
-    /// matcher, not the matcher itself** — the real one lives in Claude Code and cannot be
-    /// imported here, so a bug in this reimplementation would pass silently. Keep it dumb:
-    /// full-string match, `*` the only wildcard, no other glob syntax.
-    fn glob_matches(pattern: &str, candidate: &str) -> bool {
-        fn rec(p: &[u8], c: &[u8]) -> bool {
-            match p.first() {
-                None => c.is_empty(),
-                Some(b'*') => rec(&p[1..], c) || (!c.is_empty() && rec(p, &c[1..])),
-                Some(head) => c.first() == Some(head) && rec(&p[1..], &c[1..]),
-            }
-        }
-        rec(pattern.as_bytes(), candidate.as_bytes())
-    }
-
-    fn subcommands_of(command: &str) -> Vec<String> {
-        let mut pieces = vec![command.to_string()];
-        for separator in ["|&", "&&", "||", ";", "|", "&", "\n"] {
-            pieces = pieces
-                .iter()
-                .flat_map(|p| p.split(separator).map(str::to_string).collect::<Vec<_>>())
-                .collect();
-        }
-        pieces.into_iter().map(|p| p.trim().to_string()).collect()
-    }
+    // `glob_matches` and `subcommands_of` used to be a from-scratch reimplementation here,
+    // maintained by hand alongside the real matcher `tools::gate` runs — two copies nothing
+    // bound, so `just verify` stayed green while they drifted. They are now imported from
+    // `tools`, the module whose copy is the native backend's **entire** enforcement barrier
+    // (nothing sits behind it), so this table validates the matcher grind actually runs rather
+    // than a parallel guess at what Claude Code's own matcher does.
+    use crate::tools::{glob_matches, subcommands_of};
 
     fn is_denied(command: &str) -> bool {
         subcommands_of(command).iter().any(|sub| {
@@ -1033,7 +570,7 @@ mod tests {
         // spelling per row is what let the whole list read complete while
         // `git push origin --force` went straight through: git accepts the flag anywhere, and
         // a table that only ever types it in one position never asks.
-        let table: [(&str, &[&str]); 18] = [
+        let table: [(&str, &[&str]); 21] = [
             (
                 "merge via gh pr merge",
                 &["gh pr merge 123 --squash", "gh pr merge --squash 123"],
@@ -1135,6 +672,43 @@ mod tests {
                     "gh api --method DELETE repos/o/r/git/refs/heads/feat/x",
                 ],
             ),
+            (
+                "shell indirection through a nested sh/bash/eval that hides the verb from a \
+                 prefix-anchored glob",
+                &[
+                    "sh -c 'git push --force origin main'",
+                    "bash -c 'gh pr merge 123'",
+                    "eval 'git reset --hard HEAD~3'",
+                ],
+            ),
+            (
+                "the same indirection with a prefix in front of sh/bash/eval, which used to \
+                 defeat their front anchor outright (fix 4)",
+                &[
+                    "env bash -c 'gh pr merge 123'",
+                    "/bin/sh -c 'gh pr merge 123'",
+                    "command eval 'git reset --hard HEAD~3'",
+                    "env gh pr merge 123",
+                    "nohup sh -c 'git push --force origin main'",
+                    "sh -c \"gh pr merge 123\"",
+                    "env -i bash -c 'gh pr merge 123'",
+                ],
+            ),
+            (
+                "an option-taking wrapper's own flags and operands sitting between the wrapper \
+                 and the verb, which used to defeat fix 4's wrapper-name list outright (fix 5) \
+                 — closed by token-suffix expansion in `tools::subcommands_of` rather than by \
+                 naming `timeout` and every other option shape",
+                &[
+                    "nice -n 5 gh pr merge 123",
+                    "stdbuf -o0 gh pr merge 123",
+                    "setsid -f gh pr merge 123",
+                    "env -i gh pr merge 123",
+                    "env -u FOO gh pr merge 123",
+                    "timeout 30 gh pr merge 123",
+                    "gh pr merge 123",
+                ],
+            ),
         ];
         for (name, spellings) in table {
             for candidate in spellings {
@@ -1144,6 +718,10 @@ mod tests {
         // Denials are per-subcommand after splitting on shell operators, so a prefix like `cd`
         // ahead of the forbidden verb must not let it through.
         assert!(is_denied("cd /tmp && git push --force origin main"));
+        // Command substitution and a leading env-var assignment must not hide the verb either.
+        assert!(is_denied("echo $(gh pr merge 123)"));
+        assert!(is_denied("echo `git push --force origin main`"));
+        assert!(is_denied("GIT_DIR=. gh pr merge 123"));
     }
 
     #[test]
@@ -1162,6 +740,15 @@ mod tests {
             "git checkout feat/x",
             "git fetch origin",
             "git log --oneline",
+            // The fix-4 normalizations must not turn an ordinary wrapper use, a path-qualified
+            // binary or a quoted string into a false denial.
+            "env RUST_LOG=debug cargo test",
+            "/usr/bin/git status",
+            "nohup cargo build --release &",
+            "echo 'hello world'",
+            // Nor must fix 5's token-suffix expansion: a long ordinary invocation is still just
+            // an ordinary invocation, wherever its tokens fall.
+            "cargo test --all",
         ] {
             assert!(!is_denied(allowed), "{allowed:?} must not be denied");
         }

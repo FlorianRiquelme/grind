@@ -19,7 +19,6 @@ use crate::policy;
 use crate::world;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 /// The record, read-only. `deny_unknown_fields` is what turns *the writer gained a field and
 /// the reader forgot it* into a failing test — without it serde drops the unknown key silently,
@@ -64,6 +63,28 @@ pub struct RunView {
     pub provenance: Option<Provenance>,
     #[serde(default)]
     pub reflected: bool,
+    /// Which adapter executes this Run's stages — snapshotted at dispatch (ADR-0017), the
+    /// read-only mirror of the writer's fields of the same names. Both default so every
+    /// record written before selection existed parses under `deny_unknown_fields`.
+    #[serde(default)]
+    pub backend: crate::runner::Backend,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_override: Option<String>,
+    /// The rest of the layout-declared selection (ADR-0017 as amended): the host's model
+    /// classes and a declared wire mode. `None` is the honest *undeclared* answer — both for a
+    /// record written before the grammar grew these keys and for a host that declares only a
+    /// backend — so the adapter falls back to its own default rather than to a blank.
+    ///
+    /// These three exist here for one reason: `RunView` is `deny_unknown_fields`, so the first
+    /// `run.json` a Dispatch writes with a `fast=`/`strong=`/`proto=` declaration would fail to
+    /// parse without them, and it would fail in `grind status` and the dashboard — the two
+    /// places a human looks to be reassured. Never let the writer gain a field this mirror lacks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_model_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strong_model_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proto_override: Option<crate::runner::ProtoMode>,
 }
 
 /// The read-only mirror of `supervisor::Provenance`. Field names duplicated by design, the same
@@ -391,252 +412,6 @@ pub fn supervisor_here(recorded: Option<&str>, live: &Observed<String>) -> Obser
     }
 }
 
-// --- the live view, read from an undocumented format ----------------------------------------
-
-/// One fanned-out subagent, as the transcript shows it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Fanout {
-    pub description: String,
-}
-
-/// What the transcript can say. Five values, each degrading on its own — an unreadable
-/// transcript costs these their values and never the whole command.
-#[derive(Debug)]
-pub struct Live {
-    pub transcript: PathBuf,
-    pub now_skill: Observed<String>,
-    pub last_words: Vec<String>,
-    /// The last assistant message, flattened to one line: the live answer to *what is it
-    /// doing right now*, observed from the transcript. Never a verdict input — ADR-0003
-    /// caps this field at describing what happened (issue #82).
-    pub assistant_now: Observed<String>,
-    pub fanout: Observed<Vec<Fanout>>,
-    /// Seconds since the newest write across the parent transcript **and every subagent
-    /// transcript**. The quietest healthy phase of a pipeline must not read as stuck.
-    pub freshness: Observed<u64>,
-}
-
-/// Claude Code writes a session's transcript under a slug of the directory it ran in.
-///
-/// The record's worktree is the **declared** clone — on this host a symlink under
-/// `~/.grind/repos/<owner>/<name>` — and the OS resolves a cwd through it, so Claude slugs the
-/// **resolved** path (`/private/var/...` where the record says `/var/...`) and the pointer
-/// named a file that was not there (#82). Resolving at read time matches what Claude records,
-/// and heals records written before the fix with no migration: the slug is recomputed from the
-/// same directory every read. A worktree that is gone cannot be canonicalised, and slugging
-/// the raw string is then the only answer there is — the old behaviour, kept for that case.
-pub fn transcript_path(home: &Path, worktree: &str, session_id: &str) -> PathBuf {
-    let resolved = world::resolve_link(Path::new(worktree))
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| worktree.to_string());
-    home.join(".claude")
-        .join("projects")
-        .join(project_slug(&resolved))
-        .join(format!("{session_id}.jsonl"))
-}
-
-fn project_slug(worktree: &str) -> String {
-    worktree
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
-}
-
-pub fn live(transcript: &Path, now_epoch: u64) -> Live {
-    let text = world::read_to_string(transcript).ok();
-    let newest = newest_write(transcript);
-    Live {
-        transcript: transcript.to_path_buf(),
-        now_skill: match &text {
-            Some(body) => now_skill(body),
-            None => Observed::Unobservable(Reason::saying("the transcript could not be read")),
-        },
-        assistant_now: match &text {
-            Some(body) => assistant_now(body),
-            None => Observed::Unobservable(Reason::saying("the transcript could not be read")),
-        },
-        last_words: match &text {
-            Some(body) => last_words(body, 3),
-            // Still exactly three lines: the block's height is fixed so `watch` never jitters,
-            // and an unreadable transcript must not change the shape of the view.
-            None => vec![String::new(); 3],
-        },
-        fanout: match &text {
-            Some(body) => fanout(body),
-            None => Observed::Unobservable(Reason::saying("the transcript could not be read")),
-        },
-        freshness: match newest {
-            Some(at) => Observed::Present(seconds_since(at, now_epoch)),
-            None => {
-                Observed::Unobservable(Reason::saying("no transcript write to read a time from"))
-            }
-        },
-    }
-}
-
-/// The newest write across the parent transcript and `<uuid>/subagents/*.jsonl`.
-///
-/// A fan-out makes the **parent** go quiet while subagents work, so a parent-only mtime
-/// misreads a healthy fan-out as a stall and sends the operator to kill a working Run.
-pub fn newest_write(transcript: &Path) -> Option<SystemTime> {
-    let mut newest = world::mtime(transcript);
-    let Some(stem) = transcript.file_stem() else {
-        return newest;
-    };
-    let subagents = transcript
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(stem)
-        .join("subagents");
-    for child in world::list_with_extension(&subagents, "jsonl") {
-        if let Some(at) = world::mtime(&child) {
-            newest = Some(match newest {
-                Some(current) if current > at => current,
-                _ => at,
-            });
-        }
-    }
-    newest
-}
-
-fn seconds_since(at: SystemTime, now_epoch: u64) -> u64 {
-    let then = at
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    now_epoch.saturating_sub(then)
-}
-
-/// Tolerant `serde_json::Value` lookups, line by line.
-///
-/// A derive against an undocumented format has to track it forever, and optional-with-default
-/// still loses **every sibling field on a line** when one field's type is unexpected. The same
-/// real file changes field names and field types between its own lines, so an unreadable line
-/// costs its own values and nothing else.
-pub fn now_skill(text: &str) -> Observed<String> {
-    let mut last: Option<String> = None;
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if let Some(skill) = value.get("attributionSkill").and_then(|s| s.as_str())
-            && !skill.is_empty()
-        {
-            last = Some(skill.to_string());
-        }
-    }
-    match last {
-        Some(skill) => Observed::Present(skill),
-        // The same *nothing recognised* rule the fan-out matcher carries. This field is not
-        // currently broken; the rule is what keeps it from breaking silently the way the
-        // fan-out one did.
-        None => nothing_recognised(text, "attributionSkill"),
-    }
-}
-
-/// The last assistant message, flattened to one line: the live answer to *what is it doing
-/// right now* while the Run is still going (#82). It reads only assistant lines — unlike
-/// `last_words`, which takes every message — because the operator asking *what is it doing*
-/// means what Claude said, not what was said to it. Both role spellings are recognised, the
-/// top-level `type` and `message.role`, because the real file carries the role inconsistently
-/// between its own lines and a matcher over one spelling is the next silent-stale one. Like
-/// everything in this view it describes what happened and is never a verdict input (ADR-0003).
-pub fn assistant_now(text: &str) -> Observed<String> {
-    let mut last: Option<String> = None;
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let is_assistant = value.get("type").and_then(|t| t.as_str()) == Some("assistant")
-            || value
-                .get("message")
-                .and_then(|m| m.get("role"))
-                .and_then(|r| r.as_str())
-                == Some("assistant");
-        if is_assistant && let Some(said) = first_text(&value) {
-            last = Some(one_line(&said));
-        }
-    }
-    match last {
-        Some(said) => Observed::Present(said),
-        None => nothing_recognised(text, "assistant message"),
-    }
-}
-
-/// The tool a fan-out spawn names. The CLI calls it `Agent`; `Task` is the former spelling, and
-/// matching only that one printed `none` on every Run that fanned out — **203 spawns to 0**
-/// across sixty transcripts. The fixture that should have caught it is authored, so it asserted
-/// the matcher against itself and caught nothing.
-pub const FANOUT_TOOLS: [&str; 2] = ["Agent", "Task"];
-
-/// Every tool-use block in a transcript, whatever it named.
-///
-/// This is what separates *nothing recognised* from *nothing there*. A transcript full of tool
-/// calls and no recognised spawn is a matcher that has gone stale, and reading it as `Absent`
-/// is indistinguishable from a Run that genuinely fanned out to nobody.
-pub fn tool_calls(text: &str) -> usize {
-    let mut calls = 0usize;
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let Some(serde_json::Value::Array(parts)) =
-            value.get("message").and_then(|m| m.get("content"))
-        else {
-            continue;
-        };
-        calls += parts
-            .iter()
-            .filter(|part| part.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
-            .count();
-    }
-    calls
-}
-
-/// *Could not observe*, with the tool-call count in the reason — or `Absent` where there was
-/// nothing in the transcript to recognise in the first place.
-fn nothing_recognised<T>(text: &str, what: &str) -> Observed<T> {
-    let calls = tool_calls(text);
-    if calls == 0 {
-        return Observed::Absent;
-    }
-    Observed::Unobservable(Reason::saying(&format!(
-        "{calls} tool call{} in the transcript and no recognised `{what}`",
-        if calls == 1 { "" } else { "s" }
-    )))
-}
-
-/// The last-words block, fixed at exactly `wanted` lines so `watch -n 30` never jitters.
-pub fn last_words(text: &str, wanted: usize) -> Vec<String> {
-    let mut said: Vec<String> = Vec::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if let Some(text) = first_text(&value) {
-            said.push(one_line(&text));
-        }
-    }
-    let start = said.len().saturating_sub(wanted);
-    let mut block: Vec<String> = said[start..].to_vec();
-    while block.len() < wanted {
-        block.push(String::new());
-    }
-    block
-}
-
-fn first_text(value: &serde_json::Value) -> Option<String> {
-    let content = value.get("message")?.get("content")?;
-    match content {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Array(parts) => parts
-            .iter()
-            .find_map(|p| p.get("text").and_then(|t| t.as_str()))
-            .map(str::to_string),
-        _ => None,
-    }
-}
-
 /// One line, capped: whitespace flattened and at most 100 characters, so a long value renders
 /// at a fixed width. `render` reuses this for fan-out descriptions — five long Agent
 /// descriptions wrapping differently on every `watch` refresh is the jitter the fixed view
@@ -648,151 +423,6 @@ pub(crate) fn one_line(text: &str) -> String {
     } else {
         flattened
     }
-}
-
-/// Fan-out as a count with descriptions — *blocked on five agents, newest wrote forty seconds
-/// ago* has to be an available answer.
-///
-/// Both spellings are recognised (`FANOUT_TOOLS`), and a transcript carrying tool-use blocks
-/// with **zero** recognised spawns reads *could not observe* rather than `Absent`. Widening the
-/// matcher alone would leave the next rename exactly as silent as this one was.
-///
-/// **A spawn paired to a `tool_result` anywhere in the same text is not running.** This is the
-/// same `tool_use` → `tool_result` pairing [`fanout_counts`] assumes, and the same transcript:
-/// the live view reads the whole append-only file, so listing every spawn listed finished work
-/// as currently-running forever — attempt 1's three agents all returned, and `grind status`
-/// kept saying *3 agents*. A spawn carrying no id cannot be paired, so it stays listed, the
-/// same assumed-not-returned direction `fanout_counts` reads. When every spawn has paired
-/// there is nothing running to observe, which is `Absent` — never `Present(vec![])`, an empty
-/// list whose only consumer rendered as a word and whose non-empty case is the whole point.
-///
-/// A bare top-level `description` field is **not** a spawn. That field belongs to subagent
-/// side-chain lines (`isSidechain: true` in `<session>/subagents/*.jsonl`), files this view
-/// reads only for freshness ([`newest_write`]) — the parent transcript this function reads
-/// never carries one, and matching it counted unrelated lines as spawns that could never pair
-/// away.
-pub fn fanout(text: &str) -> Observed<Vec<Fanout>> {
-    let mut spawned: Vec<(Option<String>, Fanout)> = Vec::new();
-    let mut returned: Vec<String> = Vec::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let Some(serde_json::Value::Array(parts)) =
-            value.get("message").and_then(|m| m.get("content"))
-        else {
-            continue;
-        };
-        for part in parts {
-            let named = part
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or_default();
-            if FANOUT_TOOLS.contains(&named) {
-                spawned.push((
-                    part.get("id").and_then(|i| i.as_str()).map(str::to_string),
-                    Fanout {
-                        description: part
-                            .get("input")
-                            .and_then(|i| i.get("description"))
-                            .and_then(|d| d.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                    },
-                ));
-            } else if part.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                && let Some(paired) = part.get("tool_use_id").and_then(|i| i.as_str())
-            {
-                returned.push(paired.to_string());
-            }
-        }
-    }
-    if spawned.is_empty() {
-        return nothing_recognised(text, "fan-out spawn");
-    }
-    let running: Vec<Fanout> = spawned
-        .iter()
-        .filter(|(id, _)| match id {
-            Some(id) => !returned.iter().any(|seen| seen == id),
-            None => true,
-        })
-        .map(|(_, fanout)| fanout.clone())
-        .collect();
-    if running.is_empty() {
-        return Observed::Absent;
-    }
-    Observed::Present(running)
-}
-
-/// The fan-out in **the lines appended since** `already_written`, which is what *per Attempt*
-/// means here (R51).
-///
-/// A Run's transcript is one append-only file for the Run's whole life: the session id is fixed
-/// at dispatch and every later Attempt resumes that session. So counting the whole file on
-/// Attempt N counts Attempts 1..N, and since `render` sums the per-Attempt pairs, a Run fanning
-/// out to 2 agents on each of 3 attempts reported 12 spawned. The suffix is the fix, and it is a
-/// suffix by line because the transcript is line-delimited JSON.
-pub fn fanout_since(text: &str, already_written: usize) -> Observed<(u64, u64)> {
-    fanout_counts(
-        &text
-            .lines()
-            .skip(already_written)
-            .collect::<Vec<&str>>()
-            .join("\n"),
-    )
-}
-
-/// **Spawned and returned, both read from the parent transcript** (KTD8). Spawns are the
-/// tool-use blocks naming the fan-out tool; returns are the `tool_result` blocks that pair to
-/// them by id. The subagent files on disk are the third source and are deliberately unused:
-/// they have zero observed disagreements with these counts, so they add reading and no
-/// information.
-///
-/// **No summary, boolean or health word sits over the two integers.** A count of processes must
-/// never become an assertion about a review, and whether a returned subagent errored is
-/// unproven across 203 observations and is not modelled.
-///
-/// The `tool_use` → `tool_result` pairing is **assumed**, not verified. Where a spawn carries no
-/// id it cannot be paired, so it counts as spawned and never as returned — which reads low
-/// rather than high, the safe direction for a number nobody should fold into a verdict.
-pub fn fanout_counts(text: &str) -> Observed<(u64, u64)> {
-    let mut spawned: Vec<String> = Vec::new();
-    let mut unidentified = 0u64;
-    let mut returned = 0u64;
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let Some(serde_json::Value::Array(parts)) =
-            value.get("message").and_then(|m| m.get("content"))
-        else {
-            continue;
-        };
-        for part in parts {
-            let named = part
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or_default();
-            if FANOUT_TOOLS.contains(&named) {
-                match part.get("id").and_then(|i| i.as_str()) {
-                    Some(id) => spawned.push(id.to_string()),
-                    None => unidentified += 1,
-                }
-                continue;
-            }
-            if part.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                && let Some(paired) = part.get("tool_use_id").and_then(|i| i.as_str())
-                && spawned.iter().any(|id| id == paired)
-            {
-                returned += 1;
-            }
-        }
-    }
-    let total = spawned.len() as u64 + unidentified;
-    if total == 0 {
-        return nothing_recognised(text, "fan-out spawn");
-    }
-    Observed::Present((total, returned))
 }
 
 /// Observe a Run's durable artifacts fresh. **Reads and never writes** — this path observes and
@@ -811,6 +441,13 @@ pub fn observe_fresh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The transcript matchers moved verbatim to `runner::claude`; every assertion below is
+    // unchanged and simply names them through the new path.
+    use crate::claude::{
+        Fanout, assistant_now, fanout, fanout_counts, fanout_since, last_words, live, now_skill,
+        transcript_path,
+    };
 
     const DAY_ONE: &str = include_str!("../tests/fixtures/record/day-one.json");
     const RENAMED_FIELD: &str = include_str!("../tests/fixtures/transcript/renamed-field.jsonl");
