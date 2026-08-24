@@ -8,6 +8,7 @@
 use crate::claude;
 use crate::decide;
 use crate::job::{self, Check, Depth, Refusal};
+use crate::native;
 use crate::net;
 use crate::observe::{self, Observed, Outcome};
 use crate::render::{self, DoctorLine, SingleRun};
@@ -16,7 +17,6 @@ use crate::supervisor;
 use crate::view::{self, Lookup};
 use crate::world;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 /// Whether the command could answer the question it was asked. **Not how the Run is doing.**
 enum Observability {
@@ -400,45 +400,23 @@ fn observe_for(found: &view::RunView) -> observe::Observation {
     )
 }
 
-/// The live view, branching on the Run's snapshotted backend (#135). `claude::live` reads a
-/// single transcript file a claude-code Run writes; a native Run writes no such file —
-/// `NativeAdapter::run` leaves `messages-N.jsonl` under the Run's own directory instead — so
-/// reading that path there degraded every field to `Unobservable` at once while `grind status`
-/// still exited *Answered* over a blank panel. This reads only `freshness` for a native Run,
-/// off the newest `messages-*.jsonl` write; every other field stays honestly `Unobservable`
-/// until `native::live` learns to parse transcript content, which is out of scope here (pending
-/// P3 dogfooding evidence). A claude-code Run is unaffected — this is `claude::live` unchanged.
-fn live_for(home: &Path, run_id: &str, found: &view::RunView) -> claude::Live {
+/// The live view, dispatched on the Run's snapshotted backend (#135). Each adapter reads its own
+/// transcripts and returns the one [`view::Live`] shape: `claude::live` a claude-code session's
+/// JSONL under `~/.claude/projects/`, `native::live` the `messages-N.jsonl` the native loop
+/// leaves under the Run's own directory. The floor this replaces read only `freshness` for a
+/// native Run and left every other field `Unobservable`; `grind status` exited *Answered* over a
+/// blank panel, which is no answer at all for the command `docs/agents/run-observation.md` names
+/// as the way to ask what a Run is doing. A claude-code Run is unaffected.
+fn live_for(home: &Path, run_id: &str, found: &view::RunView) -> view::Live {
     match found.backend {
         runner::Backend::ClaudeCode => claude::live(
             &claude::transcript_path(home, &found.worktree, &found.session_id),
             world::now_epoch(),
         ),
         runner::Backend::Native => {
-            let run_dir = job::runs_dir(home).join(run_id);
-            let mtimes: Vec<SystemTime> = world::list_with_extension(&run_dir, "jsonl")
-                .iter()
-                .filter_map(|path| world::mtime(path))
-                .collect();
-            claude::Live {
-                transcript: run_dir,
-                now_skill: native_unread(),
-                assistant_now: native_unread(),
-                last_words: vec![String::new(); 3],
-                fanout: native_unread(),
-                freshness: observe::native_freshness(&mtimes, world::now_epoch()),
-            }
+            native::live(&job::runs_dir(home).join(run_id), world::now_epoch())
         }
     }
-}
-
-/// Shared by every `claude::Live` field a native Run cannot yet answer content-wise. A named
-/// helper rather than four repeated literals, so the one thing worth saying about all of them —
-/// *pending, not overlooked* — cannot drift between fields.
-fn native_unread<T>() -> Observed<T> {
-    Observed::Unobservable(observe::Reason::saying(
-        "native backend: transcript content is not read yet (pending P3 dogfooding evidence, #135)",
-    ))
 }
 
 // --- serve -------------------------------------------------------------------------------------
@@ -784,20 +762,35 @@ mod tests {
             claude::transcript_path(home, &found.worktree, &found.session_id)
         );
         // Unaffected also means unaffected in *how* it fails: the same shape a broken
-        // claude-code transcript path always produced, not the native branch's four
-        // fixed-reason "pending P3" strings.
+        // claude-code transcript path always produced, never anything the native reader says.
         assert!(matches!(live.freshness, Observed::Unobservable(_)));
         assert!(matches!(live.now_skill, Observed::Unobservable(_)));
     }
 
     #[test]
-    fn a_native_run_with_a_messages_file_reports_freshness_rather_than_unobservable() {
+    fn a_native_run_reads_its_own_transcript_and_not_only_its_freshness() {
+        // The floor this replaces answered `freshness` and nothing else, so `grind status`
+        // exited *Answered* over a blank panel — for the one command
+        // `docs/agents/run-observation.md` names as the way to ask what a Run is doing. The
+        // fixture is hand-written `messages-N.jsonl`, exactly what `NativeAdapter` appends.
         let found = found_with_backend("native");
         let home = world::temp_dir("cli-live-for-native");
         let run_dir = job::runs_dir(&home).join(&found.run_id);
         world::create_dir_all(&run_dir).expect("a scratch run directory");
-        world::write(&run_dir.join("messages-1.jsonl"), "{\"event\":\"turn\"}\n")
-            .expect("a scratch messages file");
+        world::write(
+            &run_dir.join("messages-1.jsonl"),
+            concat!(
+                r#"{"event":"skill_declared","value":{"skill":"work"}}"#,
+                "\n",
+                r#"{"event":"protocol_selected","value":{"mode":"text","reason":"declared"}}"#,
+                "\n",
+                r#"{"event":"assistant_tool_calls","value":{"calls":[{"name":"bash","arguments":"{\"command\":\"just verify\"}"}]}}"#,
+                "\n",
+                r#"{"event":"tool_result","value":{"call_id":"text","output":"all green"}}"#,
+                "\n",
+            ),
+        )
+        .expect("a scratch messages file");
 
         let live = live_for(&home, &found.run_id, &found);
         assert!(
@@ -805,10 +798,56 @@ mod tests {
             "{:?}",
             live.freshness
         );
-        // Every other field stays honestly pending — this floor parses no transcript content.
-        assert!(matches!(live.now_skill, Observed::Unobservable(_)));
-        assert!(matches!(live.assistant_now, Observed::Unobservable(_)));
-        assert!(matches!(live.fanout, Observed::Unobservable(_)));
+        // The rung, from the row the loop writes before its first request.
+        assert_eq!(live.now_skill, Observed::Present("work".to_string()));
+        // *Doing* is the last thing the assistant authored — a tool call, which is what an
+        // attempt in flight consists of. The tool *result* is not it: that is the world talking.
+        assert_eq!(
+            live.assistant_now,
+            Observed::Present(r#"bash {"command":"just verify"}"#.to_string())
+        );
+        // Three lines always — `claude::last_words`' own fixed shape, padded at the end when
+        // the transcript is shorter than the block, and tool results included.
+        assert_eq!(
+            live.last_words,
+            vec![
+                r#"bash {"command":"just verify"}"#.to_string(),
+                "all green".to_string(),
+                String::new(),
+            ]
+        );
+        // Fan-out stays *could not observe*, and the reason says why rather than pointing at
+        // unfinished work: this loop has no tool to spawn a subagent with.
+        assert!(
+            matches!(live.fanout, Observed::Unobservable(_)),
+            "{:?}",
+            live.fanout
+        );
+        // The panel names the file that was read, not the directory it was found in.
+        assert_eq!(live.transcript, run_dir.join("messages-1.jsonl"));
+
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn a_native_transcript_of_nothing_recognisable_is_absent_and_never_a_crash() {
+        // A file whose lines are not `TranscriptEvent`s at all — the shape a format drift would
+        // leave. Every field degrades on its own and `freshness` still answers off the mtime,
+        // because the file exists whatever is in it.
+        let found = found_with_backend("native");
+        let home = world::temp_dir("cli-live-for-native-garbage");
+        let run_dir = job::runs_dir(&home).join(&found.run_id);
+        world::create_dir_all(&run_dir).expect("a scratch run directory");
+        world::write(
+            &run_dir.join("messages-1.jsonl"),
+            "{\"event\":\"turn\"}\nnot json\n",
+        )
+        .expect("a scratch messages file");
+
+        let live = live_for(&home, &found.run_id, &found);
+        assert!(matches!(live.freshness, Observed::Present(_)));
+        assert_eq!(live.now_skill, Observed::Absent);
+        assert_eq!(live.assistant_now, Observed::Absent);
         assert_eq!(live.last_words, vec![String::new(); 3]);
 
         world::remove_tree(&home);

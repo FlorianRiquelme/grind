@@ -8,11 +8,10 @@
 //! this module emits against that rule; there is a test at the bottom that does.
 
 use crate::attempt::Clearance;
-use crate::claude::Live;
 use crate::decide::{Decision, Stage, Verdict, VerifyContract};
 use crate::observe::{Observation, Observed, Outcome, RunOutcome, UNOBSERVABLE_MARK};
 use crate::rung::{ReturnStatus, StageEntry};
-use crate::view::{Facts, RosterRow, RunView, one_line};
+use crate::view::{Facts, Live, RosterRow, RunView, one_line};
 use std::path::Path;
 
 /// One item of doctor's report, as `cli` hands it over: the name and the depth mark alongside
@@ -963,9 +962,9 @@ fn item_outcome(outcome: &Observed<Outcome>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::Fanout;
     use crate::decide::VerifyCoverage;
     use crate::observe::{Pr, Reason};
+    use crate::view::Fanout;
     use std::path::PathBuf;
 
     const DAY_ONE: &str = include_str!("../tests/fixtures/record/day-one.json");

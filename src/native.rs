@@ -12,12 +12,13 @@ use crate::runner::{
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::attempt::{Attempt, Mode, is_rate_limited};
 use crate::net::{ChatClient, ChatTurn, NetError, ToolCallSpec};
-use crate::observe::{Observed, Reason};
+use crate::observe::{self, Observed, Reason};
 use crate::tools::{self, GateDecision, GateLayer, RawCall, ToolDef, ToolRegistry};
+use crate::view::{Live, one_line};
 use crate::world;
 
 /// Hard ceiling on conversation turns per attempt; exhaustion is loud, never a stop.
@@ -204,6 +205,37 @@ fn extract_done(text: &str) -> Option<String> {
     let start = text.find("<done>")? + "<done>".len();
     let end = text[start..].find("</done>")? + start;
     Some(text[start..end].trim().to_string())
+}
+
+/// The skill the stage prompt declares about itself, read off its own YAML frontmatter.
+///
+/// A stage prompt is the skill file verbatim followed by a context block
+/// (`claude::stage_dispatch_prompt`), and every `skills/run/<stage>/SKILL.md` opens with a
+/// `name:` row — so the prompt names its own rung, and nothing extra has to be threaded
+/// through the seam to learn it. Only the leading `---` block is read: the composed prompt
+/// uses `---` again as a separator, and scanning past the first block would start reading the
+/// context block's prose as frontmatter.
+///
+/// `None` where there is no leading block, no `name:` row, or an empty value — the caller logs
+/// nothing then, and the reader reports *could not observe* rather than a blank skill.
+fn declared_skill(prompt: &str) -> Option<String> {
+    let mut lines = prompt.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            return None;
+        }
+        if let Some(name) = line.strip_prefix("name:") {
+            let name = name.trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -650,6 +682,12 @@ impl StageRunner for crate::runner::NativeAdapter {
         // recorded, so a `resume` recomputing this same `n` must not append after
         // the dead attempt's partial content in the same file.
         transcript.truncate();
+        // Which rung is running, recorded before anything else this attempt does: the loop
+        // below emits only wire events, so without this line nothing in the transcript could
+        // answer `grind status`'s `now` question for a native Run at all.
+        if let Some(skill) = declared_skill(spec.invocation.prompt()) {
+            transcript.log(&TranscriptEvent::SkillDeclared { skill });
+        }
         let system_for = |mode: ProtoMode| json!({"role": "system", "content": system_prompt(&spec.cwd.display().to_string(), &defs, mode)});
 
         // Per-run latch (R5/ADR-0018): a host declaration (`proto=`) wins outright and
@@ -696,7 +734,7 @@ impl StageRunner for crate::runner::NativeAdapter {
             let mode = outcome.mode;
 
             // First protocol determination of this run: logged once, before any
-            // of this attempt's other events.
+            // of this attempt's other wire events.
             if proto.is_none() {
                 let (selected, reason) = match outcome.latch {
                     Some((m, r)) => (m, r),
@@ -826,10 +864,368 @@ fn truncate_denial(layer: GateLayer, reason: &str) -> String {
     ))
 }
 
+// --- the live view, read from grind's own format ----------------------------------------------
+//
+// The mirror of `claude::live`, over a format grind writes itself (R4) — and owning the format
+// inverts `claude`'s reading discipline rather than copying it. There, tolerant `Value` lookups
+// are the answer because the schema is undocumented and changes field names between its own
+// lines. Here the schema *is* [`TranscriptEvent`], written by this same binary, so a line either
+// deserializes as one of its variants or is not grind's at all; a typed read is the honest one,
+// and a line that fails it costs itself and nothing else — the same per-line degradation rule.
+//
+// One field stays *could not observe* on purpose. `fanout` has nothing to report because the
+// native loop has no fan-out tool to spawn a subagent with (the plan defers subagents to a later
+// unit), and saying so is the answer rather than a gap — `Absent` in this view means *spawned,
+// and every one returned*, which is a different and false claim.
+
+/// Reason the fan-out field carries on every native Run. A named constant because it is a
+/// standing fact about the loop, not a placeholder for a reader nobody wrote.
+const NO_FANOUT: &str = "the native loop spawns no subagents";
+
+/// The events one transcript file holds, in order, skipping what does not parse.
+fn events(text: &str) -> Vec<TranscriptEvent> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<TranscriptEvent>(line).ok())
+        .collect()
+}
+
+/// What an event said, as one capped line — or `None` for the events carrying no prose: usage
+/// rows and the two selection records are facts about the harness, not anything the Run narrated.
+fn said(event: &TranscriptEvent) -> Option<String> {
+    match event {
+        TranscriptEvent::Final { text } => Some(one_line(text)),
+        TranscriptEvent::ProtocolNudge { assistant_text } => Some(one_line(assistant_text)),
+        // A working attempt's assistant turns *are* tool calls, so this is most of what there is
+        // to read while a Run is still going. Name and arguments, through the same one-line cap
+        // as everything else on a fixed-shape view.
+        TranscriptEvent::AssistantToolCalls { calls } => Some(one_line(
+            &calls
+                .iter()
+                .map(|call| format!("{} {}", call.name, call.arguments))
+                .collect::<Vec<String>>()
+                .join("; "),
+        )),
+        TranscriptEvent::ToolResult { output, .. } => Some(one_line(output)),
+        TranscriptEvent::Usage(_)
+        | TranscriptEvent::ProtocolSelected { .. }
+        | TranscriptEvent::SkillDeclared { .. } => None,
+    }
+}
+
+/// Whether the assistant itself authored this event — which is what *doing* answers.
+fn is_assistant(event: &TranscriptEvent) -> bool {
+    matches!(
+        event,
+        TranscriptEvent::Final { .. }
+            | TranscriptEvent::ProtocolNudge { .. }
+            | TranscriptEvent::AssistantToolCalls { .. }
+    )
+}
+
+/// *Could not observe*, with the event count in the reason — or `Absent` where the transcript
+/// held nothing to recognise in the first place. `claude::nothing_recognised`'s rule, for the
+/// same reason: a transcript full of events with no recognised row is a reader that has gone
+/// stale, and reading that as `Absent` is indistinguishable from a Run with nothing to show.
+fn nothing_recognised<T>(found: &[TranscriptEvent], what: &str) -> Observed<T> {
+    if found.is_empty() {
+        return Observed::Absent;
+    }
+    Observed::Unobservable(Reason::saying(&format!(
+        "{} event{} in the transcript and no `{what}`",
+        found.len(),
+        if found.len() == 1 { "" } else { "s" }
+    )))
+}
+
+/// The last thing the assistant itself said, one line: *what is it doing right now* (#82).
+///
+/// **Tool calls count as something said.** A native attempt's assistant turns are tool calls
+/// until the very last one, so reading only [`TranscriptEvent::Final`] would leave this blank
+/// for the entire window a human is watching — the exact window the field exists for. Like
+/// everything in this view it describes what happened and is never a verdict input (ADR-0003).
+pub fn assistant_now(text: &str) -> Observed<String> {
+    let found = events(text);
+    match found.iter().rev().find(|e| is_assistant(e)).and_then(said) {
+        Some(line) => Observed::Present(line),
+        None => nothing_recognised(&found, "assistant event"),
+    }
+}
+
+/// Which rung's skill this attempt is running, from the [`TranscriptEvent::SkillDeclared`] row
+/// the loop writes before its first request. The last one wins, the same rule
+/// `claude::now_skill` gives `attributionSkill`.
+pub fn now_skill(text: &str) -> Observed<String> {
+    let found = events(text);
+    let last = found.iter().rev().find_map(|event| match event {
+        TranscriptEvent::SkillDeclared { skill } => Some(skill.clone()),
+        _ => None,
+    });
+    match last {
+        Some(skill) => Observed::Present(skill),
+        None => nothing_recognised(&found, "skill_declared"),
+    }
+}
+
+/// The last-words block, fixed at exactly `wanted` lines so `watch -n 30` never jitters —
+/// `claude::last_words`' own rule, over this format's events. Tool results are in it for the
+/// same reason the claude-code reader takes every message and not only the assistant's: what
+/// came back is half of what a human reads to see whether a Run is getting anywhere.
+pub fn last_words(text: &str, wanted: usize) -> Vec<String> {
+    let said: Vec<String> = events(text).iter().filter_map(said).collect();
+    let start = said.len().saturating_sub(wanted);
+    let mut block: Vec<String> = said[start..].to_vec();
+    while block.len() < wanted {
+        block.push(String::new());
+    }
+    block
+}
+
+/// Shared by every field a transcript that could not be read cannot answer.
+fn unread<T>() -> Observed<T> {
+    Observed::Unobservable(Reason::saying("the transcript could not be read"))
+}
+
+/// A native Run's [`Live`], read off the transcripts under the Run's own directory.
+///
+/// **The newest-written transcript is the one read.** Each attempt writes its own file and
+/// Reflect writes one more, so *what is it doing now* is whichever was touched last — not the
+/// highest attempt number (Reflect runs after the ladder), and not all of them concatenated,
+/// which would report attempt 1's last words for the rest of the Run's life. Freshness still
+/// spans every file, through the same [`observe::native_freshness`] the floor this replaces used.
+///
+/// `world` supplies the bytes and the times; every field is decided by the pure readers above,
+/// so each of them is testable from literals with no filesystem.
+pub fn live(run_dir: &Path, now_epoch: u64) -> Live {
+    let stamped: Vec<(PathBuf, Option<SystemTime>)> = world::list_with_extension(run_dir, "jsonl")
+        .into_iter()
+        .map(|path| {
+            let at = world::mtime(&path);
+            (path, at)
+        })
+        .collect();
+    // `None` sorts below `Some`, so a file whose mtime could not be read is still the one read
+    // when it is the only file there, and never wins over one that does carry a time. The path
+    // breaks a tie, so two files stamped the same second pick the same one every refresh.
+    let newest = stamped
+        .iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let mtimes: Vec<SystemTime> = stamped.iter().filter_map(|(_, at)| *at).collect();
+    let text = newest.and_then(|(path, _)| world::read_to_string(path).ok());
+    Live {
+        transcript: match newest {
+            Some((path, _)) => path.clone(),
+            // Nothing written yet — name where it looked, so the panel still points somewhere.
+            None => run_dir.to_path_buf(),
+        },
+        now_skill: match &text {
+            Some(body) => now_skill(body),
+            None => unread(),
+        },
+        assistant_now: match &text {
+            Some(body) => assistant_now(body),
+            None => unread(),
+        },
+        last_words: match &text {
+            Some(body) => last_words(body, 3),
+            // Still exactly three lines: an unreadable transcript must not change the shape of
+            // the view (`claude::live`'s own rule).
+            None => vec![String::new(); 3],
+        },
+        fanout: Observed::Unobservable(Reason::saying(NO_FANOUT)),
+        freshness: observe::native_freshness(&mtimes, now_epoch),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // --- the live view, from literals ------------------------------------------------------
+
+    /// One attempt's transcript as `NativeAdapter` appends it: the skill row, the wire latch,
+    /// then the tool-call / tool-result alternation a working attempt consists of.
+    const TRANSCRIPT: &str = concat!(
+        r#"{"event":"skill_declared","value":{"skill":"work"}}"#,
+        "\n",
+        r#"{"event":"protocol_selected","value":{"mode":"text","reason":"declared"}}"#,
+        "\n",
+        r#"{"event":"assistant_tool_calls","value":{"calls":[{"name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}]}}"#,
+        "\n",
+        r#"{"event":"tool_result","value":{"call_id":"text","output":"pub mod job;"}}"#,
+        "\n",
+        r#"{"event":"usage","value":{"total_tokens":812}}"#,
+        "\n",
+        r#"{"event":"assistant_tool_calls","value":{"calls":[{"name":"bash","arguments":"{\"command\":\"just verify\"}"}]}}"#,
+        "\n",
+        r#"{"event":"tool_result","value":{"call_id":"text","output":"all green"}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn the_declared_skill_comes_off_the_prompt_s_own_frontmatter() {
+        // The real shape: a `skills/run/<stage>/SKILL.md` verbatim, then the context block the
+        // stage composition appends after a `---` separator.
+        let prompt = "---\nname: work\ndescription: The fourth rung.\n---\n\n# Work\n\nDo it.\n\n\
+                      ---\n\nname: not-the-skill\n";
+        assert_eq!(declared_skill(prompt), Some("work".to_string()));
+    }
+
+    #[test]
+    fn a_prompt_declaring_no_name_declares_nothing_rather_than_a_blank() {
+        // Four ways to have no name, none of which may produce `Some("")` — an empty skill
+        // would render as an answered `now` line saying nothing at all.
+        assert_eq!(declared_skill(""), None);
+        assert_eq!(declared_skill("# Work\n\nno frontmatter here\n"), None);
+        assert_eq!(declared_skill("---\ndescription: no name row\n---\n"), None);
+        assert_eq!(declared_skill("---\nname:   \n---\n"), None);
+    }
+
+    #[test]
+    fn a_name_row_after_the_frontmatter_closes_is_not_the_skill() {
+        // The composed prompt uses `---` as its own separator, so a reader that scanned the
+        // whole text would start reading the context block's prose as frontmatter.
+        assert_eq!(
+            declared_skill("---\ndescription: only this\n---\n\nname: prose\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn now_skill_reads_the_declared_row_and_the_last_one_wins() {
+        assert_eq!(now_skill(TRANSCRIPT), Observed::Present("work".to_string()));
+        let two = format!(
+            "{TRANSCRIPT}{}\n",
+            r#"{"event":"skill_declared","value":{"skill":"ship"}}"#
+        );
+        assert_eq!(now_skill(&two), Observed::Present("ship".to_string()));
+    }
+
+    #[test]
+    fn doing_is_the_last_thing_the_assistant_authored_and_a_tool_call_counts() {
+        // A native attempt's assistant turns *are* tool calls until the very last one, so
+        // reading only `Final` would leave this blank for the whole window a human watches.
+        // The newer tool *result* does not win it: that is the world talking, not the model.
+        assert_eq!(
+            assistant_now(TRANSCRIPT),
+            Observed::Present(r#"bash {"command":"just verify"}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn a_final_answer_wins_doing_once_it_lands() {
+        let done = format!(
+            "{TRANSCRIPT}{}\n",
+            r#"{"event":"final","value":{"text":"twelve commits, PR open"}}"#
+        );
+        assert_eq!(
+            assistant_now(&done),
+            Observed::Present("twelve commits, PR open".to_string())
+        );
+    }
+
+    #[test]
+    fn a_protocol_nudge_is_something_the_assistant_said() {
+        // Drift prose is what the Run is doing at that moment, and it is exactly what an
+        // operator needs to see — a text-latched model that has stopped emitting tags.
+        let nudged = concat!(
+            r#"{"event":"skill_declared","value":{"skill":"plan"}}"#,
+            "\n",
+            r#"{"event":"protocol_nudge","value":{"assistant_text":"Let me think about this."}}"#,
+            "\n",
+        );
+        assert_eq!(
+            assistant_now(nudged),
+            Observed::Present("Let me think about this.".to_string())
+        );
+    }
+
+    #[test]
+    fn last_words_is_exactly_three_lines_whatever_the_transcript_said() {
+        // The block's height is fixed so `watch -n 30` never jitters — the same rule
+        // `claude::last_words` carries, over this format's events.
+        assert_eq!(
+            last_words(TRANSCRIPT, 3),
+            vec![
+                "pub mod job;".to_string(),
+                r#"bash {"command":"just verify"}"#.to_string(),
+                "all green".to_string(),
+            ]
+        );
+        assert_eq!(last_words("", 3), vec![String::new(); 3]);
+        assert_eq!(last_words(TRANSCRIPT, 1), vec!["all green".to_string()]);
+    }
+
+    #[test]
+    fn usage_and_the_two_selection_rows_are_not_words() {
+        // They are facts about the harness, not anything the Run narrated — a `last words`
+        // block reading `{"total_tokens":812}` tells an operator nothing about the work.
+        let only_harness = concat!(
+            r#"{"event":"usage","value":{"total_tokens":812}}"#,
+            "\n",
+            r#"{"event":"protocol_selected","value":{"mode":"native","reason":"probe"}}"#,
+            "\n",
+            r#"{"event":"skill_declared","value":{"skill":"work"}}"#,
+            "\n",
+        );
+        assert_eq!(last_words(only_harness, 3), vec![String::new(); 3]);
+        // …and the three of them present is *could not observe* for `doing`, never `Absent`:
+        // events were recognised, just none the assistant authored.
+        let found = assistant_now(only_harness);
+        assert!(matches!(found, Observed::Unobservable(_)), "{found:?}");
+    }
+
+    #[test]
+    fn a_transcript_of_nothing_recognisable_is_absent_and_a_bad_line_costs_only_itself() {
+        // Nothing recognised at all is `Absent`; one unparseable line among good ones costs
+        // its own values and no sibling's — the per-line degradation `claude` established.
+        assert_eq!(assistant_now(""), Observed::Absent);
+        assert_eq!(
+            now_skill("not json\n{\"event\":\"turn\"}\n"),
+            Observed::Absent
+        );
+        let holed = format!("not json at all\n{TRANSCRIPT}");
+        assert_eq!(now_skill(&holed), Observed::Present("work".to_string()));
+    }
+
+    #[test]
+    fn live_reads_the_newest_written_transcript_and_names_the_file() {
+        // Each attempt writes its own file and Reflect writes one more, so *what is it doing
+        // now* is whichever was touched last — never all of them concatenated, which would
+        // report attempt 1's last words for the rest of the Run's life.
+        let dir = world::temp_dir("native-live");
+        world::write(
+            &dir.join("messages-1.jsonl"),
+            r#"{"event":"skill_declared","value":{"skill":"plan"}}"#,
+        )
+        .expect("attempt 1's transcript");
+        world::write(&dir.join("messages-2.jsonl"), TRANSCRIPT).expect("attempt 2's transcript");
+
+        let live = live(&dir, world::now_epoch());
+        assert_eq!(live.transcript, dir.join("messages-2.jsonl"));
+        assert_eq!(live.now_skill, Observed::Present("work".to_string()));
+        assert!(matches!(live.freshness, Observed::Present(_)));
+        // Fan-out is a standing fact about the loop, not an unfinished reader.
+        match live.fanout {
+            Observed::Unobservable(reason) => assert_eq!(reason.to_string(), NO_FANOUT),
+            other => panic!("fan-out must stay could-not-observe: {other:?}"),
+        }
+
+        world::remove_tree(&dir);
+    }
+
+    #[test]
+    fn live_over_a_run_directory_with_no_transcript_yet_names_the_directory() {
+        // A Run whose first attempt has not written yet must still point the panel somewhere,
+        // and freshness must read *could not observe* rather than *just wrote*.
+        let dir = world::temp_dir("native-live-empty");
+        let live = live(&dir, world::now_epoch());
+        assert_eq!(live.transcript, dir);
+        assert!(matches!(live.freshness, Observed::Unobservable(_)));
+        assert_eq!(live.last_words, vec![String::new(); 3]);
+        world::remove_tree(&dir);
+    }
 
     // --- text-protocol parsing ------------------------------------------------
 

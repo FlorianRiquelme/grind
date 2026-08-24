@@ -6,9 +6,8 @@
 //! (`data-g-root`, `data-gid`, `data-epoch`, …) bind to `script.rs`.
 
 use crate::attempt::Attempt;
-use crate::claude::Live;
 use crate::observe::Observed;
-use crate::view::{Facts, ProposalEntry, RosterRow, RunView};
+use crate::view::{Facts, Live, ProposalEntry, RosterRow, RunView};
 
 // ───────────────────────────── escaping ─────────────────────────────
 
