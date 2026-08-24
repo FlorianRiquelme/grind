@@ -227,6 +227,7 @@ fn drive_attempt(server: &Server, run_dir: &Path, cwd: &Path, attempt_n: usize) 
     let invocation = claude::stage_invocation(&conditions, &ctx, Mode::Dispatch, None);
 
     let denied_globs = attempt::denied_for(rung::Stage::Work);
+    let model = runner::StageModel::Class(runner::ModelClass::Strong);
     let spec = runner::RunSpec {
         invocation: &invocation,
         cwd,
@@ -234,12 +235,16 @@ fn drive_attempt(server: &Server, run_dir: &Path, cwd: &Path, attempt_n: usize) 
         attempt_n,
         session_id: "",
         worktree: &worktree,
-        model: None,
+        model: &model,
         denied_globs: &denied_globs,
+        file_label: runner::FileLabel::Attempt,
     };
 
     NativeAdapter {
         endpoint_override: Some(format!("http://127.0.0.1:{}", server.port)),
+        fast_model: None,
+        strong_model: None,
+        proto_override: None,
     }
     .run(&spec)
 }

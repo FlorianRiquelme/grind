@@ -37,12 +37,13 @@ impl StageRunner for crate::runner::ClaudeCodeAdapter {
         // running, so the file is quiescent and the last line is whole. A fresh session has
         // nothing to skip; that is zero lines.
         let already_written = transcript_lines(&self.home, spec.worktree, spec.session_id);
+        let prefix = spec.file_label.as_str();
         let outcome = run(
             spec.invocation,
             spec.cwd,
-            &spec.run_dir.join(format!("attempt-{n}.prompt.txt")),
-            &spec.run_dir.join(format!("attempt-{n}.stdout.json")),
-            &spec.run_dir.join(format!("attempt-{n}.stderr.log")),
+            &spec.run_dir.join(format!("{prefix}-{n}.prompt.txt")),
+            &spec.run_dir.join(format!("{prefix}-{n}.stdout.json")),
+            &spec.run_dir.join(format!("{prefix}-{n}.stderr.log")),
         );
         let ended_at = world::now_iso();
         let attempt = match outcome {
@@ -988,6 +989,7 @@ mod tests {
             home: PathBuf::from("/nonexistent-home-for-claude-adapter-test"),
         };
         let run_dir = PathBuf::from("/nonexistent-dir-for-claude-adapter-test/run-1");
+        let model = crate::runner::StageModel::Class(crate::runner::ModelClass::Strong);
         let spec = RunSpec {
             invocation: &invocation,
             cwd: Path::new("."),
@@ -995,8 +997,9 @@ mod tests {
             attempt_n: 1,
             session_id: "session-1",
             worktree: "/nonexistent-worktree-for-claude-adapter-test",
-            model: None,
+            model: &model,
             denied_globs: &[],
+            file_label: crate::runner::FileLabel::Attempt,
         };
 
         // Must not panic: the seam is infallible by design, and a panic here would abort the

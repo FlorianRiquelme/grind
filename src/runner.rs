@@ -111,16 +111,38 @@ pub enum ProtoMode {
     Text,
 }
 
-/// One `~/.grind/agent` line: `<backend>[ <base-url>]`. The base-url token is the
-/// hermetic-test / self-hosting seam; credentials never appear here (env only).
+/// One `~/.grind/agent` line: `<backend> [<base-url>] [key=value ...]` (ADR-0017, extended).
+/// The base-url token — bare, no `=` — is the hermetic-test / self-hosting seam kept for
+/// backward compatibility with the grammar ADR-0017 first shipped; `base-url=`, `model=`,
+/// `fast=`, `strong=` and `proto=` are the key/value extensions. Credentials never appear
+/// here (env only).
 #[derive(Clone, Debug, Default)]
 pub struct Selection {
     pub backend: Backend,
     pub endpoint_override: Option<String>,
+    /// The model id `StageModel::Class(ModelClass::Fast)` resolves to on the native
+    /// backend (`fast=`, or `model=` when `fast=` is absent). `None` falls back to
+    /// [`DEFAULT_MODEL`].
+    pub fast_model: Option<String>,
+    /// The model id `StageModel::Class(ModelClass::Strong)` resolves to on the native
+    /// backend (`strong=`, or `model=` when `strong=` is absent). `None` falls back to
+    /// [`DEFAULT_MODEL`].
+    pub strong_model: Option<String>,
+    /// A declared wire mode, when `proto=` is present. Declaring it skips the probe
+    /// entirely and latches from the declaration (ADR-0018): `stealth/ox-alpha` proved
+    /// unable to execute native tool calls at all, so an undeclared run wastes one failed
+    /// request discovering that every time.
+    pub proto_override: Option<ProtoMode>,
 }
 
 impl Selection {
     /// Parse the file's single line. An empty (or whitespace) line is the default.
+    ///
+    /// Grammar: `<backend> [<base-url>] [key=value ...]`. A token containing `=` is a
+    /// key/value; the first bare (no `=`) token after the backend is the base-url
+    /// positional, kept for backward compatibility. An unknown key, a duplicate key, a
+    /// `key=` with an empty value, or `proto=` with anything but `native`/`text` fails
+    /// loud — the same register `Backend::parse` already rejects an unknown backend on.
     pub fn parse_line(line: &str) -> Result<Self, String> {
         let line = line.trim();
         if line.is_empty() {
@@ -128,23 +150,164 @@ impl Selection {
         }
         let mut tokens = line.split_whitespace();
         let backend = Backend::parse(tokens.next().expect("non-empty line"))?;
-        let extra = tokens.next();
-        match (backend, extra, tokens.next()) {
-            (_, None, _) => Ok(Self {
-                backend,
-                endpoint_override: None,
-            }),
-            (Backend::Native, Some(url), None) => Ok(Self {
-                backend,
-                endpoint_override: Some(url.to_string()),
-            }),
-            (Backend::ClaudeCode, Some(extra), _) => Err(format!(
-                "claude-code takes no arguments, found {extra:?} \
-                 (expected a bare \"claude-code\" line)"
-            )),
-            (Backend::Native, Some(_), Some(_)) => {
-                Err("too many tokens on the agent line (expected `<backend>[ <base-url>]`)".into())
+        let mut tokens: Vec<&str> = tokens.collect();
+
+        if backend == Backend::ClaudeCode {
+            return if tokens.is_empty() {
+                Ok(Self {
+                    backend,
+                    ..Self::default()
+                })
+            } else {
+                Err(format!(
+                    "claude-code takes no arguments, found {:?} \
+                     (expected a bare \"claude-code\" line)",
+                    tokens.join(" ")
+                ))
+            };
+        }
+
+        // The base-url positional: a bare (no `=`) token immediately after the backend.
+        let mut endpoint_override = None;
+        if let Some(first) = tokens.first()
+            && !first.contains('=')
+        {
+            endpoint_override = Some(first.to_string());
+            tokens.remove(0);
+        }
+
+        let mut model: Option<String> = None;
+        let mut fast: Option<String> = None;
+        let mut strong: Option<String> = None;
+        let mut proto: Option<ProtoMode> = None;
+
+        for token in tokens {
+            let Some((key, value)) = token.split_once('=') else {
+                return Err(format!(
+                    "expected `key=value` on the agent line, found {token:?}"
+                ));
+            };
+            if value.is_empty() {
+                return Err(format!("`{key}=` has an empty value on the agent line"));
             }
+            match key {
+                "base-url" if endpoint_override.is_some() => {
+                    return Err("duplicate `base-url` on the agent line".to_string());
+                }
+                "base-url" => endpoint_override = Some(value.to_string()),
+                "model" if model.is_some() => {
+                    return Err("duplicate `model` on the agent line".to_string());
+                }
+                "model" => model = Some(value.to_string()),
+                "fast" if fast.is_some() => {
+                    return Err("duplicate `fast` on the agent line".to_string());
+                }
+                "fast" => fast = Some(value.to_string()),
+                "strong" if strong.is_some() => {
+                    return Err("duplicate `strong` on the agent line".to_string());
+                }
+                "strong" => strong = Some(value.to_string()),
+                "proto" if proto.is_some() => {
+                    return Err("duplicate `proto` on the agent line".to_string());
+                }
+                "proto" => {
+                    proto = Some(match value {
+                        "native" => ProtoMode::Native,
+                        "text" => ProtoMode::Text,
+                        other => {
+                            return Err(format!(
+                                "unknown proto {other:?} on the agent line \
+                                 (expected \"native\" or \"text\")"
+                            ));
+                        }
+                    })
+                }
+                other => return Err(format!("unknown key {other:?} on the agent line")),
+            }
+        }
+
+        // `model=` sets both classes at once; an explicit `fast=`/`strong=` overrides it
+        // individually.
+        let fast_model = fast.or_else(|| model.clone());
+        let strong_model = strong.or(model);
+
+        Ok(Self {
+            backend,
+            endpoint_override,
+            fast_model,
+            strong_model,
+            proto_override: proto,
+        })
+    }
+}
+
+/// Grind's own routing intent for one stage, not a concrete model id: a model id is a
+/// provider fact (`vendor/model` on the native backend's OpenAI-compatible wire, a plain
+/// alias on claude-code); the class is grind's, and each adapter resolves it to its own
+/// concrete id (ADR-0017, extended). **Not named `Tier`** — [`crate::decide::Tier`] already
+/// names the T0/T1/T2 plan tiers, a different axis entirely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelClass {
+    Fast,
+    Strong,
+}
+
+/// Which model backs one stage's Attempt, resolved by [`crate::supervisor`]'s
+/// `resolve_stage_model` and consumed by both adapters. A Job's `model:` pin is a concrete
+/// id and crosses the seam verbatim (`Pinned`); grind's own `fast`/`strong` routing is a
+/// class (`Class`), each adapter resolving it to its own concrete id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StageModel {
+    /// A Job's `model:` pin — passed through verbatim by both adapters.
+    Pinned(String),
+    /// Grind's own routing intent — each adapter resolves this to its own concrete id.
+    Class(ModelClass),
+}
+
+impl StageModel {
+    /// The claude-code alias `Class(Fast)` resolves to — a concrete Anthropic model id,
+    /// the harness's own vocabulary, never the native wire's `vendor/model` namespace.
+    pub const CLAUDE_FAST_ALIAS: &'static str = "claude-sonnet-5";
+
+    /// The claude-code `--model` argument this stage-model resolves to, or `None` for no
+    /// flag at all — `Class(Strong)`'s shape, the harness default before this plan existed
+    /// and the one R2 requires stay byte-for-byte unchanged.
+    pub fn claude_code_arg(&self) -> Option<String> {
+        match self {
+            Self::Pinned(id) => Some(id.clone()),
+            Self::Class(ModelClass::Fast) => Some(Self::CLAUDE_FAST_ALIAS.to_string()),
+            Self::Class(ModelClass::Strong) => None,
+        }
+    }
+
+    /// The concrete model id this resolves to on the native backend: a pin verbatim, or
+    /// the host-declared class model (`fast_model`/`strong_model` off the selection),
+    /// falling back to [`DEFAULT_MODEL`] when the host declared neither.
+    pub fn native_id(&self, fast_model: Option<&str>, strong_model: Option<&str>) -> String {
+        match self {
+            Self::Pinned(id) => id.clone(),
+            Self::Class(ModelClass::Fast) => fast_model.unwrap_or(DEFAULT_MODEL).to_string(),
+            Self::Class(ModelClass::Strong) => strong_model.unwrap_or(DEFAULT_MODEL).to_string(),
+        }
+    }
+}
+
+/// Which artifact family one [`RunSpec`]'s file names belong to. `Attempt` is `attempt-N.*`
+/// (claude-code) / `messages-N.jsonl` (native) — both adapters' default. `Reflect` is
+/// `reflect-N.*` / `reflect-messages-N.jsonl`: Reflect is never an Attempt (it lands no
+/// `Attempt` row and is budget-exempt), so its files must never collide with attempt N's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileLabel {
+    Attempt,
+    Reflect,
+}
+
+impl FileLabel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Attempt => "attempt",
+            Self::Reflect => "reflect",
         }
     }
 }
@@ -240,12 +403,21 @@ pub struct RunSpec<'a> {
     /// Stable per-(run, stage) session identity (attempt::stage_session_id).
     pub session_id: &'a str,
     /// The declared worktree path as recorded (transcript slugging needs the string).
+    /// For Reflect this is the run directory's own string — Reflect's `cwd` is the run
+    /// directory, never the worktree, and the claude-code adapter's transcript discovery
+    /// slugs off whatever directory the child actually ran in.
     pub worktree: &'a str,
-    /// Job-level model override, if any.
-    pub model: Option<&'a str>,
+    /// This stage's routed model — a Job's pin or grind's own fast/strong class
+    /// (`resolve_stage_model`). Never optional: every stage resolves to one or the other,
+    /// and each adapter maps it to its own concrete id (`StageModel::claude_code_arg`,
+    /// `StageModel::native_id`).
+    pub model: &'a StageModel,
     /// This stage's denied-tool globs (attempt::denied_for / denied_for_reflect) —
     /// the single permission source both adapters enforce.
     pub denied_globs: &'a [String],
+    /// Which artifact family this call's file names belong to (`attempt-N.*` /
+    /// `messages-N.jsonl` vs. `reflect-N.*` / `reflect-messages-N.jsonl`).
+    pub file_label: FileLabel,
 }
 
 /// The one seam. Infallible by design: failures are loud failed Attempts (`is_error`,
@@ -270,6 +442,24 @@ pub struct ClaudeCodeAdapter {
 pub struct NativeAdapter {
     /// Optional base-url override from the selection line; default endpoint otherwise.
     pub endpoint_override: Option<String>,
+    /// Host-declared model id for `StageModel::Class(ModelClass::Fast)` (`Selection::fast_model`).
+    pub fast_model: Option<String>,
+    /// Host-declared model id for `StageModel::Class(ModelClass::Strong)` (`Selection::strong_model`).
+    pub strong_model: Option<String>,
+    /// A declared wire mode (`Selection::proto_override`) — when present, skips the probe
+    /// entirely and latches from the declaration (ADR-0018).
+    pub proto_override: Option<ProtoMode>,
+}
+
+/// Everything [`runner_for`] needs from the layout-declared selection (ADR-0017) beyond
+/// `backend` and `claude_bin`, bundled so the factory's signature does not grow a new
+/// parameter every time the `~/.grind/agent` grammar gains a key.
+#[derive(Clone, Debug, Default)]
+pub struct NativeConfig {
+    pub endpoint_override: Option<String>,
+    pub fast_model: Option<String>,
+    pub strong_model: Option<String>,
+    pub proto_override: Option<ProtoMode>,
 }
 
 /// The ONE backend branch in the codebase (R1). Everything downstream calls this.
@@ -277,14 +467,19 @@ pub fn runner_for(
     backend: Backend,
     claude_bin: &str,
     home: &Path,
-    endpoint_override: Option<String>,
+    native: NativeConfig,
 ) -> Box<dyn StageRunner> {
     match backend {
         Backend::ClaudeCode => Box::new(ClaudeCodeAdapter {
             claude_bin: claude_bin.to_string(),
             home: home.to_path_buf(),
         }),
-        Backend::Native => Box::new(NativeAdapter { endpoint_override }),
+        Backend::Native => Box::new(NativeAdapter {
+            endpoint_override: native.endpoint_override,
+            fast_model: native.fast_model,
+            strong_model: native.strong_model,
+            proto_override: native.proto_override,
+        }),
     }
 }
 
@@ -366,5 +561,166 @@ mod tests {
     fn no_key_at_all_is_its_own_refusal() {
         let refused = key_for(None, None, true).expect_err("a refusal");
         assert!(refused.contains("no OPENROUTER_API_KEY"), "{refused}");
+    }
+
+    // --- the extended agent-line grammar (unit 2) -------------------------------------------
+
+    #[test]
+    fn a_bare_native_line_still_parses_with_no_overrides() {
+        let s = Selection::parse_line("native").expect("bare native");
+        assert_eq!(s.backend, Backend::Native);
+        assert_eq!(s.endpoint_override, None);
+        assert_eq!(s.fast_model, None);
+        assert_eq!(s.strong_model, None);
+        assert_eq!(s.proto_override, None);
+    }
+
+    #[test]
+    fn the_bare_base_url_positional_still_parses_backward_compatibly() {
+        // ADR-0017's original grammar: `native <base-url>`, no `=` in sight.
+        let s = Selection::parse_line("native https://example.invalid/v1").expect("bare url");
+        assert_eq!(
+            s.endpoint_override.as_deref(),
+            Some("https://example.invalid/v1")
+        );
+    }
+
+    #[test]
+    fn model_key_sets_both_classes_at_once() {
+        let s = Selection::parse_line("native model=stealth/ox-alpha").expect("model=");
+        assert_eq!(s.fast_model.as_deref(), Some("stealth/ox-alpha"));
+        assert_eq!(s.strong_model.as_deref(), Some("stealth/ox-alpha"));
+    }
+
+    #[test]
+    fn explicit_fast_or_strong_overrides_model_individually() {
+        let s =
+            Selection::parse_line("native model=shared fast=quick/one").expect("model= plus fast=");
+        assert_eq!(s.fast_model.as_deref(), Some("quick/one"), "fast= wins");
+        assert_eq!(
+            s.strong_model.as_deref(),
+            Some("shared"),
+            "model= still backs strong"
+        );
+    }
+
+    #[test]
+    fn proto_declares_the_wire_mode_and_skips_the_probe() {
+        let s = Selection::parse_line("native proto=text").expect("proto=text");
+        assert_eq!(s.proto_override, Some(ProtoMode::Text));
+        let s = Selection::parse_line("native proto=native").expect("proto=native");
+        assert_eq!(s.proto_override, Some(ProtoMode::Native));
+    }
+
+    #[test]
+    fn base_url_positional_and_keys_compose_in_one_line() {
+        let s = Selection::parse_line(
+            "native https://example.invalid/v1 model=stealth/ox-alpha proto=text",
+        )
+        .expect("full grammar");
+        assert_eq!(
+            s.endpoint_override.as_deref(),
+            Some("https://example.invalid/v1")
+        );
+        assert_eq!(s.fast_model.as_deref(), Some("stealth/ox-alpha"));
+        assert_eq!(s.strong_model.as_deref(), Some("stealth/ox-alpha"));
+        assert_eq!(s.proto_override, Some(ProtoMode::Text));
+    }
+
+    #[test]
+    fn base_url_key_is_equivalent_to_the_bare_positional() {
+        let s =
+            Selection::parse_line("native base-url=https://example.invalid/v1").expect("base-url=");
+        assert_eq!(
+            s.endpoint_override.as_deref(),
+            Some("https://example.invalid/v1")
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_refuses_loudly() {
+        let refused = Selection::parse_line("native color=blue").expect_err("must refuse");
+        assert!(refused.contains("unknown key"), "{refused}");
+        assert!(refused.contains("color"), "{refused}");
+    }
+
+    #[test]
+    fn a_duplicate_key_refuses_loudly() {
+        let refused = Selection::parse_line("native model=a model=b").expect_err("must refuse");
+        assert!(refused.contains("duplicate"), "{refused}");
+        assert!(refused.contains("model"), "{refused}");
+    }
+
+    #[test]
+    fn an_empty_value_refuses_loudly() {
+        let refused = Selection::parse_line("native model=").expect_err("must refuse");
+        assert!(refused.contains("empty value"), "{refused}");
+    }
+
+    #[test]
+    fn an_unknown_proto_value_refuses_loudly() {
+        let refused = Selection::parse_line("native proto=json").expect_err("must refuse");
+        assert!(refused.contains("unknown proto"), "{refused}");
+    }
+
+    #[test]
+    fn claude_code_still_refuses_any_argument_key_or_not() {
+        let refused = Selection::parse_line("claude-code model=a").expect_err("must refuse");
+        assert!(
+            refused.contains("claude-code takes no arguments"),
+            "{refused}"
+        );
+        let refused = Selection::parse_line("claude-code https://x").expect_err("must refuse");
+        assert!(
+            refused.contains("claude-code takes no arguments"),
+            "{refused}"
+        );
+    }
+
+    // --- StageModel (unit 1) -----------------------------------------------------------------
+
+    #[test]
+    fn claude_code_arg_maps_pinned_verbatim_fast_to_the_alias_strong_to_no_flag() {
+        assert_eq!(
+            StageModel::Pinned("gpt-4o".into()).claude_code_arg(),
+            Some("gpt-4o".to_string())
+        );
+        assert_eq!(
+            StageModel::Class(ModelClass::Fast).claude_code_arg(),
+            Some(StageModel::CLAUDE_FAST_ALIAS.to_string())
+        );
+        assert_eq!(
+            StageModel::Class(ModelClass::Strong).claude_code_arg(),
+            None
+        );
+    }
+
+    #[test]
+    fn native_id_never_injects_the_claude_alias_and_falls_back_to_default() {
+        // The Unit 1 defect: a fast-routed stage must never send "claude-sonnet-5" to an
+        // OpenAI-compatible endpoint.
+        let fast = StageModel::Class(ModelClass::Fast);
+        assert_eq!(fast.native_id(None, None), DEFAULT_MODEL);
+        assert_eq!(
+            fast.native_id(
+                Some("stealth/ox-alpha"),
+                Some("deepseek/deepseek-chat-v3.1")
+            ),
+            "stealth/ox-alpha"
+        );
+        let strong = StageModel::Class(ModelClass::Strong);
+        assert_eq!(strong.native_id(None, None), DEFAULT_MODEL);
+        assert_eq!(
+            strong.native_id(
+                Some("stealth/ox-alpha"),
+                Some("deepseek/deepseek-chat-v3.1")
+            ),
+            "deepseek/deepseek-chat-v3.1"
+        );
+        assert_eq!(
+            StageModel::Pinned("gpt-4o".into()).native_id(Some("x"), Some("y")),
+            "gpt-4o",
+            "a pin crosses verbatim regardless of the declared classes"
+        );
     }
 }

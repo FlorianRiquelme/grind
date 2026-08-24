@@ -16,6 +16,7 @@ use crate::supervisor;
 use crate::view::{self, Lookup};
 use crate::world;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Whether the command could answer the question it was asked. **Not how the Run is doing.**
 enum Observability {
@@ -363,10 +364,7 @@ fn status_one(run_id: &str) -> i32 {
             let signals = decide::signals_of(&observation);
             let promised = found.attempts.last().is_some_and(|a| a.done_promise);
             let verdict = decide::verdict(&signals, promised);
-            let live = claude::live(
-                &claude::transcript_path(&home, &found.worktree, &found.session_id),
-                world::now_epoch(),
-            );
+            let live = live_for(&home, run_id, &found);
             let here = view::supervisor_here(
                 found.supervisor_identity.as_deref(),
                 &observe::process_start_stamp(&world::ps_start_stamp(found.supervisor_pid)),
@@ -400,6 +398,47 @@ fn observe_for(found: &view::RunView) -> observe::Observation {
         &found.job.base_branch,
         world::now_iso(),
     )
+}
+
+/// The live view, branching on the Run's snapshotted backend (#135). `claude::live` reads a
+/// single transcript file a claude-code Run writes; a native Run writes no such file —
+/// `NativeAdapter::run` leaves `messages-N.jsonl` under the Run's own directory instead — so
+/// reading that path there degraded every field to `Unobservable` at once while `grind status`
+/// still exited *Answered* over a blank panel. This reads only `freshness` for a native Run,
+/// off the newest `messages-*.jsonl` write; every other field stays honestly `Unobservable`
+/// until `native::live` learns to parse transcript content, which is out of scope here (pending
+/// P3 dogfooding evidence). A claude-code Run is unaffected — this is `claude::live` unchanged.
+fn live_for(home: &Path, run_id: &str, found: &view::RunView) -> claude::Live {
+    match found.backend {
+        runner::Backend::ClaudeCode => claude::live(
+            &claude::transcript_path(home, &found.worktree, &found.session_id),
+            world::now_epoch(),
+        ),
+        runner::Backend::Native => {
+            let run_dir = job::runs_dir(home).join(run_id);
+            let mtimes: Vec<SystemTime> = world::list_with_extension(&run_dir, "jsonl")
+                .iter()
+                .filter_map(|path| world::mtime(path))
+                .collect();
+            claude::Live {
+                transcript: run_dir,
+                now_skill: native_unread(),
+                assistant_now: native_unread(),
+                last_words: vec![String::new(); 3],
+                fanout: native_unread(),
+                freshness: observe::native_freshness(&mtimes, world::now_epoch()),
+            }
+        }
+    }
+}
+
+/// Shared by every `claude::Live` field a native Run cannot yet answer content-wise. A named
+/// helper rather than four repeated literals, so the one thing worth saying about all of them —
+/// *pending, not overlooked* — cannot drift between fields.
+fn native_unread<T>() -> Observed<T> {
+    Observed::Unobservable(observe::Reason::saying(
+        "native backend: transcript content is not read yet (pending P3 dogfooding evidence, #135)",
+    ))
 }
 
 // --- serve -------------------------------------------------------------------------------------
@@ -720,6 +759,60 @@ fn print_err(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DAY_ONE: &str = include_str!("../tests/fixtures/record/day-one.json");
+
+    /// The day-one fixture, with `backend` overridden — a record written before selection
+    /// existed carries neither field and defaults to `ClaudeCode`, so a literal string edit is
+    /// how the other backend gets exercised without hand-building the whole record shape.
+    fn found_with_backend(backend: &str) -> view::RunView {
+        let mut value: serde_json::Value = serde_json::from_str(DAY_ONE).unwrap();
+        value["backend"] = serde_json::json!(backend);
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn a_claude_code_run_is_unaffected_by_the_native_branch() {
+        // No filesystem to touch: the fixture's worktree/session do not exist on this box, and
+        // `live_for` must still take exactly the `claude::live` path it always did, over the
+        // same transcript path, rather than routing through the native branch's freshness scan.
+        let found = found_with_backend("claude-code");
+        let home = Path::new("/nowhere/that/exists");
+        let live = live_for(home, &found.run_id, &found);
+        assert_eq!(
+            live.transcript,
+            claude::transcript_path(home, &found.worktree, &found.session_id)
+        );
+        // Unaffected also means unaffected in *how* it fails: the same shape a broken
+        // claude-code transcript path always produced, not the native branch's four
+        // fixed-reason "pending P3" strings.
+        assert!(matches!(live.freshness, Observed::Unobservable(_)));
+        assert!(matches!(live.now_skill, Observed::Unobservable(_)));
+    }
+
+    #[test]
+    fn a_native_run_with_a_messages_file_reports_freshness_rather_than_unobservable() {
+        let found = found_with_backend("native");
+        let home = world::temp_dir("cli-live-for-native");
+        let run_dir = job::runs_dir(&home).join(&found.run_id);
+        world::create_dir_all(&run_dir).expect("a scratch run directory");
+        world::write(&run_dir.join("messages-1.jsonl"), "{\"event\":\"turn\"}\n")
+            .expect("a scratch messages file");
+
+        let live = live_for(&home, &found.run_id, &found);
+        assert!(
+            matches!(live.freshness, Observed::Present(_)),
+            "{:?}",
+            live.freshness
+        );
+        // Every other field stays honestly pending — this floor parses no transcript content.
+        assert!(matches!(live.now_skill, Observed::Unobservable(_)));
+        assert!(matches!(live.assistant_now, Observed::Unobservable(_)));
+        assert!(matches!(live.fanout, Observed::Unobservable(_)));
+        assert_eq!(live.last_words, vec![String::new(); 3]);
+
+        world::remove_tree(&home);
+    }
 
     #[test]
     fn the_exit_code_reports_whether_status_could_answer_and_never_how_the_run_is_doing() {

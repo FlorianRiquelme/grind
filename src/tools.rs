@@ -3,6 +3,7 @@
 //! carries only the frozen surface.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -19,6 +20,13 @@ const STANDARD_NAMES: [&str; 3] = ["bash", "read_file", "write_file"];
 /// model, which can read files and receive prompt injection from the target repo, so these two
 /// are scrubbed from the child before it spawns rather than trusted not to be echoed back.
 const CREDENTIAL_ENV_VARS: [&str; 2] = ["OPENROUTER_API_KEY", "OPENAI_API_KEY"];
+
+/// Wall-clock bound on one `bash` tool call. A stage legitimately runs the target repo's whole
+/// `just verify` (or equivalent) as part of its work, which can take minutes for a real build,
+/// so this has to be generous enough that a real build is never cut off — it exists to catch a
+/// hung child (an accidental `tail -f`, a stalled network call), not to enforce a time budget.
+/// 600s is a chosen default, not a measured one, and cheap to change.
+const BASH_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// OpenAI function-schema description of one tool.
 #[derive(Clone, Debug)]
@@ -83,10 +91,11 @@ impl ToolRegistry {
         let field = |key: &str| parsed[key].as_str().unwrap_or_default().to_string();
         let (full, exit) = match call.name.as_str() {
             "bash" => {
-                let completed = world::run_scrubbed(
+                let completed = world::run_bounded(
                     &["sh".to_string(), "-c".to_string(), field("command")],
                     Some(self.workdir.as_path()),
                     &CREDENTIAL_ENV_VARS,
+                    BASH_TIMEOUT,
                 );
                 let exit = completed.code;
                 (format_completed(completed), exit)
@@ -226,16 +235,22 @@ pub struct ToolOutcome {
     pub exit: Option<i32>,
 }
 
-/// Format a finished child POC-verbatim. `world::run` folds spawn failure into
-/// `code: None` with the error in stderr, so that is where the POC's
-/// "failed to spawn" string is reproduced from.
+/// Format a finished child POC-verbatim, plus the one case the POC never had to render:
+/// `world::run_bounded` folds both *never started* (a spawn failure) and *started but killed on
+/// its deadline* into the same `code: None` shape, with the reason in `stderr` either way. The
+/// wording here is generic over both rather than "failed to spawn" — which would read as a
+/// contradiction for a command the model can see printed output for — so a model reading a
+/// timeout result can tell its command was killed on a deadline rather than that it never ran.
 fn format_completed(completed: Completed) -> String {
     match completed.code {
         Some(code) => format!(
             "exit: {code}\nstdout:\n{}\nstderr:\n{}",
             completed.stdout, completed.stderr
         ),
-        None => format!("failed to spawn: {}", completed.stderr),
+        None => format!(
+            "did not complete: {}\nstdout:\n{}",
+            completed.stderr, completed.stdout
+        ),
     }
 }
 

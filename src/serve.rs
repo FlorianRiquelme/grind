@@ -11,7 +11,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::claude;
 use crate::job;
 use crate::observe;
+use crate::observe::Observed;
 use crate::page;
+use crate::runner;
 use crate::view;
 use crate::world;
 
@@ -209,16 +211,54 @@ fn run_response(home: &Path, id: &str, fragment: bool) -> Response {
         found.supervisor_identity.as_deref(),
         &observe::process_start_stamp(&world::ps_start_stamp(found.supervisor_pid)),
     );
-    let live = claude::live(
-        &claude::transcript_path(home, &found.worktree, &found.session_id),
-        world::now_epoch(),
-    );
+    let live = live_for(home, id, &found);
     let body = if fragment {
         page::run_fragment(id, &facts, &live, &here)
     } else {
         page::run_page(id, &facts, &live, &here)
     };
     html(body)
+}
+
+/// The live view, branching on the Run's snapshotted backend (#135). `claude::live` reads a
+/// single transcript file a claude-code Run writes; a native Run writes no such file —
+/// `NativeAdapter::run` leaves `messages-N.jsonl` under the Run's own directory instead — so
+/// reading that path there degraded every field to `Unobservable` at once, and the dashboard
+/// still rendered as if it had answered. This reads only `freshness` for a native Run, off the
+/// newest `messages-*.jsonl` write; every other field stays honestly `Unobservable` until
+/// `native::live` learns to parse transcript content, which is out of scope here (pending P3
+/// dogfooding evidence). A claude-code Run is unaffected — this is `claude::live` unchanged.
+fn live_for(home: &Path, run_id: &str, found: &view::RunView) -> claude::Live {
+    match found.backend {
+        runner::Backend::ClaudeCode => claude::live(
+            &claude::transcript_path(home, &found.worktree, &found.session_id),
+            world::now_epoch(),
+        ),
+        runner::Backend::Native => {
+            let run_dir = job::runs_dir(home).join(run_id);
+            let mtimes: Vec<SystemTime> = world::list_with_extension(&run_dir, "jsonl")
+                .iter()
+                .filter_map(|path| world::mtime(path))
+                .collect();
+            claude::Live {
+                transcript: run_dir,
+                now_skill: native_unread(),
+                assistant_now: native_unread(),
+                last_words: vec![String::new(); 3],
+                fanout: native_unread(),
+                freshness: observe::native_freshness(&mtimes, world::now_epoch()),
+            }
+        }
+    }
+}
+
+/// Shared by every `claude::Live` field a native Run cannot yet answer content-wise. A named
+/// helper rather than four repeated literals, so the one thing worth saying about all of them —
+/// *pending, not overlooked* — cannot drift between fields.
+fn native_unread<T>() -> Observed<T> {
+    Observed::Unobservable(observe::Reason::saying(
+        "native backend: transcript content is not read yet (pending P3 dogfooding evidence, #135)",
+    ))
 }
 
 /// The `supervisor.log` delta (KTD9): `o` bytes in, at most [`LOG_CAP`] bytes out, the

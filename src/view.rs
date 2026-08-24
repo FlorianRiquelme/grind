@@ -70,6 +70,21 @@ pub struct RunView {
     pub backend: crate::runner::Backend,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint_override: Option<String>,
+    /// The rest of the layout-declared selection (ADR-0017 as amended): the host's model
+    /// classes and a declared wire mode. `None` is the honest *undeclared* answer — both for a
+    /// record written before the grammar grew these keys and for a host that declares only a
+    /// backend — so the adapter falls back to its own default rather than to a blank.
+    ///
+    /// These three exist here for one reason: `RunView` is `deny_unknown_fields`, so the first
+    /// `run.json` a Dispatch writes with a `fast=`/`strong=`/`proto=` declaration would fail to
+    /// parse without them, and it would fail in `grind status` and the dashboard — the two
+    /// places a human looks to be reassured. Never let the writer gain a field this mirror lacks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_model_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strong_model_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proto_override: Option<crate::runner::ProtoMode>,
 }
 
 /// The read-only mirror of `supervisor::Provenance`. Field names duplicated by design, the same

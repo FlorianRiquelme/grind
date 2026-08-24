@@ -197,6 +197,16 @@ plus a login* on darwin, and do not let the shorter phrase stand for both.
   the key check above owns presence. Reported for both backends regardless of which is
   declared, so both stay selectable from one doctor run.
 
+The line's grammar extends past the backend and the bare base-url token (ADR-0017, amended):
+`model=`, `fast=` and `strong=` declare which model id each of grind's own `fast`/`strong`
+routing classes resolves to on the native backend — `fast=`/`strong=` override `model=`
+individually — and `proto=native`/`proto=text` declares the wire mode outright, skipping the
+probe that would otherwise cost one failed request per attempt on an upstream (`stealth/ox-alpha`,
+observed) that cannot execute native tool calls at all. Neither key is a doctor check
+of its own: the two checks above already cover what a native Dispatch needs before its first
+Attempt, and a declared model id or protocol is only as good as the Attempt that actually
+calls the endpoint with it.
+
 ## Credentials
 
 [#37](https://github.com/FlorianRiquelme/grind/issues/37)'s six steps, verbatim in substance. All

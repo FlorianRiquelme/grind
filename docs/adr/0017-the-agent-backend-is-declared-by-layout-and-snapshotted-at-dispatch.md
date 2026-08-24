@@ -114,3 +114,66 @@ snapshot, so the filesystem states the intent once and the record owns the conse
 The transport this selection feeds is [ADR-0016](0016-the-agent-harness-takes-a-vetted-sync-http-stack.md)'s
 decision; the per-Run protocol behavior it gates is
 [ADR-0018](0018-tool-calling-is-capability-adaptive.md)'s.
+
+## Amendment (2026-08-24): a model *class* crosses the seam, and the grammar grows keys
+
+Epic #135's own dogfooding surfaced a defect this ADR's original grammar had no way to avoid.
+Grind routes every `fast`-classified stage to a hardwired literal — `"claude-sonnet-5"` — and
+handed that string straight through to whichever backend the Run declared. On claude-code that
+string is exactly right: it is the harness's own `--model` alias. On the native backend it is
+wrong in every case: the native wire's `model` field is OpenRouter's `vendor/model` namespace,
+so every `fast`-routed stage sent an Anthropic alias to an OpenAI-compatible endpoint and burned
+three retries discovering the 400/404, on every attempt, with no way for an operator to avoid it
+short of never using `fast` at all.
+
+**The fix: a model *class* crosses the seam, never a concrete id.** A model id is a provider
+fact — `vendor/model` on the native wire, a plain alias on claude-code's harness. The class
+(`fast` or `strong`) is grind's own routing intent, decided the same way it always was
+(`decide::Decision::model_per_stage`), and it is *that* — a `StageModel::Pinned(id)` for a
+Job's verbatim `model:` pin, or `StageModel::Class(Fast | Strong)` for grind's own routing —
+that now crosses from `supervisor::resolve_stage_model` into the seam. Each adapter resolves
+its own concrete id from the class: claude-code maps `Class(Fast)` to the `claude-sonnet-5`
+alias and `Class(Strong)` to no `--model` flag at all (the harness default, unchanged from
+before this amendment — R2's byte-for-byte claim holds because the claude-code mapping is
+exactly the literal the old code hardwired); the native adapter maps each class to the model id
+the host declared for it, falling back to the same `DEFAULT_MODEL` constant it already used when
+nothing was declared. A Job's pin still crosses verbatim to both adapters — the freeze still
+beats the routing — but grind's own `fast`/`strong` intent no longer masquerades as a provider
+fact it was never entitled to assert.
+
+**The grammar grows to carry the declaration**, still one line, still no format beyond it:
+
+```
+<backend> [<base-url>] [key=value ...]
+```
+
+Keys: `base-url`, `model`, `fast`, `strong`, `proto`. `model=<id>` sets both classes at once;
+an explicit `fast=`/`strong=` overrides one individually — an operator naming one class without
+committing to the same id for the other. The bare base-url positional token — no `=` in it —
+still parses exactly as it did before this amendment; a token containing `=` is a key/value.
+Every failure mode stays loud, on the same register `Backend::parse` already set for an unknown
+backend: an unknown key, a duplicate key, a `key=` with an empty value, or a `proto=` value that
+is neither `native` nor `text`, all refuse rather than silently defaulting or taking the first.
+
+**`proto=` exists because probing is not free, and one upstream proved the probe is not even
+informative.** R5's default is to probe once per Run and latch what the probe found. The
+epic's own proof-of-concept ran `stealth/ox-alpha` and found it "unable to execute native tool
+calls at all" — not flaky, not occasionally rejecting `tools`, but never able to use them. Every
+Run against a host permanently declared to that model wastes one failed request per Run
+discovering a fact the operator already knows. `proto=native` / `proto=text` names the wire mode
+outright and skips the probe entirely, latching from the declaration before the first request
+goes out — the same latch shape R5 already uses for a resumed attempt's inherited protocol, just
+sourced from the layout instead of from a transcript. The transcript still carries a
+`ProtocolSelected` event naming the declaration as its reason, so nothing about *how the mode
+was chosen* becomes unobservable, and `scan_latch`'s resume path keeps working unchanged: a
+declared run always re-derives the same latch on every attempt, so a resumed attempt reading an
+earlier attempt's transcript agrees with a fresh one reading the declaration directly.
+
+**The mirror obligation, again.** `fast_model_override`, `strong_model_override` and
+`proto_override` join `backend`/`endpoint_override` on `RunRecord`, snapshotted at dispatch from
+the same selection read, `#[serde(default, skip_serializing_if = "Option::is_none")]` for the
+same reason: undeclared is the honest answer for every record written before the grammar grew
+these keys, never a blank one. Each needs the same read-only mirror on `view::RunView` this
+ADR already obligates for every future record field — left for the module that owns `view.rs` to
+land, since the writer and the reader are deliberately blind to each other (ADR-0007's wall) and
+this amendment's author does not own that side of it.

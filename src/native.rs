@@ -8,7 +8,7 @@
 //! failed [`Attempt`], never a clean stop.
 
 use crate::runner::{
-    Backend, CallSummary, Endpoint, ProtoMode, RunSpec, StageRunner, TranscriptEvent,
+    Backend, CallSummary, Endpoint, FileLabel, ProtoMode, RunSpec, StageRunner, TranscriptEvent,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -33,6 +33,30 @@ const TAIL_CHARS: usize = 1500;
 const TEXT_CALL_ID: &str = "text";
 /// Reason recorded when this attempt inherits a latch from an earlier attempt.
 const RESUMED_LATCH_REASON: &str = "resumed from an earlier attempt's ProtocolSelected";
+
+/// Reason recorded when the wire mode came from the `~/.grind/agent` line's `proto=` key
+/// rather than a probe or an earlier attempt's latch — the case ADR-0018's `proto=` exists
+/// for: a model proven unable to execute native tool calls (`stealth/ox-alpha`) otherwise
+/// wastes one failed request discovering that on every single attempt.
+fn declared_reason(mode: ProtoMode) -> String {
+    format!(
+        "declared via `proto={}` on the `~/.grind/agent` line — the probe was skipped",
+        match mode {
+            ProtoMode::Native => "native",
+            ProtoMode::Text => "text",
+        }
+    )
+}
+
+/// This call's transcript file name (ADR-0017's `messages-N.jsonl` for an Attempt, kept
+/// byte-for-byte; a distinguishable name for Reflect so its events never collide with
+/// attempt N's own file).
+fn transcript_filename(label: FileLabel, n: usize) -> String {
+    match label {
+        FileLabel::Attempt => format!("messages-{n}.jsonl"),
+        FileLabel::Reflect => format!("reflect-messages-{n}.jsonl"),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Wire shapes — pure builders so every decision is testable from literals.
@@ -208,23 +232,38 @@ fn latched_mode(transcripts: &[&str]) -> Option<ProtoMode> {
     found
 }
 
-/// Scan the run directory's prior `messages-*.jsonl` files (sorted, so oldest
-/// first) for the latch. This attempt's own file is skipped.
+/// Scan the run directory's prior `messages-*.jsonl` files, oldest attempt
+/// first, for the latch. This attempt's own file is skipped.
+///
+/// Ordered by the parsed attempt number, not the lexicographic path order
+/// `list_with_extension` returns — that sort puts `messages-10.jsonl` before
+/// `messages-2.jsonl`, which would make attempt 10 look older than attempt 2
+/// the moment a run passes nine attempts.
 fn scan_latch(run_dir: &Path, current_attempt: usize) -> Option<ProtoMode> {
     let own = format!("messages-{current_attempt}.jsonl");
-    let mut texts: Vec<String> = Vec::new();
+    let mut numbered: Vec<(usize, PathBuf)> = Vec::new();
     for path in world::list_with_extension(run_dir, "jsonl") {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if !name.starts_with("messages-") || name == own {
+        if name == own {
             continue;
         }
-        if let Ok(text) = world::read_to_string(&path) {
-            texts.push(text);
-        }
+        let Some(num) = name
+            .strip_prefix("messages-")
+            .and_then(|s| s.strip_suffix(".jsonl"))
+            .and_then(|s| s.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        numbered.push((num, path));
     }
+    numbered.sort_by_key(|(num, _)| *num);
+    let texts: Vec<String> = numbered
+        .into_iter()
+        .filter_map(|(_, path)| world::read_to_string(&path).ok())
+        .collect();
     latched_mode(&texts.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
@@ -447,19 +486,45 @@ struct Transcript {
 }
 
 impl Transcript {
+    /// Reset this attempt's file to empty. Must run exactly once per `run()`,
+    /// before the first `log` call — a crashed attempt is never recorded, so a
+    /// resumed retry recomputes the same `attempt_n` and would otherwise append
+    /// after the dead attempt's partial content in the same file
+    /// (`messages-N.jsonl` must hold exactly one attempt's events, matching the
+    /// claude-code adapter's `File::create` truncation). Calling this once per
+    /// `log` instead would erase the attempt as it goes, so callers must not.
+    ///
+    /// Never panics, for the same reason `log` doesn't: a disk-write failure
+    /// here must not take down the per-run supervisor before
+    /// `record.push_attempt` ever runs. A failure is folded into the same
+    /// `append_failed` slot a failed append uses, so it still surfaces in
+    /// `terminal_reason` when the attempt is already failing.
+    fn truncate(&self) {
+        if let Err(e) = world::write(&self.path, "") {
+            self.note_failure(format!(
+                "attempt {}: transcript truncate failed: {e}",
+                self.attempt_n
+            ));
+        }
+    }
+
+    fn note_failure(&self, msg: String) {
+        let mut slot = self.append_failed.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(msg);
+        }
+    }
+
     /// Never panics: a disk-write failure here must not take down the per-run
     /// supervisor before `record.push_attempt` ever runs.
     fn log(&self, event: &TranscriptEvent) {
         // `encode()` returns the bare JSON line; `append_line`'s own `writeln!` is
         // what supplies the single trailing newline.
         if let Err(e) = world::append_line(&self.path, &event.encode()) {
-            let mut slot = self.append_failed.borrow_mut();
-            if slot.is_none() {
-                *slot = Some(format!(
-                    "attempt {}: transcript append failed: {e}",
-                    self.attempt_n
-                ));
-            }
+            self.note_failure(format!(
+                "attempt {}: transcript append failed: {e}",
+                self.attempt_n
+            ));
         }
     }
 }
@@ -549,8 +614,14 @@ impl StageRunner for crate::runner::NativeAdapter {
         let started_at = world::now_iso();
 
         // Resolution happens at attempt start; failure is a loud failed Attempt,
-        // never a clean stop.
-        let endpoint = match Endpoint::resolve(self.endpoint_override.as_deref(), spec.model) {
+        // never a clean stop. The concrete id is this stage's routed class (or pin)
+        // resolved against the host's declared fast/strong models — never the
+        // claude-code alias `resolve_stage_model` used to hand every adapter verbatim
+        // (Unit 1's defect).
+        let model_id = spec
+            .model
+            .native_id(self.fast_model.as_deref(), self.strong_model.as_deref());
+        let endpoint = match Endpoint::resolve(self.endpoint_override.as_deref(), Some(&model_id)) {
             Ok(endpoint) => endpoint,
             Err(reason) => {
                 return synthesize(AttemptFacts {
@@ -571,20 +642,28 @@ impl StageRunner for crate::runner::NativeAdapter {
         let tools_wire = defs_as_wire(&defs);
         let client = ChatClient::new();
         let transcript = Transcript {
-            path: spec.run_dir.join(format!("messages-{n}.jsonl")),
+            path: spec.run_dir.join(transcript_filename(spec.file_label, n)),
             attempt_n: n,
             append_failed: std::cell::RefCell::new(None),
         };
+        // Truncate once, before any `log` call: a crashed attempt was never
+        // recorded, so a `resume` recomputing this same `n` must not append after
+        // the dead attempt's partial content in the same file.
+        transcript.truncate();
         let system_for = |mode: ProtoMode| json!({"role": "system", "content": system_prompt(&spec.cwd.display().to_string(), &defs, mode)});
 
-        // Per-run latch (R5/ADR-0018): an earlier attempt's ProtocolSelected
+        // Per-run latch (R5/ADR-0018): a host declaration (`proto=`) wins outright and
+        // skips the probe entirely — the case a model proven unable to execute native
+        // tool calls exists for. Absent one, an earlier attempt's ProtocolSelected
         // decides the wire before the first request goes out.
-        let mut proto = scan_latch(spec.run_dir, n);
+        let mut proto = self.proto_override.or_else(|| scan_latch(spec.run_dir, n));
         if let Some(mode) = proto {
-            transcript.log(&TranscriptEvent::ProtocolSelected {
-                mode,
-                reason: RESUMED_LATCH_REASON.to_string(),
-            });
+            let reason = if self.proto_override.is_some() {
+                declared_reason(mode)
+            } else {
+                RESUMED_LATCH_REASON.to_string()
+            };
+            transcript.log(&TranscriptEvent::ProtocolSelected { mode, reason });
         }
 
         let mut messages = vec![
@@ -815,6 +894,30 @@ mod tests {
         let transcript = "\n{\"event\":\"final\",\"value\":{\"text\":\"hi\"}}\nnot json\n";
         assert_eq!(latched_mode(&[transcript]), None);
         assert_eq!(latched_mode(&[]), None);
+    }
+
+    #[test]
+    fn scan_latch_orders_by_attempt_number_not_lexicographic_path() {
+        // A lexicographic sort of filenames puts "messages-10.jsonl" before
+        // "messages-2.jsonl". Attempt 2 selected Text; attempt 10 (a later,
+        // still-unlatched attempt under the old bug's premise) selects Native.
+        // Numeric order must read attempt 2 first and let attempt 10 win as the
+        // last ProtocolSelected.
+        let dir = world::temp_dir("native-scan-latch-order");
+        world::write(
+            &dir.join("messages-2.jsonl"),
+            "{\"event\":\"protocol_selected\",\"value\":{\"mode\":\"text\",\"reason\":\"r\"}}\n",
+        )
+        .expect("write attempt 2");
+        world::write(
+            &dir.join("messages-10.jsonl"),
+            "{\"event\":\"protocol_selected\",\"value\":{\"mode\":\"native\",\"reason\":\"r\"}}\n",
+        )
+        .expect("write attempt 10");
+
+        assert_eq!(scan_latch(&dir, 11), Some(ProtoMode::Native));
+
+        world::remove_tree(&dir);
     }
 
     fn http_reject() -> NetError {
@@ -1168,6 +1271,48 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("first") && !lines[0].is_empty());
         assert!(lines[1].contains("second"));
+        world::remove_tree(&dir);
+    }
+
+    #[test]
+    fn truncate_before_log_starts_the_attempt_from_empty_not_appended() {
+        // Simulates a crashed attempt N followed by a resumed attempt that
+        // recomputes the same N: the second `Transcript` open for that same
+        // path must start empty rather than appending after the first's
+        // partial content (finding #23).
+        let dir = world::temp_dir("native-transcript-truncate");
+        let path = dir.join("messages-1.jsonl");
+
+        let dead = Transcript {
+            path: path.clone(),
+            attempt_n: 1,
+            append_failed: std::cell::RefCell::new(None),
+        };
+        dead.truncate();
+        dead.log(&TranscriptEvent::Final {
+            text: "partial from a crashed attempt".to_string(),
+        });
+
+        let retry = Transcript {
+            path: path.clone(),
+            attempt_n: 1,
+            append_failed: std::cell::RefCell::new(None),
+        };
+        retry.truncate();
+        retry.log(&TranscriptEvent::Final {
+            text: "the retry's own event".to_string(),
+        });
+
+        let contents = world::read_to_string(&path).expect("read transcript");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "truncate must drop the dead attempt's content, not append after it"
+        );
+        assert!(lines[0].contains("the retry's own event"));
+        assert!(!contents.contains("partial from a crashed attempt"));
+
         world::remove_tree(&dir);
     }
 

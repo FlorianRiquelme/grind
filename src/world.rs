@@ -25,10 +25,10 @@
 //! to the globs.
 
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// What a short-lived child left behind. Three values, and nothing interpreted.
 ///
@@ -120,6 +120,118 @@ pub fn run_scrubbed(argv: &[String], cwd: Option<&Path>, drop_vars: &[&str]) -> 
             stderr: e.to_string(),
             code: None,
         },
+    }
+}
+
+/// `run_scrubbed`, plus a wall-clock deadline: a child still running when `limit` elapses is
+/// killed rather than awaited forever.
+///
+/// The command string a native attempt's `bash` tool runs comes from an arbitrary third-party
+/// model, and `Command::output()` — what `run_scrubbed` calls — blocks on `wait()` with no
+/// deadline. An accidental `tail -f`, a hung network call or a child waiting on stdin wedges
+/// the per-run supervisor thread forever; nothing above this function bounds wall time (`MAX_TURNS`
+/// bounds turns, not seconds).
+///
+/// `Command::output()` cannot be given a timeout, so this spawns instead and polls
+/// [`std::process::Child::try_wait`] on a short interval until either the child exits or the
+/// deadline passes. Both pipes are drained on their own threads *before* the poll loop blocks on
+/// anything, so a chatty child that fills one pipe's kernel buffer while nobody is reading the
+/// other cannot deadlock the wait the way a synchronous read of both, one after the other, would.
+/// `stdin` is nulled, not piped: a child that reads from it would otherwise block on EOF that
+/// never comes, which is itself a hang this exists to catch.
+///
+/// A child still running past `limit` is `kill()`ed and reaped, and comes back as
+/// `code: None` with the reason in `stderr` — the same *could not observe* shape `run_scrubbed`
+/// already uses for a spawn failure, so the classifier stays unchanged, and worded so a caller
+/// reading `stderr` can tell *killed on a deadline* apart from *never started*.
+pub fn run_bounded(
+    argv: &[String],
+    cwd: Option<&Path>,
+    drop_vars: &[&str],
+    limit: Duration,
+) -> Completed {
+    let Some((program, rest)) = argv.split_first() else {
+        return Completed {
+            stdout: String::new(),
+            stderr: "empty argv".into(),
+            code: None,
+        };
+    };
+    let mut command = Command::new(program);
+    command.args(rest);
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    for var in drop_vars {
+        command.env_remove(var);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return Completed {
+                stdout: String::new(),
+                stderr: e.to_string(),
+                code: None,
+            };
+        }
+    };
+
+    // Taken before the poll loop, so both pipes drain concurrently with the wait rather than
+    // sequentially after it.
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped above");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped above");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + limit;
+    let poll_interval = Duration::from_millis(50);
+    let mut timed_out = false;
+    let exit_code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    break None;
+                }
+                std::thread::sleep(poll_interval);
+            }
+            Err(_) => break None,
+        }
+    };
+    if timed_out {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr_tail =
+        String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).into_owned();
+
+    Completed {
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: if timed_out {
+            format!(
+                "killed after exceeding the {}s deadline\nstderr:\n{stderr_tail}",
+                limit.as_secs()
+            )
+        } else {
+            stderr_tail
+        },
+        code: exit_code,
     }
 }
 
@@ -543,6 +655,86 @@ pub fn remove_var_for_test(name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- run_bounded ------------------------------------------------------------------
+
+    fn words(argv: &[&str]) -> Vec<String> {
+        argv.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_child_that_exits_normally_is_unaffected_by_the_bound() {
+        let out = run_bounded(
+            &words(&["sh", "-c", "echo out; echo err >&2; exit 7"]),
+            None,
+            &[],
+            Duration::from_secs(5),
+        );
+        assert_eq!(out.code, Some(7));
+        assert_eq!(out.stdout, "out\n");
+        assert_eq!(out.stderr, "err\n");
+    }
+
+    #[test]
+    fn a_child_that_outlives_the_deadline_is_killed_and_reported_as_a_loud_failure() {
+        let out = run_bounded(
+            &words(&["sh", "-c", "sleep 5"]),
+            None,
+            &[],
+            Duration::from_millis(200),
+        );
+        assert_eq!(
+            out.code, None,
+            "a killed child never reports a real exit code"
+        );
+        assert!(
+            out.stderr.contains("deadline"),
+            "the model must be able to tell this was a timeout, not a crash: {}",
+            out.stderr
+        );
+    }
+
+    #[test]
+    fn a_child_reading_stdin_hangs_forever_without_the_null_but_is_still_killed_on_time() {
+        // `cat` with no args reads stdin until EOF. With `stdin(Stdio::null())` that EOF is
+        // immediate, so this either exits almost instantly or, if something about the
+        // environment makes it hang anyway, is still caught by the deadline rather than
+        // wedging the test.
+        let out = run_bounded(&words(&["cat"]), None, &[], Duration::from_millis(500));
+        assert!(out.code == Some(0) || out.code.is_none(), "{out:?}");
+    }
+
+    #[test]
+    fn output_larger_than_a_pipe_buffer_does_not_deadlock_the_wait() {
+        // A pipe's kernel buffer is typically 64KiB; ~1MiB on both stdout and stderr would
+        // deadlock a synchronous "read stdout, then read stderr, then wait" implementation
+        // once the child blocks on a full buffer nobody is draining yet.
+        let out = run_bounded(
+            &words(&[
+                "sh",
+                "-c",
+                "yes out | head -c 1000000; (yes err | head -c 1000000) 1>&2",
+            ]),
+            None,
+            &[],
+            Duration::from_secs(10),
+        );
+        assert_eq!(out.code, Some(0));
+        assert_eq!(out.stdout.len(), 1_000_000);
+        assert_eq!(out.stderr.len(), 1_000_000);
+    }
+
+    #[test]
+    fn a_missing_program_still_comes_back_as_a_spawn_failure_not_a_timeout() {
+        let out = run_bounded(
+            &words(&["/no/such/program-grind-test"]),
+            None,
+            &[],
+            Duration::from_secs(5),
+        );
+        assert_eq!(out.code, None);
+        assert!(!out.stderr.contains("deadline"), "{}", out.stderr);
+    }
 
     #[test]
     fn read_bytes_round_trips_what_was_written() {
