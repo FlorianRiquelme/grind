@@ -313,11 +313,40 @@ pub(crate) fn glob_matches(pattern: &str, candidate: &str) -> bool {
 /// leading assignment tokens stripped. More candidates can only mean more refusals, never a
 /// false allow, which is the direction widening is allowed to move in.
 ///
-/// **This is not a shell parser and is not trying to become one.** It has no notion of quoting,
-/// escaping or comments, so a quoted separator inside `sh -c '...'` can still fragment a
-/// candidate early — the glob still matches the fragment carrying the verb, but a determined
-/// adversary constructing shell syntax by hand has more room here than the matcher closes. It
-/// narrows the bypass surface documented above; it does not claim to eliminate it.
+/// A second gap (fix 4): `Bash(sh -c*)`, `Bash(bash -c*)` and `Bash(eval*)` are themselves
+/// front-anchored, so *any* prefix on the outer command defeats them — `env bash -c '...'`,
+/// `/bin/sh -c '...'` and `command eval '...'` all reach a nested shell without `sh`, `bash` or
+/// `eval` ever sitting at the front of a subcommand. Three more normalizations close this, each
+/// **purely additive** for the same reason as the two above — they only ever widen the
+/// candidate set, so they can only turn an allow into a refusal, never the reverse:
+///
+/// 1. **Quoted-span extraction.** A nested shell has to pass its payload as a string, so the
+///    inside of every `'...'` and `"..."` span becomes its own candidate too (queued back
+///    through this same pipeline, so a quoted span containing a further substitution or wrapper
+///    is still unwound). `env bash -c 'gh pr merge 123'` yields the candidate `gh pr merge 123`
+///    directly — already refused by `Bash(gh pr merge*)` — no matter what the wrapper is called
+///    or how deeply it is spelled. This is the general move: it needs no list of wrapper names.
+/// 2. **Basename normalization.** A candidate whose first token contains `/` also yields a
+///    variant with that token reduced to its basename, so `/bin/sh -c '...'` also presents as
+///    `sh -c '...'`, which the existing front-anchored glob matches directly.
+/// 3. **Leading-wrapper stripping**, for the handful of commands that take the wrapped command
+///    as their own argument list rather than as a string, so there is no quote for (1) to find:
+///    `env`, `command`, `nohup`, `nice`, `stdbuf` and `setsid`, and `time`. Stripping the wrapper
+///    token (and, for `env`, any `NAME=value` tokens riding after it) re-queues the remainder as
+///    its own candidate, so `env gh pr merge 123` — which carries no quotes and no path for (2)
+///    to trim — still surfaces `gh pr merge 123` at the front.
+///
+/// Together these accept two documented false refusals: a quoted span that happens to spell a
+/// denied command as a string literal rather than as an invocation (`git commit -m "git push
+/// --force"` is now refused, because the quoted text matches `Bash(git push*--force*)`), and any
+/// spelling of an outer wrapper this file did not think to name. Both are acceptable for a
+/// barrier of this kind — the same trade `Bash(git -C*)` and `Bash(git push*:*)` already make.
+///
+/// **This is not a shell parser and is not trying to become one.** It has no notion of escaping
+/// or comments, so a quoted separator inside `sh -c '...'` can still fragment a candidate early —
+/// the glob still matches the fragment carrying the verb, but a determined adversary constructing
+/// shell syntax by hand has more room here than the matcher closes. It narrows the bypass surface
+/// documented above; it does not claim to eliminate it.
 pub(crate) fn subcommands_of(command: &str) -> Vec<String> {
     let mut queue = vec![command.to_string()];
     let mut seen: Vec<String> = Vec::new();
@@ -337,17 +366,101 @@ pub(crate) fn subcommands_of(command: &str) -> Vec<String> {
         for piece in pieces {
             let trimmed = piece.trim().to_string();
             queue.extend(extract_spans(&trimmed));
+            queue.extend(extract_quoted(&trimmed));
             // The plain trimmed piece stays a candidate regardless — stripping only adds a
             // second candidate on top, so a future glob with no fixed prefix cannot lose a
-            // match this already had.
+            // match this already had. Each of `trimmed` and its assignment-stripped variant
+            // also contributes a basename-normalized variant, and either may unwrap a leading
+            // wrapper command, whose remainder is queued to run back through this same pipeline.
             let stripped = strip_leading_assignments(&trimmed);
-            candidates.push(trimmed.clone());
+            push_with_basename(&mut candidates, &trimmed);
+            queue.extend(strip_leading_wrapper(&trimmed));
             if stripped != trimmed {
-                candidates.push(stripped);
+                push_with_basename(&mut candidates, &stripped);
+                queue.extend(strip_leading_wrapper(&stripped));
             }
         }
     }
     candidates
+}
+
+/// Push `candidate`, plus — when its first whitespace-delimited token contains a `/` — a second
+/// variant with that token reduced to its basename. Purely additive, same as every other
+/// widening in [`subcommands_of`].
+fn push_with_basename(candidates: &mut Vec<String>, candidate: &str) {
+    candidates.push(candidate.to_string());
+    let end = candidate
+        .find(char::is_whitespace)
+        .unwrap_or(candidate.len());
+    let (first, rest) = candidate.split_at(end);
+    if first.contains('/') {
+        let base = first.rsplit('/').next().unwrap_or(first);
+        candidates.push(format!("{base}{rest}"));
+    }
+}
+
+/// Leading commands that take the wrapped command as their own argument list rather than as a
+/// string — so quoted-span extraction finds no quotes to unwind. `env` alone also accepts
+/// `NAME=value` tokens ahead of the wrapped command.
+const LEADING_WRAPPERS: [&str; 7] = [
+    "env", "command", "nohup", "nice", "stdbuf", "setsid", "time",
+];
+
+/// If `command` starts with one of [`LEADING_WRAPPERS`], the remainder after that token (and,
+/// for `env`, after any `NAME=value` tokens following it) — otherwise `None`. The remainder is
+/// re-queued in [`subcommands_of`] rather than trusted as a final candidate, so a stack of
+/// wrappers (`nohup env bash -c '...'`) unwinds one layer per pass.
+fn strip_leading_wrapper(command: &str) -> Option<String> {
+    let trimmed = command.trim_start();
+    let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    let head = &trimmed[..end];
+    if !LEADING_WRAPPERS.contains(&head) {
+        return None;
+    }
+    let mut rest = trimmed[end..].trim_start();
+    if head == "env" {
+        loop {
+            let tok_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let token = &rest[..tok_end];
+            if is_assignment_token(token) {
+                rest = rest[tok_end..].trim_start();
+            } else {
+                break;
+            }
+        }
+    }
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest.to_string())
+    }
+}
+
+/// The inside of every `'...'` and `"..."` span in `text`, outermost only — the payload a nested
+/// shell (`sh -c '...'`, `eval "..."`) receives as a single string argument. Not quote-aware in
+/// any deeper sense: an escaped quote inside the span is not honored, and a span is skipped
+/// (rather than guessed at) if it never closes.
+fn extract_quoted(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let quote = bytes[i];
+        if quote == b'\'' || quote == b'"' {
+            match text[i + 1..].find(quote as char) {
+                Some(offset) => {
+                    let end = i + 1 + offset;
+                    spans.push(text[i + 1..end].to_string());
+                    i = end + 1;
+                    continue;
+                }
+                None => i += 1,
+            }
+        } else {
+            i += 1;
+        }
+    }
+    spans
 }
 
 /// The inside of every `$( ... )`, backtick `` `...` `` and bare `( ... )` span in `text`,
@@ -626,6 +739,39 @@ mod tests {
     }
 
     #[test]
+    fn nested_shell_wrappers_no_longer_hide_the_verb_from_a_front_anchored_glob() {
+        // Fix 4: `Bash(sh -c*)`, `Bash(bash -c*)` and `Bash(eval*)` are front-anchored, so any
+        // prefix on the outer command used to defeat them outright. Gated against the real
+        // `attempt::DENIED_TOOLS` list, since the point is that the matcher now finds these
+        // regardless of which glob ends up doing the refusing.
+        let all_denials: Vec<String> = crate::attempt::DENIED_TOOLS
+            .iter()
+            .map(|g| g.to_string())
+            .collect();
+        for command in [
+            "env bash -c 'gh pr merge 123'",
+            "/bin/sh -c 'gh pr merge 123'",
+            "command eval 'git reset --hard HEAD~3'",
+            "env gh pr merge 123",
+            "nohup sh -c 'git push --force origin main'",
+            "sh -c \"gh pr merge 123\"",
+        ] {
+            let decision = gate(
+                &all_denials,
+                call(
+                    "bash",
+                    &serde_json::json!({ "command": command }).to_string(),
+                ),
+            );
+            assert_eq!(
+                denied_layer(decision),
+                GateLayer::DeniedGlob,
+                "`{command}` must be denied"
+            );
+        }
+    }
+
+    #[test]
     fn benign_commands_pass_the_real_denied_tools_entries() {
         let globs: Vec<String> = crate::attempt::DENIED_TOOLS
             .iter()
@@ -637,6 +783,13 @@ mod tests {
             "gh pr view 135",
             "cargo test --lib runner::tools",
             "echo done",
+            // The new normalizations must not turn an ordinary invocation of a wrapper, a
+            // path-qualified binary or a quoted string into a false denial.
+            "env RUST_LOG=debug cargo test",
+            "/usr/bin/git status",
+            "nohup cargo build --release &",
+            "echo 'hello world'",
+            "git commit -m \"widen the denied-tools matcher\"",
         ] {
             let decision = gate(
                 &globs,

@@ -144,6 +144,28 @@ pub fn run_scrubbed(argv: &[String], cwd: Option<&Path>, drop_vars: &[&str]) -> 
 /// `code: None` with the reason in `stderr` — the same *could not observe* shape `run_scrubbed`
 /// already uses for a spawn failure, so the classifier stays unchanged, and worded so a caller
 /// reading `stderr` can tell *killed on a deadline* apart from *never started*.
+///
+/// **Two more hazards, both about the child's own children.** `read_to_end` on a pipe returns
+/// only at EOF, and EOF arrives only once *every* write end is closed — not when the direct
+/// child exits. A command run through `sh -c` that backgrounds something (`sleep 30 &`,
+/// `npm start &`, a `tail -f`) leaves that grandchild holding the inherited write end open, so
+/// the direct child can exit — or be killed — while the pipe stays open indefinitely. Two
+/// things follow from that:
+///
+/// - `child.kill()` signals the direct child alone, so it does not reach the grandchild.
+///   `process_group(0)` puts the child at the head of its own process group before it spawns
+///   (best-effort: `#[cfg(unix)]`, a no-op elsewhere), and [`kill_process_group_best_effort`]
+///   then signals the *group*, which reaches an ordinary backgrounded grandchild too. This is
+///   deliberately not load-bearing — a grandchild that double-forks into its own session
+///   (real daemonizing) sits outside the group and survives it regardless, and the pid can in
+///   principle be recycled between reap and signal. Both are accepted, rare misses.
+/// - Because that best-effort kill can miss, the reader threads are never `join()`ed. They
+///   send their bytes over a channel instead, and collection reads that channel with
+///   `recv_timeout` under a fixed grace period. If nothing arrives in time, this function
+///   returns with whatever it has (often nothing) and the reader thread is abandoned mid-read,
+///   still blocked on the pipe. That is a leaked thread — a bounded, one-time cost — traded
+///   deliberately against the alternative, which is the supervisor thread itself hanging past
+///   its own deadline, exactly the failure this function exists to prevent.
 pub fn run_bounded(
     argv: &[String],
     cwd: Option<&Path>,
@@ -169,6 +191,14 @@ pub fn run_bounded(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Best-effort: gives `kill_process_group_best_effort` below a group to signal. A no-op on
+    // non-unix, where the group kill is skipped entirely and the bounded collection below is
+    // what carries the whole guarantee.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -180,20 +210,25 @@ pub fn run_bounded(
             };
         }
     };
+    let child_id = child.id();
 
     // Taken before the poll loop, so both pipes drain concurrently with the wait rather than
-    // sequentially after it.
+    // sequentially after it. Each reader hands its bytes over a channel rather than being
+    // `join`ed — see the doc comment above for why an unbounded join is exactly the hang this
+    // function must not have.
     let mut stdout_pipe = child.stdout.take().expect("stdout was piped above");
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped above");
-    let stdout_reader = std::thread::spawn(move || {
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
+        let _ = stdout_tx.send(buf);
     });
-    let stderr_reader = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
+        let _ = stderr_tx.send(buf);
     });
 
     let deadline = Instant::now() + limit;
@@ -214,12 +249,38 @@ pub fn run_bounded(
     };
     if timed_out {
         let _ = child.kill();
+        // Reap the group **before** `wait()`, and only on this path. Ordering is the whole
+        // safety argument: a reaped pid is free for reuse immediately, so signalling the group
+        // afterwards can send SIGKILL to whatever process group inherited that number — not a
+        // failed kill, a successful kill of the wrong thing, silently, on a host that runs many
+        // Runs at once. While the child is still unreaped its pid cannot be recycled and the
+        // group id stays reserved by the zombie leader, so here the number still means what we
+        // think it means.
+        //
+        // The clean-exit path deliberately does not do this. `try_wait` has already reaped the
+        // child by then, so the same ordering guarantee is unavailable — and a command that
+        // *succeeded* has not earned having its background children killed, which a stage
+        // starting a dev server would not expect. An orphan holding the pipe there costs the
+        // collection grace below and nothing more.
+        kill_process_group_best_effort(child_id);
         let _ = child.wait();
     }
 
-    let stdout = stdout_reader.join().unwrap_or_default();
+    // A fixed grace period, independent of `limit`: by the time we get here the child is dead
+    // and — on the timeout path — so is its group, so any output still in flight should land
+    // within milliseconds. The margin is generous purely to avoid flaking on a loaded machine or
+    // a large trailing write, never because this is expected to run long.
+    //
+    // **One deadline shared across both pipes, not one each.** The case that actually spends it
+    // is a clean exit whose backgrounded grandchild still holds the write ends — there is no
+    // group kill on that path, so both reads block and a per-pipe grace would stack into double
+    // the wait for a command that already succeeded.
+    let collection_deadline = Instant::now() + Duration::from_secs(2);
+    let remaining = || collection_deadline.saturating_duration_since(Instant::now());
+    let stdout = stdout_rx.recv_timeout(remaining()).unwrap_or_default();
     let stderr_tail =
-        String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).into_owned();
+        String::from_utf8_lossy(&stderr_rx.recv_timeout(remaining()).unwrap_or_default())
+            .into_owned();
 
     Completed {
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -234,6 +295,38 @@ pub fn run_bounded(
         code: exit_code,
     }
 }
+
+/// Signal the whole process group `run_bounded`'s child leads (its pid doubles as the group id
+/// after `process_group(0)`), so an ordinary backgrounded grandchild (`sleep 30 &`, `tail -f`)
+/// dies alongside it rather than being orphaned onto whatever reaps stray processes on this
+/// host. No syscall for this is in `std`, and `libc` is outside the crate's dependency budget
+/// (ADR-0005/ADR-0016), so the signal goes out via a spawned `kill` — `world` is exactly the
+/// module allowed to do that.
+///
+/// Deliberately swallows every failure: a missing `kill` binary or a group that already has no
+/// members look the same from here, and neither may become load-bearing — `run_bounded`'s
+/// bounded-collection step is the actual guarantee. A daemonizing grandchild that double-forked
+/// into its own session is not in this group at all and is not reached by this either way.
+///
+/// **The caller owns the one hazard this cannot swallow.** Signalling a *recycled* pid is not a
+/// failure that lands here as an error — it is a successful SIGKILL of an unrelated process
+/// group. So this must only ever be called while the child is still unreaped, which keeps its
+/// pid out of circulation and the group id reserved by the zombie leader. `run_bounded` calls it
+/// between `kill()` and `wait()` for exactly that reason; do not move it after the reap, and do
+/// not call it with a pid whose child has already been waited on.
+#[cfg(unix)]
+fn kill_process_group_best_effort(pgid: u32) {
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(format!("-{pgid}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(unix))]
+fn kill_process_group_best_effort(_pgid: u32) {}
 
 /// The long-lived `claude` child. **The real seam, and it is the binary path** — only a real
 /// process replays real SIGKILL, real empty-not-truncated stdout, a real separate stderr file
@@ -722,6 +815,35 @@ mod tests {
         assert_eq!(out.code, Some(0));
         assert_eq!(out.stdout.len(), 1_000_000);
         assert_eq!(out.stderr.len(), 1_000_000);
+    }
+
+    #[test]
+    fn a_backgrounded_grandchild_outliving_the_deadline_does_not_hang_the_call() {
+        // The direct child (`sh`) runs `echo` and returns almost immediately, but `sleep 30 &`
+        // keeps running after it, still holding the inherited stdout pipe open. Before this
+        // fix, `read_to_end` on that pipe never sees EOF and the unbounded `join()` after it
+        // hangs forever — exactly the failure `run_bounded` exists to prevent. A limit of a
+        // couple of seconds (never the 600s constant `tools.rs` uses) is enough to prove the
+        // call returns at all; the assertion bound is generous so a loaded machine can't flake
+        // it, while still catching a real regression back to an unbounded hang.
+        let start = Instant::now();
+        let out = run_bounded(
+            &words(&["sh", "-c", "sleep 30 & echo started"]),
+            None,
+            &[],
+            Duration::from_secs(2),
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "run_bounded must return in bounded time even when the child backgrounds a \
+             process that outlives it; took {elapsed:?}"
+        );
+        assert_eq!(
+            out.code,
+            Some(0),
+            "the direct child (`sh`) exits cleanly: {out:?}"
+        );
     }
 
     #[test]

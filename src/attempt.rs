@@ -570,7 +570,7 @@ mod tests {
         // spelling per row is what let the whole list read complete while
         // `git push origin --force` went straight through: git accepts the flag anywhere, and
         // a table that only ever types it in one position never asks.
-        let table: [(&str, &[&str]); 19] = [
+        let table: [(&str, &[&str]); 20] = [
             (
                 "merge via gh pr merge",
                 &["gh pr merge 123 --squash", "gh pr merge --squash 123"],
@@ -681,6 +681,18 @@ mod tests {
                     "eval 'git reset --hard HEAD~3'",
                 ],
             ),
+            (
+                "the same indirection with a prefix in front of sh/bash/eval, which used to \
+                 defeat their front anchor outright (fix 4)",
+                &[
+                    "env bash -c 'gh pr merge 123'",
+                    "/bin/sh -c 'gh pr merge 123'",
+                    "command eval 'git reset --hard HEAD~3'",
+                    "env gh pr merge 123",
+                    "nohup sh -c 'git push --force origin main'",
+                    "sh -c \"gh pr merge 123\"",
+                ],
+            ),
         ];
         for (name, spellings) in table {
             for candidate in spellings {
@@ -712,6 +724,12 @@ mod tests {
             "git checkout feat/x",
             "git fetch origin",
             "git log --oneline",
+            // The fix-4 normalizations must not turn an ordinary wrapper use, a path-qualified
+            // binary or a quoted string into a false denial.
+            "env RUST_LOG=debug cargo test",
+            "/usr/bin/git status",
+            "nohup cargo build --release &",
+            "echo 'hello world'",
         ] {
             assert!(!is_denied(allowed), "{allowed:?} must not be denied");
         }

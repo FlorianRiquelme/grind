@@ -320,14 +320,30 @@ fn raw_file(home: &Path, id: &str, file: &str) -> Response {
 
 fn evidence_allowed(file: &str) -> bool {
     const WHOLE: [&str; 3] = ["run.json", "supervisor.log", "resume.log"];
-    const SUFFIXES: [&str; 3] = [".prompt.txt", ".stdout.json", ".stderr.log"];
+    /// What the claude-code adapter writes per invocation, for both file labels.
+    const SPAWNED: [&str; 3] = [".prompt.txt", ".stdout.json", ".stderr.log"];
     if WHOLE.contains(&file) {
         return true;
     }
-    SUFFIXES.iter().any(|suffix| {
-        file.strip_prefix("attempt-")
-            .and_then(|rest| rest.strip_suffix(suffix))
-            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    // One `<prefix><digits><suffix>` rule, applied to every name an adapter actually writes.
+    // The list grew twice and the route did not follow either time: the native adapter writes
+    // `messages-N.jsonl` instead of the claude trio — and the dashboard links it — while reflect
+    // now runs through the seam too and writes the `reflect-` pair. Every one of those links
+    // resolved to a 404 on a route whose whole job is serving the evidence behind them.
+    const NUMBERED: [(&str, &[&str]); 4] = [
+        ("attempt-", &SPAWNED),
+        ("reflect-", &SPAWNED),
+        ("messages-", &[".jsonl"]),
+        ("reflect-messages-", &[".jsonl"]),
+    ];
+    NUMBERED.iter().any(|(prefix, suffixes)| {
+        suffixes.iter().any(|suffix| {
+            file.strip_prefix(prefix)
+                .and_then(|rest| rest.strip_suffix(suffix))
+                .is_some_and(|digits| {
+                    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+                })
+        })
     })
 }
 
@@ -962,6 +978,14 @@ mod tests {
             "attempt-12.prompt.txt",
             "attempt-12.stdout.json",
             "attempt-12.stderr.log",
+            // Reflect runs through the seam too, and the native adapter writes its own
+            // transcripts instead of the claude trio. The dashboard links these; the route
+            // must serve them.
+            "reflect-3.prompt.txt",
+            "reflect-3.stdout.json",
+            "reflect-3.stderr.log",
+            "messages-7.jsonl",
+            "reflect-messages-3.jsonl",
         ] {
             world::write_atomic(&run_dir.join(name), "evidence bytes\n").unwrap();
             let target = format!("/raw/runs/abc/{name}");
@@ -985,6 +1009,11 @@ mod tests {
             "attempt-x.stdout",
             "attempt-.prompt.txt",
             "attempt-1x.stderr.log",
+            "messages-.jsonl",
+            "messages-x.jsonl",
+            "messages-1.jsonl.bak",
+            "reflect-.prompt.txt",
+            "reflect-messages-x.jsonl",
             "Attempt-1.prompt.txt",
             "attempt-1.prompt.txt.bak",
             "secrets.env",

@@ -173,7 +173,15 @@ earlier attempt's transcript agrees with a fresh one reading the declaration dir
 `proto_override` join `backend`/`endpoint_override` on `RunRecord`, snapshotted at dispatch from
 the same selection read, `#[serde(default, skip_serializing_if = "Option::is_none")]` for the
 same reason: undeclared is the honest answer for every record written before the grammar grew
-these keys, never a blank one. Each needs the same read-only mirror on `view::RunView` this
-ADR already obligates for every future record field — left for the module that owns `view.rs` to
-land, since the writer and the reader are deliberately blind to each other (ADR-0007's wall) and
-this amendment's author does not own that side of it.
+these keys, never a blank one. Each carries the same read-only mirror on `view::RunView` this
+ADR already obligates for every future record field; all three landed with the amendment.
+
+The carrier that binds the two sides needed widening to cover them, and the reason is worth
+recording because it generalizes. `what_the_writer_serialises_is_what_the_reader_deserialises`
+asserts that the reader accepts every field the writer emits — but all three of these are
+`skip_serializing_if = "Option::is_none"`, so a test record leaving them unset emits nothing and
+the carrier passes over a mirror that does not have them. The drift would then surface on the
+first Dispatch that declared a model or a wire mode, as a `run.json` that `grind status` and the
+dashboard could not parse: the two places a human looks precisely when they want reassurance.
+**An optional field on the record must be given a value in that test, or it is not covered at
+all.** The attribute that keeps legacy records parsing is the same one that hides the gap.

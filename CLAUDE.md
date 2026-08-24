@@ -168,9 +168,37 @@ change carries a safety property, not for coverage's sake.
   leading `NAME=value` assignment token off every candidate — `echo $(gh pr merge 123)`,
   `` `git push --force origin main` `` and `GIT_DIR=. gh pr merge 123` all reached a shell
   without the verb ever appearing at the front of a subcommand the plain split saw. This is
-  still not a shell parser: it has no notion of quoting or escaping, so it narrows the bypass
-  rather than closing it, and it only ever adds candidates — never fewer, so it can only refuse
-  more, not less.
+  still not a shell parser: it has no notion of escaping, so it narrows the bypass rather than
+  closing it, and it only ever adds candidates — never fewer, so it can only refuse more, not
+  less.
+
+  A fourth gap (widened alongside the three above, same file, same rule): the last three globs
+  below — `Bash(sh -c*)`, `Bash(bash -c*)`, `Bash(eval*)` — are themselves front-anchored, so
+  *any* prefix on the outer command defeated them. `env bash -c 'gh pr merge 123'`,
+  `/bin/sh -c 'gh pr merge 123'` and `command eval 'git reset --hard HEAD~3'` all reached a
+  nested shell without `sh`, `bash` or `eval` ever sitting at the front of a subcommand.
+  `tools::subcommands_of` closes this with three more purely-additive normalizations rather than
+  by enumerating wrapper names, which is the same whack-a-mole this file already rejects
+  elsewhere: (1) the inside of every `'...'` and `"..."` span becomes its own candidate too — a
+  nested shell has to pass its payload as a string, so `env bash -c 'gh pr merge 123'` yields the
+  candidate `gh pr merge 123` directly, already refused by `Bash(gh pr merge*)`, no matter what
+  the wrapper is called; (2) a candidate whose first token contains `/` also yields a variant
+  with that token reduced to its basename, so `/bin/sh -c '...'` also presents as `sh -c '...'`;
+  (3) a fixed set of leading wrappers that take the command as an argument list rather than as a
+  string — `env`, `command`, `nohup`, `nice`, `stdbuf`, `setsid`, `time` — are stripped (and,
+  for `env`, any `NAME=value` tokens riding after it too), so `env gh pr merge 123`, which carries
+  no quotes for (1) and no `/` for (2), still surfaces `gh pr merge 123` at the front. All three
+  are additive in the same direction as the first three: they can only grow the candidate set, so
+  they can only turn an allow into a refusal, never the reverse. Two false refusals are accepted
+  as a result: a quoted string that happens to spell a denied command as a literal rather than as
+  an invocation (`git commit -m "git push --force"` is now refused, since the quoted text matches
+  `Bash(git push*--force*)`), and any spelling of an outer wrapper this list did not think to
+  name. The three globs themselves stay front-anchored rather than becoming position-independent
+  (`Bash(*eval*)` and the like): the normalizations above already catch the realistic shape of
+  this evasion — a wrapped command handed to a nested shell as a string, or through one of the
+  seven listed wrappers — and a position-independent `eval`/`sh -c`/`bash -c` glob would refuse
+  on any substring match anywhere in a command, a far broader false-refusal surface for a gap
+  the normalizations already close.
 
   **The first twelve each anchor their flag immediately after the verb, and git accepts the flag
   anywhere.** `git push origin --force`, `git push origin main --force`,
