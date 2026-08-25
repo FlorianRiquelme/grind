@@ -140,8 +140,6 @@ pub struct RawCall {
 /// the gating layer).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GateLayer {
-    UnknownTool,
-    InvalidArgs,
     DeniedGlob,
     PathEscape,
 }
@@ -162,38 +160,21 @@ pub enum GateDecision {
 /// Gate BEFORE execution against this stage's denied-tool globs (the same
 /// `attempt::denied_for` list the claude-code adapter passes to --disallowedTools).
 ///
+/// **Precondition:** the call is already well-formed — [`protocol_fault`] returned
+/// `None` for it. Well-formedness is the nudge channel's business (a malformed call
+/// is a nonconforming reply under ADR-0018, corrected once and logged), not policy;
+/// folding it back in here would let protocol drift hide as a denial record instead
+/// of a measured nudge. On a precondition violation this degrades harmlessly — a
+/// null argument set matches no glob and escapes no path — rather than panicking,
+/// because a gate must never be the thing that crashes a Run.
+///
 /// Matching mirrors Claude Code's own deny-glob matcher as encoded in
 /// `attempt::DENIED_TOOLS`: a `Bash(<pattern>)` entry matches shell commands of the
 /// bash tool — per subcommand after splitting on shell separators, `*` the only
 /// wildcard — while a bare entry matches tool names directly.
 pub fn gate(denied_globs: &[String], raw: RawCall) -> GateDecision {
-    // 1. The tool must exist at all.
-    if !STANDARD_NAMES.contains(&raw.name.as_str()) {
-        return GateDecision::Denied(GateReport {
-            layer: GateLayer::UnknownTool,
-            tool: raw.name.clone(),
-            reason: format!("no such tool {}", raw.name),
-        });
-    }
-    // 2. Arguments must be a JSON object.
-    let args: Value = match serde_json::from_str(&raw.arguments_json) {
-        Ok(v) => v,
-        Err(_) => {
-            return GateDecision::Denied(GateReport {
-                layer: GateLayer::InvalidArgs,
-                tool: raw.name.clone(),
-                reason: "tool arguments were not valid JSON".to_string(),
-            });
-        }
-    };
-    if !args.is_object() {
-        return GateDecision::Denied(GateReport {
-            layer: GateLayer::InvalidArgs,
-            tool: raw.name.clone(),
-            reason: "tool arguments were not a JSON object".to_string(),
-        });
-    }
-    // 3. Denied-tool globs.
+    let args: Value = serde_json::from_str(&raw.arguments_json).unwrap_or(Value::Null);
+    // 1. Denied-tool globs.
     let command = || args["command"].as_str().unwrap_or_default();
     for glob in denied_globs {
         let denied = match glob.strip_prefix("Bash(").and_then(|g| g.strip_suffix(')')) {
@@ -215,7 +196,7 @@ pub fn gate(denied_globs: &[String], raw: RawCall) -> GateDecision {
             });
         }
     }
-    // 4. Path-carrying tools must stay inside the working directory.
+    // 2. Path-carrying tools must stay inside the working directory.
     if matches!(raw.name.as_str(), "read_file" | "write_file")
         && !resolves_within(args["path"].as_str().unwrap_or_default())
     {
@@ -226,6 +207,52 @@ pub fn gate(denied_globs: &[String], raw: RawCall) -> GateDecision {
         });
     }
     GateDecision::Allowed(raw)
+}
+
+/// Is this a well-formed invocation of a known tool? `None` means yes; `Some`
+/// carries one human-readable fault naming exactly what was wrong, so the model
+/// can correct it on the next turn (#142).
+///
+/// This is protocol conformance, deliberately kept out of [`gate`]: an empty name
+/// (`{"name": "", "arguments": "\"\""}`, 17 of 63 calls in one real attempt), an
+/// invented tool, arguments that are not an object, and a call missing a required
+/// argument (`write_file` carrying only `content`) are all *replies that did not
+/// conform* — ADR-0018's nudge case — while a well-formed call the stage may not
+/// make is a denial. One function per channel, so neither can blur into the other.
+pub fn protocol_fault(defs: &[ToolDef], name: &str, arguments_json: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("the tool call had an empty name".to_string());
+    }
+    let Some(def) = defs.iter().find(|d| d.name == name) else {
+        return Some(format!("no such tool {name}"));
+    };
+    let args: Value = match serde_json::from_str(arguments_json) {
+        Ok(v) => v,
+        Err(_) => return Some("the tool call's arguments were not valid JSON".to_string()),
+    };
+    let Some(object) = args.as_object() else {
+        return Some("the tool call's arguments were not a JSON object".to_string());
+    };
+    let missing: Vec<&str> = def
+        .parameters
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|required| {
+            required
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|key| !object.contains_key(*key))
+                .collect()
+        })
+        .unwrap_or_default();
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "missing required argument(s): {}",
+            missing.join(", ")
+        ))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -582,33 +609,71 @@ mod tests {
         globs.iter().map(|g| g.to_string()).collect()
     }
 
-    // --- gating matrix ------------------------------------------------------------------
+    // --- protocol faults: the nudge channel (#142) ---------------------------------------
+    //
+    // Well-formedness moved out of `gate` into `protocol_fault`: a malformed call is a
+    // nonconforming reply (ADR-0018's nudge case), not policy. Every shape from the issue
+    // is asserted here by its exact wire spelling.
 
-    #[test]
-    fn unknown_tool_is_refused_before_anything_else_is_examined() {
-        let decision = gate(&denied_globs(&["bash"]), call("rm_rf", r#"{"path": "x"}"#));
-        assert_eq!(denied_layer(decision), GateLayer::UnknownTool);
+    fn defs() -> Vec<ToolDef> {
+        // The workdir is inert for definitions — `defs()` never reads it.
+        ToolRegistry::standard(PathBuf::new()).defs()
     }
 
     #[test]
-    fn non_json_and_non_object_arguments_are_refused_as_invalid_args() {
+    fn an_empty_name_is_a_fault() {
+        // Issue #142 attempt 1: 17 of 63 calls arrived exactly like this.
+        assert_eq!(
+            protocol_fault(&defs(), "", "\"\"").as_deref(),
+            Some("the tool call had an empty name")
+        );
+    }
+
+    #[test]
+    fn an_invented_tool_name_is_a_fault() {
+        let fault = protocol_fault(&defs(), "rm_rf", r#"{"path": "x"}"#).unwrap();
+        assert!(fault.contains("no such tool"), "{fault}");
+        assert!(fault.contains("rm_rf"), "{fault}");
+    }
+
+    #[test]
+    fn non_json_and_non_object_arguments_are_faults() {
         for arguments_json in ["not json", "[1,2]", "\"bash\"", "42"] {
-            let decision = gate(&[], call("bash", arguments_json));
-            assert_eq!(
-                denied_layer(decision),
-                GateLayer::InvalidArgs,
-                "{arguments_json}"
-            );
+            let fault = protocol_fault(&defs(), "bash", arguments_json);
+            assert!(fault.is_some(), "{arguments_json} must be a fault");
         }
     }
 
     #[test]
-    fn invalid_args_beats_denied_glob_in_the_gate_order() {
+    fn a_call_missing_a_required_argument_is_a_fault_naming_the_key() {
+        // Issue #142 attempt 2: write_file carrying only `content`, no `path`.
+        let arguments =
+            serde_json::json!({ "content": "---\nreadiness: ready\n---\n" }).to_string();
+        assert_eq!(
+            protocol_fault(&defs(), "write_file", &arguments).as_deref(),
+            Some("missing required argument(s): path")
+        );
+    }
+
+    #[test]
+    fn a_well_formed_call_has_no_fault() {
+        assert_eq!(protocol_fault(&defs(), "bash", r#"{"command":"ls"}"#), None);
+        assert_eq!(
+            protocol_fault(&defs(), "write_file", r#"{"path":"a.md","content":"hi"}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn the_gate_degrades_harmlessly_on_a_malformed_call_instead_of_denying_it() {
+        // Documented precondition behavior: protocol faults never reach the gate in the
+        // live loop, but if one ever does, the gate must neither panic nor dress the
+        // fault up as a policy denial.
         let decision = gate(
             &denied_globs(&["Bash(git push -f*)"]),
             call("bash", "not json"),
         );
-        assert_eq!(denied_layer(decision), GateLayer::InvalidArgs);
+        assert!(allowed_layer(decision).is_some());
     }
 
     #[test]
