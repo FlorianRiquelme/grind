@@ -278,6 +278,18 @@ Code work happens in a dedicated `git worktree`, never in this checkout — mult
 worked in parallel here. Before starting a change: `git worktree add ../grind-<issue> -b <branch>`,
 edit and verify there, open the PR from that branch.
 
+### CodeRabbit triage
+
+Every PR gets an automatic CodeRabbit bot review a few minutes after opening, and every inline
+comment must be answered — replying is what teaches the bot. Immediately after `gh pr create`
+succeeds, start the watcher **in the background (async), before ending the turn**; never open a
+PR and yield without it. When its result delivers, read
+`skill://coderabbit-review-triage` and triage every comment (fix or substantively reject).
+
+```
+PR=<n>; REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner); for i in $(seq 1 30); do C=$(gh api repos/$REPO/pulls/$PR/comments --jq 'length'); R=$(gh api repos/$REPO/pulls/$PR/reviews --jq '[.[] | select(.user.login=="coderabbitai[bot]")] | length'); if [ "$((C+R))" -gt 0 ]; then echo "CodeRabbit reviewed #$PR: $C inline comment(s)"; exit 0; fi; sleep 60; done; echo "TIMEOUT: no CodeRabbit review on #$PR after 30 min"
+```
+
 ### Issue tracker
 
 Issues live as GitHub issues in `FlorianRiquelme/grind`, driven via the `gh` CLI. See `docs/agents/issue-tracker.md`.
