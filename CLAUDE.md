@@ -272,6 +272,12 @@ change carries a safety property, not for coverage's sake.
 
 ## Agent skills
 
+### Worktrees
+
+Code work happens in a dedicated `git worktree`, never in this checkout — multiple issues are
+worked in parallel here. Before starting a change: `git worktree add ../grind-<issue> -b <branch>`,
+edit and verify there, open the PR from that branch.
+
 ### Issue tracker
 
 Issues live as GitHub issues in `FlorianRiquelme/grind`, driven via the `gh` CLI. See `docs/agents/issue-tracker.md`.
