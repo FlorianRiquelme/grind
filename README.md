@@ -111,7 +111,7 @@ ln -s <path-to-this-repo>/skills/enqueue ~/.claude/skills/enqueue
   contract with `src/job.rs`, tested by `tests/enqueue_template.rs`.
 - [`tests/`](tests/) — every safety property, including the compile-fail carrier, which shells out
   to `rustc` rather than taking a dev-dependency.
-- [`docs/adr/`](docs/adr/) — fifteen accepted decisions constraining almost every change here.
+- [`docs/adr/`](docs/adr/) — eighteen accepted decisions constraining almost every change here.
 - [`docs/findings/`](docs/findings/) — four dogfood Runs' measurements, `0001`–`0004`.
 - [`docs/provisioned-host.md`](docs/provisioned-host.md) — what a host owes before a Dispatch
   succeeds on it.
