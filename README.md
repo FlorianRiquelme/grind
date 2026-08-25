@@ -112,7 +112,7 @@ ln -s <path-to-this-repo>/skills/enqueue ~/.claude/skills/enqueue
 - [`tests/`](tests/) — every safety property, including the compile-fail carrier, which shells out
   to `rustc` rather than taking a dev-dependency.
 - [`docs/adr/`](docs/adr/) — eighteen accepted decisions constraining almost every change here.
-- [`docs/findings/`](docs/findings/) — four dogfood Runs' measurements, `0001`–`0004`.
+- [`docs/findings/`](docs/findings/) — five dogfood Runs' measurements, `0001`–`0005`.
 - [`docs/provisioned-host.md`](docs/provisioned-host.md) — what a host owes before a Dispatch
   succeeds on it.
 - [`CLAUDE.md`](CLAUDE.md) and [`CONTEXT.md`](CONTEXT.md) — contributor constraints, and the

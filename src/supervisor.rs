@@ -2043,19 +2043,45 @@ mod tests {
         );
     }
 
+    /// The seam itself (issue #146, CodeRabbit review): the supervisor records whatever
+    /// `reflect_status` answers for the classified Attempt — the fix substituted
+    /// `reflect_status(classified.is_error)` for `classified.done_promise ||
+    /// classified.parse_ok`. Error taking precedence over a spoken done-promise is only
+    /// guaranteed while the promise stays out of the helper's inputs, so this builds the
+    /// classified Attempt the name claims — errored ending, DONE promised mid-stream — and
+    /// pins the record through the same expression the supervisor runs. Reverting the
+    /// substitution at the push_stage_entry call fails here, not three helper-only greens.
     #[test]
-    fn a_reflect_that_exhausts_its_turn_budget_is_incomplete_not_complete() {
+    fn an_error_ending_takes_precedence_over_a_spoken_done_promise() {
+        let attempt = Attempt {
+            n: 1,
+            mode: Mode::Dispatch,
+            started_at: "s".to_string(),
+            ended_at: "e".to_string(),
+            exit_code: Some(1),
+            is_error: true,
+            parse_ok: true,
+            subtype: Some("success".to_string()),
+            stop_reason: None,
+            api_error_status: None,
+            terminal_reason: None,
+            num_turns: Some(3),
+            total_cost_usd: None,
+            usage: None,
+            permission_denials: vec![],
+            done_promise: true,
+            rate_limited: false,
+            result_tail: String::new(),
+            fanout: Observed::Absent,
+        };
+        let status = reflect_status(attempt.is_error);
         assert_eq!(
-            reflect_status(true),
+            status,
             ReturnStatus::Incomplete,
-            "an errored ending — turn exhaustion, a crash — is not a complete stage"
+            "an errored ending that spoke the sentinel mid-stream is still not a complete stage"
         );
     }
 
-    #[test]
-    fn an_error_ending_takes_precedence_over_a_spoken_done_promise() {
-        assert_eq!(reflect_status(true), ReturnStatus::Incomplete);
-    }
     #[test]
     fn a_reflect_that_spoke_for_itself_is_complete() {
         assert_eq!(reflect_status(false), ReturnStatus::Complete);
