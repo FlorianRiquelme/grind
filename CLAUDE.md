@@ -286,9 +286,11 @@ succeeds, start the watcher **in the background (async), before ending the turn*
 PR and yield without it. When its result delivers, read
 `skill://coderabbit-review-triage` and triage every comment (fix or substantively reject).
 
+```sh
+PR=000   # set to the number gh pr create just printed
+REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner); for i in $(seq 1 30); do C=$(gh api repos/$REPO/pulls/$PR/comments --jq 'length'); R=$(gh api repos/$REPO/pulls/$PR/reviews --jq '[.[] | select(.user.login=="coderabbitai[bot]")] | length'); if [ "$((C+R))" -gt 0 ]; then echo "CodeRabbit reviewed #$PR: $C inline comment(s)"; exit 0; fi; sleep 60; done; echo "TIMEOUT: no CodeRabbit review on #$PR after 30 min"
 ```
-PR=<n>; REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner); for i in $(seq 1 30); do C=$(gh api repos/$REPO/pulls/$PR/comments --jq 'length'); R=$(gh api repos/$REPO/pulls/$PR/reviews --jq '[.[] | select(.user.login=="coderabbitai[bot]")] | length'); if [ "$((C+R))" -gt 0 ]; then echo "CodeRabbit reviewed #$PR: $C inline comment(s)"; exit 0; fi; sleep 60; done; echo "TIMEOUT: no CodeRabbit review on #$PR after 30 min"
-```
+
 
 ### Issue tracker
 
