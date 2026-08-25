@@ -471,20 +471,47 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
 
     point_at_this_host(&record);
 
-    say(
-        &run_dir,
-        &format!(
-            "  model {}",
-            record
-                .model
-                .as_deref()
-                .unwrap_or("(session default — unpinned)")
-        ),
-    );
-    say(&run_dir, &format!("  claude {}", record.claude_bin));
+    for said in dispatch_banner(&record) {
+        say(&run_dir, &said);
+    }
     say(&run_dir, &format!("  run {run_id}"));
 
     supervise(&mut record, &run_dir)
+}
+
+/// The lines a Dispatch says about itself, read off the record it just wrote (#141). Every line
+/// must be true of the Run it introduces: a banner contradicting its own record costs exactly
+/// the trust the record exists to provide. The claude binary is named only under the backend
+/// that spawns one; a native Run names its declared models rather than calling itself
+/// unpinned — and an undeclared class still names the concrete id [`runner::DEFAULT_MODEL`]
+/// resolves to, because that is what will run.
+fn dispatch_banner(record: &RunRecord) -> Vec<String> {
+    let mut lines = vec![format!("  backend {}", record.backend.as_str())];
+    lines.push(match &record.model {
+        Some(pinned) => format!("  model {pinned}"),
+        None => match record.backend {
+            Backend::Native => {
+                let fast = record
+                    .fast_model_override
+                    .as_deref()
+                    .unwrap_or(runner::DEFAULT_MODEL);
+                let strong = record
+                    .strong_model_override
+                    .as_deref()
+                    .unwrap_or(runner::DEFAULT_MODEL);
+                if fast == strong {
+                    format!("  model {fast}")
+                } else {
+                    format!("  model fast {fast} · strong {strong}")
+                }
+            }
+            Backend::ClaudeCode => "  model (session default — unpinned)".to_string(),
+        },
+    });
+    if record.backend == Backend::ClaudeCode {
+        lines.push(format!("  claude {}", record.claude_bin));
+    }
+    lines
 }
 
 /// The identity to record beside a pid. `Absent` and `Unobservable` are the same fact at *this*
@@ -2014,6 +2041,86 @@ mod tests {
     #[test]
     fn an_unpinned_job_proceeds_on_the_native_backend() {
         assert_eq!(refuse_claude_pin_on_native(Backend::Native, None), Ok(()));
+    }
+
+    #[test]
+    fn a_claude_code_banner_still_names_the_unpinned_default_and_the_binary() {
+        let mut record = day_one();
+        record.backend = Backend::ClaudeCode;
+        record.model = None;
+        assert_eq!(
+            dispatch_banner(&record),
+            vec![
+                "  backend claude-code".to_string(),
+                "  model (session default — unpinned)".to_string(),
+                format!("  claude {}", record.claude_bin),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_native_banner_names_the_declared_model_instead_of_calling_itself_unpinned() {
+        // #141, Run 20260824-160445-grind-138's exact shape: both classes declared the same
+        // id, yet the banner called the Run unpinned and named a claude binary nothing read.
+        let mut record = day_one();
+        record.backend = Backend::Native;
+        record.model = None;
+        record.fast_model_override = Some("stealth/ox-alpha".to_string());
+        record.strong_model_override = Some("stealth/ox-alpha".to_string());
+        assert_eq!(
+            dispatch_banner(&record),
+            vec![
+                "  backend native".to_string(),
+                "  model stealth/ox-alpha".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_native_banner_splits_distinct_fast_and_strong_declarations() {
+        let mut record = day_one();
+        record.backend = Backend::Native;
+        record.model = None;
+        record.fast_model_override = Some("stealth/ox-alpha".to_string());
+        record.strong_model_override = Some("deepseek/deepseek-chat-v3.1".to_string());
+        assert_eq!(
+            dispatch_banner(&record),
+            vec![
+                "  backend native".to_string(),
+                "  model fast stealth/ox-alpha · strong deepseek/deepseek-chat-v3.1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_undeclared_native_banner_names_the_concrete_default_that_will_run() {
+        let mut record = day_one();
+        record.backend = Backend::Native;
+        record.model = None;
+        assert_eq!(
+            dispatch_banner(&record),
+            vec![
+                "  backend native".to_string(),
+                format!("  model {}", runner::DEFAULT_MODEL),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pinned_job_names_its_pin_on_either_backend() {
+        for backend in [Backend::Native, Backend::ClaudeCode] {
+            let mut record = day_one();
+            record.backend = backend;
+            record.model = Some("claude-opus-9".to_string());
+            let banner = dispatch_banner(&record);
+            assert_eq!(banner[0], format!("  backend {}", backend.as_str()));
+            assert_eq!(banner[1], "  model claude-opus-9");
+            assert_eq!(
+                banner.iter().any(|l| l.starts_with("  claude ")),
+                backend == Backend::ClaudeCode,
+                "{backend:?}: only a claude-code Run names the binary"
+            );
+        }
     }
 
     #[test]
