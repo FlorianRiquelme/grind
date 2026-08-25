@@ -664,18 +664,31 @@ pub fn now_local_hour_minute() -> (u32, u32) {
 /// A unique scratch directory under the system temporary directory. Test scaffolding —
 /// `tests/topology.rs` keeps `std::fs` and `std::env` out of every other module, so the
 /// tests that need a throwaway clone ask here. The caller removes what it creates.
+///
+/// Uniqueness comes from a process-global counter rather than wall-clock time: two tests
+/// spawning concurrently can land inside the same nanosecond, and the loser's
+/// [`remove_tree`] then deletes the winner's fixture mid-write.
+///
+/// Creation is exclusive with a retry on `AlreadyExists`: the counter restarts at zero
+/// every process, pids get reused, and a test that panics skips its [`remove_tree`] — so
+/// a stale tree from an aborted run can sit exactly where this name regenerates. Adopting
+/// it would seed the new fixture with foreign files; advancing the sequence cannot.
 #[cfg(test)]
 pub fn temp_dir(tag: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "grind-test-{tag}-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&path).expect("a scratch directory");
-    path
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let path = std::env::temp_dir().join(format!(
+            "grind-test-{tag}-{}-{}",
+            std::process::id(),
+            SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => return path,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => panic!("a scratch directory: {err}"),
+        }
+    }
 }
 
 /// The inverse of [`temp_dir`]: best-effort removal of a scratch tree.
