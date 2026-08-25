@@ -48,10 +48,17 @@ pub enum TranscriptEvent {
     ToolResult { call_id: String, output: String },
     /// Token usage from the provider (R8: spend is recorded, never bounded).
     Usage(serde_json::Value),
-    /// Prose arrived where the protocol demanded a tag or a done sentinel;
-    /// a corrective nudge was issued and sent. Logged every time so drift rates
-    /// stay comparable across models in P3.
-    ProtocolNudge { assistant_text: String },
+    /// A reply did not conform to the protocol: either prose arrived where a tag or
+    /// a done sentinel was demanded (`fault` absent — the original shape), or a tool
+    /// call arrived malformed (an empty name, an invented tool, arguments that are
+    /// not an object, a required argument missing — `fault` carrying what was
+    /// wrong, #142). Either way one corrective nudge was issued and sent. Logged
+    /// every time so drift rates stay comparable across models in P3.
+    ProtocolNudge {
+        assistant_text: String,
+        #[serde(default)]
+        fault: Option<String>,
+    },
     /// The wire mode was determined for this run (probe result or resumed latch).
     ProtocolSelected { mode: ProtoMode, reason: String },
     /// The attempt's final answer text (also carried by Attempt.result_tail).

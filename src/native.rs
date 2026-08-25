@@ -183,6 +183,26 @@ fn nudge_exchange(assistant_text: &str) -> Vec<Value> {
     ]
 }
 
+/// The corrective exchange sent after a tool call arrived malformed (#142): the
+/// assistant's text echoed back, then one user turn naming exactly what was wrong —
+/// an empty name, an unknown tool, arguments that are not an object, a required
+/// argument missing — so the model can re-issue a well-formed call. Logged as
+/// [`TranscriptEvent::ProtocolNudge`] with the same fault first, always, so drift
+/// rates stay comparable across models in P3.
+///
+/// The malformed calls themselves never enter `messages` and are never executed:
+/// echoing them would demand tool results the conversation then owes, executing
+/// them spends real work on garbage. The turn still counts — the request was spent.
+fn malformed_call_exchange(assistant_text: &str, fault: &str) -> Vec<Value> {
+    vec![
+        json!({"role": "assistant", "content": assistant_text}),
+        json!({"role": "user", "content": format!(
+            "Your reply tried to invoke a tool but was not well-formed: {fault}. \
+             Re-issue it as a proper tool call with a known tool name and every \
+             required argument present.")}),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Text-protocol parsing.
 // ---------------------------------------------------------------------------
@@ -509,8 +529,6 @@ fn denial_json(report: &tools::GateReport, arguments_json: &str) -> Value {
 
 fn layer_name(layer: GateLayer) -> &'static str {
     match layer {
-        GateLayer::UnknownTool => "unknown_tool",
-        GateLayer::InvalidArgs => "invalid_args",
         GateLayer::DeniedGlob => "denied_glob",
         GateLayer::PathEscape => "path_escape",
     }
@@ -801,11 +819,31 @@ impl StageRunner for crate::runner::NativeAdapter {
             } else {
                 outcome.turn.tool_calls
             };
+            // Well-formedness before anything else (#142): a malformed call — an empty
+            // name (`{"name": "", "arguments": "\"\""}`, 17 of one attempt's 63 calls),
+            // an invented tool, arguments that are not an object, a required argument
+            // missing — is a *nonconforming reply*, ADR-0018's nudge case, never a tool
+            // to run and never a policy denial. One nudge naming every fault; the bad
+            // calls enter neither history nor execution; the turn still counts.
+            let faults: Vec<String> = pending
+                .iter()
+                .filter_map(|call| tools::protocol_fault(&defs, &call.name, &call.arguments_json))
+                .collect();
+            if !faults.is_empty() {
+                let fault = faults.join("; ");
+                transcript.log(&TranscriptEvent::ProtocolNudge {
+                    assistant_text: content.clone(),
+                    fault: Some(fault.clone()),
+                });
+                messages.extend(malformed_call_exchange(&content, &fault));
+                continue;
+            }
 
             if pending.is_empty() {
                 // Prose where a tag was demanded: one corrective nudge, logged.
                 transcript.log(&TranscriptEvent::ProtocolNudge {
                     assistant_text: content.clone(),
+                    fault: None,
                 });
                 messages.extend(nudge_exchange(&content));
                 continue;
@@ -910,7 +948,7 @@ fn events(text: &str) -> Vec<TranscriptEvent> {
 fn said(event: &TranscriptEvent) -> Option<String> {
     match event {
         TranscriptEvent::Final { text } => Some(one_line(text)),
-        TranscriptEvent::ProtocolNudge { assistant_text } => Some(one_line(assistant_text)),
+        TranscriptEvent::ProtocolNudge { assistant_text, .. } => Some(one_line(assistant_text)),
         // A working attempt's assistant turns *are* tool calls, so this is most of what there is
         // to read while a Run is still going. Name and arguments, through the same one-line cap
         // as everything else on a fixed-shape view.
