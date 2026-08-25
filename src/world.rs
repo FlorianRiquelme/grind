@@ -72,8 +72,6 @@ pub enum TryLock {
     Failed(String),
 }
 
-// --- children -------------------------------------------------------------------------
-
 /// One short-lived child (`git`, `gh`, `ps`). Concrete, no trait: a trait here would be a
 /// hypothetical seam with one production impl and one test impl, both in Rust, and the actual
 /// spawn path exercised by neither (ADR-0007).
@@ -191,9 +189,6 @@ pub fn run_bounded(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Best-effort: gives `kill_process_group_best_effort` below a group to signal. A no-op on
-    // non-unix, where the group kill is skipped entirely and the bounded collection below is
-    // what carries the whole guarantee.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -212,10 +207,6 @@ pub fn run_bounded(
     };
     let child_id = child.id();
 
-    // Taken before the poll loop, so both pipes drain concurrently with the wait rather than
-    // sequentially after it. Each reader hands its bytes over a channel rather than being
-    // `join`ed — see the doc comment above for why an unbounded join is exactly the hang this
-    // function must not have.
     let mut stdout_pipe = child.stdout.take().expect("stdout was piped above");
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped above");
     let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
@@ -249,32 +240,10 @@ pub fn run_bounded(
     };
     if timed_out {
         let _ = child.kill();
-        // Reap the group **before** `wait()`, and only on this path. Ordering is the whole
-        // safety argument: a reaped pid is free for reuse immediately, so signalling the group
-        // afterwards can send SIGKILL to whatever process group inherited that number — not a
-        // failed kill, a successful kill of the wrong thing, silently, on a host that runs many
-        // Runs at once. While the child is still unreaped its pid cannot be recycled and the
-        // group id stays reserved by the zombie leader, so here the number still means what we
-        // think it means.
-        //
-        // The clean-exit path deliberately does not do this. `try_wait` has already reaped the
-        // child by then, so the same ordering guarantee is unavailable — and a command that
-        // *succeeded* has not earned having its background children killed, which a stage
-        // starting a dev server would not expect. An orphan holding the pipe there costs the
-        // collection grace below and nothing more.
         kill_process_group_best_effort(child_id);
         let _ = child.wait();
     }
 
-    // A fixed grace period, independent of `limit`: by the time we get here the child is dead
-    // and — on the timeout path — so is its group, so any output still in flight should land
-    // within milliseconds. The margin is generous purely to avoid flaking on a loaded machine or
-    // a large trailing write, never because this is expected to run long.
-    //
-    // **One deadline shared across both pipes, not one each.** The case that actually spends it
-    // is a clean exit whose backgrounded grandchild still holds the write ends — there is no
-    // group kill on that path, so both reads block and a per-pipe grace would stack into double
-    // the wait for a command that already succeeded.
     let collection_deadline = Instant::now() + Duration::from_secs(2);
     let remaining = || collection_deadline.saturating_duration_since(Instant::now());
     let stdout = stdout_rx.recv_timeout(remaining()).unwrap_or_default();
@@ -360,7 +329,6 @@ pub fn spawn_recorded(
 
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(prompt.as_bytes());
-        // Dropping stdin closes it, so the child sees EOF.
     }
 
     child
@@ -368,8 +336,6 @@ pub fn spawn_recorded(
         .map(|status| status.code())
         .map_err(|e| e.to_string())
 }
-
-// --- the filesystem -------------------------------------------------------------------
 
 pub fn read_to_string(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
@@ -476,8 +442,6 @@ pub fn try_lock(path: &Path) -> TryLock {
         Err(fs::TryLockError::Error(e)) => TryLock::Failed(format!("{}: {e}", path.display())),
     }
 }
-
-// --- the process and its environment --------------------------------------------------
 
 /// `$HOME` is the only environment variable Grind reads, and there is no override. A unit with
 /// a different `User=` resolves a different `~/.grind` and fails loudly — which is the point
@@ -620,13 +584,6 @@ pub fn print_error(line: &str) {
     let _ = err.flush();
 }
 
-// --- the wall clock -------------------------------------------------------------------
-//
-// Civil-time arithmetic lives here, beside the clock read, rather than in a producer. The
-// alternatives are worse: two producers would duplicate it, and a module named for a noun two
-// others share is exactly what ADR-0007 forbids. It is proleptic-Gregorian and UTC-only,
-// which is all a record needs.
-
 pub fn now_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -649,7 +606,6 @@ pub fn now_stamp() -> String {
 fn civil(epoch: u64) -> (u64, u64, u64, u64, u64, u64) {
     let days = epoch / 86_400;
     let rem = epoch % 86_400;
-    // Howard Hinnant's civil_from_days, shifted to a March-based year so the leap day is last.
     let z = days + 719_468;
     let era = z / 146_097;
     let doe = z - era * 146_097;
@@ -734,22 +690,18 @@ pub fn remove_tree(path: &Path) {
 /// than a test elsewhere calling `std::env::temp_dir` directly.
 #[cfg(test)]
 pub fn set_var_for_test(name: &str, value: &str) {
-    // SAFETY: test-only, and no production code path ever calls this.
     unsafe { std::env::set_var(name, value) };
 }
 
 /// The inverse of [`set_var_for_test`].
 #[cfg(test)]
 pub fn remove_var_for_test(name: &str) {
-    // SAFETY: test-only, and no production code path ever calls this.
     unsafe { std::env::remove_var(name) };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- run_bounded ------------------------------------------------------------------
 
     fn words(argv: &[&str]) -> Vec<String> {
         argv.iter().map(|s| s.to_string()).collect()
@@ -789,19 +741,12 @@ mod tests {
 
     #[test]
     fn a_child_reading_stdin_hangs_forever_without_the_null_but_is_still_killed_on_time() {
-        // `cat` with no args reads stdin until EOF. With `stdin(Stdio::null())` that EOF is
-        // immediate, so this either exits almost instantly or, if something about the
-        // environment makes it hang anyway, is still caught by the deadline rather than
-        // wedging the test.
         let out = run_bounded(&words(&["cat"]), None, &[], Duration::from_millis(500));
         assert!(out.code == Some(0) || out.code.is_none(), "{out:?}");
     }
 
     #[test]
     fn output_larger_than_a_pipe_buffer_does_not_deadlock_the_wait() {
-        // A pipe's kernel buffer is typically 64KiB; ~1MiB on both stdout and stderr would
-        // deadlock a synchronous "read stdout, then read stderr, then wait" implementation
-        // once the child blocks on a full buffer nobody is draining yet.
         let out = run_bounded(
             &words(&[
                 "sh",
@@ -819,13 +764,6 @@ mod tests {
 
     #[test]
     fn a_backgrounded_grandchild_outliving_the_deadline_does_not_hang_the_call() {
-        // The direct child (`sh`) runs `echo` and returns almost immediately, but `sleep 30 &`
-        // keeps running after it, still holding the inherited stdout pipe open. Before this
-        // fix, `read_to_end` on that pipe never sees EOF and the unbounded `join()` after it
-        // hangs forever — exactly the failure `run_bounded` exists to prevent. A limit of a
-        // couple of seconds (never the 600s constant `tools.rs` uses) is enough to prove the
-        // call returns at all; the assertion bound is generous so a loaded machine can't flake
-        // it, while still catching a real regression back to an unbounded hang.
         let start = Instant::now();
         let out = run_bounded(
             &words(&["sh", "-c", "sleep 30 & echo started"]),

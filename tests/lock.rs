@@ -53,15 +53,12 @@ fn a_held_lock_outlives_this_call() {
     let home = PathBuf::from(std::env::var(HOME_FOR_HOLDER).expect("a home to lock under"));
     let _held = take_lock(&home, REPO, BRANCH).expect("the holder must acquire");
     fs::write(home.join("acquired"), "yes").expect("signal readiness");
-    // Held for as long as this process lives. The parent kills it.
     std::thread::sleep(Duration::from_secs(120));
 }
 
 #[test]
 fn two_worktrees_of_one_repo_on_one_branch_collide() {
     let home = scratch_home("collide");
-    // Two genuinely separate processes, and the second passes a different worktree path — it
-    // still collides, because the key is the target repo and the branch and never a path.
     let mut holder = spawn_a_holder(&home);
 
     let refused = take_lock(&home, REPO, BRANCH).expect_err("the second Dispatch must be refused");
@@ -69,8 +66,6 @@ fn two_worktrees_of_one_repo_on_one_branch_collide() {
         refused.to_string().contains("already holds"),
         "a collision must read as a collision: {refused}"
     );
-    // Named neutrally: for `resume` and `cleared` the holder can be the named Run's own
-    // supervisor, so the collision word must not send the human hunting for *another* Run.
     assert!(!refused.to_string().contains("another Run"), "{refused}");
 
     let _ = holder.kill();
@@ -79,8 +74,6 @@ fn two_worktrees_of_one_repo_on_one_branch_collide() {
 
 #[test]
 fn a_second_dispatch_while_the_first_supervisor_is_inside_its_loop_is_refused() {
-    // Not merely one attempted after dispatch returned: the holder below is still sitting on
-    // the lock, which is the whole point of the handle outliving the function that took it.
     let home = scratch_home("in-flight");
     let mut holder = spawn_a_holder(&home);
     assert!(take_lock(&home, REPO, BRANCH).is_err());
@@ -90,9 +83,6 @@ fn a_second_dispatch_while_the_first_supervisor_is_inside_its_loop_is_refused() 
 
 #[test]
 fn the_kernel_releases_the_lock_when_its_holder_is_killed() {
-    // There is no `running` state in the record, so a SIGKILLed supervisor would leave a Run
-    // `dispatched` forever and any state-based check would refuse dispatch onto a branch
-    // nothing is touching. An OS-held lock has no such failure mode.
     let home = scratch_home("sigkill");
     let mut holder = spawn_a_holder(&home);
     assert!(take_lock(&home, REPO, BRANCH).is_err(), "held while alive");
@@ -126,8 +116,6 @@ fn a_branch_full_of_slashes_locks_as_one_file() {
 
 #[test]
 fn a_lock_that_cannot_be_opened_is_could_not_determine_and_never_a_collision() {
-    // The two are never folded together: collapsing them reproduces the exact bug the
-    // three-valued observation exists to remove, relocated to the lock.
     let home = scratch_home("undetermined");
     let blocked = lock_path(&home, REPO, BRANCH);
     fs::create_dir_all(&blocked).expect("put a directory where the lock file goes");

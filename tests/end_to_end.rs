@@ -32,8 +32,6 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-// --- the sandbox --------------------------------------------------------------------------
-
 struct Sandbox {
     home: PathBuf,
     path: String,
@@ -297,9 +295,6 @@ fn sandbox(name: &str) -> Sandbox {
     fs::create_dir_all(fake.join("shapes")).expect("fake shapes");
     fs::create_dir_all(home.join(".grind/bin")).expect("the layout's bin");
     fs::create_dir_all(home.join(".grind/repos").join(OWNER)).expect("the layout's repos");
-    // The ten stage skill directories (ADR-0015) — `refuse_unless_host_ready` now checks their
-    // presence at every Dispatch, legacy path and ladder alike. Presence only: empty directories
-    // are enough for the check, and the mega-session scenarios below never read their contents.
     for stage in [
         "plan",
         "plan-review",
@@ -317,8 +312,6 @@ fn sandbox(name: &str) -> Sandbox {
         fs::write(dir.join("SKILL.md"), format!("# {stage}\n")).expect("a stage skill file");
     }
 
-    // The fakes are checked in executable. A copy that loses the bit fails as *could not
-    // observe* rather than as a test failure, which is the confusing shape to avoid.
     let fakes_bin = home.join(".fake/bin");
     fs::create_dir_all(&fakes_bin).expect("a fakes bin");
     for tool in ["gh", "claude"] {
@@ -334,30 +327,20 @@ fn sandbox(name: &str) -> Sandbox {
         assert_executable(&path);
         fs::copy(&path, fake.join("shapes").join(path.file_name().unwrap())).expect("copy a shape");
     }
-    // `~/.grind/bin/claude` is where the layout says the binary Grind spawns lives.
     fs::copy(fakes_bin.join("claude"), home.join(".grind/bin/claude")).expect("place claude");
-    // Run 2's real triple, for the rate-limit shape to replay verbatim.
     fs::copy(
         repo_root().join("tests/fixtures/run2/rate-limited.stdout.json"),
         fake.join("rate-limited.stdout.json"),
     )
     .expect("place the recorded triple");
 
-    // A real clone, with real `git` against it — real git output is the point.
     let clone = home.join(".grind/repos").join(OWNER).join(NAME);
     fs::create_dir_all(&clone).expect("a clone");
     git(&clone, &["init", "-b", "main", "-q"]);
     git(&clone, &["config", "user.email", "run@example.invalid"]);
     git(&clone, &["config", "user.name", "Grind Test"]);
     git(&clone, &["config", "commit.gpgsign", "false"]);
-    // A bare repo on disk stands in for `origin`. Dispatch fetches before it asks anything
-    // about the worktree, so `origin` has to be reachable — and a local one keeps *no network*
-    // structural rather than merely unexercised.
     let origin = fake.join("origin.git");
-    // `-b main` explicitly: without it the bare repo takes the machine's `init.defaultBranch`,
-    // its HEAD points at a branch nothing ever pushes, and `remote set-head -a` cannot resolve
-    // `origin/HEAD` — which base drift reads. A green laptop and a red CI, from one config
-    // difference.
     git(
         &home,
         &[
@@ -430,8 +413,6 @@ fn sandbox(name: &str) -> Sandbox {
     .expect("the checks answer");
     fs::write(fake.join("gh/pr_from"), "1").expect("pr_from");
 
-    // Replaced, never prepended to: the fakes plus a toolbox holding exactly what the fakes and
-    // the real `git` need. No real `gh` is reachable at all.
     let toolbox = home.join(".fake/toolbox");
     fs::create_dir_all(&toolbox).expect("a toolbox");
     for tool in ["git", "sh", "cat", "sed", "dirname", "uname", "ps", "mkdir"] {
@@ -490,11 +471,8 @@ fn wait_for_line(child: &mut Child, needle: &str, patience: Duration) -> String 
     panic!("never saw `{needle}`. Output so far:\n{seen}");
 }
 
-// --- the six scenarios -----------------------------------------------------------------------
-
 #[test]
 fn scenario_a_a_real_run_shape_with_the_literal_argv_of_every_attempt() {
-    // Run 1's shape: three deaths, a clean invocation that had not finished, then the promise.
     let box_ = sandbox("a-real-run-shape");
     box_.scenario(&[
         "half_json",
@@ -515,9 +493,6 @@ fn scenario_a_a_real_run_shape_with_the_literal_argv_of_every_attempt() {
     assert_eq!(attempts.len(), 5, "five attempts, as Run 1 took");
 
     let all_argvs = box_.argvs();
-    // Six: the five real Attempts plus the one Reflect session a Completed terminal
-    // observation now dispatches (idempotent, budget-exempt — it lands no `Attempt` row, but
-    // the fake still logs the invocation it received).
     assert_eq!(
         all_argvs.len(),
         6,
@@ -529,7 +504,6 @@ fn scenario_a_a_real_run_shape_with_the_literal_argv_of_every_attempt() {
         .expect("a session id")
         .to_string();
 
-    // The first invocation opens the session id; every later one resumes the same one.
     assert!(argvs[0].contains(&"--session-id".to_string()));
     assert!(!argvs[0].contains(&"--resume".to_string()));
     for (n, argv) in argvs.iter().enumerate() {
@@ -547,7 +521,6 @@ fn scenario_a_a_real_run_shape_with_the_literal_argv_of_every_attempt() {
             assert_eq!(argv[at], "--resume", "attempt {} must resume", n + 1);
             assert!(!argv.contains(&"--session-id".to_string()));
         }
-        // The denials ride every one of them.
         let denials = argv
             .iter()
             .position(|a| a == "--disallowedTools")
@@ -586,22 +559,14 @@ fn scenario_a_a_real_run_shape_with_the_literal_argv_of_every_attempt() {
                 "Bash(eval*)",
             ]
         );
-        // No spend ceiling on any of them, and the Job issue still carries the row (ADR-0010).
         assert!(!argv.contains(&"--max-budget-usd".to_string()));
         assert!(argv.contains(&"bypassPermissions".to_string()));
-        // A fresh Dispatch walks the ladder (ADR-0015), and a stage invocation names no
-        // plugin — the retired pin's record field and resolution are gone (unit D).
         assert!(!argv.contains(&"--plugin-dir".to_string()));
     }
 
-    // Reflect's own session, never the Run's: a fresh `--session-id`, no `--plugin-dir` (a
-    // stage-shaped invocation never names one, and the plugin pin no longer exists to be one),
-    // and the base denials still ride it.
     assert_eq!(reflect.len(), 1);
     assert!(reflect[0].contains(&"--session-id".to_string()));
     assert!(!reflect[0].contains(&"--plugin-dir".to_string()));
-    // Reflect's own derived UUID — never a `<run>-reflect` suffix, which was not a UUID and
-    // died every dispatch at startup.
     let reflect_at = reflect[0]
         .iter()
         .position(|a| a == "--session-id")
@@ -611,7 +576,6 @@ fn scenario_a_a_real_run_shape_with_the_literal_argv_of_every_attempt() {
         attempt::reflect_session_id(&run_id)
     );
 
-    // Every attempt's raw landed on disk, including the ones that died and the silent one.
     for n in 1..=5 {
         let raw = box_.run_dir().join(format!("attempt-{n}.stdout.json"));
         assert!(raw.exists(), "attempt {n}'s raw stdout must be on disk");
@@ -626,11 +590,9 @@ fn scenario_a_a_real_run_shape_with_the_literal_argv_of_every_attempt() {
                 .exists()
         );
     }
-    // Zero bytes is itself a recorded fact, not a lost one.
     let silent = fs::metadata(box_.run_dir().join("attempt-3.stdout.json")).unwrap();
     assert_eq!(silent.len(), 0);
 
-    // `subtype` reads "success" on the attempts that died, so it is not the outcome.
     assert_eq!(attempts[1]["subtype"], "success");
     assert_eq!(attempts[1]["is_error"], true);
     assert_eq!(attempts[4]["done_promise"], true);
@@ -666,7 +628,6 @@ fn scenario_b_a_chaotic_parse_keeps_the_tail_and_the_loop_continues() {
 
 #[test]
 fn scenario_c_a_child_that_kills_itself_is_recorded_and_the_loop_re_enters() {
-    // `kill -9 $$` — no chance to close stdout cleanly or set an exit code the parent chose.
     let box_ = sandbox("c-sigkilled");
     box_.scenario(&["sigkilled", "success_done"])
         .pr_appears_at(2);
@@ -687,7 +648,6 @@ fn scenario_c_a_child_that_kills_itself_is_recorded_and_the_loop_re_enters() {
         attempts[0]
     );
     assert_eq!(attempts[0]["parse_ok"], false);
-    // Whatever reached the pipe before the kill landed is on disk.
     let raw = fs::read_to_string(box_.run_dir().join("attempt-1.stdout.json")).expect("the raw");
     assert!(
         raw.starts_with('{'),
@@ -698,18 +658,10 @@ fn scenario_c_a_child_that_kills_itself_is_recorded_and_the_loop_re_enters() {
 
 #[test]
 fn scenario_d_a_rate_limit_announces_the_recorded_sleep_rather_than_burning_the_budget() {
-    // Run 2's real triple. Its prose matches none of the script's phrases; only the 429
-    // classifies it. Had that missed, eight attempts would have burned in under a minute
-    // against a three-hour wall.
     let box_ = sandbox("d-rate-limited");
     box_.scenario(&["rate_limited"]).pr_appears_at(99);
 
     let mut child = box_.spawn(&["run", ISSUE]);
-    // The fixture's own prose names a stated reset time (`resets 5pm (Europe/Berlin)`), so
-    // decision 5's parse fires and the announced duration is no longer the fixed 1800s — it is
-    // whatever hour is 5pm from wherever the test happens to run, capped at 12h. The property
-    // this scenario still pins is that *something* bounded is announced and slept on, not a
-    // literal figure that would make the assertion depend on the wall clock at test time.
     let seen = wait_for_line(&mut child, "rate limited", Duration::from_secs(30));
     let seconds: u64 = seen
         .split("sleeping ")
@@ -730,8 +682,6 @@ fn scenario_d_a_rate_limit_announces_the_recorded_sleep_rather_than_burning_the_
     assert_eq!(attempts.len(), 1, "it slept rather than burning attempts");
     assert_eq!(attempts[0]["rate_limited"], true);
     assert_eq!(attempts[0]["api_error_status"], "429");
-    // And it did no work, so it is a Wait: it parsed, cost nothing and took one turn. Nothing
-    // records that as a field — the predicate is derived from these three.
     assert_eq!(attempts[0]["parse_ok"], true);
     assert_eq!(attempts[0]["total_cost_usd"], 0.0);
     assert_eq!(attempts[0]["num_turns"], 1);
@@ -751,20 +701,12 @@ fn scenario_e_attempts_exhausted_is_its_own_outcome_and_not_a_death() {
 
     let record = box_.record();
     assert_eq!(record["state"], "exhausted", "distinct from `died`");
-    // Grit's arithmetic (the ten-Attempt fullest walk plus four re-entries of headroom).
     assert_eq!(record["attempts"].as_array().expect("attempts").len(), 14);
     assert_eq!(record["attempt_budget"], 14);
 }
 
 #[test]
 fn scenario_f_an_unobservable_run_pauses_before_looking_again_and_spends_no_attempt() {
-    // A fault in Grind's own eyes must never cost an attempt, and three retries fired within
-    // milliseconds of each other cannot span the transient this pause exists for (the window
-    // after a laptop wake), so this asserts on the *announced* pause and kills the child
-    // mid-sleep — exactly scenario d's technique for the 1800s rate-limit sleep. Nothing here
-    // waits out the three real fifteen-second pauses it would otherwise take to walk this Run
-    // all the way to `unobserved`; that terminal transition is `policy`'s own
-    // `re_observation_spent_stops_as_unobserved_rather_than_as_a_death`.
     let box_ = sandbox("f-unobservable");
     box_.scenario(&["silent"]).gh_cannot_be_reached();
 
@@ -791,9 +733,6 @@ fn scenario_f_an_unobservable_run_pauses_before_looking_again_and_spends_no_atte
 
 #[test]
 fn scenario_g_a_repeated_denial_with_no_progress_stops_for_a_human_and_resumes() {
-    // A Run refused the same operation twice over stops instead of spending its remaining
-    // budget against it — and it never spent the budget, so it re-enters where it stopped once
-    // the human has cleared the obstacle. The world changed, not the number.
     let box_ = sandbox("g-blocked");
     box_.scenario(&["denied", "denied", "denied", "success_done"])
         .pr_appears_at(4);
@@ -813,11 +752,9 @@ fn scenario_g_a_repeated_denial_with_no_progress_stops_for_a_human_and_resumes()
 
     let run_id = record["run_id"].as_str().expect("a run id").to_string();
 
-    // The stop names the two-step repair in order: `cleared` records, `resume` spends.
     assert!(out.contains(&format!("grind cleared {run_id}")), "{out}");
     assert!(out.contains(&format!("grind resume {run_id}")), "{out}");
 
-    // An unknown run id and an empty note both leave in the incoherent-input register.
     let (_, err, code) = box_.run(&["cleared", "nope", "the wall moved"]);
     assert_eq!(code, Some(2), "{err}");
     assert!(err.contains("no Run `nope` on this host"), "{err}");
@@ -829,8 +766,6 @@ fn scenario_g_a_repeated_denial_with_no_progress_stops_for_a_human_and_resumes()
         "a refusal records nothing"
     );
 
-    // The clearance: a multi-word unquoted note, joined from the rest of argv. It records
-    // and does not spend — the state stays blocked until the hand re-enters.
     let (out, err, code) =
         box_.run(&["cleared", &run_id, "the", "deploy", "key", "was", "rotated"]);
     assert_eq!(code, Some(0), "{out}\n{err}");
@@ -856,9 +791,6 @@ fn scenario_g_a_repeated_denial_with_no_progress_stops_for_a_human_and_resumes()
     );
     assert_eq!(box_.record()["state"], "completed");
 
-    // The note rode the resumed Attempt's prompt — and only Resume-mode prompts: the
-    // dispatch prompt on disk stays exactly what it was (R6's safety property, pinned on
-    // the files the supervisor wrote rather than on the builder alone).
     let resumed_prompt = fs::read_to_string(box_.run_dir().join("attempt-4.prompt.txt"))
         .expect("the resumed attempt's prompt");
     assert!(
@@ -876,8 +808,6 @@ fn scenario_g_a_repeated_denial_with_no_progress_stops_for_a_human_and_resumes()
         "{dispatch_prompt}"
     );
 
-    // The note reaches the Handback and the terminal comment — the Record carries what was
-    // cleared, not merely that something was.
     assert!(out.contains("the deploy key was rotated"), "{out}");
     let comments = comments_on_the_job_issue(&box_);
     let terminal = comments.last().expect("a terminal comment");
@@ -886,7 +816,6 @@ fn scenario_g_a_repeated_denial_with_no_progress_stops_for_a_human_and_resumes()
         "{terminal}"
     );
 
-    // A Run that finished has no Blocker to clear anymore: the actual state is named.
     let (_, err, code) = box_.run(&["cleared", &run_id, "again"]);
     assert_eq!(code, Some(2), "{err}");
     assert!(err.contains("completed"), "{err}");
@@ -894,17 +823,6 @@ fn scenario_g_a_repeated_denial_with_no_progress_stops_for_a_human_and_resumes()
 
 #[test]
 fn scenario_h_a_ladder_walk_completes_plan_then_triage_before_plan_review_ever_dispatches() {
-    // A full ten-rung fake is disproportionate (per the plan's own escape valve): this walks
-    // the first two rungs honestly — Plan, an [S] session, and Triage, a zero-token [R] pass —
-    // then lets PlanReview's own stage session re-enter itself under `rung::next`'s earliest-
-    // absent-return contract until the budget is spent, which this asserts deterministically
-    // (no killed-mid-flight race, unlike the sleep-blocked scenarios above: nothing here
-    // blocks between one rung and the next). `plan_writes_return.sh` plays Plan honestly: it
-    // writes `plan-facts.json` and its own return under the stages directory the context block
-    // names, exactly what a real stage session's structured return would do; every attempt
-    // after it — PlanReview's, since its own shape never writes back — replays it too, which
-    // is harmless (Plan's return already exists) and lets the same one shape drive the whole
-    // scenario.
     let box_ = sandbox("h-ladder-walk");
     box_.scenario(&["plan_writes_return"]).pr_appears_at(99);
 
@@ -931,15 +849,12 @@ fn scenario_h_a_ladder_walk_completes_plan_then_triage_before_plan_review_ever_d
         attempt::stage_session_id(&run_id, rung::Stage::Plan)
     );
 
-    // Triage: zero-token, no session, costing none of Plan's or plan-review's attempts.
     assert_eq!(stages[1]["name"], "triage");
     assert_eq!(stages[1]["session_id"], "[R]");
     assert_eq!(stages[1]["status"], "complete");
     assert_eq!(stages[1]["cost_usd"], 0.0);
     assert_eq!(stages[1]["turns"], 0);
 
-    // Every remaining row is PlanReview, re-entering **its own** session — never Plan's again,
-    // the earliest-absent-return contract `rung::next` states.
     let plan_review_rows = &stages[2..];
     assert_eq!(plan_review_rows.len(), 13, "14 attempts minus Plan's one");
     for row in plan_review_rows {
@@ -950,7 +865,6 @@ fn scenario_h_a_ladder_walk_completes_plan_then_triage_before_plan_review_ever_d
         );
     }
 
-    // Triage's own decision landed on disk.
     let decision = fs::read_to_string(
         box_.run_dir()
             .join("stages")
@@ -960,8 +874,6 @@ fn scenario_h_a_ladder_walk_completes_plan_then_triage_before_plan_review_ever_d
     .expect("triage's decision.json");
     assert!(decision.contains("\"tier\""), "{decision}");
 
-    // The argv shape: Plan's session opens fresh, and every plan-review attempt after the
-    // first resumes the same one rather than re-opening it.
     let argvs = box_.argvs();
     assert_eq!(
         argvs.len(),
@@ -994,8 +906,6 @@ fn scenario_h_a_ladder_walk_completes_plan_then_triage_before_plan_review_ever_d
     }
 }
 
-// --- surviving a reboot -------------------------------------------------------------------------
-
 /// A completed Run's record, to stage cut-off and stopped Runs from.
 fn a_real_record(box_: &Sandbox) -> serde_json::Value {
     box_.scenario(&["success_done"]).pr_appears_at(1);
@@ -1011,7 +921,6 @@ const GONE: u32 = 999_999;
 
 #[test]
 fn resume_all_re_enters_the_cut_off_and_never_the_stopped() {
-    // Two records staged as cut off and two as stopped re-enter exactly two Runs.
     let box_ = sandbox("resume-all");
     let template = a_real_record(&box_);
     for (run_id, state) in [
@@ -1042,7 +951,6 @@ fn resume_all_re_enters_the_cut_off_and_never_the_stopped() {
 fn resume_all_re_enters_no_run_whose_recorded_supervisor_is_alive() {
     let box_ = sandbox("resume-all-alive");
     let template = a_real_record(&box_);
-    // This test process is unambiguously alive, and its start stamp matches itself.
     let alive = std::process::id();
     assert!(identity_of(alive).is_some(), "ps must answer for this pid");
     box_.stage(&template, "r-alive", "dispatched", alive);
@@ -1056,9 +964,6 @@ fn resume_all_re_enters_no_run_whose_recorded_supervisor_is_alive() {
 
 #[test]
 fn a_cut_off_run_whose_worktree_is_dirty_is_skipped_and_the_skip_is_recorded() {
-    // A machine that just rebooted is exactly where someone was mid-edit, and this is the one
-    // path that starts an agent with nobody present. A skip rather than a refusal, because one
-    // unre-enterable Run must not stop the others.
     let box_ = sandbox("resume-all-dirty");
     let template = a_real_record(&box_);
     box_.stage(&template, "r-dirty", "died", GONE);
@@ -1083,8 +988,6 @@ fn a_skipped_run_does_not_stop_the_others_from_re_entering() {
     let box_ = sandbox("resume-all-partial");
     let template = a_real_record(&box_);
     box_.stage(&template, "r-good", "died", GONE);
-    // A record nothing can read. There is deliberately no migration read path, and a record
-    // written before this build lacks fields the base forces at construction.
     let old = box_.home.join(".grind/runs/r-ancient");
     fs::create_dir_all(&old).expect("a staged run directory");
     fs::write(
@@ -1101,11 +1004,6 @@ fn a_skipped_run_does_not_stop_the_others_from_re_entering() {
 
 #[test]
 fn fan_out_is_recorded_per_attempt_and_never_cumulatively() {
-    // Three Attempts of one Run, each fanning out to two subagents that both return. The Run's
-    // transcript is **one append-only file** — the session id is fixed at dispatch and every
-    // later Attempt resumes it — so reading the whole file on Attempt N counted Attempts 1..N,
-    // and `render::fanout_totals` then summed those pairs: (2,2), (4,4), (6,6) published as
-    // *12 spawned, 12 returned* for a Run that spawned six. R51 says per Attempt.
     let box_ = sandbox("fanout-per-attempt");
     box_.scenario(&["fanout", "fanout", "fanout", "success_done"])
         .pr_appears_at(4);
@@ -1124,8 +1022,6 @@ fn fan_out_is_recorded_per_attempt_and_never_cumulatively() {
             n + 1
         );
     }
-    // And the Handback, which sums those pairs, says six rather than twelve — as does the
-    // comment posted on the Job issue, which is where a wrong number leaves the host.
     assert!(
         out.contains("6 spawned, 6 returned"),
         "the Handback:\n{out}"
@@ -1137,10 +1033,6 @@ fn fan_out_is_recorded_per_attempt_and_never_cumulatively() {
 
 #[test]
 fn resume_all_re_enters_nothing_on_a_host_whose_ps_cannot_answer() {
-    // The reading `resume --all` acts on. A `ps` that cannot spawn used to yield no stamp, and
-    // *no stamp* collapsed into *the supervisor is gone* — so every Run on the host read as cut
-    // off and every Run was re-entered at boot, with nobody watching. The safe direction is to
-    // decline, and to say so rather than skip in silence.
     let box_ = sandbox("resume-all-blind-ps");
     let template = a_real_record(&box_);
     box_.stage(&template, "r-dispatched", "dispatched", GONE);
@@ -1164,8 +1056,6 @@ fn resume_all_re_enters_nothing_on_a_host_whose_ps_cannot_answer() {
 
 #[test]
 fn the_supervisors_resume_all_spawns_outlive_it_and_it_exits_on_what_it_started() {
-    // `resume --all` reports which Runs it started and exits on that, never on any Run's
-    // verdict. The children keep going after it is gone.
     let box_ = sandbox("resume-all-detached");
     let template = a_real_record(&box_);
     box_.stage(&template, "r-detached", "died", GONE);
@@ -1184,7 +1074,6 @@ fn the_supervisors_resume_all_spawns_outlive_it_and_it_exits_on_what_it_started(
         "it never reports what a Run concluded:\n{out}"
     );
 
-    // The child is still alive after its parent is gone, and finishes the Run.
     let deadline = Instant::now() + Duration::from_secs(30);
     while box_.state_of("r-detached") != "completed" {
         assert!(
@@ -1208,8 +1097,6 @@ fn resume_all_is_not_parsed_as_a_run_id_named_all() {
     assert!(out.contains("no Run on this host was cut off"), "{out}");
 }
 
-// --- the exit code reports observability, never health ----------------------------------------
-
 /// Dispatch a Run that stops short of completion, and hand back its run id.
 fn a_run_that_did_not_finish(box_: &Sandbox) -> String {
     box_.scenario(&["subtle_error"]).pr_appears_at(99);
@@ -1223,9 +1110,6 @@ fn a_run_that_did_not_finish(box_: &Sandbox) -> String {
 
 #[test]
 fn an_unhealthy_but_fully_observed_run_exits_zero() {
-    // The idiom every CLI has ever followed is *non-zero means bad*, and following it here is
-    // how Grind grows a gate through the back door. This Run is exhausted with no PR — as
-    // unhealthy as it gets — and status answered, so status exits zero.
     let box_ = sandbox("status-unhealthy");
     let run_id = a_run_that_did_not_finish(&box_);
 
@@ -1259,7 +1143,6 @@ fn a_run_whose_signals_could_not_be_observed_exits_non_zero() {
         Some(2),
         "and not the incoherent-input register either"
     );
-    // The blind signals render as could-not-observe rather than as facts.
     assert!(out.contains("unobserved"), "{out}");
 }
 
@@ -1272,15 +1155,12 @@ fn bare_status_prints_the_roster_and_never_a_single_runs_view() {
     assert_eq!(code, Some(0), "{out}\n{err}");
     assert!(out.contains("this host only"), "{out}");
     assert!(out.contains(&run_id), "the roster lists it:\n{out}");
-    // Nothing from the single-Run view: a bare status that resolves to one Run is Grind
-    // selecting, and the repair "pick the one in flight" would pick a zombie.
     assert!(!out.contains("last words"), "{out}");
     assert!(!out.contains("furthest stage"), "{out}");
 }
 
 #[test]
 fn status_reads_and_never_writes() {
-    // Watching a Run to be reassured must not destroy the one field nothing can rebuild.
     let box_ = sandbox("status-read-only");
     let run_id = a_run_that_did_not_finish(&box_);
     let record = box_.run_dir().join("run.json");
@@ -1330,10 +1210,6 @@ fn resume_on_a_completed_run_prints_the_handback_and_starts_nothing() {
 
 #[test]
 fn resume_on_an_exhausted_run_prints_the_handback_and_starts_nothing() {
-    // `supervise` attempts before it ever consults `policy::next`, so without this guard a
-    // resume of an exhausted Run would spend one more attempt against its recorded budget.
-    // The Handback names the state it actually found, so an exhausted Run reads as
-    // exhausted rather than borrowing the word `completed` from its sibling short-circuit.
     let box_ = sandbox("resume-exhausted");
     let run_id = a_run_that_did_not_finish(&box_);
     let record = box_.record();
@@ -1360,12 +1236,6 @@ fn resume_on_an_exhausted_run_prints_the_handback_and_starts_nothing() {
 
 #[test]
 fn resume_at_the_attempt_budget_starts_nothing_whatever_the_state_word_says() {
-    // `Uncorroborated` and `Unobserved` are deliberately resumable: neither stopped because the
-    // budget ran out. But a Run can land one *at* its recorded budget — and `supervise` runs
-    // `run_one_attempt` before it ever consults `policy::next`, so a guard keyed on the state
-    // word walks that Run into one more attempt with no policy check standing in front of it,
-    // stops in the same state, and does it again on the next resume. A recorded Attempt in this
-    // project costs $7–$37.
     let box_ = sandbox("resume-at-budget");
     let run_id = a_run_that_did_not_finish(&box_);
     let attempts_before = box_.record()["attempts"]
@@ -1394,12 +1264,8 @@ fn resume_at_the_attempt_budget_starts_nothing_whatever_the_state_word_says() {
     }
 }
 
-// --- the sandbox's own guarantees ------------------------------------------------------------
-
 #[test]
 fn an_unimplemented_gh_subcommand_fails_loudly_rather_than_escaping() {
-    // Dispatch removes a label and comments on a real Job issue. A fall-through would mutate
-    // GitHub from a routine `just verify`, so the fake refuses anything it does not implement.
     let box_ = sandbox("gh-loud");
     let out = Command::new("gh")
         .args(["pr", "merge", "30"])
@@ -1440,7 +1306,6 @@ fn a_dirty_worktree_refuses_and_nothing_is_dispatched_onto_it() {
         .join(NAME)
         .join(".claude/worktrees")
         .join(format!("grind-{}", BRANCH.replace('/', "-")));
-    // Dispatch once so the worktree exists, then dirty it and dispatch again.
     let _ = box_.run(&["run", ISSUE]);
     fs::write(worktree.join("uncommitted.txt"), "work the human left\n").expect("dirty it");
     let _ = fs::remove_dir_all(box_.home.join(".grind/runs"));
@@ -1460,8 +1325,6 @@ fn a_dirty_worktree_refuses_and_nothing_is_dispatched_onto_it() {
 
 #[test]
 fn a_complete_run_issues_no_gh_issue_edit_at_all() {
-    // Grind adds and never classifies (ADR-0012). `ready-for-agent` is one of the five canonical
-    // triage roles, so removing it erased a triage fact to record a queue fact.
     let box_ = sandbox("no-issue-edit");
     box_.scenario(&["success_done"]).pr_appears_at(1);
     let (out, err, code) = box_.run(&["run", ISSUE]);
@@ -1495,7 +1358,6 @@ fn a_complete_run_issues_no_gh_issue_edit_at_all() {
 
 #[test]
 fn the_dispatch_comment_still_carries_the_run_id_and_the_hostname() {
-    // Half of the only off-host surface leg 1 has, kept byte-identical.
     let box_ = sandbox("dispatch-comment");
     box_.scenario(&["success_done"]).pr_appears_at(1);
     let (out, err, code) = box_.run(&["run", ISSUE]);
@@ -1514,8 +1376,6 @@ fn the_dispatch_comment_still_carries_the_run_id_and_the_hostname() {
 
 #[test]
 fn a_completed_run_leaves_a_supervisor_log_beside_its_record() {
-    // What the supervisor said is the only account of a Run between the dispatch comment and a
-    // terminal state, and it died with the terminal it was said to.
     let box_ = sandbox("supervisor-log");
     box_.scenario(&["success_done"]).pr_appears_at(1);
     let (out, err, code) = box_.run(&["run", ISSUE]);
@@ -1558,13 +1418,11 @@ fn the_supervisor_log_is_appended_across_a_resume_rather_than_truncated() {
 
 #[test]
 fn a_run_whose_log_cannot_be_written_still_exits_on_its_real_verdict() {
-    // A log that cannot be written is not worth abandoning a Run over.
     let box_ = sandbox("supervisor-log-unwritable");
     box_.scenario(&["success_done"]).pr_appears_at(1);
     let (out, err, code) = box_.run(&["run", ISSUE]);
     assert_eq!(code, Some(0), "{out}\n{err}");
 
-    // Replace the log with a directory, which nothing can append a line to, and re-enter.
     let log = box_.run_dir().join("supervisor.log");
     fs::remove_file(&log).expect("drop the log");
     fs::create_dir(&log).expect("put something unwritable in its place");
@@ -1579,8 +1437,6 @@ fn a_run_whose_log_cannot_be_written_still_exits_on_its_real_verdict() {
 
 #[test]
 fn a_completed_run_posts_exactly_one_terminal_comment_on_the_job_issue() {
-    // Everything only the supervisor knows survives the host. Between the dispatch comment and
-    // nothing, the human's only instrument was SSH.
     let box_ = sandbox("terminal-comment");
     box_.scenario(&["success_done"]).pr_appears_at(1);
     let (out, err, code) = box_.run(&["run", ISSUE]);
@@ -1612,8 +1468,6 @@ fn a_completed_run_posts_exactly_one_terminal_comment_on_the_job_issue() {
 
 #[test]
 fn a_blocked_run_resumed_to_completion_posts_two_terminal_comments() {
-    // Append, never edit. A Run that reaches a terminal state twice leaves two comments, and
-    // two comments are the honest account.
     let box_ = sandbox("two-terminal-comments");
     box_.scenario(&["denied", "denied", "denied", "success_done"])
         .pr_appears_at(4);
@@ -1636,7 +1490,6 @@ fn a_blocked_run_resumed_to_completion_posts_two_terminal_comments() {
 
 #[test]
 fn a_gh_that_fails_on_issue_comment_still_exits_on_the_runs_real_verdict() {
-    // Best-effort. A Run that finished must not become `unobserved` because GitHub was down.
     let box_ = sandbox("comment-fails");
     box_.scenario(&["success_done"])
         .pr_appears_at(1)
@@ -1653,7 +1506,6 @@ fn a_gh_that_fails_on_issue_comment_still_exits_on_the_runs_real_verdict() {
 
 #[test]
 fn a_job_whose_anchor_artifact_is_not_on_disk_refuses() {
-    // A Run handed a path to nothing invents requirements, satisfies them, and opens a green PR.
     let box_ = sandbox("anchor-absent");
     box_.scenario(&["success_done"])
         .anchor_becomes("docs/plans/a-plan-that-was-never-written.md");
@@ -1677,8 +1529,6 @@ fn a_job_whose_anchor_artifact_is_not_on_disk_refuses() {
 
 #[test]
 fn an_anchor_artifact_that_is_present_but_empty_proceeds() {
-    // Presence, never shape. An admission check must not arrive through the back door of an
-    // admission rule, so nothing here reads R-IDs or a readiness field.
     let box_ = sandbox("anchor-empty");
     let clone = box_.clone_path();
     git(&clone, &["checkout", "-q", BRANCH]);
@@ -1701,13 +1551,9 @@ fn an_anchor_artifact_that_is_present_but_empty_proceeds() {
 
 #[test]
 fn a_worktree_behind_the_handoff_sha_refuses_at_second_zero() {
-    // Run 2's opening condition. The string comparison this replaces printed the same note here
-    // as it printed on a worktree that was harmlessly ahead, and the Run proceeded — the signer
-    // outage, the denied force-push and five hours of `pr: null` are all downstream of it.
     let box_ = sandbox("behind-the-handoff");
     box_.scenario(&["success_done"]);
 
-    // A commit the branch does not have, reachable as an object and nothing else.
     let clone = box_.clone_path();
     git(&clone, &["checkout", "-q", BRANCH]);
     fs::write(clone.join("docs/plans/later.md"), "# the human moved on\n").expect("a later plan");
@@ -1739,7 +1585,6 @@ fn a_handoff_sha_off_this_worktrees_history_refuses() {
     let box_ = sandbox("handoff-elsewhere");
     box_.scenario(&["success_done"]);
 
-    // An unrelated root commit: neither an ancestor nor a descendant of the branch.
     let clone = box_.clone_path();
     git(&clone, &["checkout", "-q", "--orphan", "elsewhere"]);
     fs::write(clone.join("README.md"), "another history entirely\n").expect("seed it");

@@ -241,7 +241,6 @@ mod tests {
     #[test]
     fn over_the_cap_oldest_unpromoted_lines_are_evicted_first() {
         let mut lines: Vec<String> = (0..205).map(|n| format!("line {n}")).collect();
-        // Promote two of the oldest lines; they must survive despite being oldest.
         lines[0] = "line 0 [L-001] promoted".to_string();
         lines[2] = "line 2 [L-002] promoted".to_string();
         let notes = lines.join("\n");
@@ -250,9 +249,7 @@ mod tests {
         assert_eq!(kept.len(), 200);
         assert!(kept.iter().any(|l| l.contains("[L-001]")));
         assert!(kept.iter().any(|l| l.contains("[L-002]")));
-        // The newest lines are always kept.
         assert!(kept.contains(&"line 204"));
-        // An unpromoted early line should have been evicted.
         assert!(!kept.contains(&"line 1"));
     }
 

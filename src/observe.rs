@@ -176,8 +176,6 @@ pub struct Observation {
     pub pr_base_matches_declared: Observed<bool>,
 }
 
-// --- one classifier per call site -----------------------------------------------------
-
 /// `git rev-list --count <handoff-sha>..HEAD`.
 ///
 /// A zero here is a **fact**, not an absence: the Run committed nothing yet. Reading it as
@@ -326,9 +324,6 @@ pub fn pr_base_matches_declared(pr_base: &str, declared: &str) -> Observed<bool>
 /// *did anything come back red*. They are separate signals: one holds completion open and the
 /// other lands on the verdict line without holding anything (ADR-0003).
 pub fn checks(completed: &Completed) -> (Observed<bool>, Observed<bool>) {
-    // No PR yet is the normal early state of every Run, not a blind one — `pr()` already draws
-    // this line, and doing it here too is what stops the old script's "no PR = completed" bug
-    // from resurfacing as "no PR = blind" instead.
     if says_no_pr(&completed.stderr) {
         return (Observed::Absent, Observed::Absent);
     }
@@ -347,8 +342,6 @@ pub fn checks(completed: &Completed) -> (Observed<bool>, Observed<bool>) {
         );
     };
     let Some(rollup) = value.get("statusCheckRollup").and_then(|r| r.as_array()) else {
-        // The field is present-and-null when a PR has no checks configured at all. Nothing is
-        // pending and nothing is red, and both of those are observations.
         return (Observed::Present(false), Observed::Present(false));
     };
     let mut pending = false;
@@ -364,9 +357,6 @@ pub fn checks(completed: &Completed) -> (Observed<bool>, Observed<bool>) {
         {
             pending = true;
         }
-        // STARTUP_FAILURE means the required check's job never ran its steps, and STALE means
-        // GitHub retired the result — neither is pending, so without naming them red,
-        // completion could proceed over a required check that never produced a verdict.
         if matches!(
             conclusion.as_str(),
             "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE" | "STALE"
@@ -631,7 +621,6 @@ pub fn diff_facts(numstat: &str, name_only: &str, diff_text: &str) -> DiffFacts 
             continue;
         };
         let path = path.trim();
-        // `-\t-\t<path>` is numstat's spelling for a binary file — no line count to add.
         if additions == "-" || deletions == "-" || is_lockfile_or_generated(path) {
             continue;
         }
@@ -746,8 +735,6 @@ pub fn scoped_listing(changed: &Observed<Vec<String>>, directory: &str) -> Obser
     }
 }
 
-// --- observing a Run, once ---------------------------------------------------------------
-
 /// Where the durable artifacts live, relative to the worktree.
 pub const PLAN_DIR: &str = "docs/plans";
 pub const RESIDUAL_DIR: &str = "docs/residual-review-findings";
@@ -784,7 +771,6 @@ pub fn observe_run(
     ]));
     let changed = changed_files(&diffed);
 
-    // Base drift, against `origin/HEAD` in the same repository the worktree belongs to.
     let base = default_branch(&run(&argv(&[
         "git",
         "symbolic-ref",
@@ -808,7 +794,6 @@ pub fn observe_run(
             ])),
             &changed,
         ),
-        // No default branch to measure against, and no commands worth running for it.
         other => base_drift(
             other,
             &Completed {
@@ -824,9 +809,6 @@ pub fn observe_run(
             &changed,
         ),
     };
-    // The head commit first, the Job's branch as a fallback. Both stay pure parses over raw
-    // output, and the existing three-valued classification was never wrong here — it was the
-    // question that was wrong.
     let head = run(&argv(&["git", "rev-parse", "HEAD"]));
     let by_head = if head.code == Some(0) && !head.stdout.trim().is_empty() {
         pr_by_head(
@@ -848,9 +830,6 @@ pub fn observe_run(
     };
     let found = match by_head {
         Observed::Present(found) => Observed::Present(found),
-        // Nothing matched the commit — including a response whose entries all carry a
-        // different head OID — so ask the branch, which is still the right question on a Run
-        // that pushed where its Job said it would.
         Observed::Absent => pr(&run(&argv(&[
             "gh",
             "pr",
@@ -858,8 +837,6 @@ pub fn observe_run(
             "--json",
             "number,url,state,isDraft,headRefName,baseRefName",
         ]))),
-        // Blind stays blind. A head lookup that could not be made must not become *no PR*
-        // because the branch lookup also found nothing.
         Observed::Unobservable(reason) => match pr(&run(&argv(&[
             "gh",
             "pr",
@@ -872,8 +849,6 @@ pub fn observe_run(
         },
     };
 
-    // The rollup resolves against **the PR the lookup found**, by number. Two independent
-    // lookups can disagree about whether a PR exists at all.
     let (checks_pending, checks_red) = match &found {
         Observed::Present(open) => checks(&run(&argv(&[
             "gh",
@@ -890,9 +865,6 @@ pub fn observe_run(
         ),
     };
 
-    // The fifth and sixth completion signals, ANDed in `decide::verdict`. `Absent` mirrors
-    // `pr_open`'s own fold — no PR yet is a Run's normal early state, not a blind one — and a
-    // fetch failure stays could-not-observe rather than becoming a mismatch.
     let (pr_head_matches_job_branch, pr_base_matches_declared) = match &found {
         Observed::Present(open) => (
             pr_head_matches_job_branch(&open.head_ref, job_branch),
@@ -922,15 +894,6 @@ pub fn observe_run(
     }
 }
 
-// --- the native backend's freshness -------------------------------------------------------
-//
-// `claude::live` reads a claude-code Run's own transcript file, and derives its freshness from
-// that file's mtime plus every subagent file's. A native Run writes no such file —
-// `NativeAdapter::run` leaves `messages-N.jsonl` under the Run's own directory instead, one per
-// attempt — so the newest write is a max across files rather than one file's mtime. `native::live`
-// reads the rest of the view out of those files' content; this is the arithmetic it asks for, kept
-// here because it is pure over times and belongs beside the other observation primitives.
-
 /// Freshness for a `Backend::Native` Run: seconds since the newest write across the Run
 /// directory's `messages-*.jsonl` files, the same shape `claude::live`'s own `freshness` field
 /// already carries (present-with-a-count, or could-not-observe — never zero for *nothing to
@@ -955,12 +918,6 @@ fn seconds_since_epoch(at: SystemTime, now_epoch: u64) -> u64 {
         .unwrap_or(0);
     now_epoch.saturating_sub(then)
 }
-
-// --- the outcome collector ----------------------------------------------------------------
-//
-// `grind outcomes` (`cli.rs`) is the human-initiated pass the design calls the loop's best
-// fuel: did the merged work *survive*. It reads GitHub, never writes to it, and the
-// classifiers below are the pure halves — the argv that produces their input is the caller's.
 
 /// A PR's terminal facts, once it stopped moving. Facts only, never a grade (ADR-0012):
 /// `merged: true` is what happened, and it carries no opinion about whether that was good.
@@ -1078,12 +1035,6 @@ pub struct RunOutcome {
     pub followup_issues: Vec<u64>,
 }
 
-// --- the host item list's classifiers ---------------------------------------------------
-//
-// **Every one of these renders a fixed, item-specific diagnostic and never the raw stdout or
-// stderr of the check.** Doctor's whole purpose is to run on hosts that failed provisioning,
-// and a misprovisioned host is exactly where an HTTPS `origin` embeds a token.
-
 /// What a host item's check found. Distinct from [`Observed`]: `Unchecked` is a deliberate
 /// absence of a boolean, while `Observed::Unobservable` is a check that tried and could not.
 #[derive(Debug, Clone, PartialEq)]
@@ -1147,22 +1098,15 @@ pub fn boot_one_shot(completed: &Completed, fires: Fires) -> Observed<Outcome> {
                 "a one-shot calling `grind resume --all` is enabled and the user lingers, so it \
                  fires at boot"
             }
-            // The claim doctor is allowed to make on darwin. It fires when the GUI domain
-            // loads, and doctor runs from inside that domain, so *loads at boot* and *loads at
-            // login* are indistinguishable from here — it says which one is true rather than
-            // implying it checked.
             Fires::AtLogin => {
                 "a one-shot calling `grind resume --all` is loaded — it fires at login, not at \
                  boot, so a restarted host waits for a human before re-entering"
             }
         }),
-        // `sh` could not run the service manager, or there was no exit code at all.
         Some(127) | None => Observed::Unobservable(Reason::saying(
             "the service manager could not be reached to ask what it has loaded",
         )),
         Some(_) => unsatisfied(match fires {
-            // Two failures behind one exit code, deliberately: an enabled unit without linger
-            // does not start at boot, and the operator's next move is the same either way.
             Fires::AtBoot => {
                 "no one-shot calling `grind resume --all` is both enabled and lingering — a unit \
                  on disk that was never enabled counts as absent, and an enabled unit without \
@@ -1214,7 +1158,6 @@ pub fn declared_clone(
         return Observed::Unobservable(Reason::saying("git remote get-url origin: could not read"));
     }
     match repo_of_remote(&completed.stdout) {
-        // The two parsed owner/name pairs, never the remote URL.
         Some(found) if found.eq_ignore_ascii_case(declared) => {
             satisfied("origin names the target repo")
         }
@@ -1228,8 +1171,6 @@ pub fn declared_clone(
 /// `owner/name` out of an SSH or HTTPS remote. The URL itself never leaves this function.
 pub fn repo_of_remote(remote: &str) -> Option<String> {
     let remote = remote.trim().trim_end_matches(".git");
-    // The host comes first, so anything a credential helper embedded in front of it — a token
-    // in an HTTPS remote on a half-provisioned box — is dropped before the pairs are read.
     let tail = if let Some((_, tail)) = remote.split_once("github.com/") {
         tail
     } else if let Some((_, tail)) = remote.split_once("github.com:") {
@@ -1479,8 +1420,6 @@ fn first_line(text: &str) -> String {
 mod tests {
     use super::*;
 
-    // Fixtures arrive through `include_str!`, not through the filesystem: reading them at run
-    // time would name `std::fs` inside `src/`, which is what `tests/topology.rs` forbids.
     const GH_AUTH_STDOUT: &str = include_str!("../tests/fixtures/gh/auth-failure.stdout");
     const GH_AUTH_STDERR: &str = include_str!("../tests/fixtures/gh/auth-failure.stderr");
     const GH_AUTH_CODE: &str = include_str!("../tests/fixtures/gh/auth-failure.code");
@@ -1495,19 +1434,13 @@ mod tests {
 
     #[test]
     fn a_ps_that_could_not_run_is_could_not_observe_and_never_a_process_that_is_gone() {
-        // Three string literals instead of a process, which is the whole point of classifying
-        // away from the spawn. `resume --all` acts on this reading: folding *could not ask*
-        // into *gone* re-enters every Run on the host at boot.
         assert_eq!(
             process_start_stamp(&completed("Thu Aug  6 12:26:20 2026\n", "", Some(0))),
             Observed::Present("Thu Aug  6 12:26:20 2026".to_string())
         );
-        // `ps` answered, and the answer is that no process matches — a fact about the world.
         for gone in [completed("", "", Some(1)), completed("\n", "", Some(0))] {
             assert_eq!(process_start_stamp(&gone), Observed::Absent, "{gone:?}");
         }
-        // Every other failure is a fact about the check. `-p <pid> -o lstart=` is a procps/BSD
-        // spelling busybox does not implement, and Grind ships aimed at those hosts.
         for blind in [
             completed("", "ps: unrecognized option: p\n", Some(127)),
             completed("", "No such file or directory (os error 2)", None),
@@ -1537,10 +1470,6 @@ mod tests {
         );
     }
 
-    // --- the PR is found by head commit ------------------------------------------------------
-
-    // The head OID rides every fixture because the lookup now matches on it client-side
-    // (#84): `3333…` is what the fake `git rev-parse HEAD` answers in `observing`.
     const PR_JSON: &str = r#"{"number":30,"url":"https://github.com/o/n/pull/30","state":"OPEN","isDraft":false,"headRefOid":"3333333333333333333333333333333333333333","headRefName":"feat/28-slice-1b-seam","baseRefName":"main"}"#;
 
     const HEAD_SHA: &str = "3333333333333333333333333333333333333333";
@@ -1631,8 +1560,6 @@ mod tests {
 
     #[test]
     fn a_pr_on_a_branch_the_job_did_not_name_is_found_by_head_commit() {
-        // Run 2's shape exactly: pushed to `…-run`, the Job named `…-seam`. The branch lookup
-        // answers truthfully about the wrong question.
         let (observation, seen) = observing(
             completed(&format!("[{PR_JSON}]"), "", Some(0)),
             no_pr_on_this_branch(),
@@ -1665,9 +1592,6 @@ mod tests {
 
     #[test]
     fn a_search_response_that_never_indexed_the_sha_is_found_through_its_head_oid() {
-        // #84, live: GitHub's search returns the PR but its index carries no trace of the
-        // head SHA, so matching has to happen over `headRefOid` — and hex case is a rendering
-        // choice, so the comparison is case-insensitive on purpose.
         let found = pr_by_head(
             "8d30e44919bd8f372efb27a8971d2f5823680454",
             &completed(
@@ -1684,8 +1608,6 @@ mod tests {
 
     #[test]
     fn a_search_response_of_different_head_oids_falls_through_to_the_branch_fallback() {
-        // The search answered, but about somebody else's commit — that is *nothing matched*,
-        // not *no PR*, so the branch still gets asked.
         let (observation, _) = observing(
             completed(
                 r#"[{"number":99,"url":"https://github.com/o/n/pull/99","state":"MERGED","isDraft":false,"headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]"#,
@@ -1724,8 +1646,6 @@ mod tests {
             pr_by_head(HEAD_SHA, &completed("not json at all", "", Some(0))),
             Observed::Unobservable(_)
         ));
-        // An entry whose head OID *does* match but which cannot be parsed as a PR is still
-        // could-not-observe — the OID filter must not turn an unreadable answer into Absent.
         assert!(matches!(
             pr_by_head(
                 HEAD_SHA,
@@ -1747,7 +1667,6 @@ mod tests {
 
     #[test]
     fn the_check_rollup_resolves_against_the_same_pr_the_lookup_found() {
-        // Two independent lookups can disagree about whether a PR exists at all.
         let (_, seen) = observing(
             completed(&format!("[{PR_JSON}]"), "", Some(0)),
             no_pr_on_this_branch(),
@@ -1772,8 +1691,6 @@ mod tests {
         assert_eq!(observation.checks_red, Observed::Absent);
     }
 
-    // --- base drift ----------------------------------------------------------------------------
-
     fn on_main() -> Observed<String> {
         default_branch(&completed("origin/main\n", "", Some(0)))
     }
@@ -1787,8 +1704,6 @@ mod tests {
 
     #[test]
     fn drift_with_no_readable_origin_head_is_could_not_observe_and_never_zero() {
-        // What a clone whose fetch has never succeeded looks like. Recording it as *no drift*
-        // is the exact shape the three-valued reading exists to remove.
         for broken in [
             completed(
                 "",
@@ -1894,9 +1809,6 @@ mod tests {
 
     #[test]
     fn no_type_in_the_drift_carries_a_boolean_or_a_summary_over_the_count() {
-        // ADR-0006's seventh prohibited shape. The tempting argument — *`main` moved, so don't
-        // open the PR* — reads as caution rather than as the quality judgement ADR-0003
-        // refuses.
         let shape = format!(
             "{:?}",
             BaseDrift {
@@ -1915,9 +1827,6 @@ mod tests {
 
     #[test]
     fn a_killed_child_leaves_stdout_empty_and_classifies_as_could_not_observe() {
-        // A killed child leaves stdout *empty*, not truncated — measured across both Runs.
-        // There is no exit code at all, which is the only thing distinguishing it from a
-        // command that ran and found nothing.
         let killed = completed("", "", None);
         assert!(matches!(pr(&killed), Observed::Unobservable(_)));
         assert!(matches!(commits_ahead(&killed), Observed::Unobservable(_)));
@@ -2005,9 +1914,6 @@ mod tests {
 
     #[test]
     fn a_check_that_never_ran_or_was_retired_reads_red_rather_than_completable() {
-        // STARTUP_FAILURE: the required check's job never ran its steps. STALE: GitHub retired
-        // the result. Neither is pending, so if neither were red, completion could proceed
-        // over a required check that never produced a verdict.
         for conclusion in ["STARTUP_FAILURE", "STALE"] {
             let rollup = format!(
                 r#"{{"statusCheckRollup":[{{"status":"COMPLETED","conclusion":"{conclusion}"}}]}}"#
@@ -2031,9 +1937,6 @@ mod tests {
 
     #[test]
     fn a_run_with_no_pr_yet_reads_checks_as_absent_rather_than_could_not_observe() {
-        // The normal early state of every Run is "no PR yet", not "blind" — this is the same
-        // line `pr()` already draws, drawn here too so the old script's "no PR = completed"
-        // bug does not resurface one module over as "no PR = blind".
         let none = completed("", "no pull requests found for branch\n", Some(1));
         let (pending, red) = checks(&none);
         assert_eq!(pending, Observed::Absent);
@@ -2042,8 +1945,6 @@ mod tests {
 
     #[test]
     fn an_unreadable_worktree_is_not_a_run_that_produced_nothing() {
-        // A failed diff is could-not-observe. An empty listing read as absence is how a
-        // worktree that has gone missing becomes a Run that produced no plan.
         let missing = completed("", "fatal: not a git repository\n", Some(128));
         assert!(matches!(changed_files(&missing), Observed::Unobservable(_)));
         assert!(matches!(
@@ -2052,8 +1953,6 @@ mod tests {
         ));
         assert_eq!(changed_files(&completed("", "", Some(0))), Observed::Absent);
     }
-
-    // --- listings scoped to the Run's own diff -------------------------------------------------
 
     #[test]
     fn a_plan_file_the_run_itself_added_advances_the_ladder_and_one_it_did_not_does_not() {
@@ -2066,7 +1965,6 @@ mod tests {
             scoped_listing(&mine, PLAN_DIR),
             Observed::Present(vec!["docs/plans/2026-08-15-a-plan.md".to_string()])
         );
-        // A previous Run's merged plan is in the repo and not in this Run's diff.
         let elsewhere = changed_files(&completed("src/lib.rs\nREADME.md\n", "", Some(0)));
         assert_eq!(scoped_listing(&elsewhere, PLAN_DIR), Observed::Absent);
         assert_eq!(scoped_listing(&elsewhere, RESIDUAL_DIR), Observed::Absent);
@@ -2088,12 +1986,8 @@ mod tests {
 
     #[test]
     fn all_five_rungs_are_still_reachable_from_diff_scoped_listings() {
-        // Trimming the ladder to the Run-scoped rungs would throw away the distinction between
-        // a Run that died before planning and one that died after, which is why the stage
-        // exists at all.
         let stage = |o: &Observation| crate::decide::furthest_stage(o).to_string();
 
-        // A fresh Run on a repo where a previous Run merged a plan reads `dispatched`.
         let (fresh, _) = observing_with_diff("");
         assert_eq!(stage(&fresh), "dispatched");
 
@@ -2115,8 +2009,6 @@ mod tests {
         assert_eq!(stage(&walk), "pr-open");
     }
 
-    // --- the host item list's classifiers -------------------------------------------------
-
     #[test]
     fn a_clone_whose_origin_names_another_repo_fails_and_names_both() {
         let origin = completed("git@github.com:someone-else/snapper.git\n", "", Some(0));
@@ -2130,8 +2022,6 @@ mod tests {
 
     #[test]
     fn a_check_renders_the_parsed_pairs_and_never_the_remote_url() {
-        // Doctor runs on hosts that failed provisioning, which is exactly where an HTTPS
-        // origin embeds a token.
         let leaky = "https://x-access-token:ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@github.com/o/snapper.git\n";
         let origin = completed(leaky, "", Some(0));
         let found = declared_clone(true, Some(&origin), "FlorianRiquelme/snapper");
@@ -2228,8 +2118,6 @@ mod tests {
 
     #[test]
     fn a_boot_one_shot_is_satisfied_only_when_the_service_manager_says_it_is_loaded() {
-        // `launchctl print` on a loaded agent, and `systemctl --user is-enabled` on an enabled
-        // unit, both exit zero.
         let loaded = completed(
             "com.grind.resume-all = {\n\tactive count = 0\n}\n",
             "",
@@ -2242,9 +2130,6 @@ mod tests {
         assert!(on_linux.contains("fires at boot"), "{on_linux}");
         assert!(on_linux.contains("lingers"), "{on_linux}");
 
-        // **The claim darwin is allowed to make.** Doctor runs from inside the GUI domain whose
-        // loading is the thing in question, so it cannot tell *loads at boot* from *loads at
-        // login* — and the satisfied text says which one is true rather than implying it looked.
         let Observed::Present(Outcome::Satisfied(on_darwin)) =
             boot_one_shot(&loaded, Fires::AtLogin)
         else {
@@ -2262,10 +2147,6 @@ mod tests {
 
     #[test]
     fn a_user_unit_without_linger_is_unsatisfied_rather_than_quietly_enabled() {
-        // `systemctl --user is-enabled` returns enabled purely from the symlink, with or
-        // without linger, so the check is conjunctive and this is the exit code that carries
-        // the second half. Doctor going green here is the failure: the unit is correct, enabled,
-        // and on a headless box it never runs.
         let found = boot_one_shot(&completed("", "", Some(1)), Fires::AtBoot);
         let Observed::Present(Outcome::Unsatisfied(said)) = found else {
             panic!("expected unsatisfied: {found:?}");
@@ -2276,8 +2157,6 @@ mod tests {
 
     #[test]
     fn a_plist_on_disk_that_was_never_bootstrapped_is_unsatisfied_and_never_satisfied() {
-        // The likeliest way this fails, and it fails one reboot later with a Run stranded. The
-        // check asks the service manager what it has loaded, never the filesystem what is there.
         for never_loaded in [
             completed(
                 "",
@@ -2301,8 +2180,6 @@ mod tests {
 
     #[test]
     fn a_service_manager_that_cannot_be_reached_is_could_not_observe_never_unsatisfied() {
-        // *No such unit* and *no `launchctl` on this box* are different facts, and the second is
-        // about the check rather than about the host.
         for unreachable in [
             completed("", "sh: launchctl: command not found\n", Some(127)),
             completed("", "", None),
@@ -2314,8 +2191,6 @@ mod tests {
 
     #[test]
     fn the_steps_no_check_can_reach_are_named_rather_than_guessed() {
-        // No check here is a guess dressed as a boolean, and none performs a write to prove a
-        // step. The parts that cannot be reached say so in the report.
         let ssh_origin = completed("git@github.com:o/n.git\n", "", Some(0));
         let Observed::Present(Outcome::Unchecked(said)) = origin_over_ssh(&ssh_origin) else {
             panic!("a real push is not something doctor may perform");
@@ -2380,8 +2255,6 @@ mod tests {
         }
     }
 
-    // --- the fifth and sixth completion signals ---------------------------------------------
-
     #[test]
     fn a_pr_pushed_to_the_branch_the_job_named_matches_on_both_head_and_base() {
         let (observation, _) = observing(
@@ -2413,9 +2286,6 @@ mod tests {
 
     #[test]
     fn an_undeclared_base_cannot_mismatch_so_a_pre_cutover_record_still_completes() {
-        // Only a record from before the `Base branch` row existed can carry "" here —
-        // `job::from_issue_json` refuses a blank row — and holding those Runs at
-        // `Uncorroborated` forever would punish them for a declaration they never made.
         assert_eq!(
             pr_base_matches_declared("main", ""),
             Observed::Present(true)
@@ -2450,8 +2320,6 @@ mod tests {
             Observed::Unobservable(_)
         ));
     }
-
-    // --- `diff_facts` ------------------------------------------------------------------------
 
     #[test]
     fn lockfile_and_generated_churn_is_excluded_from_changed_loc() {
@@ -2541,8 +2409,6 @@ mod tests {
         assert!(!clean.dep_manifest_touched);
     }
 
-    // --- `skills_present` ---------------------------------------------------------------------
-
     #[test]
     fn all_ten_stage_skills_present_is_satisfied() {
         let entries: Vec<String> = STAGE_SKILLS.iter().map(|s| s.to_string()).collect();
@@ -2564,8 +2430,6 @@ mod tests {
         };
         assert!(text.contains("reflect"), "{text}");
     }
-
-    // --- the outcome collector -----------------------------------------------------------
 
     #[test]
     fn pr_final_state_reads_a_merged_pr() {
@@ -2633,8 +2497,6 @@ README.md
 
     #[test]
     fn reverts_touching_reads_the_final_commit_block_with_no_trailing_blank_line() {
-        // The parser flushes on end-of-input, not only on the next sha line — a log that ends
-        // mid-block (no trailing newline shape) must not silently drop its last commit.
         let log = "deadbeef1\nsrc/observe.rs";
         let run_paths = vec!["src/observe.rs".to_string()];
         assert_eq!(
@@ -2654,8 +2516,6 @@ README.md
 
     #[test]
     fn followup_issues_is_empty_over_empty_or_malformed_output() {
-        // Tolerant by construction: a repo this pass cannot query must leave the field
-        // empty, never fail the pass.
         assert!(followup_issues("").is_empty());
         assert!(followup_issues("[]").is_empty());
         assert!(followup_issues("not json").is_empty());
@@ -2664,17 +2524,12 @@ README.md
 
     #[test]
     fn followup_issues_skips_rows_whose_number_is_not_a_number() {
-        // A row whose number arrived as anything but an integer contributes nothing rather
-        // than poisoning the rest of the listing.
         let body = r#"[{"title":"no number"},{"number":null},{"number":7,"title":"real"}]"#;
         assert_eq!(followup_issues(body), vec![7]);
     }
 
     #[test]
     fn every_arm_is_constructed_somewhere_in_this_module() {
-        // ADR-0009 put clippy in the recipe because an unused variant on a type whose whole
-        // purpose is a representable state is a statement about test coverage. Under a library
-        // target a `pub` enum no longer raises that warning, so this stands in for it.
         let arms: [Observed<u64>; 3] = [
             Observed::Present(1),
             Observed::Absent,
@@ -2683,14 +2538,11 @@ README.md
         assert_eq!(arms.len(), 3);
     }
 
-    // --- native_freshness ------------------------------------------------------------------
-
     #[test]
     fn native_freshness_reads_the_newest_of_several_mtimes() {
         let now = 1_785_000_000u64;
         let older = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(now - 500);
         let newest = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(now - 20);
-        // Order in the slice must not matter — the newest wins regardless of listing order.
         assert_eq!(
             native_freshness(&[older, newest], now),
             Observed::Present(20)
@@ -2703,8 +2555,6 @@ README.md
 
     #[test]
     fn native_freshness_over_no_files_is_could_not_observe_not_zero() {
-        // An empty list must never read as *just wrote*: nothing was read at all, which is a
-        // fact about the check, not about the Run's freshness.
         let found = native_freshness(&[], 1_785_000_000);
         assert!(matches!(found, Observed::Unobservable(_)), "{found:?}");
         assert_ne!(found, Observed::Present(0));

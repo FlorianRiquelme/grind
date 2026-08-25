@@ -56,9 +56,6 @@ fn subagent_of(root: &Path, agent: &str) -> PathBuf {
 
 #[test]
 fn a_subagent_writing_more_recently_than_the_parent_wins() {
-    // A fan-out makes the parent go quiet while subagents work. Reading the parent alone
-    // misreads the quietest healthy phase of a pipeline as a stall, and sends the operator to
-    // kill a working Run.
     let root = scratch_fanout("subagent-newest");
     let base = SystemTime::now() - Duration::from_secs(600);
     set_mtime(&parent_of(&root), base);
@@ -102,7 +99,6 @@ fn the_parent_wins_when_it_is_the_newest() {
 
 #[test]
 fn a_session_that_never_fanned_out_still_reads_its_own_write() {
-    // Most sessions never fan out, so a missing subagents directory is not an error.
     let root = scratch_fanout("no-fanout");
     fs::remove_dir_all(root.join(SESSION)).expect("drop the fan-out");
     assert!(newest_write(&parent_of(&root)).is_some());
@@ -110,16 +106,11 @@ fn a_session_that_never_fanned_out_still_reads_its_own_write() {
 
 #[test]
 fn a_transcript_that_is_not_there_yields_no_time_rather_than_a_zero() {
-    // Zero would render as *written in 1970*, which reads as a fact. Nothing is the honest
-    // answer, and the view spells it as could-not-observe.
     assert!(newest_write(Path::new("/nowhere/that/exists/none.jsonl")).is_none());
 }
 
 #[test]
 fn the_transcript_slug_follows_the_symlink_the_way_claude_records_it() {
-    // #82: the declared clone `~/.grind/repos/<owner>/<name>` is a symlink, and Claude slugs
-    // the **resolved** path — on macOS the same directory is `/private/var/...` and
-    // `/var/...` — so a pointer slugged from the raw string named a file that was not there.
     let real = std::env::temp_dir().join(format!("grind-slug-real-{}", std::process::id()));
     let link = std::env::temp_dir().join(format!("grind-slug-link-{}", std::process::id()));
     let _ = fs::remove_dir_all(&real);
@@ -131,8 +122,6 @@ fn the_transcript_slug_follows_the_symlink_the_way_claude_records_it() {
     let via_link = transcript_path(home, link.to_str().unwrap(), session);
     let direct = transcript_path(home, real.to_str().unwrap(), session);
     assert_eq!(via_link, direct);
-    // A worktree that is gone cannot be canonicalised, and slugging the raw string is the old
-    // behaviour that keeps such a record's transcript path computable at all.
     let gone = transcript_path(home, "/nowhere/that/exists/snapper", session);
     assert_eq!(
         gone,

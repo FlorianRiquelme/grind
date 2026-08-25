@@ -78,8 +78,6 @@ pub struct Job {
     pub declared_hot_paths: Vec<String>,
 }
 
-// --- reading the reference and the issue ------------------------------------------------
-
 pub fn parse_reference(input: &str) -> Result<Reference, Refusal> {
     let trimmed = input.trim();
     if let Some(rest) = trimmed.strip_prefix("https://github.com/") {
@@ -123,8 +121,6 @@ pub fn from_issue_json(raw: &str) -> Result<Job, Refusal> {
     let value: serde_json::Value = serde_json::from_str(raw)
         .map_err(|e| Refusal::saying(format!("`gh issue view` returned unreadable JSON: {e}")))?;
 
-    // `url` refuses like `number`: every downstream message renders it (`Job {url} has no
-    // usable …`), and an absent one rendered as `Job  has no usable …`, blank in the prompt.
     let url = value
         .get("url")
         .and_then(|v| v.as_str())
@@ -182,8 +178,6 @@ pub fn from_issue_json(raw: &str) -> Result<Job, Refusal> {
     let handoff_sha = extract_handoff_sha(&required("handoff sha")?)?;
     let anchor = required("anchor artifact")?;
     validate_anchor(&anchor)?;
-    // No `budget ceiling` row is read. ADR-0010 withdrew the ceiling, and a Job still carrying
-    // the row is ignored the way any unknown row is.
     let intent = optional("intent");
     let model = optional("model");
     let done_predicate = required("done predicate")?;
@@ -229,10 +223,6 @@ fn field_table(body: &str) -> Vec<(String, String)> {
     let mut rows = Vec::new();
     for line in body.lines() {
         let line = line.trim();
-        // Split on the first interior `|` only. A value may itself carry a pipe — escaped
-        // `\|` or bare — and splitting on every one turned such a row into three cells that
-        // were dropped silently, so dispatch later refused on a row that was there. The
-        // trailing `|` is already stripped, so the value runs to line end.
         if !line.starts_with('|') || !line.ends_with('|') || line.len() < 3 {
             continue;
         }
@@ -268,8 +258,6 @@ fn clean(cell: &str) -> String {
         .trim()
         .to_string()
 }
-
-// --- validating what reaches a path -----------------------------------------------------
 
 fn is_segment(segment: &str) -> bool {
     !segment.is_empty()
@@ -335,8 +323,6 @@ pub fn repo_owner_and_name(target_repo: &str) -> (&str, &str) {
     target_repo.split_once('/').unwrap_or(("", target_repo))
 }
 
-// --- resolving the host's four facts, purely --------------------------------------------
-
 /// `~/.grind` — the host's Grind directory, whose **layout is the declaration**. No config
 /// file, no format to parse, and no override: `$HOME` is the only variable (ADR-0008).
 pub fn grind_dir(home: &Path) -> PathBuf {
@@ -393,18 +379,6 @@ pub fn read_selection(home: &Path) -> Result<runner::Selection, String> {
     };
     parsed.map_err(|e| format!("{}: {e}", path.display()))
 }
-
-// --- the host item list -------------------------------------------------------------------
-//
-// One list, checked at two depths: presence before every Dispatch, the full list by
-// `grind doctor`. The list lives here because `job` already absorbs host resolution — repo
-// path, worktree adoption, `claude` binary — and the dispatch-time subset is
-// part of turning a Job reference into a dispatch.
-//
-// The tension is named rather than hidden: `grind doctor` takes no Job argument, so the list
-// stretches this module's stated scope. The alternatives are worse — an eleventh module breaks
-// the cut, and `world` holds no branching. Revisit if a second Job-independent concern lands
-// here.
 
 /// How an item is caught. `docs/provisioned-host.md` is the operative list and these three
 /// marks are its depth model; the test below asserts each item carries the mark that document
@@ -603,8 +577,6 @@ pub fn dispatch_subset() -> Vec<&'static HostItem> {
 /// needs a recent git.
 pub const GIT_VERSION_FLOOR: (u64, u64) = (2, 34);
 
-// --- pure parses over porcelain ----------------------------------------------------------
-
 /// `git status --porcelain`: any output at all means dirty.
 pub fn is_dirty(porcelain: &str) -> bool {
     !porcelain.trim().is_empty()
@@ -667,8 +639,6 @@ pub fn reachability(
 ) -> Reachability {
     let head = head.trim();
     let handoff = handoff_sha.trim();
-    // The row to get right: a fetch that could not be made leaves the question unanswered, and
-    // an unanswered question is neither a clean bill of health nor a refusal.
     if !fetch_ok {
         return Reachability::Note(format!(
             "could not fetch, so whether this worktree contains {} was not observed",
@@ -682,9 +652,6 @@ pub fn reachability(
             short(head),
             short(handoff)
         )),
-        // Grind never fast-forwards and never moves the worktree: the declared clone may be a
-        // symlink to the human's own (ADR-0008), so a visible refusal is traded for an
-        // invisible mutation deliberately.
         Some(1) if handoff_contains_head => Reachability::Refuse(Refusal::saying(format!(
             "worktree HEAD {} is behind Handoff SHA {} — fast-forward and re-dispatch",
             short(head),
@@ -810,7 +777,6 @@ mod tests {
 
     #[test]
     fn a_handoff_sha_row_carrying_parenthetical_context_yields_the_bare_sha() {
-        // The shape `docs/findings/0002` recorded, which every consumer took whole.
         let rows = FULL_ROWS.replace(
             "`9d1f4c7a2b6e0538d4a17c9b3e5f8021ac6d4e77`",
             "`723ca91` (`main` after #29)",
@@ -847,8 +813,6 @@ mod tests {
 
     #[test]
     fn a_hex_run_shorter_than_a_short_sha_refuses_rather_than_truncating() {
-        // Six characters is not a commit, and yielding it would hand `handoff..HEAD` a
-        // revision that resolves to something else or to nothing.
         let rows = FULL_ROWS.replace("`9d1f4c7a2b6e0538d4a17c9b3e5f8021ac6d4e77`", "`abc123`");
         let refusal = from_issue_json(&issue_json(&rows)).expect_err("must refuse");
         assert!(refusal.to_string().contains("handoff sha"), "{refusal}");
@@ -886,8 +850,6 @@ mod tests {
 
     #[test]
     fn a_job_still_carrying_a_budget_ceiling_row_parses_and_the_row_is_ignored() {
-        // ADR-0010 withdrew the ceiling. A Job filed before that is still a readable Job, and
-        // the row is ignored the way any unknown row is.
         let rows = format!("{FULL_ROWS}\n| Budget ceiling | $12.50 |");
         let job = from_issue_json(&issue_json(&rows)).expect("a readable Job");
         assert_eq!(job.anchor, "docs/plans/2026-08-05-002-plan.md");
@@ -912,7 +874,6 @@ mod tests {
             job.intent.as_deref(),
             Some("A settled plan transcribed into one module.")
         );
-        // Absent is the ordinary case, and the ordinary case is silence.
         let bare = from_issue_json(&issue_json(FULL_ROWS)).expect("a complete Job");
         assert_eq!(bare.intent, None);
     }
@@ -992,9 +953,6 @@ mod tests {
 
     #[test]
     fn a_target_repo_row_whose_value_carries_a_pipe_parses_as_one_row() {
-        // Splitting on every `|` turned such a row into three cells that were dropped
-        // silently, and dispatch then refused on a row that was there. Escaped or bare, the
-        // value runs from the first interior `|` to the line's last.
         let table = field_table(&body(
             "| Target repo | FlorianRiquelme/snapper \\| mirrored at #12 |",
         ));
@@ -1005,7 +963,6 @@ mod tests {
                 "FlorianRiquelme/snapper \\| mirrored at #12".to_string()
             )]
         );
-        // The bare pipe reads the same way.
         let bare = field_table(&body(
             "| Target repo | FlorianRiquelme/snapper | see docs |",
         ));
@@ -1020,8 +977,6 @@ mod tests {
 
     #[test]
     fn an_issue_json_without_a_usable_url_refuses_and_names_the_field() {
-        // Every refusal downstream renders the url (`Job {url} has no usable …`), so an
-        // absent one used to print `Job  has no usable …` and land blank in the prompt.
         for url in [None, Some("")] {
             let mut raw = serde_json::json!({
                 "number": 28,
@@ -1074,8 +1029,6 @@ mod tests {
         assert_eq!(adopt_worktree(porcelain, "feat/28-slice-1b"), None);
     }
 
-    // --- reachability, all six rows of the table ---------------------------------------------
-
     const HEAD_SHA: &str = "3333333333333333333333333333333333333333";
     const HANDOFF: &str = "9d1f4c7a2b6e0538d4a17c9b3e5f8021ac6d4e77";
 
@@ -1092,7 +1045,6 @@ mod tests {
             reachability(true, Some(0), true, HANDOFF, HANDOFF),
             Reachability::Proceed
         );
-        // An abbreviated row is the same commit, not a different one.
         assert_eq!(
             reachability(true, Some(0), true, HANDOFF, "9d1f4c7"),
             Reachability::Proceed
@@ -1109,7 +1061,6 @@ mod tests {
 
     #[test]
     fn a_worktree_behind_the_handoff_sha_refuses_saying_fast_forward() {
-        // Run 2's opening condition: behind and fast-forwardable at second zero.
         let said = refusal_of(&reachability(true, Some(1), true, HEAD_SHA, HANDOFF));
         assert!(said.contains("fast-forward"), "{said}");
         assert!(
@@ -1133,7 +1084,6 @@ mod tests {
 
     #[test]
     fn a_failed_fetch_is_a_note_and_never_a_refusal_or_a_clean_bill_of_health() {
-        // The row to get right. Every ancestor answer under a failed fetch is unobserved.
         for exit in [Some(0), Some(1), Some(128), None] {
             let observed = reachability(false, exit, false, HEAD_SHA, HANDOFF);
             let Reachability::Note(note) = observed else {
@@ -1173,10 +1123,6 @@ mod tests {
         }
     }
 
-    // --- the host item list ---------------------------------------------------------------
-
-    // The operative list arrives through `include_str!` rather than the filesystem: reading it
-    // at run time would name `std::fs` inside `src/`, which `tests/topology.rs` forbids.
     const PROVISIONED_HOST: &str = include_str!("../docs/provisioned-host.md");
 
     /// Every entry in the document that carries a depth mark, reassembled from its wrapped
@@ -1214,8 +1160,6 @@ mod tests {
     }
 
     fn push_entry(entries: &mut Vec<(String, Depth)>, entry: String, in_credentials: bool) {
-        // The credential section marks all six of its steps at once, in prose above them:
-        // "All *doctor*, never *dispatch*".
         if in_credentials && entry.starts_with(|c: char| c.is_ascii_digit()) {
             entries.push((entry, Depth::Doctor));
         } else if entry.contains("— *dispatch") {
@@ -1229,9 +1173,6 @@ mod tests {
 
     #[test]
     fn every_item_carries_the_mark_the_document_gives_it() {
-        // Membership alone cannot catch a mis-marked item, and a mis-marked item is the only
-        // failure this list has: an item quietly demoted from *dispatch* to *doctor* stops
-        // running before a Dispatch and nothing says so.
         let entries = document_entries();
         assert_eq!(
             entries.len(),
@@ -1294,8 +1235,6 @@ mod tests {
 
     #[test]
     fn the_boot_one_shot_is_doctors_and_never_a_dispatch_precondition() {
-        // A Dispatch works perfectly well without it, so refusing one would gate a Job on
-        // something unrelated to it (ADR-0003).
         let item = host_items()
             .iter()
             .find(|i| i.check == Check::BootOneShot)
@@ -1340,14 +1279,10 @@ mod tests {
         assert_eq!(locks_dir(home), Path::new("/home/op/.grind/locks"));
     }
 
-    // --- the agent selection ---------------------------------------------------------------
-
     /// A throwaway home with `~/.grind/agent` laid out, removed when the test ends.
     fn home_with_agent(line: &str) -> PathBuf {
         let home = world::temp_dir("read-selection");
         world::create_dir_all(&grind_dir(&home)).expect("a scratch .grind dir");
-        // A blank line is written too, so *absent file* and *empty file* stay separate
-        // scenarios.
         world::write_atomic(&agent_file(&home), line).expect("a scratch agent file");
         home
     }

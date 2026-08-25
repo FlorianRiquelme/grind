@@ -238,8 +238,6 @@ pub struct Outcome {
     pub already_completed: bool,
 }
 
-// --- the dispatch lock ---------------------------------------------------------------------
-
 /// The lock key: the **target repo plus the branch**, never a filesystem path. Two worktrees of
 /// one repo must not pass each other silently, and one declared clone per repo is what makes
 /// this sound.
@@ -280,22 +278,14 @@ pub fn take_lock(home: &Path, target_repo: &str, branch: &str) -> Result<LockHan
     }
     match world::try_lock(&path) {
         TryLock::Acquired(handle) => Ok(handle),
-        // A collision: a live supervisor holds this branch. Named neutrally rather than as
-        // *another Run*, because for `resume` and `cleared` the holder can be the named
-        // Run's own supervisor, still running through a rate-limit sleep — and *another Run*
-        // sends the human hunting the roster for a collision that does not exist.
         TryLock::WouldBlock => Err(Refusal::saying(format!(
             "a running supervisor already holds {target_repo} {branch} on this host"
         ))),
-        // Could not determine. Never folded into the refusal and never into proceeding —
-        // collapsing the two relocates the exact bug the three-valued observation removes.
         TryLock::Failed(why) => Err(Refusal::saying(format!(
             "could not determine whether {target_repo} {branch} is held: {why}"
         ))),
     }
 }
-
-// --- dispatch -------------------------------------------------------------------------------
 
 /// The only path that starts a Run. Grind never selects; a human names a Job.
 pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
@@ -324,40 +314,17 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
     let job = job::from_issue_json(&issue.stdout)?;
     world::print_line(&format!("Job #{}: {}", job.issue, job.title));
 
-    // ADR-0017: the agent backend is declared by layout (`~/.grind/agent`) and snapshotted
-    // here, once, before any other host-readiness check reads it — the two readiness checks
-    // right below need to know which backend they are answering for. Resume loads the record
-    // this dispatch writes and proceeds on that snapshot; it never re-reads this file. An
-    // unreadable or unparseable declaration refuses the Dispatch on the same register as every
-    // other incoherent input here: a Job that cannot be read has not been assessed.
     let selection = job::read_selection(&home).map_err(Refusal::saying)?;
 
-    // Presence only, local, free, no network — a host missing its clone or its `claude` fails
-    // at second zero rather than three hours in. Backend-aware: a native-only host declares no
-    // `claude` binary and must not be refused for lacking one its selected backend never runs.
     refuse_unless_host_ready(&home, &job, selection.backend)?;
 
-    // A provisioning refusal on the same register as the one above and the dirty-worktree
-    // refusal below — never an ADR-0003 quality gate. A native Dispatch with no provider
-    // credential cannot make its first attempt, so refusing now, before the lock, the worktree
-    // or a single attempt, is the could-not-answer register R9 asks for, rather than the Run
-    // spending its whole attempt budget failing identically (Run 2's shape, one layer over).
-    // `Endpoint::resolve` only checks presence (`world::var`, no network); the resolved
-    // `Endpoint` carries the key and is dropped immediately below, never reaching the record or
-    // any serialized form.
     refuse_unless_native_ready(selection.backend, selection.endpoint_override.as_deref())?;
 
-    // A provisioning refusal on the same register as the two above, never an ADR-0003
-    // quality gate: with Unit 1 in place grind no longer injects a claude-code alias into
-    // the native path, so an operator's own `model: claude-…` pin can never make a first
-    // attempt against an OpenAI-compatible endpoint — refusing now names the incoherence
-    // rather than spending the whole attempt budget failing identically on every stage.
     refuse_claude_pin_on_native(selection.backend, job.model.as_deref())?;
 
     let repo_path = job::repo_path(&home, &job.target_repo);
     let claude_bin = job::claude_bin(&home);
 
-    // Taken before the record is written, and held for the whole process.
     let _lock = take_lock(&home, &job.target_repo, &job.branch)?;
 
     let worktree = adopt_or_create_worktree(&repo_path, &job.branch)?;
@@ -375,10 +342,6 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
             dirty.stdout.trim()
         )));
     }
-    // Four impure calls and no branching in any of them; `job::reachability` is the whole of
-    // the decision. The fetch is network, so it sits outside the *presence only, local, free,
-    // no network* comment that scopes the host-readiness check above — and it is what makes the
-    // same Job produce the same answer on a laptop and on a box.
     let fetched = world::run(&words(&["git", "fetch"]), Some(&repo_path));
     let head = world::run(&words(&["git", "rev-parse", "HEAD"]), Some(&worktree));
     let contains = world::run(
@@ -413,10 +376,6 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         job::Reachability::Refuse(refusal) => return Err(refusal),
     }
 
-    // A Run handed a path to nothing cannot invent requirements, satisfy them, and open a green
-    // PR. Presence only: the Anchor's **shape** is never checked — no R-IDs, no readiness field
-    // — because an admission check must not arrive through the back door of an admission rule.
-    // It cannot live in `refuse_unless_host_ready`, which runs before the worktree exists.
     if !world::exists(&worktree.join(&job.anchor)) {
         return Err(Refusal::saying(format!(
             "the Anchor artifact `{}` is not in the worktree at {}, so nothing is dispatched \
@@ -439,9 +398,6 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         state: State::Dispatched,
         repo_path: repo_path.display().to_string(),
         worktree: worktree.display().to_string(),
-        // The Run-level `session_id` field stays for pre-cutover records; a new record leaves
-        // it as the Plan stage's own session id (decision 4) rather than a Run-wide
-        // mega-session — Plan is where the ladder always starts.
         session_id: attempt::stage_session_id(&run_id, Stage::Plan),
         claude_bin: claude_bin.display().to_string(),
         model: job.model.clone(),
@@ -536,40 +492,10 @@ pub fn resume(run_id: &str) -> Result<Outcome, Refusal> {
     }
     let keyed = RunRecord::load(&path)?;
 
-    // A Run being re-entered by hand holds its branch exactly as a dispatched one does, and the
-    // original holder's lock died with its supervisor.
     let _lock = take_lock(&home, &keyed.job.target_repo, &keyed.job.branch)?;
 
-    // Re-loaded under the lock, the same order `cleared` follows: `save` writes the whole
-    // record, so the copy it writes must have been read while no other writer could run — a
-    // clearance recorded between the first load and the lock would otherwise be erased by the
-    // save below. The first load serves only the existence refusal and the lock key, and the
-    // guard below runs on this fresh copy so a Run another supervisor finished in that window
-    // is not re-entered.
     let mut record = RunRecord::load(&path)?;
 
-    // Option (a) from the review: widen the guard rather than add a second branch below it.
-    // `supervise` attempts before it ever consults `policy::next` (`run_one_attempt` runs, then
-    // the record is saved, then the loop asks what's next) — so `Completed` is not the only
-    // state a resume must not walk into. `Exhausted` means the record already holds a Run at
-    // its recorded attempt budget; resuming it would spend a ninth attempt with no `policy`
-    // check standing between `resume` and `run_one_attempt` to stop it, breaking *attempt N of
-    // M, with M from the record* the same way the Completed case would.
-    //
-    // `Unobserved` and `Uncorroborated` are deliberately left resumable. Neither stopped because
-    // the attempt budget ran out — `Uncorroborated` always stops regardless of budget, and
-    // `Unobserved` stops on a fault in Grind's own eyes, not the Job's — so resuming one does
-    // not overspend anything the record promises. For `Unobserved` in particular, the transient
-    // `policy`'s new reobserve pause exists for may simply have cleared since; refusing to
-    // resume it would remove the only recovery path for exactly the fault this fix's other half
-    // gives more time to clear.
-    //
-    // **Keyed on the number, not on the state word.** A Run whose last working Attempt landed
-    // `Uncorroborated` or `Unobserved` at 8 of 8 stops in a resumable state at its budget, and
-    // the state-word guard waves it straight into `run_one_attempt` — with no `policy` check
-    // between `resume` and the child, and a recorded Attempt in this project costing $7–$37.
-    // Each further resume spends another and stops in the same state. Refusing on the count
-    // keeps the case the comment above argues for resumable, and refuses only the overspend.
     if matches!(record.state, State::Completed | State::Exhausted)
         || attempt::working(record.attempts()) >= record.attempt_budget
     {
@@ -610,8 +536,6 @@ pub fn cleared(run_id: &str, note: &str) -> Result<(), Refusal> {
     let mut record = RunRecord::load(&path)?;
     record_clearance(&mut record, note, world::now_iso())?;
     record.save(&path)?;
-    // Logged from the row that was actually stored, so the account and the record cannot
-    // say two different things about one note.
     if let Some(row) = record.clearances().last() {
         say(&run_dir, &format!("  clearance recorded: {}", row.note));
     }
@@ -680,8 +604,6 @@ pub fn resume_all() -> Result<Reentry, Refusal> {
             continue;
         };
         let Ok(record) = RunRecord::load(&record_path(&run_dir)) else {
-            // A record written before this build lacks fields the base now forces, and there is
-            // deliberately no migration read path. Skipping is the only honest answer.
             let why = "its record could not be read".to_string();
             say(&run_dir, &format!("  skipped at boot: {why}"));
             report.skipped.push((run_id.to_string(), why));
@@ -698,16 +620,8 @@ pub fn resume_all() -> Result<Reentry, Refusal> {
             &crate::observe::process_start_stamp(&world::ps_start_stamp(record.supervisor_pid)),
         );
         match supervisor {
-            // The one reading that means *a restart cut this Run off*.
             Observed::Present(false) => {}
-            // Still running under the recorded identity: not cut off, and not this path's
-            // business.
             Observed::Present(true) => continue,
-            // **Could not tell.** `ps -p <pid> -o lstart=` is a procps/BSD spelling busybox does
-            // not implement, and this is the one path that *acts* on the reading rather than
-            // printing it. Skipping is the safe direction, and it is reported rather than
-            // silent: a host where every reading is blind would otherwise re-enter nothing and
-            // say nothing about why.
             other => {
                 let why = format!(
                     "whether its supervisor is still running could not be read ({})",
@@ -721,11 +635,6 @@ pub fn resume_all() -> Result<Reentry, Refusal> {
                 continue;
             }
         }
-        // `resume` runs no precondition checks and the new refusals live in `dispatch`, so boot
-        // re-entry inherits none of them. A machine that just rebooted is exactly where someone
-        // was mid-edit, and this is the one path that starts an agent with nobody present.
-        // A **skip** rather than a refusal, because one unre-enterable Run must not stop the
-        // others.
         let worktree = PathBuf::from(&record.worktree);
         let dirty = world::run(&words(&["git", "status", "--porcelain"]), Some(&worktree));
         if dirty.code != Some(0) || job::is_dirty(&dirty.stdout) {
@@ -757,8 +666,6 @@ pub fn resume_all() -> Result<Reentry, Refusal> {
     }
     Ok(report)
 }
-
-// --- the loop ---------------------------------------------------------------------------------
 
 /// Dispatch to the ladder walk for every record born under it, and to the mega-session loop for
 /// the fallback ADR-0015 names: a record with attempts already on it, no `stages` rows and no
@@ -820,9 +727,6 @@ fn finish_run(
             say(run_dir, &format!("    could not observe {said}"));
         }
     }
-    // Resumable, because it never spent the budget: the world changed, not the number.
-    // The repair is two verbs in order: `cleared` records what changed, `resume`
-    // spends — Grind never chooses to spend an Attempt, so the acts stay separate.
     if let Stop::Blocked(what) = &stop {
         say(
             run_dir,
@@ -886,10 +790,6 @@ fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
     };
     let session_id = attempt::reflect_session_id(&record.run_id);
     let worktree = PathBuf::from(&record.worktree);
-    // Bounded at one re-entry: a fresh dispatch, then at most one resume. Counted off the
-    // recorded `StageEntry` rows rather than the transcript alone — a died-before-writing-a-
-    // line session leaves no transcript to read, and absence of a transcript is not absence
-    // of an attempt (the same reasoning `run_ladder_attempt`'s own mode selection follows).
     let reflect_attempts = record
         .stages()
         .iter()
@@ -913,19 +813,6 @@ fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
     };
     let n = reflect_attempts + 1;
     say(run_dir, &format!("  [reflect] attempt {n} ({mode}) …"));
-    // Unit 4: routed through the same seam the ladder and Ship's babysit round use, rather
-    // than calling `claude::run` directly — a native Run previously executed reflect on
-    // claude-code silently, and a native-only host skipped it outright with nothing saying
-    // why (there was no claude binary to spawn). Reflect is still never an Attempt (no
-    // `push_attempt`) and still budget-exempt; only *how it runs* changes.
-    //
-    // Reflect's cwd is the **run directory**, never the worktree — there is no repo tree
-    // under this session for a Write/Edit denial to matter over — so the transcript-slug
-    // string handed as `worktree` is the run directory's own, matching whatever directory
-    // the child actually ran in. The model rides `Class(Strong)`: claude-code's own
-    // `build_reflect` never passes `--model` regardless of any Job pin, so `Strong` (no
-    // flag / the host's declared strong model) is reflect's one and only model, unchanged
-    // by this routing.
     let denied = attempt::denied_for_reflect();
     let reflect_model = runner::StageModel::Class(runner::ModelClass::Strong);
     let run_dir_str = run_dir.display().to_string();
@@ -974,8 +861,6 @@ fn reflect_status(is_error: bool) -> ReturnStatus {
     }
 }
 
-// --- the ladder walk (ADR-0015) -------------------------------------------------------------
-
 /// The rung-by-rung walk. Same shape as [`supervise_legacy`]'s loop — attempt (or [R] pass),
 /// save, observe, decide — differing only in **what one Attempt executes**: one stage's own
 /// session rather than the Run's mega-session, and a zero-token in-process pass at the two [R]
@@ -1007,8 +892,6 @@ fn supervise_ladder(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, R
                 record.save(&path)?;
                 false
             }
-            // The ladder is walked: fall through to the same observe/verdict tail the legacy
-            // loop uses, which is what decides Completed vs Uncorroborated from the six signals.
             None => true,
         };
 
@@ -1040,10 +923,6 @@ fn supervise_ladder(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, R
                 break Some(stop);
             }
 
-            // Decision 5: a stated reset time reads finer than the fixed sleep, when the last
-            // Attempt's own text names one. `policy::next`'s signature stays untouched — this
-            // only ever narrows `limit_sleep` for this one call, on the one path
-            // (`SleepThenReenter`) that reads it.
             let mut this_budget = budget;
             if let Some(last) = record.attempts().last()
                 && last.rate_limited
@@ -1114,12 +993,6 @@ fn supervise_ladder(record: &mut RunRecord, run_dir: &Path) -> Result<Outcome, R
             return finish_run(record, run_dir, &path, stop);
         }
 
-        // The tail asked for a re-entry. On a walked ladder there is no earliest-incomplete
-        // stage to resume — `rung::next` would come back `None` again, no attempt would run,
-        // and the loop would spin on an identical observation without ever progressing the
-        // attempt list (the legacy loop could not spin: every iteration ran an attempt). The
-        // re-entry lands on Ship's own session, the stage whose `complete` the observation is
-        // contradicting, and stays budget-bounded like every attempt.
         if walked {
             run_ladder_attempt(record, run_dir, &worktree, Stage::Ship)?;
             record.save(&path)?;
@@ -1171,8 +1044,6 @@ fn run_r_pass(
 ) -> Result<(), Refusal> {
     let stages_dir = run_dir.join("stages");
     let tiers = load_tiers(worktree);
-    // Derived fresh for both passes: prior same-repo Runs plus their outcome files. A bad
-    // record raises the tier floor mechanically — statistics, never taxonomy prose (ADR-0012).
     let template_record = template_record_for(&record.job.target_repo, &record.run_id);
     let decision = match stage {
         Stage::Triage => {
@@ -1199,9 +1070,6 @@ fn run_r_pass(
             let unified = world::run(&words(&["git", "diff", &range]), Some(worktree));
             let diff_facts =
                 observe::diff_facts(&numstat.stdout, &name_only.stdout, &unified.stdout);
-            // Escalation-only: bound from Triage's own call, never lower. A Triage decision
-            // that could not be read fails closed to T2, same as `select_tier`'s own reading
-            // of an absent required fact.
             let floor = world::read_to_string(&stages_dir.join("triage").join("decision.json"))
                 .ok()
                 .and_then(|text| serde_json::from_str::<decide::Decision>(&text).ok())
@@ -1403,11 +1271,6 @@ fn run_ladder_attempt(
         .map_err(|e| Refusal::saying(format!("stage `{stage}` skill text unreadable: {e}")))?;
 
     let session_id = attempt::stage_session_id(&record.run_id, stage);
-    // The same two-fact test the old mega-session's entry mode used to apply, scoped to this
-    // stage: a crash after `claude` opened the session but before this stage's own
-    // `StageEntry` was ever recorded would re-dispatch under `--session-id` and lose that
-    // session's work if this read the transcript alone — a transcript with no lines yet reads
-    // the same as no transcript at all.
     let stage_attempts_so_far = record
         .stages()
         .iter()
@@ -1419,11 +1282,6 @@ fn run_ladder_attempt(
         Mode::Resume
     };
     let stage_model = resolve_stage_model(record, run_dir, stage);
-    // The claude-code argv is built unconditionally regardless of which backend actually
-    // executes it (P1's shape: the seam normalizes *execution*, not composition) — so the
-    // class-to-alias mapping lives on `StageModel` itself (Unit 1) and is asked here, the one
-    // place that still needs a concrete claude-code `--model` argument (or none) rather than
-    // grind's own routing class.
     let claude_model_arg = stage_model.claude_code_arg();
     let notes = if stage == Stage::Plan {
         let base = notes_for(&home, &record.job.target_repo);
@@ -1514,10 +1372,6 @@ fn run_ship_babysit_attempt(
     worktree: &Path,
 ) -> Result<(), Refusal> {
     let session_id = attempt::stage_session_id(&record.run_id, Stage::Ship);
-    // #106: the stage-resolved model, not the raw Job pin slot — an unpinned Job's round
-    // must ride the same model `resolve_stage_model` routes Ship's other attempts to, or a
-    // mid-session engine change lands exactly on the round least able to afford one. A
-    // pinned Job resolves to the pin, so the freeze still beats the routing.
     let stage_model = resolve_stage_model(record, run_dir, Stage::Ship);
     let claude_model_arg = stage_model.claude_code_arg();
     let conditions = Conditions {
@@ -1586,8 +1440,6 @@ fn announce(run_dir: &Path, record: &RunRecord, observation: &Observation, verdi
         ),
     );
 }
-
-// --- dispatch's own steps ------------------------------------------------------------------
 
 fn refuse_unless_host_ready(home: &Path, job: &Job, backend: Backend) -> Result<(), Refusal> {
     for item in required_dispatch_items(backend) {
@@ -1764,7 +1616,7 @@ fn skills_hash(files: &[(String, Vec<u8>)]) -> String {
         for byte in path.bytes() {
             fnv1a(byte);
         }
-        fnv1a(0); // a separator, so "ab"+"c" and "a"+"bc" hash differently
+        fnv1a(0);
         for &byte in bytes {
             fnv1a(byte);
         }
@@ -1792,11 +1644,6 @@ fn adopt_or_create_worktree(repo_path: &Path, branch: &str) -> Result<PathBuf, R
         return Ok(adopted);
     }
     let wanted = job::worktree_to_create(repo_path, branch);
-    // A Job's declared branch is normally created *by* its Run, so at dispatch it usually
-    // exists nowhere yet: plain `add` demanded an existing ref and refused every
-    // fresh-branch Job (`invalid reference`, issue #81). `-b` makes the create path
-    // create-the-branch-and-its-worktree; when the ref already exists but holds no
-    // worktree, plain `add` checks it out exactly as before.
     let ref_exists = world::run(
         &words(&[
             "git",
@@ -1808,8 +1655,6 @@ fn adopt_or_create_worktree(repo_path: &Path, branch: &str) -> Result<PathBuf, R
         Some(repo_path),
     );
     let mut argv = vec!["git".to_string(), "worktree".to_string(), "add".to_string()];
-    // `-b` binds to the next argument, so the two forms order differently:
-    // `add -b <branch> <path>` against `add <path> <branch>`.
     if ref_exists.code != Some(0) {
         argv.push("-b".to_string());
         argv.push(branch.to_string());
@@ -1847,8 +1692,6 @@ fn report_to_the_job_issue(run_dir: &Path, record: &RunRecord) {
         );
         return;
     };
-    // The **same construction** the Handback uses, so the two renderings cannot be fed
-    // different lists.
     let Some(facts) = crate::view::gather(&home, &record.run_id) else {
         say(run_dir, "  note: could not compose the terminal comment");
         return;
@@ -1881,7 +1724,6 @@ fn report_to_the_job_issue(run_dir: &Path, record: &RunRecord) {
 fn point_at_this_host(record: &RunRecord) {
     let number = record.job.issue.to_string();
     let repo = record.job.target_repo.clone();
-    // The only thing that travels between hosts is a pointer, and it travels on the Job issue.
     let body = format!(
         "Dispatched as Run `{}` on `{}`.\n\nRun state lives on that host at `~/.grind/runs/{}/`.",
         record.run_id, record.hostname, record.run_id
@@ -1963,8 +1805,6 @@ mod tests {
 
     #[test]
     fn narrowing_by_backend_drops_no_other_item() {
-        // Every other dispatch-depth item is backend-agnostic: only `claude binary` may be
-        // filtered, and only for `Backend::Native`.
         assert_eq!(
             required_dispatch_items(Backend::ClaudeCode).len(),
             job::dispatch_subset().len()
@@ -1977,8 +1817,6 @@ mod tests {
 
     #[test]
     fn claude_code_needs_no_native_credential_preflight() {
-        // Backend != Native short-circuits before the (would-be) resolve result is even
-        // consulted, so an `Err` here proves the branch, not a real environment read.
         assert_eq!(
             refuse_unless_native_ready_from(
                 Backend::ClaudeCode,
@@ -2010,8 +1848,6 @@ mod tests {
         );
     }
 
-    // --- Unit 3: refusing a Claude-shaped pin on the native backend --------------------------
-
     #[test]
     fn a_claude_alias_pin_refuses_dispatch_on_the_native_backend() {
         let refusal = refuse_claude_pin_on_native(Backend::Native, Some("claude-sonnet-5"))
@@ -2026,8 +1862,6 @@ mod tests {
 
     #[test]
     fn a_non_claude_pin_proceeds_on_the_native_backend() {
-        // "gpt-4o" and similar are legitimate OpenAI-compatible ids — the check is narrowly
-        // "starts with claude-", never "has no slash".
         assert_eq!(
             refuse_claude_pin_on_native(Backend::Native, Some("gpt-4o")),
             Ok(())
@@ -2060,8 +1894,6 @@ mod tests {
 
     #[test]
     fn a_native_banner_names_the_declared_model_instead_of_calling_itself_unpinned() {
-        // #141, Run 20260824-160445-grind-138's exact shape: both classes declared the same
-        // id, yet the banner called the Run unpinned and named a claude binary nothing read.
         let mut record = day_one();
         record.backend = Backend::Native;
         record.model = None;
@@ -2125,7 +1957,6 @@ mod tests {
 
     #[test]
     fn a_claude_alias_pin_is_untouched_on_the_claude_code_backend() {
-        // The claude-code backend is exactly what a Claude alias is for.
         assert_eq!(
             refuse_claude_pin_on_native(Backend::ClaudeCode, Some("claude-sonnet-5")),
             Ok(())
@@ -2134,8 +1965,6 @@ mod tests {
 
     #[test]
     fn a_branch_with_slashes_locks_as_one_file_under_the_locks_directory() {
-        // Every branch this project dispatches contains a slash, so the raw key would name a
-        // directory that does not exist and the open would fail before any lock was attempted.
         let key = lock_key(
             "FlorianRiquelme/snapper",
             "feat/28-slice-1b-agent-surface-screensource-seam",
@@ -2155,8 +1984,6 @@ mod tests {
 
     #[test]
     fn the_key_is_the_repo_and_the_branch_and_never_a_filesystem_path() {
-        // Two worktrees of one repo on one branch must collide, so nothing about where either
-        // of them sits may enter the key.
         assert_eq!(lock_key("o/n", "feat/x"), lock_key("o/n", "feat/x"));
         assert_ne!(lock_key("o/n", "feat/x"), lock_key("o/n", "feat/y"));
         assert_ne!(lock_key("o/n", "feat/x"), lock_key("o/other", "feat/x"));
@@ -2191,9 +2018,6 @@ mod tests {
 
     #[test]
     fn a_blocked_run_is_resumable_and_a_completed_or_exhausted_one_is_not() {
-        // A Blocker never spent the budget — the world changed, not the number — so the hand
-        // `resume` path has nothing to refuse. `--all` excludes it for a different reason: a
-        // stopped Run must not be re-entered at the one moment nobody is watching.
         for resumable in [
             State::Dispatched,
             State::RateLimited,
@@ -2208,10 +2032,6 @@ mod tests {
 
     #[test]
     fn a_new_records_session_id_is_the_plan_stages_own() {
-        // Decision 4: a new record leaves the Run-level `session_id` as the Plan stage's id
-        // rather than a Run-wide mega-session — Plan is where the ladder always starts. The id
-        // itself is the derived UUID, pinned by attempt's own test; what matters here is that
-        // the derivation separates stages, so Plan's session is never Work's or Ship's.
         let run = "20260806-122620-snapper-28";
         let plan = attempt::stage_session_id(run, Stage::Plan);
         assert_ne!(plan, attempt::stage_session_id(run, Stage::Work));
@@ -2225,10 +2045,6 @@ mod tests {
 
     #[test]
     fn a_reflect_that_exhausts_its_turn_budget_is_incomplete_not_complete() {
-        // #146: the native adapter's `parse_ok` is a constant, so the old
-        // `done_promise || parse_ok` read every native Reflect as complete — including one
-        // that ended on `turn budget exhausted (32)` with nothing written. `is_error` is the
-        // fact both adapters set on such an ending.
         assert_eq!(
             reflect_status(true),
             ReturnStatus::Incomplete,
@@ -2238,18 +2054,12 @@ mod tests {
 
     #[test]
     fn an_error_ending_takes_precedence_over_a_spoken_done_promise() {
-        // CodeRabbit review: claude-code reads `done_promise` out of the payload's result
-        // text with no error guard, so `{is_error: true, result: "... <promise>DONE</promise>"}`
-        // is a real shape. A stage that ended in error has not completed, whatever it claimed.
         assert_eq!(reflect_status(true), ReturnStatus::Incomplete);
     }
     #[test]
     fn a_reflect_that_spoke_for_itself_is_complete() {
-        // A clean ending — payload parsed, no error — is the one completion shape.
         assert_eq!(reflect_status(false), ReturnStatus::Complete);
     }
-
-    // --- the ladder walk's pure and near-pure pieces --------------------------------------
 
     #[test]
     fn skills_hash_is_order_independent_and_content_sensitive() {
@@ -2309,11 +2119,6 @@ mod tests {
     }
     #[test]
     fn an_unpinned_jobs_babysit_round_rides_the_stage_resolved_ship_model() {
-        // #106: the babysit round used to pass `record.model` straight through, so an
-        // unpinned Job's round ran the harness default while Ship itself ran the routed
-        // `fast` model — a mid-session engine change on the one round that continues a live
-        // session. The round now resolves through `resolve_stage_model(.., Stage::Ship)`,
-        // so this pins the value it hands the round: the routed `fast` model.
         let mut record = day_one();
         record.model = None;
         let run_dir = world::temp_dir("babysit-model");
@@ -2341,10 +2146,6 @@ mod tests {
 
     #[test]
     fn a_prior_runs_ci_babysit_attempt_is_what_counts_it_as_a_ci_failure() {
-        // #105: `Mode::CiBabysit` has exactly one entry point — `Next::SpendCiBudget`, taken
-        // only when a check came back red — so a prior record showing the mode *is* the fact,
-        // derived from attempts already persisted rather than stored anew. The day-one
-        // fixture's last attempt is its ci-babysit round; a Run with none spent nothing.
         let spent = day_one();
         assert!(prior_run_spent_ci_budget(spent.attempts()));
         let mut clean = day_one();
@@ -2401,8 +2202,6 @@ mod tests {
 
     #[test]
     fn is_pre_cutover_is_false_for_a_brand_new_record_with_no_attempts() {
-        // A fresh record — no `stages`, no `attempts` — walks the ladder from Attempt 1; it is
-        // not the pre-cutover fallback, which needs an attempt already on it.
         let record = day_one();
         let run_dir = world::temp_dir("pre-cutover-fresh");
         world::create_dir_all(&run_dir).unwrap();
@@ -2448,15 +2247,11 @@ mod tests {
         assert_eq!(record.denied_tools.len(), 7);
         assert_eq!(record.state, State::Completed);
         assert!(record.attempts().iter().any(|a| a.mode == Mode::CiBabysit));
-        // The fixture predates the `cleared` verb, and absence reads as the same fact as
-        // empty — that is the whole of what `serde(default)` is for here.
         assert!(record.clearances().is_empty());
     }
 
     #[test]
     fn the_script_s_record_shape_is_refused_rather_than_half_parsed() {
-        // There is no migration read path, and a record missing the six fields the base forces
-        // at construction is not a record this program can hold.
         let script_shaped = serde_json::json!({
             "run_id": "20260802-105828-snapper-21",
             "created_at": "2026-08-02T10:58:28+00:00",
@@ -2473,14 +2268,6 @@ mod tests {
 
     #[test]
     fn what_the_writer_serialises_is_what_the_reader_deserialises() {
-        // The two types deserialise the same JSON in modules that cannot see each other, so
-        // field names are duplicated by design and can drift. The carrier is this test rather
-        // than the compiler, which is blind to it precisely because the wall is working.
-        //
-        // It has to live here: `view` cannot name `RunRecord`, which is the whole point. Under
-        // `deny_unknown_fields` on the reader, a field the writer gains and the reader forgets
-        // is a failure — a fixture-only check cannot see that, because a field the reader never
-        // declares is not a shared field and serde drops it silently.
         const DAY_ONE: &str = include_str!("../tests/fixtures/record/day-one.json");
         let mut written: RunRecord = serde_json::from_str(DAY_ONE).expect("the writer's shape");
         written.push_clearance(Clearance {
@@ -2501,11 +2288,6 @@ mod tests {
             skills_hash: "deadbeef".to_string(),
         });
         written.reflected = true;
-        // The layout-declared selection, set explicitly. Every one of these is
-        // `skip_serializing_if = "Option::is_none"`, so leaving them at their defaults would
-        // emit nothing and this carrier would pass while the reader was missing them — the
-        // drift it exists to catch, hidden by the very attribute that keeps legacy records
-        // parsing. An optional field on the writer needs a value here to be covered at all.
         written.backend = Backend::Native;
         written.endpoint_override = Some("http://localhost:8000/v1".to_string());
         written.fast_model_override = Some("stealth/ox-alpha".to_string());
@@ -2540,7 +2322,6 @@ mod tests {
 
     #[test]
     fn a_field_the_writer_gains_and_the_reader_forgets_is_caught() {
-        // The failure the test above exists for, reproduced directly.
         let mut value: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/record/day-one.json")).unwrap();
         value["fanout_health"] = serde_json::json!("healthy");
@@ -2552,8 +2333,6 @@ mod tests {
 
     #[test]
     fn the_attempt_list_can_only_grow() {
-        // `attempts` is private with an appending mutator, so *load a stale copy, then
-        // overwrite the whole list* is not expressible even from inside the writable type.
         const DAY_ONE: &str = include_str!("../tests/fixtures/record/day-one.json");
         let mut record: RunRecord = serde_json::from_str(DAY_ONE).unwrap();
         let before = record.attempts().len();
@@ -2561,7 +2340,6 @@ mod tests {
         record.push_attempt(last);
         assert_eq!(record.attempts().len(), before + 1);
     }
-    // --- a clearance records what changed, and only on a Blocked Run ---------------------------
 
     fn day_one() -> RunRecord {
         serde_json::from_str(include_str!("../tests/fixtures/record/day-one.json"))
@@ -2570,8 +2348,6 @@ mod tests {
 
     #[test]
     fn a_clearance_on_a_run_that_is_not_blocked_is_refused_naming_the_actual_state() {
-        // The same register as `resume` refusing to overspend: incoherent input, never a
-        // health verdict. The day-one record is completed, so there is nothing to clear.
         let mut record = day_one();
         let refused = record_clearance(
             &mut record,
@@ -2588,8 +2364,6 @@ mod tests {
 
     #[test]
     fn a_clearance_on_a_blocked_run_appends_a_dated_row_and_the_state_stays_blocked() {
-        // `cleared` records, `resume` spends: the state word is `resume`'s to change, so a
-        // cleared-but-not-resumed Run still reads blocked and stays out of `resume --all`.
         let mut record = day_one();
         record.state = State::Blocked;
         record_clearance(
@@ -2620,8 +2394,6 @@ mod tests {
 
     #[test]
     fn clearances_accumulate_and_the_latest_is_last() {
-        // Re-block after a clearance: clear, resume, blocked again, clear again — the
-        // latest note wins on every surface, and every row survives in the record (R3).
         let mut record = day_one();
         record.state = State::Blocked;
         record_clearance(
@@ -2681,10 +2453,6 @@ mod tests {
 
     #[test]
     fn a_branch_that_exists_nowhere_dispatches_a_worktree() {
-        // Issue #81: the create path ran `git worktree add <path> <branch>` with no `-b`,
-        // so a Job declaring a brand-new branch — the normal case, since the Run creates
-        // the branch — was refused with `fatal: invalid reference`. Pinned at the seam
-        // itself, against a real clone.
         let repo = a_clone_with_one_commit("fresh");
         let branch = "feat/81-brand-new";
         let worktree = adopt_or_create_worktree(&repo, branch).expect("a fresh branch dispatches");
@@ -2706,8 +2474,6 @@ mod tests {
 
     #[test]
     fn a_ref_that_exists_but_holds_no_worktree_is_checked_out_not_recreated() {
-        // The other half of the seam: `-b` is reached for only when the ref is missing.
-        // Recreating an existing branch would refuse (`already exists`) or, worse, reset it.
         let repo = a_clone_with_one_commit("existing");
         let sha = rev_parse(&repo, "HEAD").unwrap();
         let branched = world::run(&words(&["git", "branch", "side"]), Some(&repo));
@@ -2720,11 +2486,8 @@ mod tests {
     #[test]
     fn the_worktree_adopted_is_the_one_the_branch_already_holds() {
         let repo = a_clone_with_one_commit("adopted");
-        // Adopt stays read-only: no `-b`, no move, just the worktree the porcelain named.
         let first = adopt_or_create_worktree(&repo, "feat/81-twice").unwrap();
         let second = adopt_or_create_worktree(&repo, "feat/81-twice").unwrap();
-        // git reports worktree paths canonicalised, and on macOS /var is a symlink to
-        // /private/var — so compare through the filesystem, not through the strings.
         assert_eq!(
             world::resolve_link(&first).unwrap(),
             world::resolve_link(&second).unwrap()
@@ -2734,9 +2497,6 @@ mod tests {
 
     #[test]
     fn the_detached_resume_child_logs_beside_the_record_it_reenters() {
-        // The detached child's stdout and stderr land in one file directly under the run
-        // directory, next to `run.json` and `supervisor.log` — the one place a boot re-entry's
-        // pre-supervise refusal can still be read after the parent has exited.
         let path = resume_log_path(Path::new("/home/op/.grind/runs/20260821-000000-snapper-90"));
         assert_eq!(
             path,

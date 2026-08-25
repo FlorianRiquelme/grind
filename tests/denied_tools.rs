@@ -107,8 +107,6 @@ fn the_documented_deny_list_and_the_bound_one_are_the_same_list() {
 
 #[test]
 fn the_declared_length_matches_the_globs_actually_listed() {
-    // `[&str; N]` is the omission-shaped half of this: a glob added without bumping `N` does not
-    // compile. Asserting it here as well means the parser above cannot silently miss a line.
     let source = read("src/attempt.rs");
     let at = source
         .find("pub const DENIED_TOOLS: [&str; ")
@@ -207,8 +205,6 @@ fn work_fixes_and_ship_do_not_deny_write_or_edit() {
 
 #[test]
 fn every_built_argv_carries_all_base_denials_regardless_of_stage() {
-    // The base list must show up verbatim in every `denied_for` call and in `denied_for_reflect`
-    // — nothing here should ever filter a base glob out for any stage.
     for stage in ALL_STAGES {
         let denied = denied_for(stage);
         for glob in DENIED_TOOLS {

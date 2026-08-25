@@ -79,14 +79,12 @@ fn read_sse_stream<R: Read>(reader: R) -> Result<ChatTurn, NetError> {
     let mut line = String::new();
     loop {
         line.clear();
-        // A fresh `take` per call: the cap bounds this one line, never the stream's
-        // cumulative length, so a long healthy stream is never cut off partway through.
         let n = (&mut reader)
             .take(MAX_SSE_LINE as u64)
             .read_line(&mut line)
             .map_err(|e| NetError::Stream(format!("stream read failed: {e}")))?;
         if n == 0 {
-            break; // server closed; some providers skip [DONE]
+            break;
         }
         if n >= MAX_SSE_LINE && !line.ends_with('\n') {
             return Err(NetError::Stream(format!(
@@ -164,10 +162,6 @@ pub fn probe_endpoint(ep: &Endpoint) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SSE parsing — pure pieces so edge cases are testable without sockets.
-// ---------------------------------------------------------------------------
-
 /// Classification of one raw SSE line.
 #[derive(Debug, PartialEq)]
 pub enum SseLine<'a> {
@@ -184,7 +178,6 @@ pub enum SseLine<'a> {
 /// Classify a single newline-stripped SSE line (POC semantics verbatim).
 pub fn classify_sse_line(line: &str) -> SseLine<'_> {
     if line.is_empty() || line.starts_with(':') {
-        // SSE comment / keepalive (OpenRouter sends ": OPENROUTER PROCESSING")
         return SseLine::Keepalive;
     }
     if let Some(payload) = line.strip_prefix("data: ") {
@@ -259,10 +252,10 @@ impl SseAssembler {
                 let idx = tc["index"].as_u64().unwrap_or(0);
                 let entry = self.pending.entry(idx).or_default();
                 if let Some(id) = tc["id"].as_str() {
-                    entry.id = id.to_string(); // overwrite: later chunks carry the canonical id
+                    entry.id = id.to_string();
                 }
                 if let Some(name) = tc["function"]["name"].as_str() {
-                    entry.name.push_str(name); // some providers split names across chunks
+                    entry.name.push_str(name);
                 }
                 if let Some(a) = tc["function"]["arguments"].as_str() {
                     entry.arguments_json.push_str(a);
@@ -270,10 +263,6 @@ impl SseAssembler {
             }
         }
         if let Some(fr) = choice["finish_reason"].as_str() {
-            // Keep reading past finish (usage usually follows), but refuse anything
-            // but the two legitimate endings. OpenRouter maps upstream provider
-            // failures to finish_reason="stop" with an empty delta and stashes the
-            // real cause in native_finish_reason.
             self.finish_reason = Some(fr.to_string());
             self.native_finish_reason = choice["native_finish_reason"].as_str().map(str::to_string);
             let ok = matches!(fr, "stop" | "tool_calls");
@@ -299,15 +288,11 @@ impl SseAssembler {
     /// Validate the ending and produce the assembled turn. The empty guard fires
     /// regardless of how the stream ended — never a clean stop (R6).
     pub fn finish(self) -> Result<ChatTurn, NetError> {
-        let _ = self.done; // EOF without [DONE] is legal; recorded for parity only
+        let _ = self.done;
         if self.pending.is_empty() && self.content.trim().is_empty() {
             return Err(NetError::EmptyResponse);
         }
         if self.finish_reason.is_none() {
-            // Content or tool calls arrived, but the stream never carried a
-            // finish_reason before EOF — the connection dropped mid-turn. Never a
-            // clean stop (R6): a completed Run must not be recorded over a
-            // truncated one.
             return Err(NetError::Stream(
                 "stream ended without a finish_reason (truncated response)".to_string(),
             ));
@@ -520,7 +505,6 @@ mod tests {
 
     #[test]
     fn missing_done_marker_is_legal_eof() {
-        // Server closes without [DONE]; keep reading past finish_reason happened.
         let asm = feed_lines(&[
             "data: {\"choices\":[{\"delta\":{\"content\":\"done text\"},\"finish_reason\":\"stop\"}]}",
             "data: {\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4},\"choices\":[]}",
@@ -534,9 +518,6 @@ mod tests {
 
     #[test]
     fn truncated_stream_without_finish_reason_is_rejected() {
-        // Content arrived, then the peer dropped the connection before any
-        // finish_reason chunk ever showed up — a truncated response must never be
-        // recorded as a completed turn (P0 / R6).
         let err =
             feed_lines(&["data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}"])
                 .unwrap()
@@ -550,7 +531,6 @@ mod tests {
 
     #[test]
     fn empty_response_is_flagged() {
-        // Whitespace-only content with no tool calls still counts as empty (R6).
         let asm = feed_lines(&[
             "data: {\"choices\":[{\"delta\":{\"content\":\"   \"},\"finish_reason\":\"stop\"}]}",
             "data: [DONE]",
@@ -558,7 +538,6 @@ mod tests {
         .unwrap();
         assert_eq!(asm.finish().unwrap_err(), NetError::EmptyResponse);
 
-        // Truly empty stream too.
         assert_eq!(
             feed_lines(&["data: [DONE]"]).unwrap().finish().unwrap_err(),
             NetError::EmptyResponse
@@ -584,7 +563,7 @@ mod tests {
         let short = truncate_body("hello");
         assert_eq!(short, "hello");
 
-        let multibyte = "é".repeat(400); // 800 bytes, cuts mid-char at byte 512
+        let multibyte = "é".repeat(400);
         let truncated = truncate_body(&multibyte);
         assert!(truncated.contains("…[truncated 800 bytes]"));
         assert!(truncated.starts_with(&"é".repeat(256)));
@@ -592,10 +571,7 @@ mod tests {
 
     #[test]
     fn malformed_chunk_error_truncates_the_payload() {
-        // Sibling of the HTTP-error path (line 42/`truncate_body`): an unbounded
-        // provider payload must never reach `run.json` untruncated via this error
-        // message either.
-        let huge_garbage = "x".repeat(4000); // not valid JSON, and far past MAX
+        let huge_garbage = "x".repeat(4000);
         let stream = format!("data: {huge_garbage}\n");
         let err = read_sse_stream(std::io::Cursor::new(stream.into_bytes())).unwrap_err();
         match err {
@@ -613,9 +589,6 @@ mod tests {
 
     #[test]
     fn oversized_sse_line_without_terminator_is_rejected() {
-        // A peer that never sends a newline must not be able to grow the read
-        // buffer without bound — bounded via MAX_SSE_LINE, mirroring serve.rs's
-        // HEAD_LIMIT counter-pattern.
         let unterminated = "y".repeat(MAX_SSE_LINE + 10);
         let err = read_sse_stream(std::io::Cursor::new(unterminated.into_bytes())).unwrap_err();
         assert!(
@@ -626,9 +599,6 @@ mod tests {
 
     #[test]
     fn a_long_healthy_stream_is_not_cut_off_by_the_line_bound() {
-        // The per-line take() must be recreated each call, not accumulated across
-        // the whole stream. Two lines, each safely under MAX_SSE_LINE on its own but
-        // summing past it, prove the cap is per-line rather than cumulative.
         let chunk_size = MAX_SSE_LINE * 3 / 4;
         let padding = "a".repeat(chunk_size);
         let stream = format!(

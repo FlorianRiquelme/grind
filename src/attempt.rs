@@ -30,69 +30,25 @@ pub const DENIED_TOOLS: [&str; 29] = [
     "Bash(git rebase*)",
     "Bash(git checkout main*)",
     "Bash(git branch -D*)",
-    // Deletes a branch through `push`, the sibling of `git branch -D` above.
     "Bash(git push --delete*)",
-    // The `+refspec` force. Also refuses a push to a branch with a literal `+` in its name —
-    // an acceptable false refusal for a barrier of this kind.
     "Bash(git push*+*)",
-    // Every `git -C` invocation, not just the dangerous ones. A Run works inside its own
-    // worktree via cwd, so `git -C` pointing anywhere is outside the shape it should have —
-    // enumerating `-C` × each forbidden verb is the whack-a-mole this glob avoids.
     "Bash(git -C*)",
-    // The sibling of `git checkout main` above.
     "Bash(git switch main*)",
-    // Merge through the API rather than `gh pr merge`.
     "Bash(gh api*merge*)",
-    // --- the same operations with the flag off the front ---------------------------------
-    //
-    // Every glob above anchors its flag immediately after the verb, and **git accepts the flag
-    // anywhere**: `git push origin --force`, `git push -u origin main --force`,
-    // `git reset HEAD~3 --hard` and `git branch --delete --force feat/x` are the forms people
-    // and agents most often type, and all four were allowed. These eleven are the same
-    // operations, position-independent.
     "Bash(git push*--force*)",
     "Bash(git push*--delete*)",
-    // `git push origin :feat/x` deletes a branch through the refspec. Also refuses a push
-    // naming an explicit `user@host:path` remote, which is not the shape a Run pushes in —
-    // it pushes to the `origin` its worktree already has.
     "Bash(git push*:*)",
-    // `-f` as its own argument, in the two positions it can take. Deliberately **not**
-    // `git push*-f*`: a branch named `fix/PROJ-1 -form` is unlikely, but `-f` as a bare
-    // substring appears inside ordinary branch names and that glob would refuse the push.
     "Bash(git push* -f)",
     "Bash(git push* -f *)",
     "Bash(git reset*--hard*)",
     "Bash(git branch* -D*)",
     "Bash(git branch*--delete*)",
-    // Force-push under its safest-sounding spelling. It is still a force-push, and
-    // `--force-with-lease` reads like a concession a stuck Run would reach for.
     "Bash(git*--force-with-lease*)",
-    // The lowercase sibling of `Bash(git -C*)`. `git -c x rebase` moves the verb off the front
-    // exactly as `-C` does, and glob matching is byte-exact, so the uppercase glob never saw it.
     "Bash(git -c*)",
-    // Branch deletion and history rewriting one layer below the porcelain:
-    // `git update-ref -d refs/heads/x` deletes, `git update-ref refs/heads/main <sha>` rewrites.
     "Bash(git*update-ref*)",
-    // Mirror push: force-updates (and can delete) **every** ref on the remote, not one.
     "Bash(git push*--mirror*)",
-    // Prune push: deletes every remote ref with no local counterpart — remote branch
-    // deletion by side effect of an ordinary-looking push.
     "Bash(git push*--prune*)",
-    // Branch deletion one door over: `gh api -X DELETE repos/o/r/git/refs/heads/x` removes a
-    // remote branch through the API the `gh pr merge`/`gh api*merge*` globs leave open.
     "Bash(gh api*DELETE*)",
-    // --- indirection through a nested shell, rather than off the front of one verb ---------
-    //
-    // Every glob above matches a `git`/`gh` invocation appearing as its own subcommand.
-    // `sh -c '...'` and `bash -c '...'` hand the whole forbidden command to a *nested* shell as
-    // one string argument, and `eval '...'` does the same in-process — none of the globs above
-    // name the outer command, only what it wraps, so `sh -c "git push --force origin main"`
-    // went straight through. (Command substitution and a leading `NAME=value` assignment are
-    // the sibling gaps; those are closed by widening the matcher itself in
-    // `tools::subcommands_of`, not by a glob, because there is no fixed verb to anchor one on.)
-    // All three are broad by the same trade the twelve position-independent globs above already
-    // make: `sh -c "ls"` and `eval "true"` are ordinary and now refused too, an acceptable false
-    // refusal for a barrier of this kind.
     "Bash(sh -c*)",
     "Bash(bash -c*)",
     "Bash(eval*)",
@@ -171,15 +127,15 @@ fn session_id_from(run_id: &str, name: &str) -> String {
                 hash ^= u64::from(byte);
                 hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
             }
-            hash ^= 0; // a separator, so "ab"+"c" and "a"+"bc" hash differently
+            hash ^= 0;
         }
         hash
     }
     let mut bytes = [0u8; 16];
     bytes[..8].copy_from_slice(&fnv1a(0xcbf2_9ce4_8422_2325, [run_id, name]).to_be_bytes());
     bytes[8..].copy_from_slice(&fnv1a(0x9e37_79b9_7f4a_7c15, [name, run_id]).to_be_bytes());
-    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
-    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-\
          {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
@@ -465,8 +421,6 @@ pub(crate) fn normalise(text: &str) -> String {
 mod tests {
     use super::*;
 
-    // The builders and classifier moved verbatim to `runner::claude`; every assertion below
-    // is unchanged and simply names them through the new path.
     use crate::claude::{
         CI_BABYSIT_PROMPT, ci_babysit, classify, stage_dispatch, stage_invocation, stage_resume,
     };
@@ -549,12 +503,6 @@ mod tests {
         assert!(!invocation.argv().contains(&"--model".to_string()));
     }
 
-    // `glob_matches` and `subcommands_of` used to be a from-scratch reimplementation here,
-    // maintained by hand alongside the real matcher `tools::gate` runs — two copies nothing
-    // bound, so `just verify` stayed green while they drifted. They are now imported from
-    // `tools`, the module whose copy is the native backend's **entire** enforcement barrier
-    // (nothing sits behind it), so this table validates the matcher grind actually runs rather
-    // than a parallel guess at what Claude Code's own matcher does.
     use crate::tools::{glob_matches, subcommands_of};
 
     fn is_denied(command: &str) -> bool {
@@ -571,11 +519,6 @@ mod tests {
 
     #[test]
     fn each_forbidden_operation_has_a_glob_that_refuses_it_under_the_documented_matcher() {
-        // Table of forbidden operation -> **every spelling that performs it**, flag-first and
-        // flag-last. This is the coverage the membership test above cannot give, and one
-        // spelling per row is what let the whole list read complete while
-        // `git push origin --force` went straight through: git accepts the flag anywhere, and
-        // a table that only ever types it in one position never asks.
         let table: [(&str, &[&str]); 21] = [
             (
                 "merge via gh pr merge",
@@ -721,10 +664,7 @@ mod tests {
                 assert!(is_denied(candidate), "{name}: {candidate:?} must be denied");
             }
         }
-        // Denials are per-subcommand after splitting on shell operators, so a prefix like `cd`
-        // ahead of the forbidden verb must not let it through.
         assert!(is_denied("cd /tmp && git push --force origin main"));
-        // Command substitution and a leading env-var assignment must not hide the verb either.
         assert!(is_denied("echo $(gh pr merge 123)"));
         assert!(is_denied("echo `git push --force origin main`"));
         assert!(is_denied("GIT_DIR=. gh pr merge 123"));
@@ -735,8 +675,6 @@ mod tests {
         for allowed in [
             "git push origin feat/x",
             "git push -u origin feat/x",
-            // A branch name carrying `-f` or `-D` as a substring is ordinary, and the
-            // position-independent globs are written to leave it alone.
             "git push -u origin fix/PROJ-1-form-fields",
             "git push -u origin feat/PROJ-2-Dashboard",
             "git status",
@@ -746,14 +684,10 @@ mod tests {
             "git checkout feat/x",
             "git fetch origin",
             "git log --oneline",
-            // The fix-4 normalizations must not turn an ordinary wrapper use, a path-qualified
-            // binary or a quoted string into a false denial.
             "env RUST_LOG=debug cargo test",
             "/usr/bin/git status",
             "nohup cargo build --release &",
             "echo 'hello world'",
-            // Nor must fix 5's token-suffix expansion: a long ordinary invocation is still just
-            // an ordinary invocation, wherever its tokens fall.
             "cargo test --all",
         ] {
             assert!(!is_denied(allowed), "{allowed:?} must not be denied");
@@ -762,9 +696,6 @@ mod tests {
 
     #[test]
     fn nothing_observes_the_narrative_or_the_closing_keyword() {
-        // Asserted as an absence, over the two modules that could grow a reader for either.
-        // `include_str!` rather than the filesystem: reading a file at run time from inside
-        // `src/` is what `tests/topology.rs` forbids everywhere but `world`.
         const OBSERVE: &str = include_str!("observe.rs");
         const DECIDE: &str = include_str!("decide.rs");
         for (name, source) in [("observe", OBSERVE), ("decide", DECIDE)] {
@@ -785,8 +716,6 @@ mod tests {
 
     #[test]
     fn a_bare_429_with_no_matching_prose_anywhere_is_a_rate_limit() {
-        // Run 2's real triple. `api_error_status` is a JSON number here, and the prose matches
-        // none of the script's phrases — only the status code classified these six attempts.
         let value: serde_json::Value = serde_json::from_str(RUN2_RATE_LIMITED).unwrap();
         assert_eq!(
             value.get("api_error_status").unwrap(),
@@ -847,10 +776,6 @@ mod tests {
 
     #[test]
     fn unparseable_stdout_becomes_a_record_that_says_so_and_keeps_the_tail() {
-        // Expectations here are derived independently of `tail` rather than by calling it a
-        // second time: `tail` is the production path's own helper, so re-invoking it would let
-        // an off-by-one or wrong-end bug in `tail` reproduce identically on both sides of the
-        // assertion and pass unnoticed.
         for raw in [TRUNCATED, GARBAGE, EMPTY] {
             let found = classify(raw, "", Some(1), 1, Mode::Dispatch, "start", "end");
             assert!(!found.parse_ok, "this fixture does not parse");
@@ -865,15 +790,12 @@ mod tests {
                 "a tail must be a suffix of what it came from"
             );
         }
-        // The truncated fixture is 1998 characters, long enough to actually cross the
-        // 1500-character boundary — the case that matters, where bytes arrived and then stopped.
         let truncated = classify(TRUNCATED, "", Some(1), 1, Mode::Dispatch, "start", "end");
         assert_eq!(truncated.result_tail.chars().count(), 1500);
         assert_ne!(
             truncated.result_tail, TRUNCATED,
             "the boundary was crossed, so the tail must actually have been cut"
         );
-        // Both of these fixtures are under the boundary, so nothing was cut.
         for raw in [GARBAGE, EMPTY] {
             let found = classify(raw, "", Some(1), 1, Mode::Dispatch, "start", "end");
             assert_eq!(
@@ -915,10 +837,6 @@ mod tests {
 
     #[test]
     fn a_result_key_renamed_to_output_is_recorded_as_missing_not_as_an_empty_promise() {
-        // The fixture this wires in models a real drift: `claude` sent a well-formed payload
-        // whose DONE text sits under `output` rather than `result`. Before this fix, that read
-        // as `parse_ok: true, done_promise: false` — indistinguishable from a session that
-        // genuinely said nothing.
         let found = classify(
             DEGRADED_RENAMED,
             "",
@@ -960,8 +878,6 @@ mod tests {
 
     #[test]
     fn the_ci_babysit_prompt_names_what_the_globs_will_refuse_anyway() {
-        // Reacting to a red check is the one situation where the forbidden repairs are the
-        // idiomatic ones, so an unwarned agent spends its single invocation on the barrier.
         for named in [
             "merge",
             "force-push",
@@ -979,16 +895,12 @@ mod tests {
         assert!(CI_BABYSIT_PROMPT.contains("Never weaken, trim or skip a step of `just verify`"));
     }
 
-    // --- the clearance note rides Resume and nothing else --------------------------------------
-
     fn a_clearance(note: &str) -> Clearance {
         Clearance {
             cleared_at: "2026-08-21T19:00:00+00:00".to_string(),
             note: note.to_string(),
         }
     }
-
-    // --- the Wait predicate -------------------------------------------------------------------
 
     fn shaped(parse_ok: bool, cost: Option<f64>, turns: Option<u64>, limited: bool) -> Attempt {
         Attempt {
@@ -1016,15 +928,12 @@ mod tests {
 
     #[test]
     fn an_attempt_with_real_cost_and_many_turns_is_never_a_wait() {
-        // Keyed on work done, never on cause: the flag says rate-limited and the Attempt still
-        // did work, so it still spends the budget.
         assert!(!shaped(true, Some(37.04), Some(187), true).is_wait());
         assert!(!shaped(true, Some(37.04), Some(187), false).is_wait());
     }
 
     #[test]
     fn an_attempt_with_explicit_zero_cost_and_one_turn_is_a_wait() {
-        // Run 2's real Waits carry the fields explicitly: 0.0 and 1.
         assert!(shaped(true, Some(0.0), Some(1), true).is_wait());
         assert!(
             shaped(true, Some(0.0), Some(1), false).is_wait(),
@@ -1034,10 +943,6 @@ mod tests {
 
     #[test]
     fn an_attempt_that_parsed_with_both_fields_absent_is_not_a_wait() {
-        // The bug this defends: absence read as zero, so a payload whose cost/turn fields were
-        // renamed away (the recorded `result-field-missing` drift) made every Attempt —
-        // including a $37/187-turn one — a Wait, and the budget never spent. Absence spends
-        // the budget; only explicit zero-and-one waits.
         assert!(!shaped(true, None, None, false).is_wait());
         assert!(!shaped(true, None, None, true).is_wait());
         assert!(!shaped(true, Some(37.04), None, false).is_wait());
@@ -1046,8 +951,6 @@ mod tests {
 
     #[test]
     fn an_unparseable_attempt_is_never_a_wait_even_with_both_fields_absent() {
-        // The load-bearing clause. A child that dies before emitting parseable JSON leaves both
-        // fields absent, and reading that as *did no work* makes every crash loop free.
         assert!(!shaped(false, None, None, false).is_wait());
         assert!(!shaped(false, None, None, true).is_wait());
     }
@@ -1069,8 +972,6 @@ mod tests {
 
     #[test]
     fn a_payload_amid_stdout_noise_still_classifies() {
-        // Strict whole-string parsing would flip `parse_ok` false over the banner bytes and
-        // turn a rate limit into a crash — an immediate Reenter against an hours-long wall.
         let payload = serde_json::json!({
             "is_error": true,
             "result": "You've hit your session limit · resets 5pm (Europe/Berlin)",
@@ -1087,8 +988,6 @@ mod tests {
 
     #[test]
     fn noise_without_a_recoverable_payload_is_still_unparseable_output() {
-        // Braces alone do not make a payload: nothing parses, so the record says
-        // `unparseable-output` and keeps the raw tail exactly as before the fallback existed.
         let found = classify(
             "fatal: worker exited mid-write { see dump above }",
             "",
@@ -1108,8 +1007,6 @@ mod tests {
 
     #[test]
     fn a_rate_limit_that_killed_the_child_before_any_json_is_read_off_stderr() {
-        // The child never emitted stdout JSON, so the payload path cannot speak; the verdict
-        // sits on stderr, which `world` already wrote to disk. Sleeping beats re-entering.
         let found = classify(
             "",
             "You've hit your session limit · resets 5pm (Europe/Berlin)",
@@ -1140,8 +1037,6 @@ mod tests {
 
     #[test]
     fn a_successful_attempt_is_not_rate_limited_by_noise_on_its_stderr() {
-        // The stderr fold is gated on the payload failing to speak or the exit being non-zero:
-        // a healthy attempt whose stderr mentions limits in passing stays healthy.
         let payload = serde_json::json!({"is_error": false, "result": "done"}).to_string();
         let found = classify(
             &payload,
@@ -1167,8 +1062,6 @@ mod tests {
             "\"ci-babysit\""
         );
     }
-
-    // --- stage invocations ---------------------------------------------------------------------
 
     const ALL_STAGES: [rung::Stage; 10] = [
         rung::Stage::Plan,
@@ -1367,8 +1260,6 @@ mod tests {
             .to_string();
         assert!(plan_prompt.contains(notes));
 
-        // The same notes text, offered to a non-Plan stage, is never rendered — only Plan reads
-        // `ctx.notes` at all.
         let work_ctx = stage_ctx(rung::Stage::Work, &job, None, Some(notes));
         let work_prompt = stage_dispatch(&stage_conditions(), &work_ctx)
             .prompt()

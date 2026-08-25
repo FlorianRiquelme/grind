@@ -23,9 +23,6 @@ fn template() -> String {
 
 /// The template's own example table, lifted out of the fenced block that holds it.
 fn example_table(template: &str) -> String {
-    // The first contiguous run of `| … |` lines in the document. Nothing else in the template
-    // is a table, and taking it by shape rather than by fence keeps this test from caring how
-    // the surrounding prose is laid out.
     let mut rows: Vec<&str> = Vec::new();
     for line in template.lines() {
         let trimmed = line.trim();
@@ -72,8 +69,6 @@ fn the_templates_own_example_table_parses_and_every_required_row_resolves() {
 
 #[test]
 fn the_templates_handoff_sha_row_yields_a_bare_sha_parenthetical_and_all() {
-    // Parenthetical context after a value is how a Handoff SHA says which commit it is, and it
-    // is what every consumer used to take whole.
     let job = grind::job::from_issue_json(&as_issue(&example_table(&template())))
         .expect("a readable Job");
     assert_eq!(job.handoff_sha, "723ca913536d279e45549018f022e9d1092bbbec");
@@ -89,16 +84,12 @@ fn the_templates_table_carries_an_intent_row_and_the_parser_reads_it() {
 
 #[test]
 fn the_templates_table_carries_no_budget_ceiling_row() {
-    // ADR-0010 withdrew the ceiling, and the row went from both halves in one diff.
     let table = example_table(&template()).to_lowercase();
     assert!(!table.contains("budget ceiling"), "{table}");
 }
 
 #[test]
 fn renaming_a_required_row_on_either_side_fails_and_names_the_row() {
-    // The failure this test exists for, reproduced in both directions: the template renames a
-    // row the parser still asks for, or the parser is asked for a row the template stopped
-    // writing. They are the same bytes, so one case covers both.
     let table = example_table(&template());
     for (was, now, named) in [
         ("**Anchor artifact**", "**Anchor**", "anchor artifact"),

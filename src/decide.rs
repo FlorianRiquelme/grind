@@ -119,8 +119,6 @@ pub fn verify_coverage(
         }
         Observed::Unobservable(reason) => return Observed::Unobservable(reason.clone()),
     };
-    // Only the steps that are **present** cover anything. A contract with `ts-test` missing does
-    // not get to claim its extensions.
     let covering: Vec<&[&str]> = STEP_COVERAGE
         .iter()
         .filter(|(name, _)| contract.present.iter().any(|present| present == name))
@@ -213,12 +211,6 @@ impl std::fmt::Display for Stage {
 /// signal's three-valuedness through untouched.
 pub fn signals_of(observation: &Observation) -> RawSignals {
     RawSignals {
-        // **A PR that was found is not a PR that is open.** The head-commit lookup asks with
-        // `--state all` deliberately — a closed PR still belongs in the Handback's PR row, and
-        // deleting it from the search would answer a different question. But the signal
-        // completion is ANDed from is *`pr_open`*, and Grind's contract is *stops at an open
-        // PR*: a Run whose PR a human closed was otherwise four-for-four and reported
-        // `Completed`, printing the closed PR's URL as its result on the Job issue.
         pr_open: match &observation.pr {
             Observed::Present(found) => Observed::Present(found.state.eq_ignore_ascii_case("OPEN")),
             Observed::Absent => Observed::Present(false),
@@ -235,8 +227,6 @@ pub fn signals_of(observation: &Observation) -> RawSignals {
             Observed::Absent => Observed::Present(true),
             Observed::Unobservable(reason) => Observed::Unobservable(reason.clone()),
         },
-        // Both already carry `observation.pr`'s own fold — no PR yet reads as `Present(false)`,
-        // never blind, mirroring `pr_open` above.
         pr_head_matches_job_branch: observation.pr_head_matches_job_branch.clone(),
         pr_base_matches_declared: observation.pr_base_matches_declared.clone(),
     }
@@ -246,9 +236,6 @@ pub fn signals_of(observation: &Observation) -> RawSignals {
 /// necessary nor sufficient — two Runs finished a pipeline without emitting it, and a session
 /// that believes it finished can emit it against nothing.
 pub fn verdict(signals: &RawSignals, done_promise: bool) -> Verdict {
-    // No `..` and no `field: _`. Adding a fifth signal stops this line compiling, and the
-    // binding it then forces is unused until it is folded in below — which is an error under
-    // `-D warnings`.
     let RawSignals {
         pr_open,
         tree_clean,
@@ -271,7 +258,6 @@ pub fn verdict(signals: &RawSignals, done_promise: bool) -> Verdict {
     let mut unmet = Vec::new();
     for (name, signal) in named {
         match signal {
-            // A could-not-observe signal never contributes a true.
             Observed::Present(true) => {}
             Observed::Present(false) => unmet.push(name.to_string()),
             Observed::Absent => unmet.push(name.to_string()),
@@ -279,8 +265,6 @@ pub fn verdict(signals: &RawSignals, done_promise: bool) -> Verdict {
         }
     }
 
-    // One signal Grind could not ask about is enough to withhold a verdict, even when every
-    // signal it *could* ask looked satisfied.
     if !blind.is_empty() {
         return Verdict::Unobserved(blind);
     }
@@ -323,11 +307,6 @@ pub fn verify_contract(justfile: Option<&str>, package_json: Option<&str>) -> Ve
                 .collect(),
         };
     };
-    // A step trimmed to green but left behind as a comment (`# cargo clippy -- -D warnings`) must
-    // not read as present: the contract exists to catch exactly that trim (#82). Strip
-    // `#`-to-end-of-line segments line-wise before matching — a noisy missing report is always
-    // safer than a false green (ADR-0003), and package.json scripts carry no comments so that
-    // path is left untouched.
     let mut haystack = strip_comments(justfile);
     if let Some(scripts) = package_json.and_then(npm_scripts) {
         haystack.push_str(&scripts);
@@ -440,8 +419,6 @@ mod tests {
 
     #[test]
     fn a_could_not_observe_signal_never_contributes_a_true() {
-        // Every arrangement with a blind signal withholds the verdict, even when the other five
-        // signals Grind *could* ask all looked satisfied.
         for blind in 0..6 {
             let mut signals = all_true();
             let reason = Observed::Unobservable(Reason::saying("connection reset"));
@@ -482,9 +459,6 @@ mod tests {
 
     #[test]
     fn a_pre_cutover_run_with_no_pr_yet_reads_the_new_signals_as_absent_not_blind() {
-        // Mirrors `pr_open`'s own fold: no PR yet is a Run's normal early state. `signals_of`
-        // just carries `Observation`'s own fold through, so this is the same fixture shape as
-        // `observation()` with the PR-derived fields turned to what a PR-less Run produces.
         let mut seen = observation();
         seen.pr = Observed::Absent;
         seen.pr_head_matches_job_branch = Observed::Present(false);
@@ -511,8 +485,6 @@ mod tests {
 
     #[test]
     fn no_verdict_variant_means_rejected_blocked_or_failed() {
-        // A variant set is a policy: a careless type makes a forbidden thing newly expressible,
-        // and expressible means reachable because nobody reads the diff.
         let words = [
             format!("{:?}", Verdict::Completed),
             format!("{:?}", Verdict::Uncorroborated(vec![])),
@@ -531,8 +503,6 @@ mod tests {
 
     #[test]
     fn the_verify_contract_does_not_change_the_verdict() {
-        // A precondition must not quietly become a termination condition, so the contract is
-        // not a field on `RawSignals` and cannot reach the fold at all.
         let gutted = verify_contract(Some("verify:\n    true\n"), None);
         assert_eq!(gutted.missing.len(), 7);
         assert_eq!(verdict(&all_true(), false), Verdict::Completed);
@@ -549,9 +519,6 @@ mod tests {
 
     #[test]
     fn a_trimmed_verify_step_on_the_target_repo_is_caught() {
-        // Inherited from the Python entrypoint this replaced: the failure that costs most is
-        // a step trimmed until it goes green, because that is a false positive on the target
-        // repo and on Grind in one shot.
         assert_eq!(
             verify_contract(Some(INTACT), None).missing,
             Vec::<String>::new()
@@ -597,8 +564,6 @@ mod tests {
 
     #[test]
     fn a_step_left_behind_only_as_a_comment_is_reported_missing() {
-        // The exact failure the contract exists to catch: a step trimmed until it goes green,
-        // with the invocation surviving as a comment. The commented mention must not count.
         let commented = INTACT.replace(
             "    cargo clippy -- -D warnings",
             "    # cargo clippy -- -D warnings",
@@ -667,18 +632,12 @@ mod tests {
             verdict(&signals_of(&seen), false),
             Verdict::Incomplete(_)
         ));
-        // `observe::checks` could not return `Absent` before Fix 1 — it is what a Run with no
-        // PR yet now produces, and `signals_of` reads it as nothing left to hold open, not as
-        // blind.
         seen.checks_pending = Observed::Absent;
         assert_eq!(verdict(&signals_of(&seen), false), Verdict::Completed);
     }
 
     #[test]
     fn a_closed_or_merged_pr_is_not_an_open_one_and_does_not_complete_the_run() {
-        // The head-commit lookup asks with `--state all`, so a PR a human closed is still
-        // `Observed::Present` — and every other completion signal on such a Run is satisfied.
-        // Grind's contract is *stops at an open PR*; the closed one must hold it incomplete.
         for state in ["CLOSED", "MERGED", "closed", "merged"] {
             let mut seen = observation();
             let Observed::Present(pr) = &mut seen.pr else {
@@ -690,22 +649,17 @@ mod tests {
                     if unmet.contains(&"PR open".to_string())),
                 "a {state} PR must not read as open"
             );
-            // The promise does not rescue it either: DONE over a closed PR is uncorroborated.
             assert!(matches!(
                 verdict(&signals_of(&seen), true),
                 Verdict::Uncorroborated(_)
             ));
-            // And the PR itself stays observed, so the Handback's row still names it.
             assert!(matches!(seen.pr, Observed::Present(_)));
         }
-        // The spelling `gh` actually returns still completes the Run.
         assert_eq!(
             verdict(&signals_of(&observation()), false),
             Verdict::Completed
         );
     }
-
-    // --- the verify-coverage estimate ------------------------------------------------------
 
     fn rust_only() -> VerifyContract {
         VerifyContract {
@@ -752,8 +706,6 @@ mod tests {
 
     #[test]
     fn a_contract_with_a_step_missing_does_not_count_that_steps_extensions_as_covered() {
-        // `rust-only` above declares no TypeScript step, so `.tsx` is uncovered. Add them and
-        // the same path becomes covered — the estimate reads the contract, not the ecosystem.
         let with_ts = VerifyContract {
             present: vec!["rust-test".into(), "ts-lint".into()],
             missing: vec!["rust-fmt".into()],
@@ -802,7 +754,6 @@ mod tests {
         for banned in ["ok", "healthy", "passed", "true", "false", "sufficient"] {
             assert!(!shape.contains(banned), "{shape}");
         }
-        // And the estimate never gates: nothing in this module branches on it.
         assert!(!include_str!("policy.rs").contains("verify_coverage"));
         assert!(!include_str!("supervisor.rs").contains("verify_coverage"));
     }
@@ -818,17 +769,6 @@ mod tests {
         }
     }
 }
-
-// ============================================================================================
-// Grit's tier selection (issue #92, phase 1) — the pure core only.
-//
-// Nothing calls any of this yet: `select_tier` and `panel` are the pure halves of the ladder's
-// two free passes, Triage and Diff-triage (ADR-0015), unwired until the stage machinery (a
-// later phase) dispatches them. Zero behavior change. Same discipline as the rest
-// of this module: deterministic computation over observable facts (ADR-0012) — a Decision says
-// what was selected, never what the diff is worth (ADR-0006) — and nothing here bounds spend,
-// only shapes it (ADR-0010).
-// ============================================================================================
 
 /// How much review a Run buys. Ord follows declaration order (`T0 < T1 < T2 < T3`) because
 /// escalation is a comparison, not a lookup: `select_tier`'s `computed.max(floor)` and the
@@ -1497,8 +1437,6 @@ mod tier_tests {
 
     #[test]
     fn tiers_toml_parses_to_the_compiled_defaults() {
-        // The shipped file and the compiled fallback must never drift silently — this is what
-        // notices if someone edits one without the other.
         assert_eq!(
             tiers_from_toml(include_str!("../docs/tiers.toml")),
             Tiers::default()
@@ -1521,8 +1459,6 @@ mod tier_tests {
 
     #[test]
     fn tier_and_persona_serialize_kebab_case_matching_the_skills_vocabulary() {
-        // `decision.json` is read by prompt text the skills author, so `Tier::T0` must land on
-        // disk as `"t0"` — kebab-case of a bare digit suffix, not `"T0"` or `"t-0"`.
         for (tier, word) in [
             (Tier::T0, "\"t0\""),
             (Tier::T1, "\"t1\""),
@@ -1564,8 +1500,6 @@ mod tier_tests {
 
     #[test]
     fn missing_diff_facts_at_diff_triage_is_fail_closed_to_at_least_t2() {
-        // The design's own example: Diff-triage called with no `DiffFacts` because the numstat
-        // parse failed. A missing fact must never read as zero signals.
         let decision = select_tier(
             Pass::DiffTriage,
             None,
@@ -1585,7 +1519,6 @@ mod tier_tests {
 
     #[test]
     fn escalation_is_the_only_direction_a_floor_can_move_a_diff_triage_tier() {
-        // A trivial diff under a T2 floor from plan review stays T2, never drops to T0.
         let tiny_diff = DiffFacts {
             changed_loc: 3,
             risky_paths_hit: vec![],
@@ -1710,8 +1643,6 @@ mod tier_tests {
 
     #[test]
     fn panel_is_correctness_only_at_t0_even_with_a_risky_diff() {
-        // T0 is never actually reached alongside a risky-path hit by `select_tier`, but `panel`
-        // itself must not need that guarantee — the T0 branch is unconditional.
         let diff = DiffFacts {
             changed_loc: 5,
             risky_paths_hit: vec![RiskyPathKind::Auth],
@@ -1783,7 +1714,6 @@ mod tier_tests {
             tiers.models_for(Tier::T3).get("review").map(String::as_str),
             Some("strong")
         );
-        // Judgment seats never route down, at any tier.
         for tier in [Tier::T0, Tier::T1, Tier::T2, Tier::T3] {
             assert_eq!(
                 tiers.models_for(tier).get("plan").map(String::as_str),
@@ -1795,14 +1725,6 @@ mod tier_tests {
             );
         }
     }
-
-    // --- calibration: replaying the four dogfood Runs through `select_tier` -------------------
-    //
-    // Each Run's facts are read from its findings doc plus, where the doc gives no exact
-    // number, the real PR diff stats via `gh pr view --json additions,deletions,changedFiles`
-    // (recorded in this session's own report). These are the first calibration datapoints the
-    // design's dogfood plan asks for — asserted from the honest facts below, not from the tier
-    // the Run's actual cost might suggest.
 
     fn tiers() -> Tiers {
         Tiers::default()
@@ -1825,13 +1747,6 @@ mod tier_tests {
 
     #[test]
     fn run_1_snapper_21_lands_t3_on_the_deploy_surface_hit() {
-        // docs/findings/0001: PR snapper#23, 64 files, +12,744/-0 lines (gh pr view snapper#23).
-        // A brand-new Tauri macOS scaffold — most of the raw total is generated project
-        // boilerplate (Xcode settings, lockfiles), so `changed_loc` here is an honest rough net
-        // after excluding that churn rather than the raw PR total; it stays comfortably over
-        // every threshold either way. The plan named 16 requirements (step_count). The Run
-        // touches code signing and the build assertion (Info.plist, `plutil -lint`,
-        // `bundle.targets`) — `DeploySurface`, which alone reaches T3 regardless of size.
         let plan = PlanFacts {
             step_count: 16,
             forecast_paths: vec!["src-tauri/Info.plist".to_string()],
@@ -1850,14 +1765,6 @@ mod tier_tests {
 
     #[test]
     fn run_2_snapper_28_lands_t2_on_size_and_surface() {
-        // docs/findings/0002: PR snapper#30, +4,469/-105 lines, 33 files (gh pr view
-        // snapper#30) — the agent surface behind the ScreenSource seam, three new crates, 76
-        // tests. The Anchor authored 36 requirements (step_count). No hit on the compiled
-        // risky-path list (no auth/crypto/payments/migrations/public-api/ci-config/deploy-
-        // surface path in this diff); the new agent surface is a `surface_delta` and a
-        // `dep_manifest_touched` fact instead, and the capture/agent threading is read as one
-        // `Concurrency` content signal. That combination reaches T2 on its own — the design's
-        // own text cites this Run's $64.32 as the T1/T2 cost band's reference point.
         let plan = PlanFacts {
             step_count: 36,
             forecast_paths: vec![],
@@ -1876,14 +1783,6 @@ mod tier_tests {
 
     #[test]
     fn run_3_grind_80_lands_t1_just_over_the_loc_floor() {
-        // docs/findings/0003: PR grind#84, +163/-2 lines across 2 files (gh pr view grind#84) —
-        // two plan documents plus an issue correction, no code touched, described as the
-        // cheapest possible dogfood Job. The plan itself was small (step_count below the T1
-        // threshold), but 165 changed lines of plan prose clears `loc_t1` (80) by a comfortable
-        // margin, which the tier table reads exactly as it would any other diff: docs-only does
-        // not exempt a diff from the size signal, and "any ambiguity rounds up" is the design's
-        // own instruction. T1, not T0 — a real, if mild, calibration surprise worth recording
-        // rather than rounding down to match the Run's low cost.
         let plan = PlanFacts {
             step_count: 3,
             forecast_paths: vec![
@@ -1904,15 +1803,6 @@ mod tier_tests {
 
     #[test]
     fn run_4_grind_87_lands_t2_the_supervisor_feature_diff() {
-        // docs/findings/0004 (PR grind#89, `gh pr view 89`): +1,007/-34 lines across 10 files —
-        // a five-module supervisor feature (attempt.rs, cli.rs, render.rs, supervisor.rs,
-        // view.rs, plus tests and docs). `changed_loc` is the raw additions+deletions total
-        // (1,041): none of the touched files are lockfiles or generated. No compiled
-        // risky-path hit — this is grind's own crate, not a target repo with auth/payments/
-        // migrations/deploy surfaces to name. `tests/lock.rs` is new file-locking test
-        // coverage, read as one `Concurrency` content signal; the new `Clearance` type and its
-        // accessors are a `surface_delta`. Either alone reaches T2 once `changed_loc` also
-        // clears `loc_t2` (400), which it does by a wide margin.
         let plan = PlanFacts {
             step_count: 6,
             forecast_paths: vec![],

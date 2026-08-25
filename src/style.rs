@@ -273,7 +273,6 @@ mod tests {
                             name.trim()
                         );
                     } else if h.starts_with('@') {
-                        // @media wrapper: audit the nested rules inside its body.
                         let (inner, next) = balanced(sheet, i);
                         audit(inner);
                         i = next;
@@ -281,7 +280,7 @@ mod tests {
                     } else if names_a_class(h) {
                         assert!(h.contains(".g-"), "selector `{}` lacks a g- class", h);
                     }
-                    let (_, next) = balanced(sheet, i); // skip declarations
+                    let (_, next) = balanced(sheet, i);
                     i = next;
                     continue;
                 }
@@ -312,9 +311,6 @@ mod tests {
             .find("@media (prefers-reduced-motion")
             .expect("reduced-motion block");
         let blk = &CSS[pos..];
-        // The four animated effects, pinned by their host selectors:
-        // pulse dot, poll LED blink, live card edge (g-flow), sweeping
-        // live waterfall bar (g-sweep).
         for host in [
             ".g-pulse",
             ".g-blink",
@@ -335,7 +331,6 @@ mod tests {
 
     #[test]
     fn every_class_selector_is_g_namespaced() {
-        // Panics inside on the first offender.
         audit(CSS);
     }
 }

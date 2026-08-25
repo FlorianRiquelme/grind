@@ -174,18 +174,15 @@ pub enum GateDecision {
 /// wildcard — while a bare entry matches tool names directly.
 pub fn gate(denied_globs: &[String], raw: RawCall) -> GateDecision {
     let args: Value = serde_json::from_str(&raw.arguments_json).unwrap_or(Value::Null);
-    // 1. Denied-tool globs.
     let command = || args["command"].as_str().unwrap_or_default();
     for glob in denied_globs {
         let denied = match glob.strip_prefix("Bash(").and_then(|g| g.strip_suffix(')')) {
-            // Shell-shaped glob: applies to what the bash tool would run.
             Some(pattern) => {
                 raw.name == "bash"
                     && subcommands_of(command())
                         .iter()
                         .any(|sub| glob_matches(pattern, sub))
             }
-            // Bare name glob (`Write`, `Edit`, ...): matches the tool name itself.
             None => glob_matches(glob, &raw.name),
         };
         if denied {
@@ -196,7 +193,6 @@ pub fn gate(denied_globs: &[String], raw: RawCall) -> GateDecision {
             });
         }
     }
-    // 2. Path-carrying tools must stay inside the working directory.
     if matches!(raw.name.as_str(), "read_file" | "write_file")
         && !resolves_within(args["path"].as_str().unwrap_or_default())
     {
@@ -297,12 +293,10 @@ fn resolves_within(raw: &str) -> bool {
         match component {
             std::path::Component::Normal(_) => depth += 1,
             std::path::Component::CurDir => {}
-            // More `..` than real components means we are above the workdir root.
             std::path::Component::ParentDir => match depth.checked_sub(1) {
                 Some(d) => depth = d,
                 None => return false,
             },
-            // Unreachable after the strip; treat defensively as contained.
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
         }
     }
@@ -408,11 +402,6 @@ pub(crate) fn subcommands_of(command: &str) -> Vec<String> {
             let trimmed = piece.trim().to_string();
             queue.extend(extract_spans(&trimmed));
             queue.extend(extract_quoted(&trimmed));
-            // Every token-boundary suffix of the piece — dropping no leading tokens, one, two,
-            // and so on — becomes its own candidate, each with its own basename-normalized
-            // variant. This is what makes the old wrapper-name list and assignment stripper
-            // redundant: dropping *any* prefix of leading tokens finds the verb regardless of
-            // what sits in front of it.
             for suffix in token_suffixes(&trimmed) {
                 push_with_basename(&mut candidates, &suffix);
             }
@@ -609,20 +598,12 @@ mod tests {
         globs.iter().map(|g| g.to_string()).collect()
     }
 
-    // --- protocol faults: the nudge channel (#142) ---------------------------------------
-    //
-    // Well-formedness moved out of `gate` into `protocol_fault`: a malformed call is a
-    // nonconforming reply (ADR-0018's nudge case), not policy. Every shape from the issue
-    // is asserted here by its exact wire spelling.
-
     fn defs() -> Vec<ToolDef> {
-        // The workdir is inert for definitions — `defs()` never reads it.
         ToolRegistry::standard(PathBuf::new()).defs()
     }
 
     #[test]
     fn an_empty_name_is_a_fault() {
-        // Issue #142 attempt 1: 17 of 63 calls arrived exactly like this.
         assert_eq!(
             protocol_fault(&defs(), "", "\"\"").as_deref(),
             Some("the tool call had an empty name")
@@ -646,7 +627,6 @@ mod tests {
 
     #[test]
     fn a_call_missing_a_required_argument_is_a_fault_naming_the_key() {
-        // Issue #142 attempt 2: write_file carrying only `content`, no `path`.
         let arguments =
             serde_json::json!({ "content": "---\nreadiness: ready\n---\n" }).to_string();
         assert_eq!(
@@ -666,9 +646,6 @@ mod tests {
 
     #[test]
     fn the_gate_degrades_harmlessly_on_a_malformed_call_instead_of_denying_it() {
-        // Documented precondition behavior: protocol faults never reach the gate in the
-        // live loop, but if one ever does, the gate must neither panic nor dress the
-        // fault up as a policy denial.
         let decision = gate(
             &denied_globs(&["Bash(git push -f*)"]),
             call("bash", "not json"),
@@ -678,10 +655,6 @@ mod tests {
 
     #[test]
     fn real_denied_tools_entries_refuse_their_shell_commands() {
-        // All 29 entries of `attempt::DENIED_TOOLS`, each against the exact evasion spelling
-        // its own comment names as the form people and agents most often type — flag-first and
-        // flag-last, verb-first and verb-displaced. A prior gap here left 16 of 26 globs
-        // exercised only by the membership test below, never against a real shell string.
         for (glob, command) in [
             ("Bash(gh pr merge*)", "gh pr merge 123"),
             ("Bash(gh pr merge*)", "gh pr merge --squash 7"),
@@ -731,9 +704,6 @@ mod tests {
                 "Bash(gh api*DELETE*)",
                 "gh api -X DELETE repos/o/r/git/refs/heads/x",
             ),
-            // The shell-indirection trio from fix 2: none of the 26 globs above name `sh`,
-            // `bash` or `eval` themselves, so a nested shell was the one gap a wider matcher
-            // could not close and only a new glob could.
             ("Bash(sh -c*)", "sh -c 'git push --force origin main'"),
             ("Bash(bash -c*)", "bash -c 'gh pr merge 123'"),
             ("Bash(eval*)", "eval 'git reset --hard HEAD~3'"),
@@ -755,10 +725,6 @@ mod tests {
 
     #[test]
     fn substitutions_subshells_and_leading_env_assignments_no_longer_hide_the_verb() {
-        // The three constructions fix 2 names: command substitution, a backtick span, and a
-        // leading `NAME=value` assignment token in front of the forbidden verb. Gated against
-        // the real `attempt::DENIED_TOOLS` list, not a single hand-picked glob, since the
-        // point is that the *matcher* now finds these, not that some glob happens to.
         let all_denials: Vec<String> = crate::attempt::DENIED_TOOLS
             .iter()
             .map(|g| g.to_string())
@@ -785,17 +751,6 @@ mod tests {
 
     #[test]
     fn nested_shell_wrappers_no_longer_hide_the_verb_from_a_front_anchored_glob() {
-        // Fix 4: `Bash(sh -c*)`, `Bash(bash -c*)` and `Bash(eval*)` are front-anchored, so any
-        // prefix on the outer command used to defeat them outright. Gated against the real
-        // `attempt::DENIED_TOOLS` list, since the point is that the matcher now finds these
-        // regardless of which glob ends up doing the refusing.
-        //
-        // Fix 5 folds in the round-three bypass: an option-taking wrapper (`nice -n 5`,
-        // `stdbuf -o0`, `setsid -f`, `env -i`, `env -u FOO`, `timeout 30`) was allowed straight
-        // through because `strip_leading_wrapper` only ever removed the wrapper's own token,
-        // never its options or operands, so the remainder never reached the front. Token-suffix
-        // expansion in `subcommands_of` closes this generally rather than by naming `timeout`
-        // and re-anchoring on yet another wrapper's flag shape.
         let all_denials: Vec<String> = crate::attempt::DENIED_TOOLS
             .iter()
             .map(|g| g.to_string())
@@ -844,8 +799,6 @@ mod tests {
             "cargo test --lib runner::tools",
             "cargo test --all",
             "echo done",
-            // The new normalizations must not turn an ordinary invocation of a wrapper, a
-            // path-qualified binary or a quoted string into a false denial.
             "env RUST_LOG=debug cargo test",
             "/usr/bin/git status",
             "nohup cargo build --release &",
@@ -891,7 +844,6 @@ mod tests {
 
     #[test]
     fn shell_shaped_globs_never_touch_non_bash_tools() {
-        // `Bash(git push -f*)` denies the bash tool running git, not read_file.
         let decision = gate(
             &denied_globs(&["Bash(git push -f*)"]),
             call("read_file", r#"{"path": "notes.md"}"#),
@@ -901,11 +853,6 @@ mod tests {
 
     #[test]
     fn write_file_is_refused_under_report_only_denials_and_left_alone_at_work() {
-        // `Bash(...)` globs never apply to `write_file` — this walks the bare-name branch,
-        // matched straight against `raw.name`. `write_file` is the native toolkit's own name
-        // for the writer `Write`/`Edit` name on the claude-code side, so the real
-        // `attempt::denied_for` list for a report-only stage must carry `write_file` itself
-        // (not just `Write`/`Edit`) for this to refuse under `backend: native`.
         let review_denials = crate::attempt::denied_for(crate::rung::Stage::Review);
         let decision = gate(
             &review_denials,
@@ -913,8 +860,6 @@ mod tests {
         );
         assert_eq!(denied_layer(decision), GateLayer::DeniedGlob);
 
-        // A worktree-writing stage's own denial set carries no `Write`/`Edit`/`write_file`
-        // entry at all, so the same call stays allowed there.
         let work_denials = crate::attempt::denied_for(crate::rung::Stage::Work);
         let decision = gate(
             &work_denials,
@@ -922,8 +867,6 @@ mod tests {
         );
         allowed_layer(decision);
 
-        // A grind-side bare glob over our own names also works, wildcards included —
-        // independent of what `denied_for` happens to push.
         for glob in ["write_file", "write_*"] {
             let decision = gate(
                 &denied_globs(&[glob]),
@@ -937,8 +880,6 @@ mod tests {
         );
         allowed_layer(decision);
     }
-
-    // --- path resolution / escape ---------------------------------------------------------
 
     #[test]
     fn path_escapes_are_refused_for_path_carrying_tools_only() {
@@ -959,7 +900,6 @@ mod tests {
                 "{name} {arguments_json}"
             );
         }
-        // Inside-the-workdir climbs are fine, and bash has no path to escape with.
         for (name, arguments_json) in [
             ("read_file", r#"{"path": "a/../b.txt"}"#),
             ("read_file", r#"{"path": "./x"}"#),
@@ -970,8 +910,6 @@ mod tests {
             allowed_layer(gate(&[], call(name, arguments_json)));
         }
     }
-
-    // --- truncation ------------------------------------------------------------------------
 
     #[test]
     fn output_at_or_under_the_cap_passes_through_untouched() {
@@ -990,13 +928,11 @@ mod tests {
             "\n…[truncated {} bytes]",
             s.len() - MAX_TOOL_OUTPUT
         )));
-        assert!(out.len() > MAX_TOOL_OUTPUT); // suffix rides on top, POC verbatim
+        assert!(out.len() > MAX_TOOL_OUTPUT);
     }
 
     #[test]
     fn truncation_never_splits_a_multi_byte_character() {
-        // 'é' is 2 bytes, '€' 3, '🦀' 4: fill to MAX-1 so the cut point at MAX
-        // lands strictly inside the first multibyte char and the walk-back runs.
         for unit in ["é", "€", "🦀"] {
             let mut s = "a".repeat(MAX_TOOL_OUTPUT - 1);
             s.push_str(&unit.repeat(2));
@@ -1015,7 +951,6 @@ mod tests {
 
     #[test]
     fn emoji_straddling_the_cut_survives_without_panicking() {
-        // 4-byte crab repeated so MAX lands mid-crab.
         let s = "🦀".repeat(MAX_TOOL_OUTPUT / 4 + 1);
         let out = truncate_output(&s);
         let kept = out.split_once("\n…").unwrap().0;
@@ -1024,14 +959,10 @@ mod tests {
         assert!(out.ends_with(&format!("\n…[truncated {} bytes]", s.len() - kept.len())));
     }
 
-    // --- execution ---------------------------------------------------------------------------
-
     struct TempWorkdir(PathBuf);
 
     impl TempWorkdir {
         fn new(tag: &str) -> Self {
-            // `world::temp_dir` is the sanctioned scratch seam — `tests/topology.rs`
-            // keeps `std::fs` and `std::env` out of this module.
             Self(crate::world::temp_dir(&format!("runner-tools-{tag}")))
         }
     }
@@ -1062,9 +993,6 @@ mod tests {
 
     #[test]
     fn bash_never_sees_the_supervisors_provider_credentials() {
-        // The concrete leak fix 3 closes: a provider key sits in the supervisor's own
-        // environment so it can call the model at all, and the native `bash` tool used to
-        // hand that whole environment to a shell the model drives.
         let _guard = EnvVarGuard::set("OPENROUTER_API_KEY", "sk-leak-me-not");
         let wd = TempWorkdir::new("scrub-env");
         let registry = ToolRegistry::standard(wd.0.clone());
@@ -1114,7 +1042,6 @@ mod tests {
     fn write_then_read_round_trips_through_the_workdir_root() {
         let wd = TempWorkdir::new("rw");
         let registry = ToolRegistry::standard(wd.0.clone());
-        // POC-verbatim `fs::write`: no parent-directory creation, so a root-level file.
         let outcome = registry.execute(&call(
             "write_file",
             r#"{"path": "note.txt", "content": "héllo 🦀"}"#,
@@ -1125,7 +1052,6 @@ mod tests {
         let outcome = registry.execute(&call("read_file", r#"{"path": "note.txt"}"#));
         assert_eq!(outcome.output, "héllo 🦀");
 
-        // Leading-slash strip: an absolute-looking model path lands in the workdir.
         let outcome = registry.execute(&call("read_file", r#"{"path": "/note.txt"}"#));
         assert_eq!(outcome.output, "héllo 🦀");
     }
@@ -1142,7 +1068,6 @@ mod tests {
         );
         assert_eq!(outcome.exit, None);
 
-        // Writing under a regular file fails too, still as a string.
         registry.execute(&call("write_file", r#"{"path": "plain", "content": "x"}"#));
         let outcome = registry.execute(&call(
             "write_file",
@@ -1177,8 +1102,6 @@ mod tests {
         assert_eq!(kept.len(), MAX_TOOL_OUTPUT);
         assert!(outcome.exit.is_some());
     }
-
-    // --- registry surface ---------------------------------------------------------------------
 
     #[test]
     fn standard_registry_defines_exactly_the_poc_three_tools_with_verbatim_schemas() {

@@ -32,10 +32,6 @@ use grind::rung;
 use grind::runner::{self, NativeAdapter, StageRunner};
 use serde_json::{Value, json};
 
-// ---------------------------------------------------------------------------
-// The scripted server: one TcpListener, sequential accepts, N canned replies.
-// ---------------------------------------------------------------------------
-
 /// One scripted reply. `Sse` answers 200 with an `text/event-stream` body;
 /// `Status` answers with a bare status + plain-text body (429 et al).
 enum Reply {
@@ -73,11 +69,7 @@ impl Server {
                 };
                 let _ = stream.write_all(&bytes);
                 let _ = stream.flush();
-                // Connection: close per reply — the next request opens a fresh
-                // connection, so the sequential accept loop stays trivially ordered.
             }
-            // Script exhausted (or a peer hung up): stop accepting. Any further
-            // request fails at connect time, which the retry budget reports loudly.
         });
         Server { port, bodies }
     }
@@ -120,10 +112,6 @@ fn http_bytes(status: u16, reason: &str, body: &str, content_type: &str) -> Vec<
     .into_bytes()
 }
 
-// ---------------------------------------------------------------------------
-// SSE script builders — literal data:/comment/[DONE] lines per scenario.
-// ---------------------------------------------------------------------------
-
 /// One chat-completion streaming chunk.
 fn chunk(delta: Value, finish: Option<&str>, native_finish: Option<&str>) -> Value {
     json!({
@@ -160,10 +148,6 @@ fn sse(chunks: Vec<Value>) -> String {
 fn sse_empty() -> String {
     ": keepalive\n\ndata: [DONE]\n\n".to_string()
 }
-
-// ---------------------------------------------------------------------------
-// Driving the real library path, mirroring supervisor.rs's construction.
-// ---------------------------------------------------------------------------
 
 /// `Endpoint::resolve` demands a key from the environment; the fixture supplies a
 /// dummy once, idempotently, so hermetic runs never depend on host credentials.
@@ -267,19 +251,12 @@ fn transcript_events(run_dir: &Path, attempt_n: usize) -> Vec<(String, Value)> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Scenario a — happy native-tools path ≙ fakes/shapes/success_done.sh
-// ---------------------------------------------------------------------------
-
 #[test]
 fn happy_native_tools_completes_with_usage_and_transcript() {
     let (run_dir, cwd) = scratch("happy");
     std::fs::write(cwd.join("note.txt"), "the quick brown fixture\n")
         .expect("seed the workdir file");
 
-    // Chunked tool-call deltas, deliberately hostile: index 1 arrives FIRST
-    // (out of order), call_a's NAME splits across two chunks, its ARGUMENTS across
-    // three. Assembly must reorder by index and concatenate the pieces.
     let script = vec![
         Reply::Sse(sse(vec![
             chunk(
@@ -319,7 +296,6 @@ fn happy_native_tools_completes_with_usage_and_transcript() {
 
     let attempt = drive_attempt(&server, &run_dir, &cwd, 1);
 
-    // Attempt-level outcome ≙ success_done.sh's is_error:false + done promise.
     assert!(!attempt.is_error, "{:?}", attempt.terminal_reason);
     assert!(attempt.done_promise);
     assert_eq!(attempt.exit_code, Some(0));
@@ -331,13 +307,11 @@ fn happy_native_tools_completes_with_usage_and_transcript() {
         "All work complete. <promise>DONE</promise>"
     );
     assert_eq!(attempt.num_turns, Some(2));
-    // R8: the provider's usage rides through verbatim.
     assert_eq!(
         attempt.usage,
         Some(json!({"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}))
     );
 
-    // R4: the grind-owned transcript carries the whole conversation.
     let events = transcript_events(&run_dir, 1);
     let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names[0], "protocol_selected", "{names:?}");
@@ -374,16 +348,10 @@ fn happy_native_tools_completes_with_usage_and_transcript() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Scenario b — abnormal native_finish_reason ≙ fakes/shapes/subtle_error.sh family
-// ---------------------------------------------------------------------------
-
 #[test]
 fn abnormal_native_finish_fails_the_attempt_without_rate_limit() {
     let (run_dir, cwd) = scratch("abnormal");
 
-    // OpenRouter's masked-failure shape: finish_reason "stop" hiding the real
-    // cause in native_finish_reason, with an empty delta.
     let abnormal = || {
         Reply::Sse(sse(vec![chunk(
             json!({}),
@@ -391,15 +359,10 @@ fn abnormal_native_finish_fails_the_attempt_without_rate_limit() {
             Some("network_error"),
         )]))
     };
-    // One Native probe (which latches Text immediately — an abnormal finish while
-    // tools were sent counts as a tools-array rejection), then the fresh Text-mode
-    // budget burns: backoff 2s + 4s, then give up. Four replies cover it.
     let server = Server::start(vec![abnormal(), abnormal(), abnormal(), abnormal()]);
 
     let attempt = drive_attempt(&server, &run_dir, &cwd, 1);
 
-    // ≙ subtle_error.sh: is_error:true, exit 1 — the subtle shape classified loudly,
-    // NOT as a rate limit and never as a clean stop (R6).
     assert!(attempt.is_error);
     assert_eq!(attempt.exit_code, Some(1));
     assert!(!attempt.done_promise);
@@ -413,15 +376,10 @@ fn abnormal_native_finish_fails_the_attempt_without_rate_limit() {
     assert_eq!(attempt.result_tail, reason);
 }
 
-// ---------------------------------------------------------------------------
-// Scenario c — empty response => failed attempt (R6)
-// ---------------------------------------------------------------------------
-
 #[test]
 fn empty_response_fails_loudly_after_retry_budget() {
     let (run_dir, cwd) = scratch("empty");
 
-    // Three replies: the retry budget spends itself (backoff 2s + 4s) and gives up.
     let server = Server::start(vec![
         Reply::Sse(sse_empty()),
         Reply::Sse(sse_empty()),
@@ -440,18 +398,11 @@ fn empty_response_fails_loudly_after_retry_budget() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Scenario d — text protocol with one prose nudge, then <done>
-// ---------------------------------------------------------------------------
-
 #[test]
 fn text_protocol_nudges_prose_then_completes_on_done_sentinel() {
     let (run_dir, cwd) = scratch("text-nudge");
     std::fs::write(cwd.join("brief.txt"), "brief body line\n").expect("seed brief.txt");
 
-    // Seed the per-run latch (R5) the honest way: a prior attempt's transcript
-    // carrying ProtocolSelected{text}. This attempt (n=2) must honor it and send
-    // NO tools array from the very first request.
     std::fs::write(
         run_dir.join("messages-1.jsonl"),
         "{\"event\":\"protocol_selected\",\"value\":{\"mode\":\"text\",\"reason\":\"seeded by the fixture\"}}\n",
@@ -460,19 +411,16 @@ fn text_protocol_nudges_prose_then_completes_on_done_sentinel() {
 
     let prose = "Happy to help with that right away.";
     let server = Server::start(vec![
-        // Turn 1: prose where a tag was demanded — the nudge case.
         Reply::Sse(sse(vec![chunk(
             json!({"content": prose}),
             Some("stop"),
             None,
         )])),
-        // Turn 2: exactly one <tool> tag.
         Reply::Sse(sse(vec![chunk(
             json!({"content": "<tool>{\"name\": \"read_file\", \"arguments\": {\"path\": \"brief.txt\"}}</tool>"}),
             Some("stop"),
             None,
         )])),
-        // Turn 3: the only legal text-mode termination.
         Reply::Sse(sse(vec![chunk(
             json!({"content": "<done>The brief is written and verified. <promise>DONE</promise></done>"}),
             Some("stop"),
@@ -490,10 +438,8 @@ fn text_protocol_nudges_prose_then_completes_on_done_sentinel() {
     let events = transcript_events(&run_dir, 2);
     let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
 
-    // Resumed latch logged first…
     assert_eq!(names[0], "protocol_selected", "{names:?}");
     assert_eq!(events[0].1["mode"], "text");
-    // …then exactly one nudge, carrying the offending prose…
     let nudges: Vec<&Value> = events
         .iter()
         .filter(|(name, _)| name == "protocol_nudge")
@@ -505,7 +451,6 @@ fn text_protocol_nudges_prose_then_completes_on_done_sentinel() {
         "one corrective nudge per occurrence: {names:?}"
     );
     assert_eq!(nudges[0]["assistant_text"], prose);
-    // …and the sentinel's inner text is the Final.
     let (_, final_value) = events
         .iter()
         .find(|(name, _)| name == "final")
@@ -519,8 +464,6 @@ fn text_protocol_nudges_prose_then_completes_on_done_sentinel() {
         "The brief is written and verified. <promise>DONE</promise>"
     );
 
-    // Server-side: the corrective exchange quotes the prose back, and Text mode
-    // omits the tools parameter entirely (ADR-0018).
     let bodies = server.bodies();
     assert_eq!(bodies.len(), 3, "three scripted turns: {}", bodies.len());
     assert!(
@@ -541,16 +484,10 @@ fn text_protocol_nudges_prose_then_completes_on_done_sentinel() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Scenario e — HTTP 429 with a limit needle ≙ fakes/shapes/rate_limited.sh
-// ---------------------------------------------------------------------------
-
 #[test]
 fn http_429_classifies_as_rate_limited() {
     let (run_dir, cwd) = scratch("rate-limited");
 
-    // Three replies: the shared classifier's needles are asked only over the
-    // final synthesized error, so the budget burns first (backoff 2s + 4s).
     let server = Server::start(vec![
         Reply::Status(
             429,
@@ -571,9 +508,6 @@ fn http_429_classifies_as_rate_limited() {
 
     let attempt = drive_attempt(&server, &run_dir, &cwd, 1);
 
-    // ≙ d_rate_limit_records_sleep / Run 2: the attempt is loud, errored, and —
-    // via attempt::is_rate_limited over the carried error text — rate-limited,
-    // so the supervisor's Wait machinery decides what happens next.
     assert!(attempt.is_error);
     assert!(!attempt.done_promise);
     assert!(attempt.rate_limited, "policy parity with claude::classify");
@@ -583,10 +517,6 @@ fn http_429_classifies_as_rate_limited() {
         "the status survives into the record: {reason}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Scenario f — a stage that merely completes speaks no Run-level promise (#139)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn a_completed_stage_without_the_sentinel_promises_nothing() {
@@ -599,9 +529,6 @@ fn a_completed_stage_without_the_sentinel_promises_nothing() {
 
     let attempt = drive_attempt(&server, &run_dir, &cwd, 1);
 
-    // The defect behind issue #139: a clean ending is a fact about the loop, not a
-    // claim about the work. Synthesizing a promise from it asked the Run-level
-    // verdict after stage one and terminated the ladder as Uncorroborated.
     assert!(!attempt.is_error, "{:?}", attempt.terminal_reason);
     assert!(
         !attempt.done_promise,

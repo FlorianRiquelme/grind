@@ -9,8 +9,6 @@ use crate::attempt::Attempt;
 use crate::observe::Observed;
 use crate::view::{Facts, Live, ProposalEntry, RosterRow, RunView};
 
-// ───────────────────────────── escaping ─────────────────────────────
-
 /// Escape a record-derived string for interpolation into HTML. Every string that
 /// originated in a Run passes through this — model output is arbitrary bytes until
 /// proven otherwise.
@@ -28,8 +26,6 @@ pub fn esc(s: &str) -> String {
     }
     out
 }
-
-// ───────────────────────────── time ─────────────────────────────
 
 /// Days since 1970-01-01 from a civil date (Hinnant's algorithm). Proleptic Gregorian.
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -90,8 +86,6 @@ fn moment(label: &str, iso: &str) -> String {
     }
 }
 
-// ─────────────────────────── classification ───────────────────────────
-
 /// Card accent family by recorded state: live-ish green, held amber, stopped red,
 /// finished gray. Unknown states read as stopped-family — they must stay visible, and
 /// red asks for eyes.
@@ -130,8 +124,6 @@ fn lane(state: &str) -> (&'static str, &'static str) {
         "blocked" => ("hold", "Needs you"),
         "dispatched" | "rate_limited" => ("go", "In flight"),
         "completed" | "exhausted" => ("done", "Finished today"),
-        // died / unobserved / uncorroborated — and anything unrecognized: an unknown
-        // recorded state must still be seen, so it lands where attention goes.
         _ => ("stop", "Stopped"),
     }
 }
@@ -256,8 +248,6 @@ fn status_bar() -> String {
     )
 }
 
-// ───────────────────────────── board ─────────────────────────────
-
 fn budget_dots(n: usize, m: usize) -> String {
     if m == 0 {
         return String::new();
@@ -321,9 +311,6 @@ fn board(rows: &[RosterRow]) -> String {
     struct Key(String, String);
     let mut groups: std::collections::BTreeMap<Key, Vec<&RosterRow>> = Default::default();
     for r in rows {
-        // Grouped by the **recorded state** itself — the column's display label is
-        // applied when the column renders, never when rows are filed (a "complete" label
-        // keyed where the record says "completed" loses every card to a silent miss).
         let (lane_name, _) = lane(&r.recorded_state);
         groups
             .entry(Key(lane_name.to_string(), r.recorded_state.clone()))
@@ -339,8 +326,6 @@ fn board(rows: &[RosterRow]) -> String {
     ];
     for (rail, title) in LANES {
         let mut cols: Vec<(String, Vec<&RosterRow>)> = Vec::new();
-        // Known columns first, in house order. The hold lane always carries its second
-        // slot even when empty: it names the repair path (`grind cleared`, then resume).
         let known: &[&str] = match *rail {
             "go" => &["working", "waiting"],
             "stop" => &["died", "unobserved", "uncorroborated"],
@@ -360,7 +345,6 @@ fn board(rows: &[RosterRow]) -> String {
                 .unwrap_or_default();
             cols.push(((*k).to_string(), rows_here));
         }
-        // Unrecognized recorded states appended after the known ones, labeled verbatim.
         let mut unknown: Vec<String> = groups
             .keys()
             .filter(|Key(l, c)| {
@@ -427,9 +411,6 @@ fn proposal_queue_section(proposals: &[(String, ProposalEntry)]) -> String {
     }
     let mut rows = String::new();
     for (run_id, entry) in proposals {
-        // Not a link: the raw-evidence route whitelists a fixed six names (R5), and a
-        // Reflect artifact's own path is not one of them. The path names where to look on
-        // the host, verbatim, the same register the Handback's own paths use.
         rows.push_str(&format!(
             "<div class=\"g-a\"><div class=\"g-aline\"><span class=\"g-idx\">{}</span>\
 <span class=\"g-verdict\">{}</span></div>\
@@ -469,8 +450,6 @@ pub fn roster_page(rows: &[RosterRow], proposals: &[(String, ProposalEntry)]) ->
     )
 }
 
-// ───────────────────────────── run page ─────────────────────────────
-
 /// Outcome label for a recorded Attempt, from what the record carries — never a quality
 /// word beyond the record's own vocabulary.
 fn outcome(a: &Attempt) -> (&'static str, &'static str) {
@@ -500,8 +479,6 @@ fn waterfall(found: &RunView) -> String {
     };
 
     let mut bars = String::new();
-    // Sleep bands: a bounded re-entry sleep between two Attempts reads as hatched time,
-    // because it is the wall the Run slept against — the thing ADR-0004 refuses to hide.
     for w in atts.windows(2) {
         if let (Some(e), Some(s)) = (iso_epoch(&w[0].ended_at), iso_epoch(&w[1].started_at))
             && s > e
@@ -925,8 +902,6 @@ pub fn run_page(run_id: &str, facts: &Facts, live: &Live, here: &Observed<bool>)
         crumb(run_id),
         run_head(facts, live, here),
         run_grid(run_id, facts),
-        // The following pane lives on the full page too, so a deep link lands
-        // with the log already attached.
         "<div class=\"g-panel g-jump\"><div class=\"g-phead\">supervisor.log\
 <span class=\"g-r g-follow\">\u{25aa} following</span></div>\
 <div data-g-root=\"log\"><div class=\"g-log\" data-offset=\"0\"></div>\
@@ -1120,8 +1095,6 @@ mod tests {
         assert!(run.contains("data-g-root=\"log\""));
     }
 
-    // --- Grit surfaces: the stage table, decision receipts, calibration and outcome -----------
-
     fn stages_two() -> Vec<crate::rung::StageEntry> {
         vec![
             crate::rung::StageEntry {
@@ -1278,8 +1251,6 @@ mod tests {
         assert!(html.contains("proposal queue"), "{html}");
         assert!(html.contains("wording tweak"), "{html}");
     }
-
-    // --- evidence links follow the Run's backend, not a fixed claude-code shape --------------
 
     #[test]
     fn a_claude_code_run_links_the_three_files_that_adapter_writes() {

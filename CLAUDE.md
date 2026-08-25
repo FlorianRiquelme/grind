@@ -317,6 +317,14 @@ The five canonical triage roles, using their default label strings. See `docs/ag
 
 Answering *what is the Run doing* is `grind status <run-id>`, not a transcript dig. See `docs/agents/run-observation.md`.
 
+### Code comments
+
+Source carries no inline comments. Doc comments (`///`, `//!`) on items are the only prose
+allowed in `.rs` files; everything else is data. New code ships comment-free: an invariant,
+an external-system quirk or a bug context that must survive belongs in
+`docs/agents/code-rationale.md` — or an ADR, if it decides something. Prose beside code rots
+faster than the code changes, and the reader here re-reads the code anyway.
+
 ### Domain docs
 
 Single-context: `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.

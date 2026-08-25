@@ -233,12 +233,6 @@ pub fn record_path(home: &Path, run_id: &str) -> PathBuf {
     job::runs_dir(home).join(run_id).join("run.json")
 }
 
-// --- Grit surfaces, read fresh from a Run's own directory ------------------------------------
-//
-// Every function here follows `observe_fresh`'s discipline: read `world`, persist nothing. A
-// Decision, an Outcome and a proposal are facts a Run already left on disk — this module names
-// where to look and how to fold a bad or absent file into *nothing to show*, never a crash.
-
 /// `stages/<stage>/decision.json`, tolerant: absent or unparseable is `None` rather than an
 /// error, the same rule `run_r_pass` writes it under. A pre-cutover Run or a Run that never
 /// reached Diff-triage carries no such file, which is not damage.
@@ -397,14 +391,8 @@ fn last_activity(created_at: &str, attempts: &[Attempt]) -> String {
 /// alive is exactly the reassurance that sends an operator back to sleep.
 pub fn supervisor_here(recorded: Option<&str>, live: &Observed<String>) -> Observed<bool> {
     match (recorded, live) {
-        // **`ps` could not be asked, which is not the supervisor being gone.** This arm used to
-        // read `None` and answer `Present(false)`, and `resume --all` acts on that answer: on a
-        // host whose `ps` cannot spawn, every Run read as cut off and every Run was re-entered.
         (_, Observed::Unobservable(reason)) => Observed::Unobservable(reason.clone()),
-        // Nothing is running under that pid at all.
         (_, Observed::Absent) => Observed::Present(false),
-        // The pid is alive but nothing was recorded to compare it against, so this is a
-        // question Grind cannot answer rather than a yes.
         (None, Observed::Present(_)) => Observed::Unobservable(Reason::saying(
             "no supervisor identity was recorded at dispatch",
         )),
@@ -424,15 +412,6 @@ pub(crate) fn one_line(text: &str) -> String {
         flattened
     }
 }
-
-// --- the live view, the shared observation currency ------------------------------------------
-//
-// `Live` describes what a Run is doing right now, and **both adapters produce it**: `claude::live`
-// reads Claude Code's own JSONL out of `~/.claude/projects/`, `native::live` reads the
-// `messages-N.jsonl` the native loop writes under the Run's own directory. It lived in `claude`
-// while that was the only reader, which made `cli`/`serve` construct a `claude::Live` to describe
-// a native Run — the read side is where it belongs, beside the `RunView` it is rendered next to.
-// Nothing here reads a transcript; the adapters do, and hand back these values.
 
 /// One fanned-out subagent, as the transcript shows it.
 #[derive(Debug, Clone, PartialEq)]
@@ -474,8 +453,6 @@ pub fn observe_fresh(
 mod tests {
     use super::*;
 
-    // The transcript matchers moved verbatim to `runner::claude`; every assertion below is
-    // unchanged and simply names them through the new path.
     use crate::claude::{
         assistant_now, fanout, fanout_counts, fanout_since, last_words, live, now_skill,
         transcript_path,
@@ -497,7 +474,6 @@ mod tests {
     fn the_read_only_reader_parses_the_same_fixture_the_writer_does() {
         let found: RunView = serde_json::from_str(DAY_ONE).expect("the base's record shape");
         assert_eq!(found.run_id, "20260806-122620-snapper-28");
-        // Four Attempts, of which one — attempt 3, $0 and one turn — did no work.
         assert_eq!(found.attempt_counter(), (3, 8));
         assert_eq!(found.attempts.len(), 4);
         assert_eq!(found.denied_tools.len(), 7);
@@ -515,8 +491,6 @@ mod tests {
 
     #[test]
     fn the_scripts_record_shape_is_refused_rather_than_half_parsed() {
-        // There is no migration read path. A record missing what the base forces at
-        // construction is not something this reader half-understands.
         let script_shaped = serde_json::json!({
             "run_id": "20260802-105828-snapper-21",
             "created_at": "2026-08-02T10:58:28+00:00",
@@ -536,7 +510,6 @@ mod tests {
         let mut value: serde_json::Value = serde_json::from_str(DAY_ONE).unwrap();
         value["attempt_budget"] = serde_json::json!(3);
         let found: RunView = serde_json::from_value(value).unwrap();
-        // The environment has no say: there is no override to read, and M is a record field.
         assert_eq!(found.attempt_counter(), (3, 3));
     }
 
@@ -546,13 +519,10 @@ mod tests {
 
     #[test]
     fn a_dead_supervisor_reads_as_gone_however_it_died() {
-        // Nothing is running under that pid.
         assert_eq!(
             supervisor_here(Some("Thu Aug  6 12:26:20 2026"), &Observed::Absent),
             Observed::Present(false)
         );
-        // The pid exists but belongs to something else — a reused pid must not report a dead
-        // Run as alive.
         assert_eq!(
             supervisor_here(
                 Some("Thu Aug  6 12:26:20 2026"),
@@ -560,7 +530,6 @@ mod tests {
             ),
             Observed::Present(false)
         );
-        // Alive and the same process.
         assert_eq!(
             supervisor_here(
                 Some("Thu Aug  6 12:26:20 2026"),
@@ -578,9 +547,6 @@ mod tests {
 
     #[test]
     fn a_ps_that_could_not_answer_is_never_a_supervisor_that_is_gone() {
-        // The input `resume --all` acts on. `ps -p <pid> -o lstart=` is a procps/BSD spelling
-        // busybox does not implement, and Grind ships as a musl static binary aimed at exactly
-        // those hosts — so *could not ask* reaches this function on an ordinary box.
         let blind = crate::observe::process_start_stamp(&crate::world::Completed {
             stdout: String::new(),
             stderr: "ps: unrecognized option: p\n".to_string(),
@@ -609,9 +575,6 @@ mod tests {
 
     #[test]
     fn a_transcript_that_spawned_three_and_saw_three_return_has_nothing_running() {
-        // The live view reads the whole append-only transcript: without pairing against
-        // `tool_result`, attempt 1's three agents read as *3 agents* forever after they all
-        // returned — finished work presented as currently-running.
         assert_eq!(fanout(&spawning(3, 3)), Observed::Absent);
     }
 
@@ -627,8 +590,6 @@ mod tests {
 
     #[test]
     fn a_spawn_without_an_id_cannot_pair_and_stays_listed() {
-        // The same assumed pairing `fanout_counts` states: where a spawn carries no id it
-        // counts as spawned and never returned, so the live view keeps it listed.
         let transcript = r#"{"message":{"content":[{"type":"tool_use","name":"Agent","input":{"description":"idless"}}]}}"#;
         let found = fanout(transcript);
         assert_eq!(
@@ -641,10 +602,6 @@ mod tests {
 
     #[test]
     fn a_bare_top_level_description_line_is_not_a_spawn() {
-        // The top-level `description` field belongs to subagent side-chain lines in
-        // `<session>/subagents/*.jsonl` — files this view reads only for freshness. The parent
-        // transcript never carries one, so matching it counted unrelated lines as spawns that
-        // could never pair away.
         let transcript = concat!(
             r#"{"description":"unrelated prose","message":{"role":"user"}}"#,
             "\n",
@@ -657,7 +614,6 @@ mod tests {
                 description: "real spawn".to_string()
             }])
         );
-        // And alone, such a line is no recognised spawn at all — the empty-transcript rule.
         assert_eq!(
             fanout(r#"{"description":"unrelated prose"}"#),
             Observed::Absent
@@ -666,8 +622,6 @@ mod tests {
 
     #[test]
     fn a_field_that_changed_name_or_type_costs_its_own_line_and_nothing_else() {
-        // The same real file changes field names and field types between its own lines, which
-        // is why this is read tolerantly and the child's stdout is read strictly.
         for damaged in [RENAMED_FIELD, TYPE_CHANGED] {
             let found = now_skill(damaged);
             assert!(
@@ -680,8 +634,6 @@ mod tests {
 
     #[test]
     fn fan_out_reads_as_a_count_with_descriptions_under_either_tool_name() {
-        // Support, not proof: both of these are authored, so they assert the matcher against
-        // itself. The load-bearing assertion is the negative-recognition test below.
         let Observed::Present(former) = fanout(FANOUT_PARENT) else {
             panic!("the former spelling is still recognised");
         };
@@ -697,9 +649,6 @@ mod tests {
 
     #[test]
     fn tool_calls_with_no_recognised_spawn_are_could_not_observe_and_never_absent() {
-        // The one authoring cannot fake. Widening the matcher alone would leave the next rename
-        // exactly as silent as this one was: 203 spawns to 0 across sixty transcripts, printed
-        // as `none` every time.
         let found = fanout(FANOUT_UNRECOGNISED);
         let Observed::Unobservable(reason) = &found else {
             panic!("a transcript full of tool calls is not a Run that fanned out to nobody");
@@ -721,8 +670,6 @@ mod tests {
         assert_ne!(fanout(EMPTY), fanout(FANOUT_UNRECOGNISED));
     }
 
-    // --- fan-out, per Attempt, as two integers -------------------------------------------------
-
     /// A parent transcript spawning `spawns` and returning the first `returns` of them.
     fn spawning(spawns: usize, returns: usize) -> String {
         let mut lines = Vec::new();
@@ -741,11 +688,6 @@ mod tests {
 
     #[test]
     fn each_attempt_of_one_run_counts_only_the_lines_it_appended() {
-        // One Run's transcript is one append-only file: the session id is fixed at dispatch and
-        // every later Attempt resumes that session. Counting the whole file on Attempt N counted
-        // Attempts 1..N — and `render` sums the per-Attempt pairs, so a Run that fanned out to
-        // two agents on each of three attempts published *12 spawned, 12 returned* (R51 says
-        // per Attempt).
         let mut transcript = String::new();
         let mut recorded = Vec::new();
         for _ in 0..3 {
@@ -753,7 +695,6 @@ mod tests {
             if !transcript.is_empty() {
                 transcript.push('\n');
             }
-            // Distinct ids per Attempt, because the real transcript never reuses one.
             transcript
                 .push_str(&spawning(2, 2).replace("toolu_", &format!("toolu_{}_", recorded.len())));
             recorded.push(fanout_since(&transcript, already_written));
@@ -767,11 +708,8 @@ mod tests {
             ],
             "the whole-file count would read (2,2), (4,4), (6,6) and sum to 12"
         );
-        // And the suffix of an Attempt that appended nothing is absent, never a stale repeat of
-        // the Attempt before it.
         let all = transcript.lines().count();
         assert_eq!(fanout_since(&transcript, all), Observed::Absent);
-        // A zero offset is the whole file, which is what the Run's first Attempt reads.
         assert_eq!(fanout_since(&transcript, 0), Observed::Present((6, 6)));
     }
 
@@ -782,7 +720,6 @@ mod tests {
 
     #[test]
     fn an_attempt_that_spawned_three_and_saw_two_return_says_so_and_nothing_else() {
-        // A count of processes must never become an assertion about a review.
         let found = fanout_counts(&spawning(3, 2));
         assert_eq!(found, Observed::Present((3, 2)));
         let rendered = format!("{found:?}").to_lowercase();
@@ -793,11 +730,9 @@ mod tests {
 
     #[test]
     fn an_attempt_with_no_transcript_records_could_not_observe_rather_than_zero_zero() {
-        // `(0, 0)` claims the Run fanned out to nobody. Nothing was read.
         let unread: Observed<(u64, u64)> =
             Observed::Unobservable(Reason::saying("the transcript could not be read"));
         assert_ne!(unread, Observed::Present((0, 0)));
-        // And a transcript full of tool calls naming something else is the same kind of silence.
         assert!(matches!(
             fanout_counts(FANOUT_UNRECOGNISED),
             Observed::Unobservable(_)
@@ -807,9 +742,6 @@ mod tests {
 
     #[test]
     fn the_record_round_trips_both_integers_through_the_reader() {
-        // One shared `Attempt` type, so there is no reader mirror to drift — and the
-        // `deny_unknown_fields` parity test binds only the record's top-level fields, so a
-        // duplicate attempt type inside `view` would not be caught by it.
         let found: RunView = serde_json::from_str(DAY_ONE).expect("the day-one record");
         assert_eq!(found.attempts[0].fanout, Observed::Present((3, 3)));
         assert!(matches!(
@@ -824,8 +756,6 @@ mod tests {
 
     #[test]
     fn the_live_stage_carries_the_same_nothing_recognised_rule() {
-        // Not currently broken. The rule is what keeps it from breaking silently the way the
-        // fan-out matcher did.
         let found = now_skill(FANOUT_UNRECOGNISED);
         assert!(matches!(found, Observed::Unobservable(_)), "{found:?}");
         assert_eq!(
@@ -849,8 +779,6 @@ mod tests {
 
     #[test]
     fn the_last_assistant_message_is_the_one_shown_and_user_lines_never_win() {
-        // `assistant_now` answers *what is it doing right now*, which is what Claude last
-        // said — not what was last said to it.
         let transcript = concat!(
             "{\"type\":\"user\",\"message\":{\"content\":\"the operator asked\"}}\n",
             "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"first answer\"}]}}\n",
@@ -864,9 +792,6 @@ mod tests {
 
     #[test]
     fn an_assistant_message_carrying_only_the_inner_role_spelling_is_still_one() {
-        // The real file carries the role inconsistently between its own lines: some lines
-        // name it only as `message.role`. A matcher over the top-level `type` alone is the
-        // next silent-stale one, so both spellings count (#82).
         let transcript = concat!(
             "{\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"inner role\"}]}}\n",
             "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"top level\"}]}}\n",
@@ -884,15 +809,12 @@ mod tests {
 
     #[test]
     fn an_assistant_line_that_never_parses_follows_the_nothing_recognised_rule() {
-        // Tool calls in the transcript but no readable assistant line: could-not-observe,
-        // never absent — the same stale-matcher distinction the fan-out matcher carries.
         let damaged = concat!(
             "{\"type\":\"assistant\",\"message\":{ oops\n",
             "{\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\"}]}}\n",
         );
         let found = assistant_now(damaged);
         assert!(matches!(found, Observed::Unobservable(_)), "{found:?}");
-        // Nothing in the transcript at all: absent, and distinguishable from a stale matcher.
         assert_eq!(assistant_now(EMPTY), Observed::Absent);
     }
 
@@ -938,8 +860,6 @@ mod tests {
         let run_dir = job::runs_dir(&home).join("20260806-122620-snapper-28");
         crate::world::create_dir_all(&run_dir).unwrap();
         crate::world::write_atomic(&run_dir.join("run.json"), DAY_ONE).unwrap();
-        // A neighbouring directory whose record does not parse costs its own row and
-        // never the board.
         let junk = job::runs_dir(&home).join("20260807-000000-junk-01");
         crate::world::create_dir_all(&junk).unwrap();
         crate::world::write_atomic(&junk.join("run.json"), "{not a record").unwrap();
@@ -952,13 +872,9 @@ mod tests {
             "Slice 1b: the agent surface and the ScreenSource seam"
         );
         assert!((row.spend - 26.69).abs() < 0.001, "{}", row.spend);
-        // Attempt 4 ended after the record was created, and the recorded string is what
-        // the row names — nothing synthesized.
         assert_eq!(row.last_activity, "2026-08-06T17:41:55+00:00");
         crate::world::remove_tree(&home);
     }
-
-    // --- Grit surfaces, read fresh from a Run's own directory ---------------------------------
 
     fn decision_json() -> String {
         serde_json::json!({
@@ -988,8 +904,6 @@ mod tests {
         assert_eq!(found.tier, decide::Tier::T1);
         assert_eq!(found.rationale.len(), 1);
 
-        // A stage that never ran, and a Run that never reached the ladder at all: both absent,
-        // never an error.
         assert!(decision_of(&run_dir, "diff-triage").is_none());
         assert!(decision_of(Path::new("/nowhere/at/all"), "triage").is_none());
         crate::world::remove_tree(&run_dir);
@@ -1076,7 +990,6 @@ mod tests {
         assert_eq!(found[1].kind, "job");
         assert!(found[1].summary.contains("Fix the residual finding"));
 
-        // A Run that never reflected has no proposal artifacts, never an error.
         assert!(proposals_in(Path::new("/nowhere/at/all")).is_empty());
         crate::world::remove_tree(&run_dir);
     }

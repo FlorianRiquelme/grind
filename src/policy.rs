@@ -159,9 +159,6 @@ pub fn reset_time_sleep(text: &str, now: (u32, u32)) -> Option<Duration> {
     };
     let mut seconds = u64::from(hours_ahead) * 3600;
     seconds = seconds.saturating_sub(u64::from(now_minute) * 60);
-    // Landing exactly on the target hour (0 minutes past, 0 hours ahead) means the reset is
-    // now — the same sleep-then-look-again shape the caller already handles, so a full cycle
-    // is asked for rather than a zero-length sleep that would spin.
     if seconds == 0 {
         seconds = 24 * 3600;
     }
@@ -198,8 +195,6 @@ pub fn next(
 ) -> Next {
     match verdict {
         Verdict::Completed => {
-            // Red CI does not hold the verdict open — it buys exactly one fresh bounded
-            // invocation, once, recorded with its own mode so a spent CI budget is visible.
             let spent = attempts.iter().any(|a| a.mode == Mode::CiBabysit);
             if matches!(ci_red, Observed::Present(true)) && !spent {
                 Next::SpendCiBudget
@@ -207,32 +202,22 @@ pub fn next(
                 Next::Stop(Stop::Completed)
             }
         }
-        // A session that believes it finished would re-emit the promise until the budget was
-        // gone, so this stops rather than re-entering.
         Verdict::Uncorroborated(unmet) => Next::Stop(Stop::Uncorroborated(unmet.clone())),
         Verdict::Unobserved(blind) => {
             if reobservations < budget.reobservations {
-                // The recorded pause, not a constant fired back-to-back.
                 Next::Reobserve(budget.reobserve_pause)
             } else {
                 Next::Stop(Stop::Unobserved(blind.clone()))
             }
         }
         Verdict::Incomplete(_) => {
-            // Working Attempts only, read from the Attempt list and never from an observation.
-            // A progress-based cap would have killed Run 2 *faster*: `commits_ahead` read zero
-            // for all eight of its Attempts while twelve real commits existed.
             if attempt::working(attempts) >= budget.attempts {
                 return Next::Stop(Stop::Exhausted);
             }
-            // Wall-clock never bounds a Run; a run of Waits does. Any working Attempt ends the
-            // run by construction, and the count comes off the persisted list so a restart
-            // cannot reset it.
             if attempt::trailing_waits(attempts) >= budget.consecutive_waits {
                 return Next::Stop(Stop::Exhausted);
             }
             match attempts.last() {
-                // The recorded sleep, not a constant.
                 Some(last) if last.rate_limited => Next::SleepThenReenter(budget.limit_sleep),
                 _ => Next::Reenter,
             }
@@ -325,7 +310,6 @@ mod tests {
             next(&attempts, &incomplete, &clear(), 0, &budget(8, 1800)),
             Next::SleepThenReenter(Duration::from_secs(1800))
         );
-        // The same policy against a record carrying a different limit sleep.
         assert_eq!(
             next(&attempts, &incomplete, &clear(), 0, &budget(8, 600)),
             Next::SleepThenReenter(Duration::from_secs(600))
@@ -385,10 +369,6 @@ mod tests {
 
     #[test]
     fn a_blind_signal_asks_for_the_recorded_pause_and_not_a_constant() {
-        // Exactly the shape of `a_rate_limited_attempt_asks_for_the_recorded_sleep_and_not_a_constant`:
-        // three retries fired back-to-back cannot span the transient this exists for, so the
-        // spacing has to be a value read from the budget rather than a literal baked into the
-        // loop.
         let attempts = [attempt(1, Mode::Dispatch, false)];
         let blind = Verdict::Unobserved(vec!["PR open: gh pr view: connection reset".to_string()]);
         assert_eq!(
@@ -401,7 +381,6 @@ mod tests {
             ),
             Next::Reobserve(Duration::from_secs(15))
         );
-        // The same policy against a budget carrying a different pause.
         assert_eq!(
             next(
                 &attempts,
@@ -434,7 +413,6 @@ mod tests {
             Next::SpendCiBudget
         );
 
-        // Once spent, a second red-CI decision stops rather than buying another.
         let mut after = attempts.clone();
         after.push(attempt(2, Mode::CiBabysit, false));
         assert_eq!(
@@ -491,11 +469,8 @@ mod tests {
         );
     }
 
-    // --- a Wait is an Attempt that did no work -----------------------------------------------
-
     #[test]
     fn a_wait_does_not_decrement_the_attempt_budget() {
-        // Eight Waits and one working Attempt against a budget of eight: one spent, not nine.
         let mut attempts: Vec<Attempt> = (1..=8).map(|n| wait(n, true)).collect();
         attempts.push(attempt(9, Mode::Resume, false));
         assert_ne!(
@@ -506,8 +481,6 @@ mod tests {
 
     #[test]
     fn a_run_of_consecutive_waits_terminates_on_its_own_bound() {
-        // Waits spend nothing, so this counter is the only thing standing between a permanent
-        // wall and a Run that never stops.
         let eleven: Vec<Attempt> = (1..=11).map(|n| wait(n, true)).collect();
         assert_eq!(
             next(&eleven, &incomplete(), &clear(), 0, &budget(8, 1800)),
@@ -539,10 +512,6 @@ mod tests {
 
     #[test]
     fn the_consecutive_wait_bound_survives_a_re_entry() {
-        // The count is derived from the persisted list, so a fresh process reads the same
-        // number the one that died would have. A loop-local counter would hand a
-        // permanently-walled Run a fresh allowance at every reboot and never terminate — and
-        // `resume --all` re-enters rate-limited Runs at boot by design.
         let twelve: Vec<Attempt> = (1..=12).map(|n| wait(n, true)).collect();
         let after_a_restart = twelve.clone();
         assert_eq!(
@@ -559,8 +528,6 @@ mod tests {
 
     #[test]
     fn an_unparseable_child_spends_the_budget_and_never_loops_forever() {
-        // The load-bearing clause of the predicate. A crash leaves both cost and turns absent,
-        // and reading absence as *did no work* would make every crash loop free.
         let eight: Vec<Attempt> = (1..=8).map(crashed).collect();
         assert_eq!(crate::attempt::working(&eight), 8);
         assert_eq!(
@@ -571,9 +538,6 @@ mod tests {
 
     #[test]
     fn replaying_run_2s_eight_attempt_shapes_leaves_five_waits_and_three_working_attempts() {
-        // `docs/findings/0002`: attempt 1 at $37.04 and 187 turns, attempt 2 at $7.06,
-        // attempts 3–7 at $0 and one turn each, attempt 8 at $20.22 — the Attempt that opened
-        // the PR. Under the recorded budget of eight, three working Attempts is not exhaustion.
         let mut run2 = vec![
             Attempt {
                 num_turns: Some(187),
@@ -604,8 +568,6 @@ mod tests {
 
     #[test]
     fn wall_clock_is_not_a_bound_and_does_not_become_one() {
-        // Nothing in the budget names a duration a Run may take. The two `Duration`s here are
-        // both waits Grind performs, never ceilings on the Run.
         let fields = format!("{:?}", budget(8, 1800));
         assert!(fields.contains("limit_sleep"), "{fields}");
         assert!(fields.contains("reobserve_pause"), "{fields}");
@@ -613,8 +575,6 @@ mod tests {
             assert!(!fields.contains(ceiling), "{fields}");
         }
     }
-
-    // --- a Blocker stops at once ---------------------------------------------------------------
 
     fn denying(n: usize, command: &str) -> Attempt {
         Attempt {
@@ -649,8 +609,6 @@ mod tests {
 
     #[test]
     fn a_single_denial_on_one_working_attempt_does_not_fire_it() {
-        // A Run may probe a denied tool once and route around it, which is what Run 2 did on
-        // the Attempt that opened its PR.
         let attempts = [
             attempt(1, Mode::Dispatch, false),
             attempt(2, Mode::Resume, false),
@@ -686,8 +644,6 @@ mod tests {
 
     #[test]
     fn an_unobservable_commit_count_on_either_attempt_never_fires_it() {
-        // Blind must not read as blocked. `commits_ahead` read zero for all eight of Run 2's
-        // Attempts against twelve real commits.
         let attempts = [
             attempt(1, Mode::Dispatch, false),
             denying(2, "git push --force-with-lease"),
@@ -705,7 +661,6 @@ mod tests {
 
     #[test]
     fn a_declaration_with_no_recorded_denial_does_not_fire_it_on_its_own() {
-        // Observed, never declared. Nothing here reads the Run's prose.
         let declaring = |n: usize| Attempt {
             result_tail: "I am blocked: the signer is dead and I cannot sign a commit.".to_string(),
             ..attempt(n, Mode::Resume, false)
@@ -741,8 +696,6 @@ mod tests {
 
     #[test]
     fn a_blocker_is_a_stop_and_never_a_verdict_variant() {
-        // ADR-0006 prohibits `Verdict::{Rejected, Blocked, Failed}` by name. The words are
-        // quality judgements about the work; a Blocker is a fact about the world.
         let variants = [
             format!("{:?}", Verdict::Completed),
             format!("{:?}", Verdict::Uncorroborated(vec![])),
@@ -761,12 +714,9 @@ mod tests {
         ));
     }
 
-    // --- the reset-time sleep (decision 5) ------------------------------------------------
-
     #[test]
     fn a_stated_midnight_reset_is_read_from_a_run_4_shaped_message() {
         let text = "The 5-hour limit resets 12am (Europe/Paris).";
-        // now is 22:00, so midnight is two hours away.
         assert_eq!(
             reset_time_sleep(text, (22, 0)),
             Some(Duration::from_secs(2 * 3600))
@@ -776,7 +726,6 @@ mod tests {
     #[test]
     fn a_stated_afternoon_reset_is_read_and_partial_minutes_are_subtracted() {
         let text = "resets 3pm";
-        // now is 13:30, so 3pm is 1h30m away.
         assert_eq!(
             reset_time_sleep(text, (13, 30)),
             Some(Duration::from_secs(3600 + 1800))
@@ -795,7 +744,6 @@ mod tests {
 
     #[test]
     fn the_reset_sleep_never_exceeds_twelve_hours() {
-        // now is 00:01, target is 23 (11pm) — 23h59m away by naive arithmetic, capped at 12h.
         let text = "resets 11pm";
         let found = reset_time_sleep(text, (0, 1)).unwrap();
         assert!(found <= Duration::from_secs(12 * 3600), "{found:?}");
@@ -810,8 +758,6 @@ mod tests {
 
     #[test]
     fn nothing_here_blocks() {
-        // The proof that effects are values: the whole suite runs in the time one assertion
-        // takes, against a policy whose answer is a thirty-minute sleep.
         let attempts = [attempt(1, Mode::Dispatch, true)];
         let asked = next(
             &attempts,

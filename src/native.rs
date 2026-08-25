@@ -59,10 +59,6 @@ fn transcript_filename(label: FileLabel, n: usize) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Wire shapes — pure builders so every decision is testable from literals.
-// ---------------------------------------------------------------------------
-
 /// The system prompt: workdir context, plus — in Text mode only — the tool
 /// protocol section built from the registry's own definitions.
 fn system_prompt(workdir: &str, defs: &[ToolDef], mode: ProtoMode) -> String {
@@ -203,10 +199,6 @@ fn malformed_call_exchange(assistant_text: &str, fault: &str) -> Vec<Value> {
     ]
 }
 
-// ---------------------------------------------------------------------------
-// Text-protocol parsing.
-// ---------------------------------------------------------------------------
-
 /// Pull the first `<tool>{"name":..,"arguments":..}</tool>` out of a reply.
 /// Markdown fencing around the tag is irrelevant; only the span between the
 /// markers is parsed.
@@ -257,10 +249,6 @@ fn declared_skill(prompt: &str) -> Option<String> {
     }
     None
 }
-
-// ---------------------------------------------------------------------------
-// Per-run protocol latch (R5/ADR-0018).
-// ---------------------------------------------------------------------------
 
 /// The mode latched by earlier attempts of this run, from their transcript
 /// contents (oldest file first). The last `ProtocolSelected` wins.
@@ -318,10 +306,6 @@ fn scan_latch(run_dir: &Path, current_attempt: usize) -> Option<ProtoMode> {
         .collect();
     latched_mode(&texts.iter().map(String::as_str).collect::<Vec<_>>())
 }
-
-// ---------------------------------------------------------------------------
-// Retry budget (R6).
-// ---------------------------------------------------------------------------
 
 /// What to do after one failed request inside a turn's retry budget.
 #[derive(Debug, PartialEq)]
@@ -385,10 +369,6 @@ fn describe_error(err: &NetError) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Attempt synthesis.
-// ---------------------------------------------------------------------------
-
 /// How one attempt ended, distilled for synthesis.
 enum Ending {
     /// Clean completion: the model's final summary.
@@ -428,11 +408,6 @@ fn synthesize(facts: AttemptFacts) -> Attempt {
         Ending::Completed(text) => (Some(0), false, text),
         Ending::Failed(reason) => (Some(1), true, reason),
     };
-    // The promise is spoken, never synthesized. A Run-level claim must come out of the
-    // agent's own final text — the same sentinel claude::classify reads
-    // (`attempt::DONE_PROMISE`) — or a stage that merely completes ends the whole Run one
-    // rung into its ladder, uncorroborated (issue #139). An ending is a fact about this
-    // loop; a promise is a claim about the work.
     let done_promise = !is_error && spoken.contains(DONE_PROMISE);
     let terminal_reason = is_error.then(|| spoken.clone());
     let count = spoken.chars().count();
@@ -534,10 +509,6 @@ fn layer_name(layer: GateLayer) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The loop.
-// ---------------------------------------------------------------------------
-
 /// One attempt's `messages-N.jsonl` writer (R4).
 struct Transcript {
     path: PathBuf,
@@ -583,8 +554,6 @@ impl Transcript {
     /// Never panics: a disk-write failure here must not take down the per-run
     /// supervisor before `record.push_attempt` ever runs.
     fn log(&self, event: &TranscriptEvent) {
-        // `encode()` returns the bare JSON line; `append_line`'s own `writeln!` is
-        // what supplies the single trailing newline.
         if let Err(e) = world::append_line(&self.path, &event.encode()) {
             self.note_failure(format!(
                 "attempt {}: transcript append failed: {e}",
@@ -678,11 +647,6 @@ impl StageRunner for crate::runner::NativeAdapter {
         let n = spec.attempt_n;
         let started_at = world::now_iso();
 
-        // Resolution happens at attempt start; failure is a loud failed Attempt,
-        // never a clean stop. The concrete id is this stage's routed class (or pin)
-        // resolved against the host's declared fast/strong models — never the
-        // claude-code alias `resolve_stage_model` used to hand every adapter verbatim
-        // (Unit 1's defect).
         let model_id = spec
             .model
             .native_id(self.fast_model.as_deref(), self.strong_model.as_deref());
@@ -711,22 +675,12 @@ impl StageRunner for crate::runner::NativeAdapter {
             attempt_n: n,
             append_failed: std::cell::RefCell::new(None),
         };
-        // Truncate once, before any `log` call: a crashed attempt was never
-        // recorded, so a `resume` recomputing this same `n` must not append after
-        // the dead attempt's partial content in the same file.
         transcript.truncate();
-        // Which rung is running, recorded before anything else this attempt does: the loop
-        // below emits only wire events, so without this line nothing in the transcript could
-        // answer `grind status`'s `now` question for a native Run at all.
         if let Some(skill) = declared_skill(spec.invocation.prompt()) {
             transcript.log(&TranscriptEvent::SkillDeclared { skill });
         }
         let system_for = |mode: ProtoMode| json!({"role": "system", "content": system_prompt(&spec.cwd.display().to_string(), &defs, mode)});
 
-        // Per-run latch (R5/ADR-0018): a host declaration (`proto=`) wins outright and
-        // skips the probe entirely — the case a model proven unable to execute native
-        // tool calls exists for. Absent one, an earlier attempt's ProtocolSelected
-        // decides the wire before the first request goes out.
         let mut proto = self.proto_override.or_else(|| scan_latch(spec.run_dir, n));
         if let Some(mode) = proto {
             let reason = if self.proto_override.is_some() {
@@ -766,8 +720,6 @@ impl StageRunner for crate::runner::NativeAdapter {
             };
             let mode = outcome.mode;
 
-            // First protocol determination of this run: logged once, before any
-            // of this attempt's other wire events.
             if proto.is_none() {
                 let (selected, reason) = match outcome.latch {
                     Some((m, r)) => (m, r),
@@ -777,9 +729,6 @@ impl StageRunner for crate::runner::NativeAdapter {
                     ),
                 };
                 proto = Some(selected);
-                // The Text system prompt, when this attempt latches, was already
-                // installed inside `drive_turn` before the retry that produced this
-                // very outcome went out — nothing left to swap here.
                 transcript.log(&TranscriptEvent::ProtocolSelected {
                     mode: selected,
                     reason,
@@ -793,8 +742,6 @@ impl StageRunner for crate::runner::NativeAdapter {
 
             let content = outcome.turn.content;
 
-            // Endings. Native: stop-with-content completes. Text: only an explicit
-            // <done> sentinel completes — everything else keeps working.
             if mode == ProtoMode::Native && outcome.turn.tool_calls.is_empty() {
                 transcript.log(&TranscriptEvent::Final {
                     text: content.clone(),
@@ -819,12 +766,6 @@ impl StageRunner for crate::runner::NativeAdapter {
             } else {
                 outcome.turn.tool_calls
             };
-            // Well-formedness before anything else (#142): a malformed call — an empty
-            // name (`{"name": "", "arguments": "\"\""}`, 17 of one attempt's 63 calls),
-            // an invented tool, arguments that are not an object, a required argument
-            // missing — is a *nonconforming reply*, ADR-0018's nudge case, never a tool
-            // to run and never a policy denial. One nudge naming every fault; the bad
-            // calls enter neither history nor execution; the turn still counts.
             let faults: Vec<String> = pending
                 .iter()
                 .filter_map(|call| tools::protocol_fault(&defs, &call.name, &call.arguments_json))
@@ -840,7 +781,6 @@ impl StageRunner for crate::runner::NativeAdapter {
             }
 
             if pending.is_empty() {
-                // Prose where a tag was demanded: one corrective nudge, logged.
                 transcript.log(&TranscriptEvent::ProtocolNudge {
                     assistant_text: content.clone(),
                     fault: None,
@@ -849,7 +789,6 @@ impl StageRunner for crate::runner::NativeAdapter {
                 continue;
             }
 
-            // Assistant echo, then the gated execution of each call.
             messages.push(match mode {
                 ProtoMode::Native => assistant_echo_native(&content, &pending),
                 ProtoMode::Text => assistant_echo_text(&content),
@@ -885,9 +824,6 @@ impl StageRunner for crate::runner::NativeAdapter {
             }
         };
 
-        // A transcript-append failure is folded into an already-failing attempt's
-        // reason rather than raised through a new channel; it never turns a
-        // completion into a failure on its own.
         let ending = match (ending, transcript.append_failed.borrow().as_ref()) {
             (Ending::Failed(reason), Some(append_err)) => {
                 Ending::Failed(format!("{reason}; {append_err}"))
@@ -917,20 +853,6 @@ fn truncate_denial(layer: GateLayer, reason: &str) -> String {
     ))
 }
 
-// --- the live view, read from grind's own format ----------------------------------------------
-//
-// The mirror of `claude::live`, over a format grind writes itself (R4) — and owning the format
-// inverts `claude`'s reading discipline rather than copying it. There, tolerant `Value` lookups
-// are the answer because the schema is undocumented and changes field names between its own
-// lines. Here the schema *is* [`TranscriptEvent`], written by this same binary, so a line either
-// deserializes as one of its variants or is not grind's at all; a typed read is the honest one,
-// and a line that fails it costs itself and nothing else — the same per-line degradation rule.
-//
-// One field stays *could not observe* on purpose. `fanout` has nothing to report because the
-// native loop has no fan-out tool to spawn a subagent with (the plan defers subagents to a later
-// unit), and saying so is the answer rather than a gap — `Absent` in this view means *spawned,
-// and every one returned*, which is a different and false claim.
-
 /// Reason the fan-out field carries on every native Run. A named constant because it is a
 /// standing fact about the loop, not a placeholder for a reader nobody wrote.
 const NO_FANOUT: &str = "the native loop spawns no subagents";
@@ -949,9 +871,6 @@ fn said(event: &TranscriptEvent) -> Option<String> {
     match event {
         TranscriptEvent::Final { text } => Some(one_line(text)),
         TranscriptEvent::ProtocolNudge { assistant_text, .. } => Some(one_line(assistant_text)),
-        // A working attempt's assistant turns *are* tool calls, so this is most of what there is
-        // to read while a Run is still going. Name and arguments, through the same one-line cap
-        // as everything else on a fixed-shape view.
         TranscriptEvent::AssistantToolCalls { calls } => Some(one_line(
             &calls
                 .iter()
@@ -1057,9 +976,6 @@ pub fn live(run_dir: &Path, now_epoch: u64) -> Live {
             (path, at)
         })
         .collect();
-    // `None` sorts below `Some`, so a file whose mtime could not be read is still the one read
-    // when it is the only file there, and never wins over one that does carry a time. The path
-    // breaks a tie, so two files stamped the same second pick the same one every refresh.
     let newest = stamped
         .iter()
         .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
@@ -1068,7 +984,6 @@ pub fn live(run_dir: &Path, now_epoch: u64) -> Live {
     Live {
         transcript: match newest {
             Some((path, _)) => path.clone(),
-            // Nothing written yet — name where it looked, so the panel still points somewhere.
             None => run_dir.to_path_buf(),
         },
         now_skill: match &text {
@@ -1081,8 +996,6 @@ pub fn live(run_dir: &Path, now_epoch: u64) -> Live {
         },
         last_words: match &text {
             Some(body) => last_words(body, 3),
-            // Still exactly three lines: an unreadable transcript must not change the shape of
-            // the view (`claude::live`'s own rule).
             None => vec![String::new(); 3],
         },
         fanout: Observed::Unobservable(Reason::saying(NO_FANOUT)),
@@ -1094,8 +1007,6 @@ pub fn live(run_dir: &Path, now_epoch: u64) -> Live {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    // --- the live view, from literals ------------------------------------------------------
 
     /// One attempt's transcript as `NativeAdapter` appends it: the skill row, the wire latch,
     /// then the tool-call / tool-result alternation a working attempt consists of.
@@ -1118,8 +1029,6 @@ mod tests {
 
     #[test]
     fn the_declared_skill_comes_off_the_prompt_s_own_frontmatter() {
-        // The real shape: a `skills/run/<stage>/SKILL.md` verbatim, then the context block the
-        // stage composition appends after a `---` separator.
         let prompt = "---\nname: work\ndescription: The fourth rung.\n---\n\n# Work\n\nDo it.\n\n\
                       ---\n\nname: not-the-skill\n";
         assert_eq!(declared_skill(prompt), Some("work".to_string()));
@@ -1127,8 +1036,6 @@ mod tests {
 
     #[test]
     fn a_prompt_declaring_no_name_declares_nothing_rather_than_a_blank() {
-        // Four ways to have no name, none of which may produce `Some("")` — an empty skill
-        // would render as an answered `now` line saying nothing at all.
         assert_eq!(declared_skill(""), None);
         assert_eq!(declared_skill("# Work\n\nno frontmatter here\n"), None);
         assert_eq!(declared_skill("---\ndescription: no name row\n---\n"), None);
@@ -1137,8 +1044,6 @@ mod tests {
 
     #[test]
     fn a_name_row_after_the_frontmatter_closes_is_not_the_skill() {
-        // The composed prompt uses `---` as its own separator, so a reader that scanned the
-        // whole text would start reading the context block's prose as frontmatter.
         assert_eq!(
             declared_skill("---\ndescription: only this\n---\n\nname: prose\n"),
             None
@@ -1157,9 +1062,6 @@ mod tests {
 
     #[test]
     fn doing_is_the_last_thing_the_assistant_authored_and_a_tool_call_counts() {
-        // A native attempt's assistant turns *are* tool calls until the very last one, so
-        // reading only `Final` would leave this blank for the whole window a human watches.
-        // The newer tool *result* does not win it: that is the world talking, not the model.
         assert_eq!(
             assistant_now(TRANSCRIPT),
             Observed::Present(r#"bash {"command":"just verify"}"#.to_string())
@@ -1180,8 +1082,6 @@ mod tests {
 
     #[test]
     fn a_protocol_nudge_is_something_the_assistant_said() {
-        // Drift prose is what the Run is doing at that moment, and it is exactly what an
-        // operator needs to see — a text-latched model that has stopped emitting tags.
         let nudged = concat!(
             r#"{"event":"skill_declared","value":{"skill":"plan"}}"#,
             "\n",
@@ -1196,8 +1096,6 @@ mod tests {
 
     #[test]
     fn last_words_is_exactly_three_lines_whatever_the_transcript_said() {
-        // The block's height is fixed so `watch -n 30` never jitters — the same rule
-        // `claude::last_words` carries, over this format's events.
         assert_eq!(
             last_words(TRANSCRIPT, 3),
             vec![
@@ -1212,8 +1110,6 @@ mod tests {
 
     #[test]
     fn usage_and_the_two_selection_rows_are_not_words() {
-        // They are facts about the harness, not anything the Run narrated — a `last words`
-        // block reading `{"total_tokens":812}` tells an operator nothing about the work.
         let only_harness = concat!(
             r#"{"event":"usage","value":{"total_tokens":812}}"#,
             "\n",
@@ -1223,16 +1119,12 @@ mod tests {
             "\n",
         );
         assert_eq!(last_words(only_harness, 3), vec![String::new(); 3]);
-        // …and the three of them present is *could not observe* for `doing`, never `Absent`:
-        // events were recognised, just none the assistant authored.
         let found = assistant_now(only_harness);
         assert!(matches!(found, Observed::Unobservable(_)), "{found:?}");
     }
 
     #[test]
     fn a_transcript_of_nothing_recognisable_is_absent_and_a_bad_line_costs_only_itself() {
-        // Nothing recognised at all is `Absent`; one unparseable line among good ones costs
-        // its own values and no sibling's — the per-line degradation `claude` established.
         assert_eq!(assistant_now(""), Observed::Absent);
         assert_eq!(
             now_skill("not json\n{\"event\":\"turn\"}\n"),
@@ -1244,9 +1136,6 @@ mod tests {
 
     #[test]
     fn live_reads_the_newest_written_transcript_and_names_the_file() {
-        // Each attempt writes its own file and Reflect writes one more, so *what is it doing
-        // now* is whichever was touched last — never all of them concatenated, which would
-        // report attempt 1's last words for the rest of the Run's life.
         let dir = world::temp_dir("native-live");
         world::write(
             &dir.join("messages-1.jsonl"),
@@ -1259,7 +1148,6 @@ mod tests {
         assert_eq!(live.transcript, dir.join("messages-2.jsonl"));
         assert_eq!(live.now_skill, Observed::Present("work".to_string()));
         assert!(matches!(live.freshness, Observed::Present(_)));
-        // Fan-out is a standing fact about the loop, not an unfinished reader.
         match live.fanout {
             Observed::Unobservable(reason) => assert_eq!(reason.to_string(), NO_FANOUT),
             other => panic!("fan-out must stay could-not-observe: {other:?}"),
@@ -1270,8 +1158,6 @@ mod tests {
 
     #[test]
     fn live_over_a_run_directory_with_no_transcript_yet_names_the_directory() {
-        // A Run whose first attempt has not written yet must still point the panel somewhere,
-        // and freshness must read *could not observe* rather than *just wrote*.
         let dir = world::temp_dir("native-live-empty");
         let live = live(&dir, world::now_epoch());
         assert_eq!(live.transcript, dir);
@@ -1279,8 +1165,6 @@ mod tests {
         assert_eq!(live.last_words, vec![String::new(); 3]);
         world::remove_tree(&dir);
     }
-
-    // --- text-protocol parsing ------------------------------------------------
 
     #[test]
     fn tool_tag_extraction_plain_and_fenced() {
@@ -1295,7 +1179,6 @@ mod tests {
             extract_tool_tag(fenced),
             Some(("read_file".into(), r#"{"path":"a.md"}"#.into()))
         );
-        // First tag wins.
         let two = "<tool>{\"name\":\"a\",\"arguments\":{}}</tool> then \
                    <tool>{\"name\":\"b\",\"arguments\":{}}</tool>";
         assert_eq!(
@@ -1327,8 +1210,6 @@ mod tests {
         assert_eq!(extract_done("</done>closed-only"), None);
     }
 
-    // --- latch scan -------------------------------------------------------------
-
     #[test]
     fn latch_scan_honors_the_last_protocol_selected() {
         let older = r#"{"event":"protocol_selected","value":{"mode":"text","reason":"rejected"}}"#;
@@ -1347,11 +1228,6 @@ mod tests {
 
     #[test]
     fn scan_latch_orders_by_attempt_number_not_lexicographic_path() {
-        // A lexicographic sort of filenames puts "messages-10.jsonl" before
-        // "messages-2.jsonl". Attempt 2 selected Text; attempt 10 (a later,
-        // still-unlatched attempt under the old bug's premise) selects Native.
-        // Numeric order must read attempt 2 first and let attempt 10 win as the
-        // last ProtocolSelected.
         let dir = world::temp_dir("native-scan-latch-order");
         world::write(
             &dir.join("messages-2.jsonl"),
@@ -1378,7 +1254,6 @@ mod tests {
 
     #[test]
     fn tools_array_rejection_latches_text_immediately_even_at_the_last_failure() {
-        // Injected literals: 3 tries, 2-second steps. The latch outranks the budget.
         assert_eq!(
             next_action(&http_reject(), ProtoMode::Native, false, 2, 3, 2),
             Action::LatchText
@@ -1403,9 +1278,6 @@ mod tests {
 
     #[test]
     fn abnormal_finish_for_an_ordinary_length_cutoff_backs_off_instead_of_latching() {
-        // finish_reason="length" (max tokens) names nothing about tools; latching
-        // Text on it would pin the whole Run to text on the strength of one long
-        // reply (P1 regression).
         let err = NetError::AbnormalFinish {
             finish: "length".into(),
             native: None,
@@ -1441,8 +1313,6 @@ mod tests {
         );
     }
 
-    // --- Attempt synthesis --------------------------------------------------------
-
     #[test]
     fn completed_attempts_mirror_the_classify_conventions() {
         let attempt = synthesize(AttemptFacts {
@@ -1459,8 +1329,6 @@ mod tests {
         assert!(!attempt.is_error);
         assert!(attempt.parse_ok);
         assert_eq!(attempt.subtype, None);
-        // "shipped it" speaks no Run-level sentinel: a completed stage promises nothing
-        // (issue #139).
         assert!(!attempt.done_promise);
         assert!(!attempt.rate_limited);
         assert_eq!(attempt.total_cost_usd, Some(0.031_833_87));
@@ -1484,9 +1352,6 @@ mod tests {
         });
         assert!(promised.done_promise);
 
-        // A stage that completes without speaking the sentinel — plan, say, whose
-        // return names neither PR nor commits — promises nothing, so the supervisor
-        // walks on to the next rung instead of asking whether the whole Run is over.
         let unpromised = synthesize(AttemptFacts {
             n: 1,
             mode: Mode::Dispatch,
@@ -1502,8 +1367,6 @@ mod tests {
 
     #[test]
     fn a_single_turn_rate_limited_native_attempt_is_a_wait() {
-        // total_cost_usd must be the honest Some(0.0), not None, or is_wait() is
-        // false for every native Attempt regardless of num_turns (P1 regression).
         let attempt = synthesize(AttemptFacts {
             n: 1,
             mode: Mode::Dispatch,
@@ -1523,8 +1386,6 @@ mod tests {
 
     #[test]
     fn an_attempt_that_spent_is_never_a_wait() {
-        // The property the old hardcoded Some(0.0) protected, stated positively: real
-        // spend means the model answered, so the Attempt did work even at one turn.
         let attempt = synthesize(AttemptFacts {
             n: 1,
             mode: Mode::Dispatch,
@@ -1608,8 +1469,6 @@ mod tests {
         assert!(long.ends_with(&attempt.result_tail));
     }
 
-    // --- nudge + prompts ----------------------------------------------------------
-
     #[test]
     fn the_nudge_is_an_assistant_echo_plus_one_corrective_user_turn() {
         let exchange = nudge_exchange("I could use a tool here.");
@@ -1679,8 +1538,6 @@ mod tests {
         );
     }
 
-    // --- denial identity (R7) ----------------------------------------------------
-
     #[test]
     fn a_denied_bash_call_carries_the_vocabulary_policy_and_render_read() {
         let report = tools::GateReport {
@@ -1697,8 +1554,6 @@ mod tests {
         assert_eq!(denial["gate_layer"], "denied_glob");
         assert_eq!(denial["reason"], "matched a denied-tool glob");
     }
-
-    // --- usage accumulation (R8) --------------------------------------------------
 
     #[test]
     fn usage_accumulates_across_turns_instead_of_keeping_only_the_last() {
@@ -1719,8 +1574,6 @@ mod tests {
         assert_eq!(total["prompt_tokens_details"]["cached_tokens"], 3);
     }
 
-    // --- text-latch system-prompt timing (P2) -------------------------------------
-
     #[test]
     fn install_system_replaces_only_the_leading_message_with_the_new_modes_prompt() {
         let mut messages = vec![
@@ -1735,16 +1588,6 @@ mod tests {
         assert_eq!(messages[0]["content"], "prompt for Text");
         assert_eq!(messages[1]["content"], "go", "only index 0 changes");
     }
-
-    // `install_system`'s call site — the `Action::LatchText` arm of `drive_turn` — is
-    // reached only through `next_action`, whose own coverage above
-    // (`tools_array_rejection_latches_text_immediately_even_at_the_last_failure`,
-    // `abnormal_finish_naming_tools_latches_but_text_never_does`) already pins down
-    // exactly when a latch fires. Together the two prove the fix: the prompt swap
-    // happens (this test), and it happens on precisely the latch action next_action
-    // decided on (that coverage) — with neither test opening a socket.
-
-    // --- transcript newline framing -----------------------------------------------
 
     #[test]
     fn transcript_log_writes_exactly_one_newline_per_line() {
@@ -1775,10 +1618,6 @@ mod tests {
 
     #[test]
     fn truncate_before_log_starts_the_attempt_from_empty_not_appended() {
-        // Simulates a crashed attempt N followed by a resumed attempt that
-        // recomputes the same N: the second `Transcript` open for that same
-        // path must start empty rather than appending after the first's
-        // partial content (finding #23).
         let dir = world::temp_dir("native-transcript-truncate");
         let path = dir.join("messages-1.jsonl");
 

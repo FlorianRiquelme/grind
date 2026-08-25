@@ -68,8 +68,6 @@ fn files_naming(sources: &[(String, String)], needle: &str) -> Vec<String> {
         .collect()
 }
 
-// --- the assertions over the real source ----------------------------------------------
-
 #[test]
 fn process_access_is_named_in_world_only() {
     let offenders = files_naming(&sources(), "std::process");
@@ -157,10 +155,6 @@ fn the_server_never_names_the_write_side() {
 #[test]
 fn no_path_in_src_classifies_an_issue() {
     let sources = sources();
-    // Both spellings of each namespace: `gh issue edit` takes `--add-`/`--remove-` and
-    // `gh issue create` takes the bare flag. `files_naming` is a plain substring match, so
-    // `"--add-project".contains("--project")` is **false** — the bare flag alone let the edit
-    // spelling through, and it was the only namespace here missing its pair.
     for classifying in [
         "--add-label",
         "--remove-label",
@@ -243,8 +237,6 @@ fn the_reset_sleep_reads_the_local_time_seam_rather_than_a_utc_path() {
          renamed with the same body elsewhere"
     );
 }
-
-// --- the same rules, checked against literals ------------------------------------------
 
 fn main_is_only_a_delegation(main: &str) -> bool {
     let code = code_only(main);

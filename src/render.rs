@@ -58,10 +58,6 @@ pub fn run_view(view: &SingleRun) -> String {
     let furthest = *furthest;
     let (made, budget) = found.attempt_counter();
     let mut out = String::new();
-    // The recorded state, **labelled as recorded**: printed bare above the fresh verdict it
-    // asks the human to adjudicate between two things Grind produced — the exact shape the
-    // Handback refuses (the test below). The word stays, because it names the record on disk;
-    // the label is what stops it reading as a fresh claim.
     line(
         &mut out,
         &format!("Run     {}  recorded [{}]", found.run_id, found.state),
@@ -90,18 +86,14 @@ pub fn run_view(view: &SingleRun) -> String {
         &mut out,
         &format!("  verdict           {}", verdict_line(verdict, observation)),
     );
-    // Only when one exists: a clearance decides nothing (#16), and the note goes through
-    // the same one-line discipline as everything else on this fixed-shape view.
     if let Some(clearance) = cleared {
         line(
             &mut out,
             &format!("  cleared           {}", one_line(&clearance.note)),
         );
     }
-    // Two separate stage lines. *How far it got* and *what it is doing* are never conflated.
     line(&mut out, &format!("  furthest stage    {furthest}"));
     line(&mut out, &format!("  now               {}", live.now_skill));
-    // *What it is doing right now* — the last assistant message, distinct from how far it got.
     line(
         &mut out,
         &format!("  doing             {}", live.assistant_now),
@@ -118,8 +110,6 @@ pub fn run_view(view: &SingleRun) -> String {
         &mut out,
         &format!("  attempts          attempt {made} of {budget}"),
     );
-    // The API-pricing counterfactual. Remaining quota prints not at all: the number nothing can
-    // compute is not estimated.
     line(
         &mut out,
         &format!(
@@ -231,9 +221,6 @@ pub fn handback(view: &Facts) -> String {
     let blocker = blocker.as_deref();
     let mut out = String::new();
 
-    // The fresh verdict, in the top position, and the recorded state nowhere. Where the two
-    // disagree the fresh one is right by construction, and printing both asks the human to
-    // adjudicate between two things Grind produced.
     line(
         &mut out,
         &format!(
@@ -273,9 +260,6 @@ pub fn handback(view: &Facts) -> String {
             unobserved: false,
         },
     ];
-    // The same rule five times: **surface the surprise, never the permanent negative.** A row
-    // that could not be observed still prints — in the block below — because *I could not look*
-    // is a surprise too.
     if found.denial_count() > 0 {
         rows.push(Row {
             label: "denied",
@@ -283,8 +267,6 @@ pub fn handback(view: &Facts) -> String {
             unobserved: false,
         });
     }
-    // The latest clearance, only when one exists: it decides nothing, and a Run nobody
-    // cleared prints nothing. On the host the human's own words come back verbatim.
     if let Some(clearance) = cleared {
         rows.push(Row {
             label: "cleared",
@@ -308,8 +290,6 @@ pub fn handback(view: &Facts) -> String {
             unobserved: drift.1,
         });
     }
-    // Two integers, and **no summary, boolean or health word over them**. A count of processes
-    // must never become an assertion about a review.
     match fanout_totals(found) {
         FanoutTotals {
             counted: Some(pair),
@@ -319,8 +299,6 @@ pub fn handback(view: &Facts) -> String {
             value: fanout_counted(pair),
             unobserved: false,
         }),
-        // **Counted and incomplete.** The number stays, because it is real; the mark stays with
-        // it, because an understated total printed bare is indistinguishable from a low one.
         FanoutTotals {
             counted: Some(pair),
             unread: Some(reason),
@@ -353,7 +331,6 @@ pub fn handback(view: &Facts) -> String {
     for seen in rows.iter().filter(|r| !r.unobserved) {
         line(&mut out, &format!("  {:<17} {}", seen.label, seen.value));
     }
-    // Empty on a Run where nothing failed to observe, and the Handback is flat.
     let blind: Vec<&Row> = rows.iter().filter(|r| r.unobserved).collect();
     if !blind.is_empty() {
         line(&mut out, "");
@@ -369,8 +346,6 @@ pub fn handback(view: &Facts) -> String {
     out.push_str(&calibration_row(calibration));
     out.push_str(&outcome_rows(outcome));
 
-    // Things you type at something, rather than claims about the world. The session handle is
-    // worthless off its host, and the worktree path is a place rather than a fact.
     line(&mut out, "");
     line(
         &mut out,
@@ -413,10 +388,6 @@ pub fn job_comment(view: &Facts) -> String {
         run_state,
         triage_decision,
         diff_triage_decision,
-        // Chronologically always `None` here: `grind outcomes` collects both only after this
-        // comment is posted, at the Run's terminal moment. Bound and unused rather than
-        // dropped from the pattern, so a caller who ever changes that ordering meets a live
-        // binding here instead of a silently absent one.
         outcome: _outcome,
         calibration: _calibration,
     } = view;
@@ -444,9 +415,6 @@ pub fn job_comment(view: &Facts) -> String {
         &format!("${:.2} (API pricing)", found.total_spend()),
     );
     cell("tool denials", &found.denial_count().to_string());
-    // The four completion observations, each with its mark and nothing else. The draft flag
-    // travels with the URL: the Handback renders it as its own row, but that rendering never
-    // leaves the host, and this comment is all the off-host triage gets.
     cell(
         "PR",
         &match &observation.pr {
@@ -458,9 +426,6 @@ pub fn job_comment(view: &Facts) -> String {
     cell("commits ahead", &marked(&observation.commits_ahead));
     cell("checks pending", &marked(&observation.checks_pending));
     cell("base drift", &marked(&observation.base_drift));
-    // Only when one exists (#16). The human typed the note for the Run, so it travels —
-    // flattened to one line with pipes escaped, because a markdown table cell is the one
-    // surface its own shape can break.
     if let Some(clearance) = cleared {
         cell(
             "cleared",
@@ -471,8 +436,6 @@ pub fn job_comment(view: &Facts) -> String {
             ),
         );
     }
-    // The same two facts, with the mark and **never the `Reason`** — the rule the verdict line
-    // above learned the hard way.
     cell(
         "fan-out",
         &match fanout_totals(found) {
@@ -497,7 +460,6 @@ pub fn job_comment(view: &Facts) -> String {
             } => crate::observe::ABSENT_MARK.to_string(),
         },
     );
-    // Presence **and** absence: naming only one of them is how a partial contract reads whole.
     cell(
         "verify contract present",
         &or_none(&contract.present.join(", ")),
@@ -507,8 +469,6 @@ pub fn job_comment(view: &Facts) -> String {
         &or_none(&contract.missing.join(", ")),
     );
     cell("verify coverage", &marked(coverage));
-    // Tier receipts, terse: the full rationale rows stay on the host (the Handback prints
-    // them), and this comment carries only what the review depth bought.
     if let Some(decision) = diff_triage_decision.as_ref().or(triage_decision.as_ref()) {
         cell("tier", &decision.tier.to_string());
     }
@@ -569,8 +529,6 @@ fn handback_verdict(
     if matches!(observation.checks_red, Observed::Present(true)) {
         said = format!("{said} — ${:.2} of repair spent", repair_spend(found));
     }
-    // The repair is named in order beside what must be cleared. Describing the way back is
-    // not a gate.
     if let Some(what) = blocker {
         said = format!(
             "{said}  (a Blocker: {what} must be cleared — {})",
@@ -712,8 +670,6 @@ pub fn refusal(said: &str) -> String {
     format!("grind: {said}\n")
 }
 
-// --- the pieces ------------------------------------------------------------------------------
-
 /// The two negatives, for the values whose `T` is a collection and so has no `Display`. Same
 /// marks as the type's own, because a reader must never have to learn two vocabularies.
 fn negative_mark<T>(found: &Observed<T>) -> &'static str {
@@ -774,9 +730,6 @@ fn freshness_line(freshness: &Observed<u64>) -> String {
 fn fanout_line(live: &Live) -> String {
     match &live.fanout {
         Observed::Present(agents) => {
-            // Each description through the same one-line discipline as `last_words`: five long
-            // Agent descriptions wrapping differently on every `watch` refresh is exactly the
-            // jitter the fixed view shape exists to prevent.
             let described: Vec<String> = agents.iter().map(|a| one_line(&a.description)).collect();
             format!(
                 "{} agent{}: {}  ({})",
@@ -786,10 +739,6 @@ fn fanout_line(live: &Live) -> String {
                 freshness_line(&live.freshness)
             )
         }
-        // `Absent` — nothing running — and *could not observe* keep the shared marks. The old
-        // `Present(agents) if agents.is_empty() => "none"` arm was unreachable: `fanout`
-        // returns `Absent` once every spawn has paired with a `tool_result`, and reads *could
-        // not observe* rather than an empty list where nothing was recognised.
         other => negative_mark(other).to_string(),
     }
 }
@@ -1067,9 +1016,6 @@ mod tests {
 
     #[test]
     fn the_recorded_state_is_labelled_so_a_stale_word_cannot_read_as_a_fresh_claim() {
-        // The Handback refuses to print the recorded state beside the fresh verdict at all;
-        // the single-Run view keeps the word — it names the record on disk — but labels it,
-        // so a stale `exhausted` above a fresh `completed` verdict cannot adjudicate itself.
         let mut record = found();
         record.state = "exhausted".to_string();
         let text = rendered_of(&record, &observation(), &live(3), &Verdict::Completed);
@@ -1078,8 +1024,6 @@ mod tests {
 
     #[test]
     fn a_long_agent_description_is_capped_like_the_last_words_block() {
-        // Five long descriptions wrapping differently on every refresh is the jitter the fixed
-        // view shape exists to prevent; the freshness suffix is deliberate and stays.
         let mut watching = live(3);
         watching.fanout = Observed::Present(vec![Fanout {
             description: "word ".repeat(40),
@@ -1271,7 +1215,6 @@ mod tests {
 
     #[test]
     fn the_handback_renders_the_fresh_verdict_in_the_top_position_and_never_the_recorded_state() {
-        // Run 2's Handback said `[exhausted]` with `PR —` over an open, green, twelve-commit PR.
         let mut record = found();
         record.state = "exhausted".to_string();
         let text = handback(&facts_of(
@@ -1305,13 +1248,10 @@ mod tests {
 
     #[test]
     fn the_handback_carries_no_plan_residual_or_ledger_count() {
-        // Three whole-directory listings that counted other people's files, every one of which
-        // is already in the PR's own diff.
         let text = handed_back(&observation(), &Verdict::Completed);
         for dropped in ["plan  ", "review residuals", "ledger entries"] {
             assert!(!text.contains(dropped), "`{dropped}` still prints:\n{text}");
         }
-        // And the observations behind them still feed the stage ladder.
         assert!(matches!(
             observation().plan_files,
             Observed::Present(_) | Observed::Absent
@@ -1320,8 +1260,6 @@ mod tests {
 
     #[test]
     fn the_session_handle_and_the_worktree_move_into_the_trailing_pointer_block() {
-        // Things you type at something, not claims about the world — and a session handle is
-        // worthless off its host.
         let text = handed_back(&observation(), &Verdict::Completed);
         let at = |needle: &str| {
             text.find(needle)
@@ -1338,7 +1276,6 @@ mod tests {
 
     #[test]
     fn attempt_n_of_m_counts_working_attempts_only_on_every_surface_that_prints_it() {
-        // The day-one record holds four Attempts, of which attempt 3 cost $0 and ran one turn.
         let text = handed_back(&observation(), &Verdict::Completed);
         assert!(text.contains("Attempts 3 of 8"), "{text}");
         let single = rendered(&observation(), &live(3), &Verdict::Completed);
@@ -1404,10 +1341,6 @@ mod tests {
 
     #[test]
     fn a_total_over_an_attempt_that_could_not_be_read_carries_the_mark_beside_the_number() {
-        // The day-one record's attempt 2 could not be read and its attempts 1 and 4 could, so
-        // 4 is a **floor**, not the total. `(Some(counted), _) => Present(counted)` dropped the
-        // blind reason whenever anything else was readable, and both surfaces print a bare
-        // "N spawned, M returned" — so an understated number left the host as a definite fact.
         let on_host = handed_back(&observation(), &Verdict::Completed);
         assert!(on_host.contains("4 spawned, 4 returned"), "{on_host}");
         assert!(on_host.contains("at least one attempt unread"), "{on_host}");
@@ -1420,7 +1353,6 @@ mod tests {
             "and the row joins the blind block:\n{on_host}"
         );
 
-        // The comment carries the same two facts with the mark and **never the `Reason`**.
         let markdown = commented(&observation(), &Verdict::Completed);
         assert!(markdown.contains("4 spawned, 4 returned"), "{markdown}");
         assert!(
@@ -1432,7 +1364,6 @@ mod tests {
             "{markdown}"
         );
 
-        // A Run whose every attempt was read says the number and nothing else.
         let clean = handback(&facts_of(
             every_attempt_read(),
             observation(),
@@ -1446,7 +1377,6 @@ mod tests {
 
     #[test]
     fn the_fan_out_arithmetic_surfaces_as_two_integers_with_no_summary_word() {
-        // The day-one record holds (3, 3) and (1, 1) across its Attempts.
         let text = handed_back(&observation(), &Verdict::Completed);
         assert!(text.contains("fan-out"), "{text}");
         assert!(text.contains("4 spawned, 4 returned"), "{text}");
@@ -1515,8 +1445,6 @@ mod tests {
         assert!(text.contains("could not observe"), "{text}");
         let block = text.split("could not observe").nth(1).expect("the block");
         assert!(block.contains("tree clean"), "{block}");
-        // And as a row it appears there and nowhere else. The verdict line names the blind
-        // signal too, which is the verdict speaking rather than a row.
         let before = text.split("could not observe").next().expect("the rows");
         assert!(!before.contains("\n  tree clean"), "{before}");
     }
@@ -1529,7 +1457,6 @@ mod tests {
         let said = text.lines().next().expect("the verdict line");
         assert!(said.contains("completed"), "{said}");
         assert!(said.contains("a check came back red"), "{said}");
-        // The day-one record's CI-babysit attempt cost $3.18.
         assert!(said.contains("$3.18 of repair spent"), "{said}");
     }
 
@@ -1545,7 +1472,6 @@ mod tests {
         assert!(said.contains("a Blocker"), "{said}");
         assert!(said.contains("git push --force-with-lease"), "{said}");
         assert!(said.contains("must be cleared"), "{said}");
-        // The two-step repair, named in order: `cleared` records, `resume` spends.
         assert!(
             said.contains("grind cleared 20260806-122620-snapper-28"),
             "{said}"
@@ -1558,8 +1484,6 @@ mod tests {
         let spend_second = said.find("grind resume").expect("the spending verb");
         assert!(record_first < spend_second, "{said}");
     }
-
-    // --- the latest clearance, only when one exists ---------------------------------------------
 
     /// The day-one record with two clearances recorded, newest last.
     fn cleared_twice() -> RunView {
@@ -1579,7 +1503,6 @@ mod tests {
 
     #[test]
     fn no_surface_prints_a_cleared_row_when_no_clearance_exists() {
-        // Render nothing when no note exists (R6): a permanent negative never prints.
         for text in [
             handed_back(&observation(), &Verdict::Completed),
             commented(&observation(), &Verdict::Completed),
@@ -1591,8 +1514,6 @@ mod tests {
 
     #[test]
     fn every_surface_shows_the_latest_note_and_every_row_stays_in_the_record() {
-        // R3 and R4: the latest note rides all three surfaces; the older row survives in
-        // the record but is not what a reader is shown.
         let record = cleared_twice();
         let facts = facts_of(
             record.clone(),
@@ -1619,15 +1540,11 @@ mod tests {
             );
         }
         assert_eq!(record.clearances.len(), 2, "both rows stay in the record");
-        // The comment is the surface that leaves the host, so the date travels with it.
         assert!(markdown.contains("2026-08-21T21:00:00+00:00"), "{markdown}");
     }
 
     #[test]
     fn a_note_that_would_break_the_comment_table_is_flattened_in_the_cell_only() {
-        // A markdown table cell is the one surface the note's own shape can break: `|`
-        // splits the row and a newline ends it. The Handback keeps the human's words
-        // verbatim — on the host, where they typed them.
         let mut record = found();
         record.clearances = vec![Clearance {
             cleared_at: "2026-08-21T19:00:00+00:00".to_string(),
@@ -1649,14 +1566,11 @@ mod tests {
         let text = handed_back(&observation(), &Verdict::Completed);
         assert!(!text.to_lowercase().contains("did not declare"), "{text}");
         assert!(!text.contains("DONE"), "{text}");
-        // Where the promise was made and the artifacts disagree, it still says so.
         let mut absent = observation();
         absent.pr = Observed::Absent;
         let uncorroborated = handed_back(&absent, &Verdict::Uncorroborated(vec!["PR open".into()]));
         assert!(uncorroborated.contains("DONE promised"), "{uncorroborated}");
     }
-
-    // --- the account that leaves the host ------------------------------------------------------
 
     fn commented(observation: &Observation, verdict: &Verdict) -> String {
         job_comment(&facts_of(
@@ -1683,7 +1597,6 @@ mod tests {
             assert!(terminal.contains(claim), "the Handback drops `{claim}`");
             assert!(markdown.contains(claim), "the comment drops `{claim}`");
         }
-        // And the comment says which host is holding the Run state it points at.
         assert!(markdown.contains("snapper.local"), "{markdown}");
     }
 
@@ -1716,13 +1629,6 @@ mod tests {
 
     #[test]
     fn the_comment_renders_at_every_one_of_the_five_terminal_states() {
-        // completed, uncorroborated, unobserved, exhausted and blocked. Exhaustion reads as an
-        // incomplete verdict over a Run whose budget ran out, and a Blocker rides the same line.
-        //
-        // **Each case asserts what only that state says.** The Run name and the table header are
-        // state-invariant, so a guard built from those two passes on all five even when the one
-        // line that tells them apart has gone — and `exhausted` and `blocked` are the same
-        // verdict, differing only by the parenthetical.
         let mut absent = observation();
         absent.pr = Observed::Absent;
         let each: [(&str, String, &[&str], &[&str]); 5] = [
@@ -1792,14 +1698,6 @@ mod tests {
 
     #[test]
     fn no_rendered_comment_contains_a_reason_built_by_reason_of() {
-        // `Reason::of` composes `<call site>: exit N: <first stderr line>`, so a reason is raw
-        // child stderr — and a misprovisioned host is exactly where an HTTPS `origin` embeds a
-        // token. An observation that could not be made shows its mark and nothing else.
-        //
-        // **The verdict is composed, never authored.** The earlier shape of this test hand-wrote
-        // its blind vector as `vec!["PR open: x"]`, which is a sanitised input: the leak was on
-        // the verdict line, built by `decide::verdict` out of the very `Reason` this test
-        // constructs, and a guard holding a literal cannot reach it.
         let mut blind = could_not_look();
         blind.base_drift = Observed::Unobservable(Reason::saying("git symbolic-ref: exit 1"));
         let markdown = commented_from(&blind);
@@ -1810,9 +1708,7 @@ mod tests {
             markdown.contains(UNOBSERVABLE_MARK),
             "the mark still shows:\n{markdown}"
         );
-        // The signal name survives — the reader off-host is told *which* observation is missing.
         assert!(markdown.contains("unobserved — PR open"), "{markdown}");
-        // And the Handback, on the host where the human already has them, still prints reasons.
         let on_host = handed_back(
             &blind,
             &crate::decide::verdict(&crate::decide::signals_of(&blind), false),
@@ -1844,8 +1740,6 @@ mod tests {
             assert!(markdown.contains(named), "the comment drops `{named}`");
         }
         assert!(markdown.contains("4 spawned, 4 returned"), "{markdown}");
-        // The draft flag travels with the URL: the Handback's `draft` row never leaves the
-        // host, and this comment is all the off-host triage gets.
         let mut draft = observation();
         draft.pr = Observed::Present(Pr {
             number: 30,
@@ -1869,7 +1763,6 @@ mod tests {
 
     #[test]
     fn nothing_in_the_comment_is_a_summary_boolean_or_a_quality_word() {
-        // A public surface is bound at least as hard as a private one.
         let markdown = commented(&observation(), &Verdict::Completed).to_lowercase();
         for banned in [
             "rejected",
@@ -1886,8 +1779,6 @@ mod tests {
 
     #[test]
     fn nothing_the_handback_renders_is_a_summary_boolean() {
-        // `tree clean  true` is a three-valued observation of one named fact, which is the
-        // opposite of a fold. What must not exist is a word standing over the rest of them.
         let text = handed_back(&observation(), &Verdict::Completed).to_lowercase();
         for banned in [" ok ", "healthy", "passing", "all good", "everything"] {
             assert!(!text.contains(banned), "`{banned}`:\n{text}");
@@ -1937,7 +1828,6 @@ mod tests {
 
     #[test]
     fn no_rendered_string_carries_a_quality_word_for_a_verdict() {
-        // ADR-0003 is enforceable as a variant set and as the strings that name those variants.
         let surfaces = [
             rendered(&observation(), &live(3), &Verdict::Completed),
             rendered(
@@ -1977,8 +1867,6 @@ mod tests {
         assert!(text.contains("this host only"));
         assert!(text.contains("no Runs here"));
     }
-
-    // --- Grit surfaces: the stage table, decision receipts, calibration and outcome -----------
 
     fn stages_two() -> Vec<StageEntry> {
         vec![

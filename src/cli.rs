@@ -55,23 +55,14 @@ pub fn run() -> i32 {
             0
         }
         ["run", issue] => finish(supervisor::dispatch(issue)),
-        // **Before** the generic arm: slice patterns match by position, so that one would
-        // otherwise bind `run_id = "--all"` and dispatch it as a run id.
         ["resume", "--all"] => resume_all(),
         ["resume", run_id] => finish(supervisor::resume(run_id)),
-        // The rest of argv joined is the note, so an unquoted multi-word note works. An
-        // empty rest still matches and refuses in `supervisor`, where the state check lives.
         ["cleared", run_id, note @ ..] => cleared(run_id, &note.join(" ")),
         ["status"] => status_roster(),
         ["status", run_id] => status_one(run_id),
         ["doctor"] => doctor(),
-        // **Before** the generic fallthrough, for the same reason `resume --all` is: slice
-        // patterns match by position, so unparsed flags would otherwise be read as tokens of
-        // an unknown command instead of parsed.
         ["serve", rest @ ..] => serve_dashboard(rest),
         ["outcomes"] => outcomes(),
-        // No `list`. A bare status that resolves to one Run is Grind selecting, and the repair
-        // *"pick the one in flight"* would pick a zombie.
         other => refuse(&format!("unknown command: {}", other.join(" "))),
     }
 }
@@ -89,8 +80,6 @@ const USAGE: &str = "grind — dispatch and supervise headless Runs against a Jo
     grind --version         which copy of the binary is this
 ";
 
-// --- run and resume ---------------------------------------------------------------------------
-
 fn finish(outcome: Result<supervisor::Outcome, Refusal>) -> i32 {
     let outcome = match outcome {
         Ok(outcome) => outcome,
@@ -102,18 +91,9 @@ fn finish(outcome: Result<supervisor::Outcome, Refusal>) -> i32 {
     if outcome.already_completed {
         print(&format!("run already {}\n", outcome.state));
     }
-    // The Handback is composed from a **fresh** read, not from anything the loop was holding.
     let Some(home) = world::home() else {
         return INCOHERENT_INPUT;
     };
-    // The verdict the Handback prints and the verdict the process exits on are **one
-    // computation**, gathered by the same function the supervisor's terminal comment uses. It
-    // used to be computed twice, moments apart, and spent on an exit code while the projection
-    // printed the recorded state instead.
-    //
-    // A record that cannot be found or read here is itself a failure to observe — the Handback
-    // this command exists to produce never got composed, so a bare `0` would tell a caller
-    // checking `$?` that everything answered when nothing did.
     let Some(facts) = view::gather(&home, &outcome.run_id) else {
         return Observability::CouldNotAnswer.code();
     };
@@ -166,8 +146,6 @@ fn resume_all() -> i32 {
     }
     Observability::Answered.code()
 }
-
-// --- outcomes ----------------------------------------------------------------------------------
 
 /// The human-initiated post-merge collector (ADR-0012 permits no watcher). For every Run on
 /// this host it reads the record **read-only**, through `view::RunView` — never the writer type,
@@ -296,8 +274,6 @@ fn followup_issues(
     if remote.code != Some(0) {
         return Vec::new();
     }
-    // One search over both facts the design names: issues mentioning the PR's number and
-    // issues naming one of its changed paths, bounded to those filed since the merge day.
     let mut terms = vec![pr_number.to_string()];
     terms.extend(run_paths.iter().map(|p| format!("\"{p}\"")));
     let mut search = terms.join(" OR ");
@@ -321,8 +297,6 @@ fn followup_issues(
     }
     observe::followup_issues(&out.stdout)
 }
-
-// --- status ------------------------------------------------------------------------------------
 
 /// Bare `grind status` prints the roster and **never resolves to a single Run**.
 fn status_roster() -> i32 {
@@ -349,8 +323,6 @@ fn status_one(run_id: &str) -> i32 {
         return INCOHERENT_INPUT;
     };
     match view::load(&home, run_id) {
-        // A Run on another box sends the operator to its Job issue rather than looking like a
-        // typo, and answering that *is* answering.
         Lookup::NotHere => {
             print(&render::not_here(run_id, &hostname()));
             Observability::Answered.code()
@@ -380,7 +352,6 @@ fn status_one(run_id: &str) -> i32 {
                 cleared: found.clearances.last(),
                 run_state: &view::record_path(&home, run_id),
             }));
-            // Derived from what could be observed. There is no path from the verdict to here.
             if matches!(verdict, decide::Verdict::Unobserved(_)) {
                 Observability::CouldNotAnswer.code()
             } else {
@@ -418,8 +389,6 @@ fn live_for(home: &Path, run_id: &str, found: &view::RunView) -> view::Live {
         }
     }
 }
-
-// --- serve -------------------------------------------------------------------------------------
 
 /// Serve the dashboard. The kernel prints its own startup line; `Ok` here only means it
 /// answered until the operator stopped it, and a bind failure leaves in the could-not-answer
@@ -474,8 +443,6 @@ fn refuse(said: &str) -> i32 {
     INCOHERENT_INPUT
 }
 
-// --- doctor -------------------------------------------------------------------------------------
-
 /// The driver: walk `job`'s item list, call `world` per item, hand the raw triples to `observe`,
 /// and pass each item's name and depth mark **alongside** its classified result to `render`.
 /// That is what keeps `render` composition-only, with no edge to the list.
@@ -513,8 +480,6 @@ fn doctor() -> i32 {
                 | Observed::Absent
         )
     });
-    // A failed host check is incoherent input, not a judgement. It is also not a gate: nothing
-    // downstream consults this code.
     if unmet { INCOHERENT_INPUT } else { 0 }
 }
 
@@ -602,10 +567,6 @@ fn check_with_probe(
                 .collect();
             observe::skills_present(&names)
         }
-        // Spelled `cfg!` rather than `std::env::consts::OS`, which is the idiomatic runtime
-        // spelling: `tests/topology.rs` string-matches the literal `std::env` and asserts only
-        // `world` names it, so the idiom would turn `just verify` red on a carrier that must
-        // pass unrelaxed.
         Check::BootOneShot => {
             let asked = if cfg!(target_os = "macos") {
                 Some((
@@ -613,11 +574,6 @@ fn check_with_probe(
                     observe::Fires::AtLogin,
                 ))
             } else if cfg!(target_os = "linux") {
-                // **Conjunctive.** `systemctl --user is-enabled` returns enabled purely from the
-                // symlink, with or without linger — and without `loginctl enable-linger` a
-                // `--user` unit's systemd instance does not start until first login, which on a
-                // headless box is never. Asking only the first half is the same silent-pass
-                // shape this check was added to prevent, one layer down.
                 Some((
                     format!(
                         "systemctl --user is-enabled {BOOT_ONE_SHOT_UNIT} >/dev/null 2>&1 && \
@@ -629,7 +585,6 @@ fn check_with_probe(
                 None
             };
             match asked {
-                // Read-only on both platforms: doctor never performs a write to prove a step.
                 Some((command, fires)) => observe::boot_one_shot(
                     &world::run(&words(&["sh", "-c", &command]), None),
                     fires,
@@ -646,7 +601,6 @@ fn check_with_probe(
             if named.is_empty() {
                 return observe::ssh_key_passphraseless(None, None);
             }
-            // A read, never a write: doctor performs no write to prove a step.
             let probe = world::run(&words(&["ssh-keygen", "-y", "-P", "", "-f", &named]), None);
             observe::ssh_key_passphraseless(Some(&named), Some(&probe))
         }
@@ -668,20 +622,10 @@ fn check_with_probe(
             )),
             None => observe::unchecked("no declared clone to read an origin from"),
         },
-        // Presence only, and the values are never printed anywhere (ADR-0017): `world::var`
-        // answers *set or unset*, which is all this check is allowed to know.
         Check::AgentKeyPresent => observe::agent_key_present(
             world::var("OPENROUTER_API_KEY").is_ok(),
             world::var("OPENAI_API_KEY").is_ok(),
         ),
-        // Both backends' readiness, regardless of which is declared (R9). Doctor takes no Job,
-        // so this reads the **declared** selection at `~/.grind/agent` — never a "selected"
-        // one — and probes its declared base URL (the default when no override is declared),
-        // never the hardcoded default regardless of what is declared: the base-url token
-        // exists to support self-hosting, and probing the default defeats that. An unreadable
-        // or unparseable agent file is unobservable rather than guessed at, on the same
-        // reasoning as every other doctor row; a key that resolves nothing leaves the probe
-        // untried either way, and `endpoint_reachable` says so.
         Check::EndpointReachable => {
             observe::endpoint_reachable(probe_declared_endpoint(job::read_selection(home), probe))
         }
@@ -751,9 +695,6 @@ mod tests {
 
     #[test]
     fn a_claude_code_run_is_unaffected_by_the_native_branch() {
-        // No filesystem to touch: the fixture's worktree/session do not exist on this box, and
-        // `live_for` must still take exactly the `claude::live` path it always did, over the
-        // same transcript path, rather than routing through the native branch's freshness scan.
         let found = found_with_backend("claude-code");
         let home = Path::new("/nowhere/that/exists");
         let live = live_for(home, &found.run_id, &found);
@@ -761,18 +702,12 @@ mod tests {
             live.transcript,
             claude::transcript_path(home, &found.worktree, &found.session_id)
         );
-        // Unaffected also means unaffected in *how* it fails: the same shape a broken
-        // claude-code transcript path always produced, never anything the native reader says.
         assert!(matches!(live.freshness, Observed::Unobservable(_)));
         assert!(matches!(live.now_skill, Observed::Unobservable(_)));
     }
 
     #[test]
     fn a_native_run_reads_its_own_transcript_and_not_only_its_freshness() {
-        // The floor this replaces answered `freshness` and nothing else, so `grind status`
-        // exited *Answered* over a blank panel — for the one command
-        // `docs/agents/run-observation.md` names as the way to ask what a Run is doing. The
-        // fixture is hand-written `messages-N.jsonl`, exactly what `NativeAdapter` appends.
         let found = found_with_backend("native");
         let home = world::temp_dir("cli-live-for-native");
         let run_dir = job::runs_dir(&home).join(&found.run_id);
@@ -798,16 +733,11 @@ mod tests {
             "{:?}",
             live.freshness
         );
-        // The rung, from the row the loop writes before its first request.
         assert_eq!(live.now_skill, Observed::Present("work".to_string()));
-        // *Doing* is the last thing the assistant authored — a tool call, which is what an
-        // attempt in flight consists of. The tool *result* is not it: that is the world talking.
         assert_eq!(
             live.assistant_now,
             Observed::Present(r#"bash {"command":"just verify"}"#.to_string())
         );
-        // Three lines always — `claude::last_words`' own fixed shape, padded at the end when
-        // the transcript is shorter than the block, and tool results included.
         assert_eq!(
             live.last_words,
             vec![
@@ -816,14 +746,11 @@ mod tests {
                 String::new(),
             ]
         );
-        // Fan-out stays *could not observe*, and the reason says why rather than pointing at
-        // unfinished work: this loop has no tool to spawn a subagent with.
         assert!(
             matches!(live.fanout, Observed::Unobservable(_)),
             "{:?}",
             live.fanout
         );
-        // The panel names the file that was read, not the directory it was found in.
         assert_eq!(live.transcript, run_dir.join("messages-1.jsonl"));
 
         world::remove_tree(&home);
@@ -831,9 +758,6 @@ mod tests {
 
     #[test]
     fn a_native_transcript_of_nothing_recognisable_is_absent_and_never_a_crash() {
-        // A file whose lines are not `TranscriptEvent`s at all — the shape a format drift would
-        // leave. Every field degrades on its own and `freshness` still answers off the mtime,
-        // because the file exists whatever is in it.
         let found = found_with_backend("native");
         let home = world::temp_dir("cli-live-for-native-garbage");
         let run_dir = job::runs_dir(&home).join(&found.run_id);
@@ -857,8 +781,6 @@ mod tests {
     fn the_exit_code_reports_whether_status_could_answer_and_never_how_the_run_is_doing() {
         assert_eq!(Observability::Answered.code(), 0);
         assert_ne!(Observability::CouldNotAnswer.code(), 0);
-        // Neither of these takes a verdict, and there is no conversion from one in existence.
-        // An unhealthy Run whose every signal was observed answers, and answering is a zero.
     }
 
     #[test]
@@ -869,8 +791,6 @@ mod tests {
 
     #[test]
     fn the_surface_is_eight_shapes_and_none_of_them_is_list() {
-        // A bare status that resolves to one Run is Grind selecting, and the repair
-        // "pick the one in flight" would pick a zombie.
         assert!(!USAGE.contains("grind list"));
         assert!(!USAGE.contains("latest if omitted"));
         for shape in [
@@ -887,8 +807,6 @@ mod tests {
         }
         assert!(USAGE.contains("roster when bare"));
         assert!(USAGE.contains("pull-only"));
-        // Not a boot verb — that names a command after its caller. Not a bare `resume` either:
-        // a typo would mutate every branch on the host.
         assert!(!USAGE.contains("grind boot"));
         assert!(!USAGE.contains("grind resume\n"));
     }
@@ -940,9 +858,6 @@ mod tests {
 
     #[test]
     fn an_unreadable_agent_declaration_never_guesses_the_endpoint() {
-        // "doctor must never guess": an unreadable or unparseable `~/.grind/agent` must not
-        // fall back to probing the default base URL as though that had been declared — it
-        // must not probe at all, so the closure below must never run.
         let probed = probe_declared_endpoint(
             Err("could not read /nowhere/.grind/agent: permission denied".to_string()),
             |_endpoint| panic!("must never probe when the declared selection could not be read"),
@@ -952,14 +867,6 @@ mod tests {
 
     #[test]
     fn the_driver_answers_for_every_item_on_the_list() {
-        // Without this wiring the host requirements have no home: `job` ships the list and its
-        // classifiers, and nothing else walks it.
-        //
-        // `check_with_probe` with a fake probe, never `check`: `EndpointReachable` is on this
-        // list, and `check` wires in the real `net::probe_endpoint`, a live 5-second outbound
-        // request whenever this test's process happens to carry a provider key. The fake never
-        // touches a socket, so this test's answer cannot depend on what is in the environment
-        // it happens to run in.
         let home = Path::new("/nowhere/that/exists");
         for item in job::host_items() {
             let outcome = check_with_probe(home, &[], item.check, |_endpoint| false);

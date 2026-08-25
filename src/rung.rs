@@ -287,8 +287,6 @@ mod tests {
 
     #[test]
     fn a_gap_with_a_later_stage_complete_still_resumes_the_earliest_absent_one() {
-        // Re-entry semantics: a later return existing does not skip over an earlier stage that
-        // never wrote one at all.
         let returns = StageReturns {
             plan: Some(complete()),
             work: Some(complete()),

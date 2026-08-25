@@ -180,7 +180,6 @@ impl Selection {
             };
         }
 
-        // The base-url positional: a bare (no `=`) token immediately after the backend.
         let mut endpoint_override = None;
         if let Some(first) = tokens.first()
             && !first.contains('=')
@@ -239,8 +238,6 @@ impl Selection {
             }
         }
 
-        // `model=` sets both classes at once; an explicit `fast=`/`strong=` overrides it
-        // individually.
         let fast_model = fast.or_else(|| model.clone());
         let strong_model = strong.or(model);
 
@@ -517,7 +514,6 @@ mod tests {
             "the api key leaked into Debug output: {printed}"
         );
         assert!(printed.contains("<redacted>"), "{printed}");
-        // The non-secret fields are still useful for diagnosis.
         assert!(printed.contains("https://example.test/v1"), "{printed}");
         assert!(printed.contains("some/model"), "{printed}");
     }
@@ -532,7 +528,6 @@ mod tests {
         };
         let line = event.encode();
         assert!(!line.ends_with('\n'), "{line:?}");
-        // Still a single valid JSON value on that one line.
         let _: serde_json::Value = serde_json::from_str(&line).expect("encode produced JSON");
     }
 
@@ -542,7 +537,6 @@ mod tests {
             key_for(Some("or-key".into()), None, false),
             Ok("or-key".into())
         );
-        // It also pays for a declared one — the operator said where it goes.
         assert_eq!(
             key_for(Some("or-key".into()), Some("oa-key".into()), true),
             Ok("or-key".into())
@@ -576,8 +570,6 @@ mod tests {
         assert!(refused.contains("no OPENROUTER_API_KEY"), "{refused}");
     }
 
-    // --- the extended agent-line grammar (unit 2) -------------------------------------------
-
     #[test]
     fn a_bare_native_line_still_parses_with_no_overrides() {
         let s = Selection::parse_line("native").expect("bare native");
@@ -590,7 +582,6 @@ mod tests {
 
     #[test]
     fn the_bare_base_url_positional_still_parses_backward_compatibly() {
-        // ADR-0017's original grammar: `native <base-url>`, no `=` in sight.
         let s = Selection::parse_line("native https://example.invalid/v1").expect("bare url");
         assert_eq!(
             s.endpoint_override.as_deref(),
@@ -690,8 +681,6 @@ mod tests {
         );
     }
 
-    // --- StageModel (unit 1) -----------------------------------------------------------------
-
     #[test]
     fn claude_code_arg_maps_pinned_verbatim_fast_to_the_alias_strong_to_no_flag() {
         assert_eq!(
@@ -710,8 +699,6 @@ mod tests {
 
     #[test]
     fn native_id_never_injects_the_claude_alias_and_falls_back_to_default() {
-        // The Unit 1 defect: a fast-routed stage must never send "claude-sonnet-5" to an
-        // OpenAI-compatible endpoint.
         let fast = StageModel::Class(ModelClass::Fast);
         assert_eq!(fast.native_id(None, None), DEFAULT_MODEL);
         assert_eq!(

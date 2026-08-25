@@ -245,8 +245,6 @@ mod tests {
 
     #[test]
     fn polling_self_reschedules_and_never_intervals() {
-        // setTimeout drives every poll beat; setInterval belongs to the one-second
-        // ticker alone.
         assert!(JS.contains("setTimeout"));
         let beats = JS.matches("setInterval").count();
         assert_eq!(beats, 1, "exactly one interval (the ticker), found {beats}");

@@ -73,7 +73,6 @@ const LOG_TAIL: usize = 64 * 1024;
 /// `BadRequest`; anything that smells like a traversal or a character outside the
 /// filesystem-safe set is `NotFound` (existence register, R7) so probes learn nothing.
 pub fn parse_request(bytes: &[u8]) -> Result<Request, Status> {
-    // One tolerated leading CRLF (clients sometimes send a stray one after pipelining).
     let bytes = bytes.strip_prefix(b"\r\n").unwrap_or(bytes);
 
     let head_end = find(bytes, b"\r\n\r\n").ok_or(Status::BadRequest)?;
@@ -303,11 +302,6 @@ fn evidence_allowed(file: &str) -> bool {
     if WHOLE.contains(&file) {
         return true;
     }
-    // One `<prefix><digits><suffix>` rule, applied to every name an adapter actually writes.
-    // The list grew twice and the route did not follow either time: the native adapter writes
-    // `messages-N.jsonl` instead of the claude trio — and the dashboard links it — while reflect
-    // now runs through the seam too and writes the `reflect-` pair. Every one of those links
-    // resolved to a 404 on a route whose whole job is serving the evidence behind them.
     const NUMBERED: [(&str, &[&str]); 4] = [
         ("attempt-", &SPAWNED),
         ("reflect-", &SPAWNED),
@@ -416,7 +410,6 @@ pub fn serve(home: &Path, host: &str, port: u16) -> Result<(), String> {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let home = home.to_path_buf();
-        // One thread per connection; a dead client must never reach the accept loop.
         std::thread::spawn(move || handle(stream, &home));
     }
     Ok(())
@@ -465,7 +458,6 @@ fn handle(mut stream: TcpStream, home: &Path) {
     }
 
     if find(&buf, b"\r\n\r\n").is_none() {
-        // Read cap exhausted with no complete head: not a legal request, say 400.
         write_all(&stream, &frame(&plain(Status::BadRequest)));
         return;
     }
@@ -578,7 +570,6 @@ fn http_date(t: SystemTime) -> String {
     let days = secs.div_euclid(86_400);
     let seconds_of_day = secs.rem_euclid(86_400);
 
-    // Civil-from-days (Hinnant 2012): valid over the full range we can ever print.
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -590,7 +581,6 @@ fn http_date(t: SystemTime) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { year + 1 } else { year };
 
-    // 1970-01-01 was a Thursday (index 4 with Sunday = 0).
     let weekday = (days.rem_euclid(7) + 4) % 7;
     format!(
         "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
@@ -719,7 +709,6 @@ mod tests {
 
     #[test]
     fn the_encoded_separator_stays_inside_one_segment_and_dies_on_charset() {
-        // %2F must not become a path separator after decoding.
         assert_eq!(parse_request(&get("/f%2Froster")), Err(Status::NotFound));
     }
 
@@ -798,7 +787,6 @@ mod tests {
     #[test]
     fn an_unknown_or_damaged_run_is_an_html_404_that_leaks_nothing() {
         let home = scratch("serve-404");
-        // A neighbouring record that does not parse costs itself and nothing else.
         plant(&home, "20260807-000000-junk-01", "{not a record");
         for target in [
             "/runs/20260806-999999-nowhere-99",
@@ -816,8 +804,6 @@ mod tests {
     #[test]
     fn the_sort_and_dir_parameters_reorder_the_board_server_side() {
         let home = scratch("serve-sort");
-        // Directory order (the default) puts `zulu` first; sorting by id or activity
-        // must be able to disagree with it.
         plant(
             &home,
             "m-alpha",
@@ -874,7 +860,6 @@ mod tests {
 
     #[test]
     fn the_log_delta_serves_the_requested_window_mid_file() {
-        // 404 lands mid-tile: the window opens on the '4' of the fifth tile.
         let (resp, _) = poll_log("serve-log-mid", Some("o=404"), "0123456789".repeat(100));
         assert_eq!(resp.body.len(), 596);
         assert!(resp.body.starts_with(b"456789"));
@@ -956,9 +941,6 @@ mod tests {
             "attempt-12.prompt.txt",
             "attempt-12.stdout.json",
             "attempt-12.stderr.log",
-            // Reflect runs through the seam too, and the native adapter writes its own
-            // transcripts instead of the claude trio. The dashboard links these; the route
-            // must serve them.
             "reflect-3.prompt.txt",
             "reflect-3.stdout.json",
             "reflect-3.stderr.log",
@@ -1000,7 +982,6 @@ mod tests {
             let resp = route(&parse_request(&get(&target)).unwrap(), &home);
             assert_eq!(resp.status, Status::NotFound, "{name}");
         }
-        // A planted-but-unlisted file still reads as not-here.
         world::write_atomic(&run_dir.join("run.json.bak"), "stale").unwrap();
         let resp = route(
             &parse_request(&get("/raw/runs/abc/run.json.bak")).unwrap(),
@@ -1012,13 +993,10 @@ mod tests {
 
     #[test]
     fn traversal_never_reaches_the_raw_handler() {
-        // The parser refuses dot segments before routing; nothing downstream has to
-        // re-check them.
         assert_eq!(
             parse_request(&get("/raw/runs/abc/../../etc/passwd")),
             Err(Status::NotFound)
         );
-        // A missing whitelisted file is also a plain not-here.
         let home = scratch("serve-raw-gone");
         let resp = route(
             &parse_request(&get("/raw/runs/abc/supervisor.log")).unwrap(),
@@ -1075,8 +1053,6 @@ mod tests {
 
     #[test]
     fn traversal_through_the_reflect_prefix_never_reaches_the_filesystem() {
-        // The parser refuses dot segments per-segment before routing; the prefix rule
-        // adds nothing that could reopen that hole.
         for target in [
             "/raw/runs/abc/stages/reflect/jobs/../secrets.env",
             "/raw/runs/abc/stages/reflect/jobs/%2e%2e/secrets.env",
@@ -1110,8 +1086,6 @@ mod tests {
         world::create_dir_all(&reflect.join("jobs").join("sub")).unwrap();
         world::write_atomic(&reflect.join("other").join("x.md"), "planted").unwrap();
         world::write_atomic(&reflect.join("jobs").join("sub").join("deep.md"), "planted").unwrap();
-        // Other stages stay dark, as do other directories under stages/reflect, deeper
-        // nesting inside an allowed directory, and an absent file in an allowed one.
         for target in [
             "/raw/runs/abc/stages/plan/jobs/x.md",
             "/raw/runs/abc/stages/skills/diffs/x.patch",
@@ -1199,11 +1173,9 @@ mod tests {
         let date = http_date(SystemTime::UNIX_EPOCH);
         assert_eq!(date, "Thu, 01 Jan 1970 00:00:00 GMT");
 
-        // 2038-01-19T03:14:07Z — the signed-32-bit cliff, still correct here.
         let t = UNIX_EPOCH + Duration::from_secs(2_147_483_647);
         assert_eq!(http_date(t), "Tue, 19 Jan 2038 03:14:07 GMT");
 
-        // Leap years land on the right days: 2024-02-29.
         let t = UNIX_EPOCH + Duration::from_secs(1_709_164_800);
         assert_eq!(http_date(t), "Thu, 29 Feb 2024 00:00:00 GMT");
 

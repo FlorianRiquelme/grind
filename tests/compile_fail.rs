@@ -49,7 +49,7 @@ fn newest_rlib_per_crate(deps: &Path) -> Vec<(String, PathBuf)> {
                 .map_or(stem, |(base, _)| base)
                 .to_string();
             if base == "grind" {
-                return None; // the scratch crate *is* grind; never extern itself
+                return None;
             }
             fs::metadata(&p)
                 .and_then(|m| m.modified())
@@ -57,8 +57,6 @@ fn newest_rlib_per_crate(deps: &Path) -> Vec<(String, PathBuf)> {
                 .map(|t| (base, t, p))
         })
         .collect();
-    // Name groups together, newest first inside a group; the dedup below keeps the first —
-    // the newest — rlib of each crate.
     newest.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
     newest.dedup_by(|a, b| a.0 == b.0);
     newest
@@ -72,7 +70,6 @@ fn scratch_crate(name: &str) -> PathBuf {
     let root = deps_dir().join("grind-compile-fail").join(name);
     let _ = fs::remove_dir_all(&root);
     copy_tree(&manifest_dir().join("src"), &root);
-    // `main.rs` is the binary's, not the library's, and it would be a second crate root.
     let _ = fs::remove_file(root.join("main.rs"));
     root
 }
@@ -123,9 +120,6 @@ fn compile(root: &Path) -> Output {
         .arg(root.join("out"))
         .arg("-L")
         .arg(format!("dependency={}", deps.display()));
-    // Every crate the library names must resolve: the newest rlib of each stands in when
-    // several versions sit in deps/. Derived as a set, so the harness never has to name
-    // crates one by one as the module tree grows.
     for (name, path) in newest_rlib_per_crate(&deps) {
         command
             .arg("--extern")
@@ -141,8 +135,6 @@ fn diagnostics(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-// --- case 1: a read path reaching the writable record type ---------------------------------
-
 #[test]
 fn a_read_path_reaching_the_writable_record_type_does_not_compile() {
     let root = scratch_crate("read-path");
@@ -154,10 +146,7 @@ fn a_read_path_reaching_the_writable_record_type_does_not_compile() {
         !output.status.success(),
         "a sibling reaching the writable record type must not compile:\n{said}"
     );
-    // Codes, not message text: messages move between rustc releases and codes do not.
     assert!(said.contains("E0603"), "expected E0603, got:\n{said}");
-    // rustc offers no fix here, which is the property that makes the import undecidable rather
-    // than merely inconvenient.
     assert!(
         !said.to_lowercase().contains("help: consider making"),
         "rustc must offer no fix in the diagnostic:\n{said}"
@@ -166,9 +155,6 @@ fn a_read_path_reaching_the_writable_record_type_does_not_compile() {
 
 #[test]
 fn the_same_crate_with_the_record_type_made_crate_visible_compiles() {
-    // The control that makes the error above attributable to the sibling wall rather than to a
-    // typo. It is also the one-keyword repair the single-crate topology accepts, which is
-    // exactly why the case above is a test rather than a wall.
     let root = scratch_crate("crate-visible");
     let supervisor = read(&root, "supervisor")
         .replace("\nstruct RunRecord {", "\npub(crate) struct RunRecord {");
@@ -189,10 +175,6 @@ fn the_same_crate_with_the_record_type_made_crate_visible_compiles() {
 
 #[test]
 fn the_same_crate_with_the_read_path_nested_under_the_records_owner_compiles() {
-    // The arrangement ADR-0007 measured: descendants see their ancestors' private items, so the
-    // idiomatic tidy-up — "supervisor.rs and view.rs are both about the record, nest them under
-    // record/" — withdraws the carrier silently, by housekeeping. Asserted so the carrier's own
-    // premise stays checked rather than assumed.
     let root = scratch_crate("nested-child");
     let supervisor = read(&root, "supervisor");
     fs::create_dir_all(root.join("supervisor")).expect("a parent directory");
@@ -217,12 +199,8 @@ fn the_same_crate_with_the_read_path_nested_under_the_records_owner_compiles() {
     );
 }
 
-// --- case 2: a fifth completion signal dropped at the fold ----------------------------------
-
 #[test]
 fn a_fifth_signal_dropped_at_the_fold_does_not_compile() {
-    // Adding the field *inside* the scratch crate is what makes this expressible at all: from
-    // outside, an extra field on a constructor is `E0560` and the fold is unreachable.
     let root = scratch_crate("fifth-signal");
     let decide = read(&root, "decide").replace(
         "    pub pr_base_matches_declared: Observed<bool>,\n}",
@@ -249,8 +227,6 @@ fn a_fifth_signal_dropped_at_the_fold_does_not_compile() {
 
 #[test]
 fn the_unmodified_crate_compiles_the_same_way() {
-    // The baseline. Without it, a scratch crate that fails to compile for an unrelated reason
-    // would read as both cases passing.
     let root = scratch_crate("baseline");
     let output = compile(&root);
     assert!(

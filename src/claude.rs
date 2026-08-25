@@ -33,9 +33,6 @@ impl StageRunner for crate::runner::ClaudeCodeAdapter {
     fn run(&self, spec: &RunSpec) -> Attempt {
         let n = spec.attempt_n;
         let started_at = world::now_iso();
-        // How much of this session's transcript exists right now — read while the child is not
-        // running, so the file is quiescent and the last line is whole. A fresh session has
-        // nothing to skip; that is zero lines.
         let already_written = transcript_lines(&self.home, spec.worktree, spec.session_id);
         let prefix = spec.file_label.as_str();
         let outcome = run(
@@ -48,25 +45,15 @@ impl StageRunner for crate::runner::ClaudeCodeAdapter {
         let ended_at = world::now_iso();
         let attempt = match outcome {
             Ok(raw) => raw.classify(n, spec.invocation.mode(), &started_at, &ended_at),
-            Err(reason) => {
-                // Unrecoverable local IO before the child ever ran — the prompt write or the
-                // spawn itself failed (a full disk, or a `claude_bin` that is not executable).
-                // The seam is infallible by design, so this cannot unwind the supervisor the
-                // way a panic would: it is routed through the same classifier every other
-                // failed attempt goes through, with no stdout/stderr to read back, so
-                // `parse_ok` comes back false and `exit_code` stays absent. That is
-                // deliberate — `Attempt::is_wait` requires `parse_ok`, so this is never
-                // mistaken for a Wait that spends nothing and loops forever.
-                classify(
-                    &reason.to_string(),
-                    "",
-                    None,
-                    n,
-                    spec.invocation.mode(),
-                    &started_at,
-                    &ended_at,
-                )
-            }
+            Err(reason) => classify(
+                &reason.to_string(),
+                "",
+                None,
+                n,
+                spec.invocation.mode(),
+                &started_at,
+                &ended_at,
+            ),
         };
         attempt.with_fanout(fanout_of(
             &self.home,
@@ -243,8 +230,6 @@ fn build_stage(
             argv.push(session_id);
         }
     }
-    // No `--plugin-dir`: a stage invocation names no plugin.
-    // No `--max-budget-usd`: ADR-0010, spend is recorded, never bounded.
     argv.push("--disallowedTools".to_string());
     argv.extend(denied_for(ctx.stage));
     Invocation::build(argv, prompt, mode)
@@ -365,9 +350,6 @@ pub fn ci_babysit(conditions: &Conditions) -> Invocation {
     }
     argv.push("--resume".to_string());
     argv.push(conditions.session_id.to_string());
-    // No `--plugin-dir`: a stage invocation names no plugin (ADR-0015 retired the pin once
-    // nothing was left to invoke it). No `--max-budget-usd`: ADR-0010, spend is recorded,
-    // never bounded.
     argv.push("--disallowedTools".to_string());
     argv.extend(DENIED_TOOLS.iter().map(|glob| glob.to_string()));
     Invocation::build(argv, CI_BABYSIT_PROMPT.to_string(), Mode::CiBabysit)
@@ -422,8 +404,6 @@ pub fn run(
         stderr_path,
     )
     .map_err(|e| Reason::saying(&format!("could not spawn `claude`: {e}")))?;
-    // Read back what is already on disk, rather than what the parent buffered. Both streams:
-    // the classifier needs stderr to see a limit that killed the child before any JSON.
     let stdout = world::read_to_string(stdout_path).unwrap_or_default();
     let stderr = world::read_to_string(stderr_path).unwrap_or_default();
     Ok(RawAttempt {
@@ -461,11 +441,6 @@ pub fn classify(
     let parse_ok = parsed.is_some();
     let value = parsed.unwrap_or(serde_json::Value::Null);
 
-    // Absent is not the same fact as present-and-empty: `result.get` distinguishes a key that
-    // never arrived (a renamed or dropped field in an otherwise well-formed payload) from one
-    // that arrived null or empty. Folding the two together with `.unwrap_or_default()` is how
-    // a finished Run's DONE promise, sitting under a renamed key, read as `done_promise: false`
-    // indistinguishable from a session that truly said nothing.
     let result_present = value.get("result").is_some();
     let result = text_at(&value, "result").unwrap_or_default();
     let is_error = value
@@ -473,9 +448,6 @@ pub fn classify(
         .and_then(|v| v.as_bool())
         .unwrap_or(!parse_ok);
 
-    // The stdout half of the rate-limit haystack, computed once: the payload's `result` when
-    // one arrived, the raw stdout otherwise — the same slice the record keeps as its tail,
-    // so no second pass over the stream is needed.
     let stream_tail = tail(
         if parse_ok && result_present {
             &result
@@ -493,14 +465,6 @@ pub fn classify(
         exit_code: code,
         is_error,
         parse_ok,
-        // `subtype` already carries a synthetic value for one kind of drift
-        // (`unparseable-output`, when the whole payload did not parse); a missing `result` key
-        // gets its own synthetic value here rather than folding into that one. A single
-        // `Attempt` has no room for a new field without breaking the record's shape everywhere
-        // it is built by hand (ADR-0006's point about widening a record's vocabulary), and
-        // collapsing both drifts into one string would make a payload that parsed cleanly but
-        // renamed a field indistinguishable, in the operator-facing announce line, from a
-        // payload that never parsed at all — its own loss of information.
         subtype: if !parse_ok {
             Some("unparseable-output".to_string())
         } else if !result_present {
@@ -520,22 +484,10 @@ pub fn classify(
             .cloned()
             .unwrap_or_default(),
         done_promise: result.contains(DONE_PROMISE),
-        // The payload's own verdict first. The raw-streams fold runs only when the payload
-        // cannot speak — it never parsed, or the child exited non-zero without the payload
-        // itself carrying the 429 — so a healthy attempt is never rate-limited by noise on
-        // its stderr. `stream_tail` is the stdout half of that fold, the same tail the
-        // record keeps for diagnosis.
         rate_limited: is_rate_limited(&value)
             || ((!parse_ok || code.is_some_and(|c| c != 0))
                 && mentions_limit(&normalise(&format!("{stream_tail} {stderr}")))),
-        // The tail is kept whether or not the response parsed, so an unreadable child still
-        // leaves something diagnosable. A missing `result` key takes the same fallback as an
-        // unparseable payload, for the same reason: there is nothing under that key to show
-        // either way, and the raw stdout is the only thing left to look at.
         result_tail: stream_tail,
-        // Could not observe until somebody reads the transcript, which is `supervisor`'s job
-        // before it pushes the Attempt. A path that forgets records *could not observe* rather
-        // than `(0, 0)`, which is the honest direction for an omission.
         fanout: Observed::Unobservable(Reason::saying("the transcript was not read")),
     }
 }
@@ -573,8 +525,6 @@ fn tail(text: &str, characters: usize) -> String {
         .skip(count.saturating_sub(characters))
         .collect()
 }
-
-// --- the live view, read from an undocumented format -----------------------------------------
 
 /// Claude Code writes a session's transcript under a slug of the directory it ran in.
 ///
@@ -617,8 +567,6 @@ pub fn live(transcript: &Path, now_epoch: u64) -> Live {
         },
         last_words: match &text {
             Some(body) => last_words(body, 3),
-            // Still exactly three lines: the block's height is fixed so `watch` never jitters,
-            // and an unreadable transcript must not change the shape of the view.
             None => vec![String::new(); 3],
         },
         fanout: match &text {
@@ -687,9 +635,6 @@ pub fn now_skill(text: &str) -> Observed<String> {
     }
     match last {
         Some(skill) => Observed::Present(skill),
-        // The same *nothing recognised* rule the fan-out matcher carries. This field is not
-        // currently broken; the rule is what keeps it from breaking silently the way the
-        // fan-out one did.
         None => nothing_recognised(text, "attributionSkill"),
     }
 }
@@ -979,8 +924,6 @@ mod tests {
             file_label: crate::runner::FileLabel::Attempt,
         };
 
-        // Must not panic: the seam is infallible by design, and a panic here would abort the
-        // supervisor mid-ladder with no Attempt ever pushed.
         let attempt = StageRunner::run(&adapter, &spec);
 
         assert!(
