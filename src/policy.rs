@@ -197,6 +197,10 @@ fn parse_reset_hour(text: &str) -> Option<u32> {
 /// are matched as bare `HTTP <status>` substrings because that is the exact shape native.rs
 /// records into `terminal_reason`, and the whole reason is quoted back so a later
 /// `grind cleared` handback states what actually had to be cleared.
+/// **Checked before the budget guards in [`next`]:** a credential verdict burns every
+/// remaining attempt identically, so it must win over `Stop::Exhausted` even on the final
+/// allowed attempt — exhaustion there dies unactionable exactly when the clearance path is
+/// what a human needs.
 fn credential_blocker(terminal_reason: &str) -> Option<String> {
     for status in ["HTTP 401", "HTTP 402", "HTTP 403"] {
         if terminal_reason.contains(status) {
@@ -234,6 +238,13 @@ pub fn next(
             }
         }
         Verdict::Incomplete(_) => {
+            let credential = attempts
+                .last()
+                .and_then(|last| last.terminal_reason.as_deref())
+                .and_then(credential_blocker);
+            if let Some(blocked_on) = credential {
+                return Next::Stop(Stop::Blocked(blocked_on));
+            }
             if attempt::working(attempts) >= budget.attempts {
                 return Next::Stop(Stop::Exhausted);
             }
@@ -242,11 +253,7 @@ pub fn next(
             }
             match attempts.last() {
                 Some(last) if last.rate_limited => Next::SleepThenReenter(budget.limit_sleep),
-                Some(last) => match last.terminal_reason.as_deref().and_then(credential_blocker) {
-                    Some(blocked_on) => Next::Stop(Stop::Blocked(blocked_on)),
-                    None => Next::Reenter,
-                },
-                None => Next::Reenter,
+                _ => Next::Reenter,
             }
         }
     }
@@ -398,6 +405,24 @@ mod tests {
                 blocked_on.contains(status),
                 "the Blocker must quote the matched status line verbatim, got: {blocked_on}"
             );
+        }
+    }
+
+    #[test]
+    fn a_credential_refusal_on_the_final_allowed_attempt_blocks_rather_than_exhausting() {
+        for status in ["HTTP 401", "HTTP 402", "HTTP 403"] {
+            let mut attempts: Vec<Attempt> =
+                (1..=8).map(|n| attempt(n, Mode::Resume, false)).collect();
+            let last = attempts.last_mut().expect("the seeded final attempt");
+            last.terminal_reason = Some(format!(
+                "turn 1 failed: {status}: Missing Authentication header"
+            ));
+            let Next::Stop(Stop::Blocked(blocked_on)) =
+                next(&attempts, &incomplete(), &clear(), 0, &budget(8, 1800))
+            else {
+                panic!("the final allowed attempt's {status} must Block, not Exhaust");
+            };
+            assert!(blocked_on.contains(status), "{blocked_on}");
         }
     }
 
