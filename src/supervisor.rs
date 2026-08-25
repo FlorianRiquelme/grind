@@ -918,17 +918,33 @@ fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
     record.push_stage_entry(rung::StageEntry {
         name: "reflect".to_string(),
         session_id,
-        status: if classified.done_promise || classified.parse_ok {
-            ReturnStatus::Complete
-        } else {
-            ReturnStatus::Incomplete
-        },
+        status: reflect_status(classified.is_error),
         artifact_paths: Vec::new(),
         model: None,
         cost_usd: classified.total_cost_usd,
         turns: classified.num_turns,
     });
     let _ = record.save(path);
+}
+
+/// Reflect's own verdict on itself, from a fact that means the same thing on both adapters
+/// (issue #146). `parse_ok` used to stand in for "the stage worked" — but on the native
+/// adapter it is a constant `true`, so a Reflect that died at `turn budget exhausted (32)`
+/// recorded `complete` with nothing written. `is_error` is real everywhere: native sets it
+/// from the loop's `Ending::Failed` (which turn exhaustion is), and claude-code folds an
+/// unparseable payload into it (`parse_ok: false` ⇒ `is_error: true`).
+///
+/// Error takes precedence over the done-promise (CodeRabbit review): claude-code reads
+/// `done_promise` straight out of the payload's result text with no error guard, so an
+/// errored ending can still carry the sentinel — and a stage that ended in error has not
+/// completed, whatever it claimed mid-stream. With that precedence the promise can never
+/// flip an outcome, so it is deliberately not an input here.
+fn reflect_status(is_error: bool) -> ReturnStatus {
+    if is_error {
+        ReturnStatus::Incomplete
+    } else {
+        ReturnStatus::Complete
+    }
 }
 
 // --- the ladder walk (ADR-0015) -------------------------------------------------------------
@@ -2098,6 +2114,32 @@ mod tests {
             attempt::reflect_session_id(run),
             "reflect is not a rung, but its session must still be its own"
         );
+    }
+
+    #[test]
+    fn a_reflect_that_exhausts_its_turn_budget_is_incomplete_not_complete() {
+        // #146: the native adapter's `parse_ok` is a constant, so the old
+        // `done_promise || parse_ok` read every native Reflect as complete — including one
+        // that ended on `turn budget exhausted (32)` with nothing written. `is_error` is the
+        // fact both adapters set on such an ending.
+        assert_eq!(
+            reflect_status(true),
+            ReturnStatus::Incomplete,
+            "an errored ending — turn exhaustion, a crash — is not a complete stage"
+        );
+    }
+
+    #[test]
+    fn an_error_ending_takes_precedence_over_a_spoken_done_promise() {
+        // CodeRabbit review: claude-code reads `done_promise` out of the payload's result
+        // text with no error guard, so `{is_error: true, result: "... <promise>DONE</promise>"}`
+        // is a real shape. A stage that ended in error has not completed, whatever it claimed.
+        assert_eq!(reflect_status(true), ReturnStatus::Incomplete);
+    }
+    #[test]
+    fn a_reflect_that_spoke_for_itself_is_complete() {
+        // A clean ending — payload parsed, no error — is the one completion shape.
+        assert_eq!(reflect_status(false), ReturnStatus::Complete);
     }
 
     // --- the ladder walk's pure and near-pure pieces --------------------------------------
