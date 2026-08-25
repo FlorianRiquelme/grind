@@ -623,8 +623,8 @@ fn check_with_probe(
             None => observe::unchecked("no declared clone to read an origin from"),
         },
         Check::AgentKeyPresent => observe::agent_key_present(
-            world::var("OPENROUTER_API_KEY").is_ok(),
-            world::var("OPENAI_API_KEY").is_ok(),
+            agent_key_declared(world::var("OPENROUTER_API_KEY")),
+            agent_key_declared(world::var("OPENAI_API_KEY")),
         ),
         Check::EndpointReachable => {
             observe::endpoint_reachable(probe_declared_endpoint(job::read_selection(home), probe))
@@ -650,6 +650,16 @@ fn probe_declared_endpoint(
             .ok()
             .map(|endpoint| probe(&endpoint))
     })
+}
+
+/// Whether a provisioned key is actually present, for the doctor's `AgentKeyPresent` item.
+/// `world::var` reports a set-but-empty binding as `Ok("")`, and counting that as set would
+/// promise a credential dispatch refuses — an empty string is sent as a bare `Bearer ` header
+/// and answered with a deterministic `401 Missing Authentication header`. An empty value is
+/// therefore reported exactly like absence. Split out so the predicate is testable from
+/// literals without mutating process state.
+fn agent_key_declared(value: Result<String, String>) -> bool {
+    value.is_ok_and(|key| !key.is_empty())
 }
 
 fn config(key: &str) -> world::Completed {
@@ -863,6 +873,18 @@ mod tests {
             |_endpoint| panic!("must never probe when the declared selection could not be read"),
         );
         assert_eq!(probed, None);
+    }
+
+    #[test]
+    fn an_empty_agent_key_reads_as_unset_for_the_doctor() {
+        assert!(
+            !agent_key_declared(Ok(String::new())),
+            "a set-but-empty key must not promise a credential dispatch refuses"
+        );
+        assert!(agent_key_declared(Ok("or-key".to_string())));
+        assert!(!agent_key_declared(Err(
+            "OPENROUTER_API_KEY not set".to_string()
+        )));
     }
 
     #[test]

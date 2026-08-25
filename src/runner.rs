@@ -361,11 +361,19 @@ pub const DEFAULT_MODEL: &str = "deepseek/deepseek-chat-v3.1";
 /// disclosed to a third party the operator never chose, and a 401 they cannot explain. An
 /// explicitly declared endpoint is the operator saying where the key goes, so that is honored;
 /// the silent default is refused instead of guessed.
+///
+/// An empty value is not a credential. A set-but-empty `OPENROUTER_API_KEY` used to reach the
+/// match as `Some("")` and was sent as a bare `Bearer ` header, which OpenRouter answers with a
+/// deterministic `401 Missing Authentication header` on every attempt until the budget burns.
+/// Both keys are therefore filtered so an empty string falls through to the same refusals as
+/// absence, before any pairing rule is consulted.
 fn key_for(
     openrouter: Option<String>,
     openai: Option<String>,
     endpoint_declared: bool,
 ) -> Result<String, String> {
+    let openrouter = openrouter.filter(|key| !key.is_empty());
+    let openai = openai.filter(|key| !key.is_empty());
     match (openrouter, openai) {
         (Some(key), _) => Ok(key),
         (None, Some(key)) if endpoint_declared => Ok(key),
@@ -568,6 +576,32 @@ mod tests {
     fn no_key_at_all_is_its_own_refusal() {
         let refused = key_for(None, None, true).expect_err("a refusal");
         assert!(refused.contains("no OPENROUTER_API_KEY"), "{refused}");
+    }
+
+    #[test]
+    fn an_empty_openrouter_key_is_refused_like_absence_rather_than_sent_as_a_bare_bearer() {
+        let refused = key_for(Some("".into()), None, false).expect_err("a refusal");
+        assert!(refused.contains("OPENROUTER_API_KEY"), "{refused}");
+        assert_eq!(
+            refused,
+            key_for(None, None, false).expect_err("absence"),
+            "an empty key must reach the identical refusal as a missing one"
+        );
+    }
+
+    #[test]
+    fn an_empty_openai_key_keeps_the_disclosure_and_pairing_behavior_of_the_real_key() {
+        let refused = key_for(Some("".into()), Some("oa-key".into()), false)
+            .expect_err("an empty openrouter key never masks the disclosure refusal");
+        assert!(refused.contains(DEFAULT_BASE_URL), "{refused}");
+        let refused =
+            key_for(None, Some("".into()), true).expect_err("an empty openai key is absence");
+        assert!(refused.contains("no OPENROUTER_API_KEY"), "{refused}");
+        assert_eq!(
+            key_for(Some("or-key".into()), Some("".into()), false),
+            Ok("or-key".into()),
+            "a real openrouter key still wins over an empty openai one"
+        );
     }
 
     #[test]
