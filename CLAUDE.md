@@ -288,7 +288,7 @@ PR and yield without it. When its result delivers, read
 
 ```sh
 PR=000   # set to the number gh pr create just printed
-REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner); for i in $(seq 1 30); do C=$(gh api repos/$REPO/pulls/$PR/comments --jq 'length'); R=$(gh api repos/$REPO/pulls/$PR/reviews --jq '[.[] | select(.user.login=="coderabbitai[bot]")] | length'); if [ "$((C+R))" -gt 0 ]; then echo "CodeRabbit reviewed #$PR: $C inline comment(s)"; exit 0; fi; sleep 60; done; echo "TIMEOUT: no CodeRabbit review on #$PR after 30 min"
+REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner); for i in $(seq 1 30); do C=$(gh api --paginate repos/$REPO/pulls/$PR/comments --jq 'length'); R=$(gh api --paginate repos/$REPO/pulls/$PR/reviews --jq '[.[] | select(.user.login=="coderabbitai[bot]")] | length'); if [ "$((C+R))" -gt 0 ]; then echo "CodeRabbit reviewed #$PR: $C inline comment(s)"; exit 0; fi; sleep 60; done; echo "TIMEOUT: no CodeRabbit review on #$PR after 30 min"
 ```
 
 **Re-watching after a fix push needs a scoped filter.** The first watch runs when the PR has no
@@ -297,8 +297,8 @@ earlier head) and your own replies — GitHub records each reply as a review by 
 unscoped count false-triggers instantly on them. Scope to what is actually new:
 
 ```sh
-HEAD=$(git rev-parse HEAD); SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner); for i in $(seq 1 30); do R=$(gh api repos/$REPO/pulls/$PR/reviews --jq '[.[] | select(.user.login=="coderabbitai[bot]" and .commit_id=="'$HEAD'")] | length'); C=$(gh api repos/$REPO/pulls/$PR/comments --jq '[.[] | select(.in_reply_to_id == null and .created_at > "'$SINCE'")] | length'); if [ "$((C+R))" -gt 0 ]; then echo "CodeRabbit re-reviewed #$PR at ${HEAD:0:7}: $C new top-level comment(s)"; exit 0; fi; sleep 60; done; echo "SETTLED: no CodeRabbit re-review of ${HEAD:0:7} within 30 min"
+HEAD=$(git rev-parse HEAD); SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ); PR=$(gh pr view --json number -q .number)
+REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner); for i in $(seq 1 30); do R=$(gh api --paginate repos/$REPO/pulls/$PR/reviews --jq '[.[] | select(.user.login=="coderabbitai[bot]" and .commit_id=="'$HEAD'")] | length'); C=$(gh api --paginate repos/$REPO/pulls/$PR/comments --jq '[.[] | select(.in_reply_to_id == null and .created_at > "'$SINCE'")] | length'); if [ "$((C+R))" -gt 0 ]; then echo "CodeRabbit re-reviewed #$PR at ${HEAD:0:7}: $C new top-level comment(s)"; exit 0; fi; sleep 60; done; echo "SETTLED: no CodeRabbit re-review of ${HEAD:0:7} within 30 min"
 ```
 
 ### Issue tracker
