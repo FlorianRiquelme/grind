@@ -918,17 +918,29 @@ fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
     record.push_stage_entry(rung::StageEntry {
         name: "reflect".to_string(),
         session_id,
-        status: if classified.done_promise || classified.parse_ok {
-            ReturnStatus::Complete
-        } else {
-            ReturnStatus::Incomplete
-        },
+        status: reflect_status(classified.done_promise, classified.is_error),
         artifact_paths: Vec::new(),
         model: None,
         cost_usd: classified.total_cost_usd,
         turns: classified.num_turns,
     });
     let _ = record.save(path);
+}
+
+/// Reflect's own verdict on itself, from facts that mean the same thing on both adapters
+/// (issue #146). `parse_ok` used to stand in for "the stage worked" — but on the native
+/// adapter it is a constant `true`, so a Reflect that died at `turn budget exhausted (32)`
+/// recorded `complete` with nothing written. `is_error` is real everywhere: native sets it
+/// from the loop's `Ending::Failed` (which turn exhaustion is), and claude-code folds an
+/// unparseable payload into it (`parse_ok: false` ⇒ `is_error: true`). A spoken done-promise
+/// still completes on its own — it is the agent's claim about its work, and never set when
+/// the ending was an error.
+fn reflect_status(done_promise: bool, is_error: bool) -> ReturnStatus {
+    if done_promise || !is_error {
+        ReturnStatus::Complete
+    } else {
+        ReturnStatus::Incomplete
+    }
 }
 
 // --- the ladder walk (ADR-0015) -------------------------------------------------------------
@@ -2098,6 +2110,29 @@ mod tests {
             attempt::reflect_session_id(run),
             "reflect is not a rung, but its session must still be its own"
         );
+    }
+
+    #[test]
+    fn a_reflect_that_exhausts_its_turn_budget_is_incomplete_not_complete() {
+        // #146: the native adapter's `parse_ok` is a constant, so the old
+        // `done_promise || parse_ok` read every native Reflect as complete — including one
+        // that ended on `turn budget exhausted (32)` with nothing written. `is_error` is the
+        // fact both adapters set on such an ending.
+        assert_eq!(
+            reflect_status(false, true),
+            ReturnStatus::Incomplete,
+            "an errored ending — turn exhaustion, a crash — is not a complete stage"
+        );
+    }
+
+    #[test]
+    fn a_reflect_that_spoke_for_itself_is_complete() {
+        // A clean ending, and claude-code's folded case (`parse_ok: false` ⇒ `is_error`
+        // defaults true, so `!is_error` covers it): both are real completions.
+        assert_eq!(reflect_status(false, false), ReturnStatus::Complete);
+        // A spoken promise completes on its own — it never coexists with an error ending,
+        // but the field alone is the agent's own claim about its work.
+        assert_eq!(reflect_status(true, false), ReturnStatus::Complete);
     }
 
     // --- the ladder walk's pure and near-pure pieces --------------------------------------
