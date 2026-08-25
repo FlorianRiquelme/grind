@@ -8,7 +8,7 @@ executes plans the human is not present for, and stops at an open PR.
 - **`CONTEXT.md`** — the glossary. Job, Enqueue, Dispatch, Run, Handoff SHA, Anchor
   artifact, Handback and the rest are defined terms with explicit `_Avoid_` lists. Use them;
   don't drift to the synonyms they rule out.
-- **`docs/adr/`** — fifteen accepted decisions that constrain almost every change here.
+- **`docs/adr/`** — eighteen accepted decisions that constrain almost every change here.
 - **`docs/provisioned-host.md`** — what a host must guarantee before a Dispatch succeeds on
   it: the `~/.grind/` layout, the executables, the six credential steps, and which items are
   checked at dispatch, by `grind doctor`, or not at all. Read it before provisioning anything.
