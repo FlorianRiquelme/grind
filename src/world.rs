@@ -664,15 +664,18 @@ pub fn now_local_hour_minute() -> (u32, u32) {
 /// A unique scratch directory under the system temporary directory. Test scaffolding —
 /// `tests/topology.rs` keeps `std::fs` and `std::env` out of every other module, so the
 /// tests that need a throwaway clone ask here. The caller removes what it creates.
+///
+/// Uniqueness comes from a process-global counter rather than wall-clock time: two tests
+/// spawning concurrently can land inside the same nanosecond, and the loser's
+/// [`remove_tree`] then deletes the winner's fixture mid-write.
 #[cfg(test)]
 pub fn temp_dir(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
         "grind-test-{tag}-{}-{}",
         std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(&path).expect("a scratch directory");
     path
