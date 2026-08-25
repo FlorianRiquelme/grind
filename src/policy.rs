@@ -185,6 +185,33 @@ fn parse_reset_hour(text: &str) -> Option<u32> {
     (hour < 24).then_some(hour)
 }
 
+/// The Blocker a terminal reason earns when it names one of the three credential statuses,
+/// carrying the reason verbatim; anything else reads as transient and gets `None`.
+///
+/// **Why these three:** HTTP 401, 402 and 403 are verdicts on *the credential* itself — a
+/// missing or revoked key, an exhausted balance, a refused authorization — so they read the
+/// same on every retry. Re-entering cannot change them; only a human acting outside Grind
+/// can, which makes them facts about the world in exactly the sense `Stop::Blocked` exists
+/// for, alongside the rate limit. Everything else a failed turn can name (timeouts, server
+/// errors, malformed output) stays transient and keeps the ordinary re-entry. The literals
+/// are matched as bare `HTTP <status>` substrings because that is the exact shape native.rs
+/// records into `terminal_reason`, and the whole reason is quoted back so a later
+/// `grind cleared` handback states what actually had to be cleared.
+/// **Checked before the budget guards in [`next`]:** a credential verdict burns every
+/// remaining attempt identically, so it must win over `Stop::Exhausted` even on the final
+/// allowed attempt — exhaustion there dies unactionable exactly when the clearance path is
+/// what a human needs.
+fn credential_blocker(terminal_reason: &str) -> Option<String> {
+    for status in ["HTTP 401", "HTTP 402", "HTTP 403"] {
+        if terminal_reason.contains(status) {
+            return Some(format!(
+                "the provider rejects this credential — {status}: {terminal_reason}"
+            ));
+        }
+    }
+    None
+}
+
 /// The whole policy, as one pure function over the attempt list and the verdict.
 pub fn next(
     attempts: &[Attempt],
@@ -211,6 +238,13 @@ pub fn next(
             }
         }
         Verdict::Incomplete(_) => {
+            let credential = attempts
+                .last()
+                .and_then(|last| last.terminal_reason.as_deref())
+                .and_then(credential_blocker);
+            if let Some(blocked_on) = credential {
+                return Next::Stop(Stop::Blocked(blocked_on));
+            }
             if attempt::working(attempts) >= budget.attempts {
                 return Next::Stop(Stop::Exhausted);
             }
@@ -349,6 +383,57 @@ mod tests {
                 &budget(8, 1800)
             ),
             Next::Stop(Stop::Exhausted)
+        );
+    }
+
+    /// The dogfooded case: a missing authentication header is recorded verbatim by native.rs
+    /// and used to be retried identically until the attempt budget died.
+    #[test]
+    fn a_credential_refusal_stops_as_blocked_instead_of_reentering() {
+        for status in ["HTTP 401", "HTTP 402", "HTTP 403"] {
+            let mut last = attempt(1, Mode::Dispatch, false);
+            last.terminal_reason = Some(format!(
+                "turn 1 failed: {status}: Missing Authentication header"
+            ));
+            let attempts = [last];
+            let Next::Stop(Stop::Blocked(blocked_on)) =
+                next(&attempts, &incomplete(), &clear(), 0, &budget(8, 1800))
+            else {
+                panic!("a {status} credential refusal must stop as Blocked");
+            };
+            assert!(
+                blocked_on.contains(status),
+                "the Blocker must quote the matched status line verbatim, got: {blocked_on}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_credential_refusal_on_the_final_allowed_attempt_blocks_rather_than_exhausting() {
+        for status in ["HTTP 401", "HTTP 402", "HTTP 403"] {
+            let mut attempts: Vec<Attempt> =
+                (1..=8).map(|n| attempt(n, Mode::Resume, false)).collect();
+            let last = attempts.last_mut().expect("the seeded final attempt");
+            last.terminal_reason = Some(format!(
+                "turn 1 failed: {status}: Missing Authentication header"
+            ));
+            let Next::Stop(Stop::Blocked(blocked_on)) =
+                next(&attempts, &incomplete(), &clear(), 0, &budget(8, 1800))
+            else {
+                panic!("the final allowed attempt's {status} must Block, not Exhaust");
+            };
+            assert!(blocked_on.contains(status), "{blocked_on}");
+        }
+    }
+
+    #[test]
+    fn any_other_terminal_reason_still_reenters_as_before() {
+        let mut last = attempt(1, Mode::Dispatch, false);
+        last.terminal_reason = Some("api_error".to_string());
+        let attempts = [last];
+        assert_eq!(
+            next(&attempts, &incomplete(), &clear(), 0, &budget(8, 1800)),
+            Next::Reenter
         );
     }
 
