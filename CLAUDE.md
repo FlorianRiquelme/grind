@@ -272,6 +272,39 @@ change carries a safety property, not for coverage's sake.
 
 ## Agent skills
 
+### Worktrees
+
+Code work happens in a dedicated `git worktree`, never in this checkout — multiple issues are
+worked in parallel here. Before starting a change: `git worktree add ../grind-<issue> -b <branch>`,
+edit and verify there, open the PR from that branch. Branch from **fresh `origin/main`** —
+`git fetch origin && git worktree add ../grind-<issue> -b <branch> origin/main` — unless the PR
+is deliberately stacked on another open branch; a worktree forked behind main silently misses
+convention and doc changes (observed: #150 opened without seeing the CodeRabbit-triage section
+#149 had just added).
+
+### CodeRabbit triage
+
+Every PR gets an automatic CodeRabbit bot review a few minutes after opening, and every inline
+comment must be answered — replying is what teaches the bot. Immediately after `gh pr create`
+succeeds, start the watcher **in the background (async), before ending the turn**; never open a
+PR and yield without it. When its result delivers, read
+`skill://coderabbit-review-triage` and triage every comment (fix or substantively reject).
+
+```sh
+PR=000   # set to the number gh pr create just printed
+REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner); for i in $(seq 1 30); do C=$(gh api --paginate repos/$REPO/pulls/$PR/comments --jq 'length'); R=$(gh api --paginate repos/$REPO/pulls/$PR/reviews --jq '[.[] | select(.user.login=="coderabbitai[bot]")] | length'); if [ "$((C+R))" -gt 0 ]; then echo "CodeRabbit reviewed #$PR: $C inline comment(s)"; exit 0; fi; sleep 60; done; echo "TIMEOUT: no CodeRabbit review on #$PR after 30 min"
+```
+
+**Re-watching after a fix push needs a scoped filter.** The first watch runs when the PR has no
+comments, so counting everything works. After triage there are old comments (pinned to the
+earlier head) and your own replies — GitHub records each reply as a review by you — and an
+unscoped count false-triggers instantly on them. Scope to what is actually new:
+
+```sh
+HEAD=$(git rev-parse HEAD); SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ); PR=$(gh pr view --json number -q .number)
+REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner); for i in $(seq 1 30); do R=$(gh api --paginate repos/$REPO/pulls/$PR/reviews --jq '[.[] | select(.user.login=="coderabbitai[bot]" and .commit_id=="'$HEAD'")] | length'); C=$(gh api --paginate repos/$REPO/pulls/$PR/comments --jq '[.[] | select(.in_reply_to_id == null and .created_at > "'$SINCE'")] | length'); if [ "$((C+R))" -gt 0 ]; then echo "CodeRabbit re-reviewed #$PR at ${HEAD:0:7}: $C new top-level comment(s)"; exit 0; fi; sleep 60; done; echo "SETTLED: no CodeRabbit re-review of ${HEAD:0:7} within 30 min"
+```
+
 ### Issue tracker
 
 Issues live as GitHub issues in `FlorianRiquelme/grind`, driven via the `gh` CLI. See `docs/agents/issue-tracker.md`.
