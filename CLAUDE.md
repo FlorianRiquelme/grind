@@ -276,7 +276,11 @@ change carries a safety property, not for coverage's sake.
 
 Code work happens in a dedicated `git worktree`, never in this checkout — multiple issues are
 worked in parallel here. Before starting a change: `git worktree add ../grind-<issue> -b <branch>`,
-edit and verify there, open the PR from that branch.
+edit and verify there, open the PR from that branch. Branch from **fresh `origin/main`** —
+`git fetch origin && git worktree add ../grind-<issue> -b <branch> origin/main` — unless the PR
+is deliberately stacked on another open branch; a worktree forked behind main silently misses
+convention and doc changes (observed: #150 opened without seeing the CodeRabbit-triage section
+#149 had just added).
 
 ### CodeRabbit triage
 
