@@ -35,7 +35,7 @@ The base is **one crate, every module a crate-root sibling, exactly two of them 
 thing that prints. Effects are returned as values — `policy` returns the sleep, `render` returns
 a `String` — so every decision is testable from literals with no network.
 
-```
+```text
 grind run <issue>       dispatch a Job now (issue number or URL)
 grind resume <run-id>   re-enter a Run that died
 grind resume --all      re-enter every Run on this host a restart cut off
@@ -51,7 +51,7 @@ The shipped artifact is a **prebuilt musl static file**; Grind never builds on a
 
 ## Verify entrypoint
 
-```
+```sh
 just verify
 ```
 
@@ -134,7 +134,7 @@ unsatisfiable by construction and gets deleted by whoever trips it next (ledger 
 - **`DENIED_TOOLS` in `src/attempt.rs` is a safety property, and the list lives here.** A Run
   must never merge its own PR, force-push, hard-reset, rebase, or delete a branch:
 
-  ```
+  ```text
   Bash(gh pr merge*)
   Bash(git push --force*)
   Bash(git push -f*)
@@ -284,8 +284,8 @@ worked in parallel here. Before starting a change: `git worktree add ../grind-<i
 edit and verify there, open the PR from that branch. Branch from **fresh `origin/main`** —
 `git fetch origin && git worktree add ../grind-<issue> -b <branch> origin/main` — unless the PR
 is deliberately stacked on another open branch; a worktree forked behind main silently misses
-convention and doc changes (observed: #150 opened without seeing the CodeRabbit-triage section
-#149 had just added).
+convention and doc changes (observed: #150 opened without seeing the CodeRabbit-triage
+section #149 had just added).
 
 ### CodeRabbit triage
 

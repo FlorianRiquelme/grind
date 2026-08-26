@@ -45,7 +45,7 @@ fn documented() -> Vec<String> {
     let mut current: Option<Vec<String>> = None;
     for line in claude_md.lines() {
         let trimmed = line.trim();
-        if trimmed == "```" {
+        if trimmed.starts_with("```") {
             match current.take() {
                 Some(block) => blocks.push(block),
                 None => current = Some(Vec::new()),

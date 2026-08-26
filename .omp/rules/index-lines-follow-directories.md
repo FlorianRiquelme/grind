@@ -1,10 +1,12 @@
 ---
-description: "Adding/removing/moving files under an indexed directory (docs/adr, docs/findings) or editing counted/ranged prose anywhere."
+description: "Adding/removing/moving files under an indexed directory, or editing counted/ranged index prose in README.md / AGENTS.md themselves."
 globs:
   - "docs/adr/**"
   - "docs/findings/**"
+  - "README.md"
+  - "AGENTS.md"
 condition:
-  - "(?i)\\b(eighteen|seventeen|nineteen|twenty)\\b"
+  - "(?i)\\b(seventeen|eighteen|nineteen|twenty([- ]?(one|two|three|four|five|nine))?|thirty)\\b"
   - "(?i)(rung|stage)s?\\b.*\\b(list|map|count)"
   - "docs/(adr|findings)/"
 interruptMode: never
