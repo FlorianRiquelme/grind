@@ -304,6 +304,7 @@ mod tests {
             rate_limited,
             result_tail: String::new(),
             fanout: crate::observe::Observed::Absent,
+            transcript_name: None,
         }
     }
 
