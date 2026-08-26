@@ -1220,8 +1220,9 @@ impl Tiers {
 /// was raised to buy.
 impl Default for Tiers {
     fn default() -> Self {
-        fn turns(rows: [(&str, usize); 1]) -> BTreeMap<String, usize> {
-            rows.into_iter()
+        fn turns(rows: &[(&str, usize)]) -> BTreeMap<String, usize> {
+            rows.iter()
+                .copied()
                 .map(|(stage, limit)| (stage.to_string(), limit))
                 .collect()
         }
@@ -1254,11 +1255,11 @@ impl Default for Tiers {
             models_t1: models("fast"),
             models_t2: models("strong"),
             models_t3: models("strong"),
-            max_turns: turns([("work", 32)]),
+            max_turns: turns(&[("work", 64), ("validate", 48), ("fixes", 96)]),
             max_turns_by_tier: [
                 BTreeMap::new(),
                 BTreeMap::new(),
-                turns([("work", 16)]),
+                turns(&[("work", 16)]),
                 BTreeMap::new(),
             ],
         }
@@ -1674,7 +1675,7 @@ mod tier_tests {
         assert_eq!(tiers.max_turns.get("review"), None);
         assert_eq!(
             tiers.max_turns.get("work"),
-            Some(&32),
+            Some(&64),
             "the skipped row leaves the compiled default beside it untouched"
         );
     }

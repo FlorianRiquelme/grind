@@ -1095,12 +1095,12 @@ mod tests {
     use crate::decide::Tiers;
     use serde_json::json;
 
-    /// The shipped calibration already declares exactly this shape — work at 32 flat,
+    /// The shipped calibration already declares exactly this shape — work at 64 flat,
     /// 16 tiered — so the scenario reads the real data instead of restating it.
     #[test]
     fn a_tiered_max_turns_entry_wins_over_the_flat_one() {
         let tiers = Tiers::default();
-        assert_eq!(max_turns_for("work", None, Some(&tiers)), 32);
+        assert_eq!(max_turns_for("work", None, Some(&tiers)), 64);
         assert_eq!(
             max_turns_for("work", Some("t2"), Some(&tiers)),
             16,
@@ -1131,7 +1131,7 @@ mod tests {
     fn an_unknown_tier_word_skips_the_tiered_table_and_falls_through() {
         assert_eq!(
             max_turns_for("work", Some("t9"), Some(&Tiers::default())),
-            32
+            64
         );
         let tiers = Tiers {
             max_turns: [("work".to_string(), 8)].into_iter().collect(),
