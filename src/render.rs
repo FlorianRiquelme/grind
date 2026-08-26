@@ -11,7 +11,6 @@ use crate::attempt::Clearance;
 use crate::decide::{Decision, Stage, Verdict, VerifyContract};
 use crate::observe::{Observation, Observed, Outcome, RunOutcome, UNOBSERVABLE_MARK};
 use crate::rung::{ReturnStatus, StageEntry};
-use crate::runner::Backend;
 use crate::view::{Facts, Live, RosterRow, RunView, one_line};
 use std::path::Path;
 
@@ -686,34 +685,17 @@ fn line(out: &mut String, text: &str) {
     out.push('\n');
 }
 
-/// The Model row's answer, derived from the record so one record has one answer about what
-/// ran (#158). The pin names itself; a native Run with no pin answers from its own class
-/// declarations — the same derivation `supervisor::dispatch_banner` prints at dispatch,
-/// including the concrete id [`runner::DEFAULT_MODEL`] resolves to when neither class is
-/// declared, because that is what will run. A claude-code Run's session picks, and grind never
-/// sees it, so `(session default — unpinned)` stays honest there.
+/// The Model row's answer: the one derivation both surfaces share
+/// (`crate::runner::declared_model` — `supervisor::dispatch_banner` prints its output at
+/// dispatch), so one record has one answer about what ran and #158's divergence between the
+/// two surfaces cannot regrow. See that function for the per-backend reading.
 fn model_of(found: &RunView) -> String {
-    match &found.model {
-        Some(pinned) => pinned.clone(),
-        None => match found.backend {
-            Backend::Native => {
-                let fast = found
-                    .fast_model_override
-                    .as_deref()
-                    .unwrap_or(crate::runner::DEFAULT_MODEL);
-                let strong = found
-                    .strong_model_override
-                    .as_deref()
-                    .unwrap_or(crate::runner::DEFAULT_MODEL);
-                if fast == strong {
-                    fast.to_string()
-                } else {
-                    format!("fast {fast} · strong {strong}")
-                }
-            }
-            Backend::ClaudeCode => "(session default — unpinned)".to_string(),
-        },
-    }
+    crate::runner::declared_model(
+        found.backend,
+        found.model.as_deref(),
+        found.fast_model_override.as_deref(),
+        found.strong_model_override.as_deref(),
+    )
 }
 
 fn presence_word(here: &Observed<bool>) -> &'static str {
@@ -937,6 +919,7 @@ mod tests {
     use super::*;
     use crate::decide::VerifyCoverage;
     use crate::observe::{Pr, Reason};
+    use crate::runner::Backend;
     use crate::view::Fanout;
     use std::path::PathBuf;
 

@@ -352,6 +352,35 @@ impl std::fmt::Debug for Endpoint {
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_MODEL: &str = "deepseek/deepseek-chat-v3.1";
 
+/// What a Run's record says about which model ran — the one derivation both surfaces
+/// render from (`supervisor::dispatch_banner` at dispatch, `render::handback` at terminal),
+/// so #158's divergence between them cannot regrow. The pin names itself; a native Run with
+/// no pin answers from its class declarations, falling back per class to [`DEFAULT_MODEL`]
+/// because that is what will run; a claude-code Run's session picks and grind never sees it,
+/// so `(session default — unpinned)` stays honest there.
+pub(crate) fn declared_model(
+    backend: Backend,
+    pinned: Option<&str>,
+    fast_override: Option<&str>,
+    strong_override: Option<&str>,
+) -> String {
+    if let Some(pinned) = pinned {
+        return pinned.to_string();
+    }
+    match backend {
+        Backend::Native => {
+            let fast = fast_override.unwrap_or(DEFAULT_MODEL);
+            let strong = strong_override.unwrap_or(DEFAULT_MODEL);
+            if fast == strong {
+                fast.to_string()
+            } else {
+                format!("fast {fast} · strong {strong}")
+            }
+        }
+        Backend::ClaudeCode => "(session default — unpinned)".to_string(),
+    }
+}
+
 /// Which key pays for the endpoint being dialled — the pure half of [`Endpoint::resolve`], so
 /// the refusal below is testable from literals with no environment.
 ///
@@ -504,6 +533,38 @@ pub fn runner_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one derivation both surfaces render from: the pin wins outright, a native Run's
+    /// equal class declarations collapse to one id, split declarations name both sides, and
+    /// an undeclared class names what [`DEFAULT_MODEL`] resolves to — while a claude-code
+    /// Run stays honestly `(session default — unpinned)`, because grind never sees its
+    /// session's picks.
+    #[test]
+    fn declared_model_answers_from_the_record_and_never_from_a_surface() {
+        for backend in [Backend::Native, Backend::ClaudeCode] {
+            assert_eq!(
+                declared_model(backend, Some("pinned/id"), Some("other"), None),
+                "pinned/id",
+                "the pin wins on every backend"
+            );
+        }
+        assert_eq!(
+            declared_model(Backend::Native, None, Some("a/b"), Some("a/b")),
+            "a/b"
+        );
+        assert_eq!(
+            declared_model(Backend::Native, None, Some("a/b"), Some("c/d")),
+            "fast a/b · strong c/d"
+        );
+        assert_eq!(
+            declared_model(Backend::Native, None, None, None),
+            DEFAULT_MODEL
+        );
+        assert_eq!(
+            declared_model(Backend::ClaudeCode, None, None, None),
+            "(session default — unpinned)"
+        );
+    }
 
     /// A derived `Debug` would print `api_key` verbatim, and this struct's own doc comment
     /// says the key is "NEVER serialized anywhere" — a single future `{ep:?}` in an error
