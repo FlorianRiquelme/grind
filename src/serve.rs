@@ -283,8 +283,9 @@ fn log_offset(query: Option<&str>) -> Option<u64> {
 }
 
 /// Whitelisted evidence, verbatim (R5). Three whole names plus `attempt-N.<suffix>` with
-/// N all digits; every near-miss — a `.bak`, a non-numeric attempt, anything else — reads
-/// as not-here and leaks nothing.
+/// N all digits, and `messages-N[-K].jsonl` where K orders same-slot retries; every
+/// near-miss — a `.bak`, a non-numeric attempt, a second retry group, anything else —
+/// reads as not-here and leaks nothing.
 fn raw_file(home: &Path, id: &str, file: &str) -> Response {
     if !evidence_allowed(file) {
         return plain(Status::NotFound);
@@ -302,21 +303,26 @@ fn evidence_allowed(file: &str) -> bool {
     if WHOLE.contains(&file) {
         return true;
     }
-    const NUMBERED: [(&str, &[&str]); 4] = [
-        ("attempt-", &SPAWNED),
-        ("reflect-", &SPAWNED),
-        ("messages-", &[".jsonl"]),
-        ("reflect-messages-", &[".jsonl"]),
+    const NUMBERED: [(&str, &[&str], bool); 4] = [
+        ("attempt-", &SPAWNED, false),
+        ("reflect-", &SPAWNED, false),
+        ("messages-", &[".jsonl"], true),
+        ("reflect-messages-", &[".jsonl"], true),
     ];
-    NUMBERED.iter().any(|(prefix, suffixes)| {
+    NUMBERED.iter().any(|(prefix, suffixes, retried)| {
         suffixes.iter().any(|suffix| {
             file.strip_prefix(prefix)
                 .and_then(|rest| rest.strip_suffix(suffix))
-                .is_some_and(|digits| {
-                    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+                .is_some_and(|stem| match stem.split_once('-') {
+                    Some((slot, retry)) if *retried => digits(slot) && digits(retry),
+                    _ => digits(stem),
                 })
         })
     })
+}
+
+fn digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// A Reflect artifact under `stages/reflect/jobs/` or `stages/reflect/diffs/`, verbatim
@@ -946,6 +952,8 @@ mod tests {
             "reflect-3.stderr.log",
             "messages-7.jsonl",
             "reflect-messages-3.jsonl",
+            "messages-2-2.jsonl",
+            "reflect-messages-1-3.jsonl",
         ] {
             world::write_atomic(&run_dir.join(name), "evidence bytes\n").unwrap();
             let target = format!("/raw/runs/abc/{name}");
@@ -974,6 +982,9 @@ mod tests {
             "messages-1.jsonl.bak",
             "reflect-.prompt.txt",
             "reflect-messages-x.jsonl",
+            "messages-2-x.jsonl",
+            "messages--2.jsonl",
+            "messages-2-2-3.jsonl",
             "Attempt-1.prompt.txt",
             "attempt-1.prompt.txt.bak",
             "secrets.env",

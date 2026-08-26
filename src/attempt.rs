@@ -301,6 +301,16 @@ pub struct Attempt {
     /// integers**: a count of processes must never become an assertion about a review
     /// (ADR-0006's sixth prohibited shape).
     pub fanout: Observed<(u64, u64)>,
+    /// The bare file name of the transcript this Attempt actually wrote — `messages-2-2.jsonl`
+    /// for a re-entered attempt 2 that found slot 1 taken. A name, never a path: the reader
+    /// joins it onto the Run directory it already knows.
+    ///
+    /// `None` on every record written before the name was recorded, and on every claude-code
+    /// Attempt — that adapter's `attempt-N.*` trio is determined by `n` alone, so the reader's
+    /// computed fallback names it exactly. Additive and `serde(default)`, so an existing
+    /// `run.json` still parses under `RunView`'s `deny_unknown_fields`.
+    #[serde(default)]
+    pub transcript_name: Option<String>,
 }
 
 impl Attempt {
@@ -923,6 +933,7 @@ mod tests {
             rate_limited: limited,
             result_tail: String::new(),
             fanout: Observed::Absent,
+            transcript_name: None,
         }
     }
 
@@ -1348,5 +1359,51 @@ mod tests {
             "reflect must still write its own artifacts"
         );
         assert!(!reflect.contains(&"Edit".to_string()));
+    }
+
+    /// An attempt record written before the transcript name was recorded. Verbatim old shape:
+    /// no `transcript_name` key anywhere.
+    const OLD_SHAPED_ATTEMPT: &str = r#"{
+        "n": 2,
+        "mode": "resume",
+        "started_at": "2026-08-21T18:00:00+00:00",
+        "ended_at": "2026-08-21T18:40:00+00:00",
+        "exit_code": 1,
+        "is_error": true,
+        "parse_ok": true,
+        "subtype": "success",
+        "stop_reason": null,
+        "api_error_status": null,
+        "terminal_reason": null,
+        "num_turns": 37,
+        "total_cost_usd": 2.35,
+        "usage": null,
+        "permission_denials": [],
+        "done_promise": false,
+        "rate_limited": false,
+        "result_tail": "",
+        "fanout": "absent"
+    }"#;
+
+    #[test]
+    fn an_attempt_written_before_the_transcript_name_existed_still_decodes() {
+        let decoded: Attempt = serde_json::from_str(OLD_SHAPED_ATTEMPT).expect("old shape decodes");
+        assert_eq!(decoded.n, 2);
+        assert_eq!(decoded.mode, Mode::Resume);
+        assert!(decoded.total_cost_usd.is_some());
+        assert_eq!(
+            decoded.transcript_name, None,
+            "a record written before the name existed defaults it away, not into a wrong name"
+        );
+    }
+
+    #[test]
+    fn a_recorded_transcript_name_round_trips_through_the_record() {
+        let named = Attempt {
+            transcript_name: Some("messages-2-2.jsonl".to_string()),
+            ..shaped(true, Some(2.35), Some(37), false)
+        };
+        let text = serde_json::to_string(&named).unwrap();
+        assert_eq!(serde_json::from_str::<Attempt>(&text).unwrap(), named);
     }
 }

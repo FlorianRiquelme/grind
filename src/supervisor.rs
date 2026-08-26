@@ -2061,6 +2061,7 @@ mod tests {
             rate_limited: false,
             result_tail: String::new(),
             fanout: Observed::Absent,
+            transcript_name: None,
         };
         let status = reflect_status(attempt.is_error);
         assert_eq!(
