@@ -232,9 +232,45 @@ pub fn signals_of(observation: &Observation) -> RawSignals {
     }
 }
 
+/// Whether the deliverable itself exists: the PR open, the tree clean, and both head/base rows
+/// matching. The check rollup corroborates against this — Grind hands off at an open PR
+/// (ADR-0003), and waiting past that point is spend without a decision.
+fn deliverable_present(
+    pr_open: &Observed<bool>,
+    tree_clean: &Observed<bool>,
+    pr_head_matches_job_branch: &Observed<bool>,
+    pr_base_matches_declared: &Observed<bool>,
+) -> bool {
+    matches!(pr_open, Observed::Present(true))
+        && matches!(tree_clean, Observed::Present(true))
+        && matches!(pr_head_matches_job_branch, Observed::Present(true))
+        && matches!(pr_base_matches_declared, Observed::Present(true))
+}
+
+/// Whether a fold row may be skipped from the unmet list. Keyed by type rather than by the
+/// row's rendering label, so renaming a label cannot silently disable a carve-out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Skip {
+    /// The row always keeps its plain reading and can hold completion open.
+    Never,
+    /// The row may be skipped once the deliverable itself exists — all four conjuncts of
+    /// [`deliverable_present`] hold. This is the check rollup's corroborated reading: Grind
+    /// hands off at an open PR (ADR-0003), and waiting past that point is spend without a
+    /// decision.
+    WhenDeliverablePresent,
+}
+
 /// The fold. Completion is **observed rather than declared**, and the DONE promise is neither
 /// necessary nor sufficient — two Runs finished a pipeline without emitting it, and a session
 /// that believes it finished can emit it against nothing.
+///
+/// Boundary on the check rollup (`no_check_pending`): a pending-but-not-failed rollup
+/// (`Present(false)`) corroborates once the four deliverable signals — `pr_open`, `tree_clean`,
+/// `pr_head_matches_job_branch`, `pr_base_matches_declared` — are all `Present(true)`; before
+/// that it keeps its plain reading and holds completion open. An absent rollup still reads
+/// unmet and an unobservable one still blinds, so the three-valuedness passes through
+/// untouched. Which checks exist or pass stays an observed fact; nothing here turns it into a
+/// gate (ADR-0003).
 pub fn verdict(signals: &RawSignals, done_promise: bool) -> Verdict {
     let RawSignals {
         pr_open,
@@ -245,18 +281,44 @@ pub fn verdict(signals: &RawSignals, done_promise: bool) -> Verdict {
         pr_base_matches_declared,
     } = signals;
 
-    let named: [(&str, &Observed<bool>); 6] = [
-        ("PR open", pr_open),
-        ("tree clean", tree_clean),
-        ("commits ahead", commits_ahead),
-        ("no check pending", no_check_pending),
-        ("PR head matches Job branch", pr_head_matches_job_branch),
-        ("PR base matches declared branch", pr_base_matches_declared),
+    // The carve-out keys off `Skip`, never off the rendering label: a row's display text is
+    // free to change without touching the fold's behaviour (validate F1).
+    let named: [(&str, &Observed<bool>, Skip); 6] = [
+        ("PR open", pr_open, Skip::Never),
+        ("tree clean", tree_clean, Skip::Never),
+        ("commits ahead", commits_ahead, Skip::Never),
+        (
+            "no check pending",
+            no_check_pending,
+            Skip::WhenDeliverablePresent,
+        ),
+        (
+            "PR head matches Job branch",
+            pr_head_matches_job_branch,
+            Skip::Never,
+        ),
+        (
+            "PR base matches declared branch",
+            pr_base_matches_declared,
+            Skip::Never,
+        ),
     ];
 
     let mut blind = Vec::new();
     let mut unmet = Vec::new();
-    for (name, signal) in named {
+    let corroborating = deliverable_present(
+        pr_open,
+        tree_clean,
+        pr_head_matches_job_branch,
+        pr_base_matches_declared,
+    );
+    for (name, signal, skip) in named {
+        if skip == Skip::WhenDeliverablePresent
+            && corroborating
+            && matches!(signal, Observed::Present(false))
+        {
+            continue;
+        }
         match signal {
             Observed::Present(true) => {}
             Observed::Present(false) => unmet.push(name.to_string()),
@@ -624,16 +686,118 @@ mod tests {
         assert_eq!(seen.checks_red, Observed::Present(true));
     }
 
+    /// (a) of the amended boundary: pending checks still yield `Incomplete` when the
+    /// deliverable does not exist. The PR is absent, so `deliverable_present` is already
+    /// false from `pr_open` alone and a pending rollup keeps its plain reading.
     #[test]
-    fn a_pending_check_holds_completion_open_and_an_absent_one_does_not() {
+    fn a_pending_check_still_holds_completion_open_when_the_pr_is_absent() {
         let mut seen = observation();
+        seen.pr = Observed::Absent;
+        seen.pr_head_matches_job_branch = Observed::Present(false);
+        seen.pr_base_matches_declared = Observed::Present(false);
         seen.checks_pending = Observed::Present(true);
         assert!(matches!(
             verdict(&signals_of(&seen), false),
-            Verdict::Incomplete(_)
+            Verdict::Incomplete(unmet) if unmet.contains(&"no check pending".to_string())
         ));
+    }
+
+    /// (b) of the amended boundary: an absent rollup — which `signals_of` maps to
+    /// `no_check_pending = Present(true)` — completes when the deliverable exists.
+    #[test]
+    fn an_absent_rollup_completes_when_the_deliverable_exists() {
+        let mut seen = observation();
         seen.checks_pending = Observed::Absent;
         assert_eq!(verdict(&signals_of(&seen), false), Verdict::Completed);
+    }
+
+    /// (c) the Job's own scenario: the deliverable exists — PR open, tree clean, head and base
+    /// rows matching — and the visible check rollup is pending-but-not-failed
+    /// (`no_check_pending = Present(false)`). The verdict reads `Completed`, so the Run reaches
+    /// its terminal state naming the PR open instead of re-entering until the budget dies.
+    #[test]
+    fn a_pending_but_not_failed_rollup_completes_once_the_deliverable_exists() {
+        let mut seen = observation();
+        seen.checks_pending = Observed::Present(true);
+        assert_eq!(verdict(&signals_of(&seen), false), Verdict::Completed);
+        assert_eq!(verdict(&signals_of(&seen), true), Verdict::Completed);
+    }
+
+    /// The rollup's carve-out fires only when **every** conjunct of `deliverable_present`
+    /// holds, so each of the later three is driven off `Present(true)` in turn while the
+    /// rollup stays pending: dropping any one of them from the conjunction must drop the
+    /// verdict back to `Incomplete`, naming the row that broke it. Without these, a
+    /// regression deleting half the conjunction compiles and keeps the suite green
+    /// (validate F3, probe mut-b).
+    #[test]
+    fn each_deliverable_conjunct_is_load_bearing_while_the_rollup_is_pending() {
+        for (row, unmake) in [
+            (
+                "tree clean",
+                Box::new(|seen: &mut Observation| {
+                    seen.tree_clean = Observed::Present(false);
+                }) as Box<dyn Fn(&mut Observation)>,
+            ),
+            (
+                "PR head matches Job branch",
+                Box::new(|seen: &mut Observation| {
+                    seen.pr_head_matches_job_branch = Observed::Present(false);
+                }),
+            ),
+            (
+                "PR base matches declared branch",
+                Box::new(|seen: &mut Observation| {
+                    seen.pr_base_matches_declared = Observed::Present(false);
+                }),
+            ),
+        ] {
+            let mut seen = observation();
+            seen.checks_pending = Observed::Present(true);
+            unmake(&mut seen);
+            assert!(
+                matches!(
+                    verdict(&signals_of(&seen), false),
+                    Verdict::Incomplete(unmet) if unmet.contains(&row.to_string())
+                ),
+                "with `{row}` broken, a pending rollup must hold completion open"
+            );
+            // The same shape without the pending rollup isolates the row's own plain
+            // reading, so a failure here names the conjunction, not the carve-out.
+            let mut plain = observation();
+            unmake(&mut plain);
+            assert!(
+                matches!(
+                    verdict(&signals_of(&plain), false),
+                    Verdict::Incomplete(unmet) if unmet.contains(&row.to_string())
+                ),
+                "`{row}` must read unmet on its own account too"
+            );
+        }
+    }
+
+    /// An unobservable head or base row blinds the fold even when every other deliverable
+    /// signal agrees: three-valuedness passes through, and the corroborated reading of a
+    /// pending rollup is unreachable on evidence the fold cannot see.
+    #[test]
+    fn an_unobservable_row_blinds_the_verdict_even_with_the_rest_of_the_deliverable() {
+        for unmake in [
+            Box::new(|seen: &mut Observation| {
+                seen.pr_head_matches_job_branch =
+                    Observed::Unobservable(Reason::saying("head ref unreadable"));
+            }) as Box<dyn Fn(&mut Observation)>,
+            Box::new(|seen: &mut Observation| {
+                seen.pr_base_matches_declared =
+                    Observed::Unobservable(Reason::saying("base ref unreadable"));
+            }),
+        ] {
+            let mut seen = observation();
+            seen.checks_pending = Observed::Present(true);
+            unmake(&mut seen);
+            assert!(
+                matches!(verdict(&signals_of(&seen), false), Verdict::Unobserved(_)),
+                "an unobservable deliverable signal must blind, never complete"
+            );
+        }
     }
 
     #[test]
