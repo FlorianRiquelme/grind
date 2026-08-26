@@ -29,6 +29,19 @@ step_count_t2 = 12
 content_signal_t2 = 1
 content_signal_t3 = 3
 
+# Per-stage hard ceilings on conversation turns per attempt for the native loop
+# (issue #157): exhaustion is loud, never a stop. The absent-entry fallback lives in
+# src/native.rs (`DEFAULT_MAX_TURNS`), mirrored into the parser's compiled default —
+# a stage missing from this table reads that fallback, never zero.
+[max_turns]
+work = 32
+
+# Optional per-tier overrides, read as `[max_turns.tN]` for t0-t3. A tiered entry
+# outranks the flat row; this one differs from it on purpose — it is the receipt
+# that an override visibly changes the limit the loop enforces.
+[max_turns.t2]
+work = 16
+
 # Mechanical stages (work, simplify, fixes, ship) run fast at every tier. Judgment seats (plan,
 # plan-review, validate) run strong at every tier — a judgment seat never routes down. Review is
 # the one stage that moves: fast while the panel is small and class-matched (T0/T1), strong once
