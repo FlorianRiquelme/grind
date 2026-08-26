@@ -192,44 +192,16 @@ fn drive_attempt(server: &Server, run_dir: &Path, cwd: &Path, attempt_n: usize) 
         cwd,
         attempt_n,
         "Do the assigned stage work.",
+        None,
     )
 }
 
-/// The same seam with a caller-supplied stage prompt — `stage_invocation` composes the
+/// The same seam with a caller-supplied stage prompt and the adapter's per-stage turn
+/// ceiling (`None` keeps the loop's compiled fallback). `stage_invocation` composes the
 /// skill file verbatim ahead of the context block, so a prompt carrying real frontmatter
-/// is how `declared_skill` gets exercised end to end.
+/// is how `declared_skill` gets exercised end to end; the ceiling is the knob issue #157
+/// put on `NativeAdapter`, driven end to end by the exhaustion scenario below.
 fn drive_attempt_with_prompt(
-    server: &Server,
-    run_dir: &Path,
-    cwd: &Path,
-    attempt_n: usize,
-    skill_text: &str,
-) -> Attempt {
-    drive_attempt_configured(server, run_dir, cwd, attempt_n, skill_text, None)
-}
-
-/// The same seam with the adapter's per-stage turn ceiling set (`None` keeps the loop's
-/// compiled fallback) — the knob issue #157 put on `NativeAdapter`, driven end to end by
-/// the exhaustion scenario below.
-#[allow(clippy::too_many_arguments)]
-fn drive_attempt_with_max_turns(
-    server: &Server,
-    run_dir: &Path,
-    cwd: &Path,
-    attempt_n: usize,
-    max_turns: Option<usize>,
-) -> Attempt {
-    drive_attempt_configured(
-        server,
-        run_dir,
-        cwd,
-        attempt_n,
-        "Do the assigned stage work.",
-        max_turns,
-    )
-}
-
-fn drive_attempt_configured(
     server: &Server,
     run_dir: &Path,
     cwd: &Path,
@@ -762,7 +734,14 @@ fn a_declared_max_turns_ceiling_bounds_the_loop_below_the_fallback() {
 
     // The override is the point: `Some(low_limit)` on the adapter literal, exactly where
     // supervisor::record.runner hands a tiers.toml-resolved value.
-    let attempt = drive_attempt_with_max_turns(&server, &run_dir, &cwd, 1, Some(low_limit));
+    let attempt = drive_attempt_with_prompt(
+        &server,
+        &run_dir,
+        &cwd,
+        1,
+        "Do the assigned stage work.",
+        Some(low_limit),
+    );
 
     assert!(attempt.is_error, "{:?}", attempt.terminal_reason);
     assert!(!attempt.done_promise);
@@ -806,7 +785,7 @@ fn frontmatter_prompt_declares_its_skill() {
         None,
     )]))]);
 
-    let attempt = drive_attempt_with_prompt(&server, &run_dir, &cwd, 1, skill_text);
+    let attempt = drive_attempt_with_prompt(&server, &run_dir, &cwd, 1, skill_text, None);
 
     assert!(!attempt.is_error, "{:?}", attempt.terminal_reason);
 

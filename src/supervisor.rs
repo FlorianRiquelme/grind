@@ -218,9 +218,14 @@ impl RunRecord {
     /// still reads the compiled fallback. No stage key means no entry can match — exactly the
     /// behavior before ceilings were data.
     fn runner(&self, home: &Path, stage: Option<Stage>) -> Box<dyn runner::StageRunner> {
-        let worktree = std::path::PathBuf::from(&self.worktree);
-        let tiers = load_tiers(&worktree);
-        let tier = stage.and_then(|_| latest_decided_tier(&worktree));
+        // Resolved inside the map, so a stage-less call (Reflect, Ship's babysit round)
+        // never touches `docs/tiers.toml` or the decision files at all.
+        let max_turns = stage.map(|stage| {
+            let worktree = std::path::PathBuf::from(&self.worktree);
+            let tiers = load_tiers(&worktree);
+            let tier = latest_decided_tier(&worktree);
+            crate::native::max_turns_for(&stage.to_string(), tier.as_deref(), Some(&tiers))
+        });
         runner::runner_for(
             self.backend,
             &self.claude_bin,
@@ -230,9 +235,7 @@ impl RunRecord {
                 fast_model: self.fast_model_override.clone(),
                 strong_model: self.strong_model_override.clone(),
                 proto_override: self.proto_override,
-                max_turns: stage.map(|stage| {
-                    crate::native::max_turns_for(&stage.to_string(), tier.as_deref(), Some(&tiers))
-                }),
+                max_turns,
             },
         )
     }
