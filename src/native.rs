@@ -49,13 +49,34 @@ fn declared_reason(mode: ProtoMode) -> String {
     )
 }
 
-/// This call's transcript file name (ADR-0017's `messages-N.jsonl` for an Attempt, kept
-/// byte-for-byte; a distinguishable name for Reflect so its events never collide with
-/// attempt N's own file).
-fn transcript_filename(label: FileLabel, n: usize) -> String {
+/// This call's transcript file name in slot `slot` (ADR-0017's `messages-N.jsonl` for an
+/// Attempt at slot 1, kept byte-for-byte; a distinguishable name for Reflect so its events
+/// never collide with attempt N's own file). Slot 2 and up carry a `-{slot}` suffix, which
+/// is how a re-entered attempt N gets a name of its own.
+fn transcript_filename(label: FileLabel, n: usize, slot: usize) -> String {
+    let suffix = if slot > 1 {
+        format!("-{slot}")
+    } else {
+        String::new()
+    };
     match label {
-        FileLabel::Attempt => format!("messages-{n}.jsonl"),
-        FileLabel::Reflect => format!("reflect-messages-{n}.jsonl"),
+        FileLabel::Attempt => format!("messages-{n}{suffix}.jsonl"),
+        FileLabel::Reflect => format!("reflect-messages-{n}{suffix}.jsonl"),
+    }
+}
+
+/// The first name in slot order that does not exist yet. A crashed attempt is never
+/// recorded, so a resumed retry recomputes the same `n` — and the file under that name is
+/// the only account of what the dead attempt was doing. Allocating past it means no
+/// existing file is ever opened for writing.
+fn allocate_transcript(run_dir: &Path, label: FileLabel, n: usize) -> PathBuf {
+    let mut slot = 1usize;
+    loop {
+        let path = run_dir.join(transcript_filename(label, n, slot));
+        if !world::exists(&path) {
+            return path;
+        }
+        slot += 1;
     }
 }
 
@@ -272,34 +293,49 @@ fn latched_mode(transcripts: &[&str]) -> Option<ProtoMode> {
     found
 }
 
-/// Scan the run directory's prior `messages-*.jsonl` files, oldest attempt
-/// first, for the latch. This attempt's own file is skipped.
+/// An attempt transcript's `(attempt, slot)` ordering key: `messages-{n}.jsonl` is
+/// attempt n slot 1, `messages-{n}-{k}.jsonl` is attempt n slot k, and k orders the
+/// same attempt's re-entries after the name they followed.
 ///
-/// Ordered by the parsed attempt number, not the lexicographic path order
+/// A Reflect transcript is refused by name. Its remainder never parsed as a `usize`
+/// before, so it was already excluded — by accident, and an accident stops holding the
+/// moment the parse widens, which is exactly what the slot suffix did.
+fn transcript_slot(name: &str) -> Option<(usize, usize)> {
+    if name.starts_with("reflect-messages-") {
+        return None;
+    }
+    let stem = name.strip_prefix("messages-")?.strip_suffix(".jsonl")?;
+    match stem.split_once('-') {
+        None => Some((stem.parse().ok()?, 1)),
+        Some((n, slot)) => Some((n.parse().ok()?, slot.parse().ok()?)),
+    }
+}
+
+/// Scan the run directory's prior `messages-*.jsonl` files, oldest attempt
+/// first, for the latch. This attempt's own file — the name `allocate_transcript`
+/// actually handed it, however suffixed — is skipped.
+///
+/// Ordered by the parsed attempt number and slot, not the lexicographic path order
 /// `list_with_extension` returns — that sort puts `messages-10.jsonl` before
 /// `messages-2.jsonl`, which would make attempt 10 look older than attempt 2
 /// the moment a run passes nine attempts.
-fn scan_latch(run_dir: &Path, current_attempt: usize) -> Option<ProtoMode> {
-    let own = format!("messages-{current_attempt}.jsonl");
-    let mut numbered: Vec<(usize, PathBuf)> = Vec::new();
+fn scan_latch(run_dir: &Path, own: &Path) -> Option<ProtoMode> {
+    let own = own.file_name().map(|n| n.to_string_lossy().into_owned());
+    let mut numbered: Vec<((usize, usize), PathBuf)> = Vec::new();
     for path in world::list_with_extension(run_dir, "jsonl") {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if name == own {
+        if own.as_deref() == Some(name.as_str()) {
             continue;
         }
-        let Some(num) = name
-            .strip_prefix("messages-")
-            .and_then(|s| s.strip_suffix(".jsonl"))
-            .and_then(|s| s.parse::<usize>().ok())
-        else {
+        let Some(key) = transcript_slot(&name) else {
             continue;
         };
-        numbered.push((num, path));
+        numbered.push((key, path));
     }
-    numbered.sort_by_key(|(num, _)| *num);
+    numbered.sort_by_key(|(key, _)| *key);
     let texts: Vec<String> = numbered
         .into_iter()
         .filter_map(|(_, path)| world::read_to_string(&path).ok())
@@ -522,13 +558,16 @@ struct Transcript {
 }
 
 impl Transcript {
-    /// Reset this attempt's file to empty. Must run exactly once per `run()`,
-    /// before the first `log` call — a crashed attempt is never recorded, so a
-    /// resumed retry recomputes the same `attempt_n` and would otherwise append
-    /// after the dead attempt's partial content in the same file
-    /// (`messages-N.jsonl` must hold exactly one attempt's events, matching the
-    /// claude-code adapter's `File::create` truncation). Calling this once per
-    /// `log` instead would erase the attempt as it goes, so callers must not.
+    /// Create this attempt's file empty. Must run exactly once per `run()`, before
+    /// the first `log` call: the file must hold exactly one attempt's events,
+    /// matching the claude-code adapter's `File::create` truncation, and calling
+    /// this once per `log` instead would erase the attempt as it goes.
+    ///
+    /// It lands on empty ground rather than over someone's record because
+    /// `allocate_transcript` hands `run()` the first name in the
+    /// `messages-{n}`, `messages-{n}-2`, … sequence that does not exist yet — so a
+    /// resumed retry that recomputed the same `attempt_n` writes beside the dead
+    /// attempt's transcript, never through it.
     ///
     /// Never panics, for the same reason `log` doesn't: a disk-write failure
     /// here must not take down the per-run supervisor before
@@ -670,8 +709,9 @@ impl StageRunner for crate::runner::NativeAdapter {
         let defs = registry.defs();
         let tools_wire = defs_as_wire(&defs);
         let client = ChatClient::new();
+        let transcript_path = allocate_transcript(spec.run_dir, spec.file_label, n);
         let transcript = Transcript {
-            path: spec.run_dir.join(transcript_filename(spec.file_label, n)),
+            path: transcript_path.clone(),
             attempt_n: n,
             append_failed: std::cell::RefCell::new(None),
         };
@@ -681,7 +721,9 @@ impl StageRunner for crate::runner::NativeAdapter {
         }
         let system_for = |mode: ProtoMode| json!({"role": "system", "content": system_prompt(&spec.cwd.display().to_string(), &defs, mode)});
 
-        let mut proto = self.proto_override.or_else(|| scan_latch(spec.run_dir, n));
+        let mut proto = self
+            .proto_override
+            .or_else(|| scan_latch(spec.run_dir, &transcript_path));
         if let Some(mode) = proto {
             let reason = if self.proto_override.is_some() {
                 declared_reason(mode)
@@ -1240,7 +1282,10 @@ mod tests {
         )
         .expect("write attempt 10");
 
-        assert_eq!(scan_latch(&dir, 11), Some(ProtoMode::Native));
+        assert_eq!(
+            scan_latch(&dir, &dir.join("messages-11.jsonl")),
+            Some(ProtoMode::Native)
+        );
 
         world::remove_tree(&dir);
     }
@@ -1650,6 +1695,160 @@ mod tests {
         );
         assert!(lines[0].contains("the retry's own event"));
         assert!(!contents.contains("partial from a crashed attempt"));
+
+        world::remove_tree(&dir);
+    }
+
+    #[test]
+    fn allocation_never_reuses_an_existing_transcript_name() {
+        let dir = world::temp_dir("native-alloc-existing");
+        let dead = dir.join("messages-2.jsonl");
+        world::write(
+            &dead,
+            "{\"event\":\"final\",\"value\":{\"text\":\"dead attempt\"}}\n",
+        )
+        .expect("write the dead attempt");
+
+        let allocated = allocate_transcript(&dir, FileLabel::Attempt, 2);
+        assert_ne!(
+            allocated, dead,
+            "a re-entered attempt 2 must not be handed the dead attempt's own name"
+        );
+        assert_eq!(
+            allocated
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned()),
+            Some("messages-2-2.jsonl".to_string())
+        );
+
+        world::write(&allocated, "").expect("occupy slot 2");
+        assert_eq!(
+            allocate_transcript(&dir, FileLabel::Attempt, 2)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned()),
+            Some("messages-2-3.jsonl".to_string())
+        );
+
+        world::remove_tree(&dir);
+    }
+
+    #[test]
+    fn the_dead_attempts_transcript_survives_the_retrys_truncate_and_log() {
+        let dir = world::temp_dir("native-alloc-survives");
+        let dead = dir.join("messages-2.jsonl");
+        let content = "{\"event\":\"final\",\"value\":{\"text\":\"what it was doing\"}}\n";
+        world::write(&dead, content).expect("write the dead attempt");
+
+        let allocated = allocate_transcript(&dir, FileLabel::Attempt, 2);
+        let retry = Transcript {
+            path: allocated.clone(),
+            attempt_n: 2,
+            append_failed: std::cell::RefCell::new(None),
+        };
+        retry.truncate();
+        retry.log(&TranscriptEvent::Final {
+            text: "the retry's own event".to_string(),
+        });
+
+        assert_eq!(
+            world::read_to_string(&dead).expect("read the dead attempt"),
+            content,
+            "the only account of the dead attempt must survive byte-for-byte"
+        );
+        let fresh = world::read_to_string(&allocated).expect("read the retry");
+        assert_eq!(fresh.lines().count(), 1);
+        assert!(fresh.contains("the retry's own event"));
+
+        world::remove_tree(&dir);
+    }
+
+    #[test]
+    fn allocation_leaves_the_bare_name_alone_when_nothing_is_there() {
+        let dir = world::temp_dir("native-alloc-fresh");
+        assert_eq!(
+            allocate_transcript(&dir, FileLabel::Attempt, 3),
+            dir.join("messages-3.jsonl")
+        );
+        world::remove_tree(&dir);
+    }
+
+    #[test]
+    fn allocation_holds_for_reflect_too() {
+        let dir = world::temp_dir("native-alloc-reflect");
+        assert_eq!(
+            allocate_transcript(&dir, FileLabel::Reflect, 1),
+            dir.join("reflect-messages-1.jsonl")
+        );
+        world::write(&dir.join("reflect-messages-1.jsonl"), "dead reflect\n")
+            .expect("write the dead reflect");
+        assert_eq!(
+            allocate_transcript(&dir, FileLabel::Reflect, 1),
+            dir.join("reflect-messages-1-2.jsonl")
+        );
+        world::remove_tree(&dir);
+    }
+
+    fn latch_line(mode: &str) -> String {
+        format!(
+            "{{\"event\":\"protocol_selected\",\"value\":{{\"mode\":\"{mode}\",\"reason\":\"r\"}}}}\n"
+        )
+    }
+
+    #[test]
+    fn a_same_slot_retry_participates_in_the_scan_ordered_after_its_predecessor() {
+        let dir = world::temp_dir("native-scan-latch-slots");
+        world::write(&dir.join("messages-2.jsonl"), &latch_line("text")).expect("write slot 1");
+        world::write(&dir.join("messages-2-2.jsonl"), &latch_line("native")).expect("write slot 2");
+
+        assert_eq!(
+            scan_latch(&dir, &dir.join("messages-3.jsonl")),
+            Some(ProtoMode::Native),
+            "the suffixed retry is younger than the bare name it followed"
+        );
+
+        world::write(&dir.join("messages-2.jsonl"), &latch_line("native")).expect("rewrite slot 1");
+        world::write(&dir.join("messages-2-2.jsonl"), &latch_line("text")).expect("rewrite slot 2");
+        assert_eq!(
+            scan_latch(&dir, &dir.join("messages-3.jsonl")),
+            Some(ProtoMode::Text)
+        );
+
+        world::remove_tree(&dir);
+    }
+
+    #[test]
+    fn this_attempts_suffixed_file_is_excluded_while_its_predecessor_is_scanned() {
+        let dir = world::temp_dir("native-scan-latch-own-suffixed");
+        let own = dir.join("messages-2-2.jsonl");
+        world::write(&dir.join("messages-2.jsonl"), &latch_line("text")).expect("write slot 1");
+        world::write(&own, &latch_line("native")).expect("write own");
+
+        assert_eq!(
+            scan_latch(&dir, &own),
+            Some(ProtoMode::Text),
+            "this attempt's own file never latches it, however suffixed"
+        );
+
+        world::remove_tree(&dir);
+    }
+
+    #[test]
+    fn reflect_transcripts_never_participate_in_the_latch_scan() {
+        let dir = world::temp_dir("native-scan-latch-reflect");
+        world::write(&dir.join("messages-1.jsonl"), &latch_line("text")).expect("write attempt 1");
+        world::write(&dir.join("reflect-messages-1.jsonl"), &latch_line("native"))
+            .expect("write reflect 1");
+        world::write(
+            &dir.join("reflect-messages-1-2.jsonl"),
+            &latch_line("native"),
+        )
+        .expect("write reflect 1 slot 2");
+
+        assert_eq!(
+            scan_latch(&dir, &dir.join("messages-2.jsonl")),
+            Some(ProtoMode::Text),
+            "a Reflect transcript is not an attempt transcript"
+        );
 
         world::remove_tree(&dir);
     }
