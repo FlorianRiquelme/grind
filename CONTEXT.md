@@ -68,6 +68,15 @@ was not ready for it. A Wait is not a failure and never spends the budget; a Run
 waits is bounded separately, by how many it does in a row.
 _Avoid_: probe, retry, no-op, free attempt
 
+**Turn ceiling**:
+The hard cap on conversation turns one native-loop Attempt may spend, declared per stage in
+`docs/tiers.toml` — the stage's tiered `[max_turns.tN]` row when its tier declares one, else
+its flat `[max_turns]` row, else the compiled fallback of 32 (`src/native.rs`). The
+supervisor resolves it once per Attempt from the stage and the decided tier and hands it to
+the native loop, which fails the Attempt loudly on exhausting it rather than stopping
+cleanly (ADR-0018).
+_Avoid_: budget, turn limit, max turns
+
 **Blocker**:
 An obstacle a Run cannot clear itself and a human can. A Run that meets one stops at once
 rather than spending Attempts against it, and resumes where it stopped once the human has

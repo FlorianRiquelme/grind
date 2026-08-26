@@ -74,9 +74,12 @@ in `net.rs` feeds directly into this ruling:
   `native_finish_reason`, when present, `∈ {stop, tool_calls, end_turn, stop_sequence}`;
   anything else is `AbnormalFinish` and fails the attempt. Reading only the OpenAI-level field
   would have classified the POC's masked `network_error` turns as clean stops.
-- **Turn budget is a failure.** Exhausting the 32-turn budget is a failed Attempt with
-  `terminal_reason` set, never a clean stop. Per-turn network retries are bounded (3 attempts,
-  2s × attempt backoff) before the attempt itself fails toward could-not-answer.
+- **Turn budget is a failure.** Exhausting the stage's turn ceiling is a failed Attempt with
+  `terminal_reason` set, never a clean stop. The ceiling is no longer one constant: it is
+  declared per stage in `docs/tiers.toml`, optionally overridden per tier, and falls back to
+  the compiled default of 32 for a stage with no declared entry (issue #157). Per-turn network
+  retries are bounded (3 attempts, 2s × attempt backoff) before the attempt itself fails
+  toward could-not-answer.
 
 ## One corrective nudge per occurrence, always logged
 
@@ -117,3 +120,13 @@ these events live (`messages-N.jsonl` in the run dir) and why the latch can trus
 [ADR-0016](0016-the-agent-harness-takes-a-vetted-sync-http-stack.md) owns the transport and the
 failure classification this ruling consumes. Separate decisions, same ticket (#135); all three
 are terms of the one epic.
+
+## Amended 2026-08-26 — the turn ceiling became data
+
+The ruling above once named "the 32-turn budget" — a single compiled constant. Issue
+[#157](https://github.com/FlorianRiquelme/grind/issues/157) moved that number out of the
+binary: the ceiling a native Attempt enforces is now declared per stage in `docs/tiers.toml`
+(the `[max_turns]` sections), optionally overridden per tier, and resolved per attempt by
+`max_turns_for` in `src/native.rs`, with the compiled 32 remaining only as the absent-entry
+fallback. What this ADR rules is unchanged: exhaustion is still a failed Attempt with
+`terminal_reason` set, never a clean stop. Only where the limit lives moved.

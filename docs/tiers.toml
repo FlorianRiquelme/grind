@@ -1,6 +1,7 @@
 # Grit's tier calibration (issue #92, phase 1).
 #
-# The weights, thresholds and per-tier model routing `select_tier` (`src/decide.rs`) reads.
+# The weights, thresholds and per-tier model routing `select_tier` (`src/decide.rs`) reads,
+# plus — since #157 — the per-stage turn ceilings the native loop (`src/native.rs`) enforces.
 # Shipped in-repo so a threshold move is a reviewed diff, never a recompile-only change —
 # calibration is something a human reads before it binds. This file is data for a
 # reviewer, not for `select_tier` itself to trust blindly: `tiers_from_toml` parses it
