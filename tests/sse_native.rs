@@ -14,6 +14,10 @@
 //! | empty_response_fails_loudly | — (R6: never a clean stop) |
 //! | text_protocol_with_nudge | success_done.sh, text-wire equivalent |
 //! | http_429_is_rate_limited | rate_limited.sh (`rate_limited:true`) |
+//! | malformed_tool_call_nudges_then_completes | — (#142: fault check runs before the
+//!   gate and before execution; the malformed call is nudged, never denied, never run) |
+//! | frontmatter_prompt_declares_its_skill | — (the writer emits what native.rs's
+//!   readers parse; positional assertions stop encoding a shape no real Run produces) |
 //! | a_completed_stage_without_the_sentinel_promises_nothing | — (issue #139: an ending
 //!   is never synthesized into a Run-level promise) |
 //!
@@ -176,6 +180,25 @@ fn scratch(name: &str) -> (PathBuf, PathBuf) {
 /// builds a stage attempt: StageConditions + StageContext → claude::stage_invocation,
 /// denied globs from attempt::denied_for(stage), a literal hand-built Job (fields pub).
 fn drive_attempt(server: &Server, run_dir: &Path, cwd: &Path, attempt_n: usize) -> Attempt {
+    drive_attempt_with_prompt(
+        server,
+        run_dir,
+        cwd,
+        attempt_n,
+        "Do the assigned stage work.",
+    )
+}
+
+/// The same seam with a caller-supplied stage prompt — `stage_invocation` composes the
+/// skill file verbatim ahead of the context block, so a prompt carrying real frontmatter
+/// is how `declared_skill` gets exercised end to end.
+fn drive_attempt_with_prompt(
+    server: &Server,
+    run_dir: &Path,
+    cwd: &Path,
+    attempt_n: usize,
+    skill_text: &str,
+) -> Attempt {
     ensure_api_key();
 
     let job = Job {
@@ -203,7 +226,7 @@ fn drive_attempt(server: &Server, run_dir: &Path, cwd: &Path, attempt_n: usize) 
     let worktree = cwd.display().to_string();
     let ctx = attempt::StageContext {
         stage: rung::Stage::Work,
-        skill_text: "Do the assigned stage work.",
+        skill_text,
         stages_dir: &stages_dir,
         worktree: &worktree,
         job: &job,
@@ -538,5 +561,168 @@ fn a_completed_stage_without_the_sentinel_promises_nothing() {
     assert_eq!(
         attempt.result_tail,
         "Stage artifacts are on disk; the ladder may advance."
+    );
+}
+
+/// A malformed tool call — arguments that are not a JSON object — arrives while a denied
+/// glob would have matched had the call reached policy: the fault check must run *before*
+/// the gate and before execution (#142), so the reply earns a protocol_nudge carrying what
+/// was wrong, no tool_result is ever logged for it, and nothing is denied. The corrected
+/// re-issue on the next turn runs and completes the stage.
+///
+/// This is also the only end-to-end carrier for the malformed branch itself: every
+/// `protocol_fault` unit test calls the function directly, so the loop's ordering —
+/// nudge instead of deny, never execute — lives here alone.
+#[test]
+fn malformed_tool_call_nudges_then_completes() {
+    let (run_dir, cwd) = scratch("malformed-nudge");
+    std::fs::write(cwd.join("note.txt"), "the quick brown fixture\n").expect("seed note.txt");
+
+    let server = Server::start(vec![
+        Reply::Sse(sse(vec![chunk(
+            json!({"tool_calls": [tool_delta(
+                0, Some("call_bad"), Some("bash"), Some("not json"),
+            )]}),
+            Some("tool_calls"),
+            None,
+        )])),
+        Reply::Sse(sse(vec![
+            chunk(
+                json!({"tool_calls": [tool_delta(
+                    0, Some("call_ok"), Some("read_file"), Some("{\"path\": \"note.txt\"}"),
+                )]}),
+                None,
+                None,
+            ),
+            json!({
+                "choices": [{"delta": {}, "finish_reason": "tool_calls", "native_finish_reason": null}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+            }),
+        ])),
+        Reply::Sse(sse(vec![chunk(
+            json!({"content": "All work complete. <promise>DONE</promise>"}),
+            Some("stop"),
+            None,
+        )])),
+    ]);
+
+    let attempt = drive_attempt(&server, &run_dir, &cwd, 1);
+
+    assert!(!attempt.is_error, "{:?}", attempt.terminal_reason);
+    assert!(attempt.done_promise);
+    assert_eq!(
+        attempt.num_turns,
+        Some(3),
+        "the malformed turn still counts"
+    );
+
+    let events = transcript_events(&run_dir, 1);
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+
+    let nudges: Vec<&Value> = events
+        .iter()
+        .filter(|(name, _)| name == "protocol_nudge")
+        .map(|(_, value)| value)
+        .collect();
+    assert_eq!(nudges.len(), 1, "exactly one corrective nudge: {names:?}");
+    let fault = nudges[0]["fault"]
+        .as_str()
+        .expect("a malformed call logs its fault");
+    assert!(
+        fault.contains("not valid JSON"),
+        "the fault names exactly what was wrong: {fault}"
+    );
+
+    // The fault check ran before the gate: Work's denials carry force-push shell forms,
+    // which a gate-first ordering could have answered with a denial record. It never did.
+    // And the malformed call itself never entered the conversation: the only
+    // assistant_tool_calls row is the corrected re-issue being echoed back before it runs.
+    let echoed: Vec<String> = events
+        .iter()
+        .filter(|(name, _)| name == "assistant_tool_calls")
+        .map(|(_, value)| value.to_string())
+        .collect();
+    assert_eq!(
+        echoed.len(),
+        1,
+        "one echoed batch across the attempt — the correction, not the fault: {names:?}"
+    );
+    assert!(
+        !echoed[0].contains("not json") && !echoed[0].contains("\"bash\""),
+        "the malformed call never entered the conversation: {}",
+        echoed[0]
+    );
+    assert!(
+        echoed[0].contains("read_file"),
+        "the one echoed batch is the corrected re-issue: {}",
+        echoed[0]
+    );
+    let results: Vec<&Value> = events
+        .iter()
+        .filter(|(name, _)| name == "tool_result")
+        .map(|(_, value)| value)
+        .collect();
+    assert_eq!(
+        results.len(),
+        1,
+        "exactly one executed call across the whole attempt: {names:?}"
+    );
+    assert_eq!(results[0]["call_id"], "call_ok");
+
+    // The corrective exchange went back over the wire, verbatim from
+    // `malformed_call_exchange`, ahead of the model's second turn.
+    let bodies = server.bodies();
+    assert_eq!(bodies.len(), 3, "three scripted turns: {}", bodies.len());
+    assert!(
+        bodies[1].contains("was not well-formed"),
+        "the correction names the malformation: {}",
+        bodies[1]
+    );
+    assert!(
+        !bodies[1].contains("\"not json\""),
+        "the malformed arguments themselves never re-enter messages"
+    );
+
+    let (_, final_value) = events
+        .iter()
+        .find(|(name, _)| name == "final")
+        .expect("Final logged");
+    assert!(
+        final_value["text"]
+            .as_str()
+            .expect("string final")
+            .contains("DONE")
+    );
+}
+
+/// A real stage prompt opens with the skill file verbatim — YAML frontmatter first — so
+/// production native transcripts begin with `skill_declared`, not `protocol_selected`.
+/// The harness prompt carried no frontmatter until now, which let positional assertions
+/// pass on a shape no Run produces (#135 follow-up): this scenario feeds real frontmatter
+/// through the same composition seam the supervisor uses and pins the writer's row at 0.
+#[test]
+fn frontmatter_prompt_declares_its_skill() {
+    let (run_dir, cwd) = scratch("skill-declared");
+    let skill_text =
+        "---\nname: work\ndescription: the stage's own words.\n---\n\nDo the assigned stage work.";
+
+    let server = Server::start(vec![Reply::Sse(sse(vec![chunk(
+        json!({"content": "Stage artifacts are on disk; the ladder may advance."}),
+        Some("stop"),
+        None,
+    )]))]);
+
+    let attempt = drive_attempt_with_prompt(&server, &run_dir, &cwd, 1, skill_text);
+
+    assert!(!attempt.is_error, "{:?}", attempt.terminal_reason);
+
+    let events = transcript_events(&run_dir, 1);
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+
+    assert_eq!(names[0], "skill_declared", "{names:?}");
+    assert_eq!(events[0].1["skill"], "work");
+    assert_eq!(
+        names[1], "protocol_selected",
+        "the probe row follows the declaration: {names:?}"
     );
 }
