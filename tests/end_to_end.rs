@@ -198,6 +198,17 @@ impl Sandbox {
             .expect("a Run")
     }
 
+    /// The worktree Dispatch created or adopted for this Run — read off the record, the way
+    /// every other reader of a finished dispatch does.
+    fn worktree_path(&self) -> PathBuf {
+        PathBuf::from(
+            self.record()["worktree"]
+                .as_str()
+                .expect("the record names its worktree")
+                .to_string(),
+        )
+    }
+
     /// The argv of each attempt, in order, as the fake actually received it.
     fn argvs(&self) -> Vec<Vec<String>> {
         split_log(&self.fake().join("argv.log"), "--- attempt")
@@ -1549,34 +1560,31 @@ fn an_anchor_artifact_that_is_present_but_empty_proceeds() {
     assert_eq!(box_.record()["state"], "completed");
 }
 
+/// The create path must be born at the declared Handoff SHA when that object exists in the
+/// clone: origin moved ahead of what the Job froze, and a worktree branched from origin HEAD
+/// would start the Run somewhere the record never named. The Job branch is taken away first,
+/// so Dispatch has to *create* it — the birth path this pin is about — and the Anchor row is
+/// moved to a file the frozen commit holds.
 #[test]
-fn a_worktree_behind_the_handoff_sha_refuses_at_second_zero() {
-    let box_ = sandbox("behind-the-handoff");
-    box_.scenario(&["success_done"]);
+fn a_dispatched_run_works_at_the_handoff_sha_when_origin_moved_ahead() {
+    let box_ = sandbox("created-at-handoff");
+    box_.scenario(&["success_done"]).anchor_becomes("README.md");
 
     let clone = box_.clone_path();
-    git(&clone, &["checkout", "-q", BRANCH]);
+    git(&clone, &["checkout", "-q", "main"]);
+    fs::create_dir_all(clone.join("docs/plans")).expect("the plans directory");
     fs::write(clone.join("docs/plans/later.md"), "# the human moved on\n").expect("a later plan");
     git(&clone, &["add", "-A"]);
     git(&clone, &["commit", "-q", "-m", "the human moved on"]);
-    let ahead = git(&clone, &["rev-parse", "HEAD"]);
-    git(&clone, &["reset", "--hard", "-q", "HEAD~1"]);
-    git(&clone, &["checkout", "-q", "main"]);
-    box_.handoff_becomes(&ahead);
+    git(&clone, &["push", "-q", "origin", "main"]);
+    git(&clone, &["branch", "-qD", BRANCH]);
 
     let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
     assert_eq!(
-        code,
-        Some(2),
-        "a refusal is incoherent input:\n{out}\n{err}"
-    );
-    assert!(
-        err.contains("fast-forward"),
-        "the one refusal that names its repair:\n{err}"
-    );
-    assert!(
-        !box_.home.join(".grind/runs").exists(),
-        "nothing is dispatched onto a worktree that does not contain the Handoff SHA"
+        git(&box_.worktree_path(), &["rev-parse", "HEAD"]),
+        box_.handoff_sha,
+        "the dispatched worktree sits exactly at the declared Handoff SHA"
     );
 }
 

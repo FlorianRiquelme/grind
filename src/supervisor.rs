@@ -327,7 +327,7 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
 
     let _lock = take_lock(&home, &job.target_repo, &job.branch)?;
 
-    let worktree = adopt_or_create_worktree(&repo_path, &job.branch)?;
+    let worktree = adopt_or_create_worktree(&repo_path, &job.branch, Some(&job.handoff_sha))?;
     let dirty = world::run(&words(&["git", "status", "--porcelain"]), Some(&worktree));
     if dirty.code != Some(0) {
         return Err(Refusal::saying(format!(
@@ -1625,7 +1625,11 @@ fn skills_hash(files: &[(String, Vec<u8>)]) -> String {
     format!("{hash:016x}")
 }
 
-fn adopt_or_create_worktree(repo_path: &Path, branch: &str) -> Result<PathBuf, Refusal> {
+fn adopt_or_create_worktree(
+    repo_path: &Path,
+    branch: &str,
+    handoff_sha: Option<&str>,
+) -> Result<PathBuf, Refusal> {
     let listed = world::run(
         &words(&["git", "worktree", "list", "--porcelain"]),
         Some(repo_path),
@@ -1659,6 +1663,20 @@ fn adopt_or_create_worktree(repo_path: &Path, branch: &str) -> Result<PathBuf, R
         argv.push("-b".to_string());
         argv.push(branch.to_string());
         argv.push(wanted.display().to_string());
+        // Freeze discipline: when the declared Handoff SHA resolves to an object inside
+        // this clone, the fresh worktree is born exactly there — not at whatever HEAD
+        // points at today. When it does not resolve, today's default start point stands
+        // and the reachability gate speaks afterward; creation stays best-effort, never
+        // a new way to refuse.
+        if let Some(sha) = handoff_sha {
+            let known = world::run(
+                &words(&["git", "cat-file", "-e", &format!("{sha}^{{commit}}")]),
+                Some(repo_path),
+            );
+            if known.code == Some(0) {
+                argv.push(sha.to_string());
+            }
+        }
     } else {
         argv.push(wanted.display().to_string());
         argv.push(branch.to_string());
@@ -2481,7 +2499,8 @@ mod tests {
     fn a_branch_that_exists_nowhere_dispatches_a_worktree() {
         let repo = a_clone_with_one_commit("fresh");
         let branch = "feat/81-brand-new";
-        let worktree = adopt_or_create_worktree(&repo, branch).expect("a fresh branch dispatches");
+        let worktree =
+            adopt_or_create_worktree(&repo, branch, None).expect("a fresh branch dispatches");
         assert_eq!(worktree, job::worktree_to_create(&repo, branch));
         assert!(
             rev_parse(&repo, &format!("refs/heads/{branch}")).is_some(),
@@ -2504,7 +2523,8 @@ mod tests {
         let sha = rev_parse(&repo, "HEAD").unwrap();
         let branched = world::run(&words(&["git", "branch", "side"]), Some(&repo));
         assert_eq!(branched.code, Some(0));
-        let worktree = adopt_or_create_worktree(&repo, "side").expect("an existing ref dispatches");
+        let worktree =
+            adopt_or_create_worktree(&repo, "side", None).expect("an existing ref dispatches");
         assert_eq!(rev_parse(&worktree, "HEAD").as_deref(), Some(sha.as_str()));
         world::remove_tree(&repo);
     }
@@ -2512,8 +2532,8 @@ mod tests {
     #[test]
     fn the_worktree_adopted_is_the_one_the_branch_already_holds() {
         let repo = a_clone_with_one_commit("adopted");
-        let first = adopt_or_create_worktree(&repo, "feat/81-twice").unwrap();
-        let second = adopt_or_create_worktree(&repo, "feat/81-twice").unwrap();
+        let first = adopt_or_create_worktree(&repo, "feat/81-twice", None).unwrap();
+        let second = adopt_or_create_worktree(&repo, "feat/81-twice", None).unwrap();
         assert_eq!(
             world::resolve_link(&first).unwrap(),
             world::resolve_link(&second).unwrap()
