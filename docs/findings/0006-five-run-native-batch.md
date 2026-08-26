@@ -150,7 +150,7 @@ those values rest on:
 - **work**: eighteen wall deaths in this batch alone, including #155's eleven-attempt stall and
   issue #157's measurement of the prior dogfood run (~40 turns: 32 + resume); 64 gives a
   two-slice budget where 32 did not finish one.
-- **validate**: clean completes landed at 13–25 turns, but three of six validate attempts died at
+- **validate**: clean completes landed at 13–25 turns, but three of seven validate attempts died at
   the 32 wall — including #157's, where the third attempt needed 25 and two full slices were
   burned first. 48 covers the observed worst slice plus headroom for one re-entry.
 - **fixes**: the largest observed fixes need is issue #157's measurement of run
