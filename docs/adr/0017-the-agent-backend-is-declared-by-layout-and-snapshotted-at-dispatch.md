@@ -81,8 +81,12 @@ At dispatch, the supervisor resolves the selection once and writes `backend` and
 
 ## Grind-owned transcripts land in the run dir
 
-The native adapter appends `messages-N.jsonl` — one file per attempt, mirroring the
-`attempt-N.*` convention — into the Run's own directory under `~/.grind/runs/<run-id>/`. Lines
+The native adapter appends `messages-N.jsonl` for attempt N, mirroring the `attempt-N.*`
+convention, into the Run's own directory under `~/.grind/runs/<run-id>/`. An attempt re-entered
+after an earlier attempt with the same number died unrecorded appends to
+`messages-N-{K}.jsonl` (`reflect-messages-{N}-{K}.jsonl` likewise) — the first name in slot
+order that does not exist yet, so a resumed retry never recycles a dead attempt's transcript:
+allocation never opens an existing file for writing, and nothing already on disk is truncated. Lines
 are `{"event": "<snake_name>", "value": {...}}`, identical shape to the POC's log: the variants
 are `AssistantToolCalls`, `ToolResult`, `Usage`, `ProtocolNudge`, `ProtocolSelected`, `Final`
 (see [ADR-0018](0018-tool-calling-is-capability-adaptive.md) for the protocol semantics the
