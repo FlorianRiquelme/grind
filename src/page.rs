@@ -1438,12 +1438,24 @@ mod tests {
     fn a_claude_code_attempts_trio_ignores_any_recorded_transcript_name() {
         let mut found = day_one();
         assert_eq!(found.backend, crate::runner::Backend::ClaudeCode);
-        found.attempts[0].transcript =
-            crate::attempt::Transcript::Recorded("messages-1-2.jsonl".to_string());
-        let html = attempt_list("id", &found);
-        assert!(html.contains("attempt-1.prompt.txt"), "{html}");
-        assert!(html.contains("attempt-1.stdout.json"), "{html}");
-        assert!(html.contains("attempt-1.stderr.log"), "{html}");
-        assert!(!html.contains("messages-1-2.jsonl"), "{html}");
+        // The trio is determined by `n` alone, however the transcript fact stands: a
+        // recorded name that adapter never sets, and the wrote-none fact it never
+        // reaches either.
+        for wrote in [
+            crate::attempt::Transcript::Recorded("messages-1-2.jsonl".to_string()),
+            crate::attempt::Transcript::WroteNone,
+        ] {
+            let mut found = found.clone();
+            found.attempts[0].transcript = wrote;
+            let html = attempt_list("id", &found);
+            assert!(html.contains("attempt-1.prompt.txt"), "{html}");
+            assert!(html.contains("attempt-1.stdout.json"), "{html}");
+            assert!(html.contains("attempt-1.stderr.log"), "{html}");
+            assert!(!html.contains("messages-1-2.jsonl"), "{html}");
+            assert!(
+                !html.contains("/raw/runs/id/messages-"),
+                "the claude-code row never links any messages file at all: {html}"
+            );
+        }
     }
 }
