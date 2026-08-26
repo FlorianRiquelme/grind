@@ -384,7 +384,6 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
 
     require_anchor_present(&worktree, &job.anchor, &job.handoff_sha)?;
     let anchor = job.anchor.clone();
-    let handoff_sha = job.handoff_sha.clone();
     let run_id = format!(
         "{}-{}-{}",
         world::now_stamp(),
@@ -456,7 +455,7 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
                         short(moved.stdout.trim()),
                     ),
                 );
-                require_anchor_present(&worktree, &anchor, &handoff_sha)?;
+                require_anchor_present(&worktree, &anchor, handoff_sha)?;
             } else {
                 return Err(refusal);
             }
