@@ -73,12 +73,16 @@ proven unit behind the stage's finish — several proven units held uncommitted 
 landings a wall death could strand in a dirty tree. The measure of this rule is simple: at any
 instant, everything independently provable is already committed.
 
+Make each unit's commit message open with that unit's ID (`<unit-id>: …`) — the re-entry
+orientation lists commits and unit returns as parallel facts, and this convention is what lets
+the two be paired without re-inspecting diffs.
+
 ## Idempotent re-entry
 
 On re-entry, your prompt lists what already survived — commits on this branch beyond the base
 branch, and unit returns recorded under `units/`. Check those facts against the tree before doing
-anything else: a unit with both its durable return on disk and its matching commit in the log is
-done — do not redo it. Resume from the earliest unit lacking either.
+anything else: a unit with both its durable return on disk and its own commit — the one whose
+message opens with its ID — is done; do not redo it. Resume from the earliest unit lacking either.
 
 ## Descriptive language only
 
