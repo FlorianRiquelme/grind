@@ -301,16 +301,214 @@ pub struct Attempt {
     /// integers**: a count of processes must never become an assertion about a review
     /// (ADR-0006's sixth prohibited shape).
     pub fanout: Observed<(u64, u64)>,
-    /// The bare file name of the transcript this Attempt actually wrote — `messages-2-2.jsonl`
-    /// for a re-entered attempt 2 that found slot 1 taken. A name, never a path: the reader
-    /// joins it onto the Run directory it already knows.
+    /// The transcript fact, three-valued for the same reason [`Attempt::fanout`] is: two of
+    /// the facts it separates once shared one `None`.
     ///
-    /// `None` on every record written before the name was recorded, and on every claude-code
-    /// Attempt — that adapter's `attempt-N.*` trio is determined by `n` alone, so the reader's
-    /// computed fallback names it exactly. Additive and `serde(default)`, so an existing
-    /// `run.json` still parses under `RunView`'s `deny_unknown_fields`.
-    #[serde(default)]
-    pub transcript_name: Option<String>,
+    /// - `Recorded(name)` — the attempt allocated a transcript and this is its bare file name
+    ///   (`messages-2-2.jsonl` for a re-entered attempt 2 that found slot 1 taken). A name,
+    ///   never a path: the reader joins it onto the Run directory it already knows.
+    /// - `PredatesName` — every record written before the field existed. The constructed
+    ///   `messages-{n}.jsonl` fallback is exactly right for these rows: the file exists and is
+    ///   the attempt's own.
+    /// - `WroteNone` — the attempt's lifecycle ended before any transcript was allocated
+    ///   (endpoint resolution fails before `allocate_transcript` is reached), so no file was
+    ///   ever written and there is nothing to link.
+    ///
+    /// Absence-of-key decodes to `PredatesName`, never `WroteNone`: today's writer
+    /// serializes `None` as an explicit `"transcript_name": null`, so absence and explicit
+    /// null both stand for *the record predates the name* — a statement about when it was
+    /// written — while `WroteNone` is a statement about how the attempt ended. An old
+    /// record's silence is evidence about when it was written, never about how its attempt
+    /// ended, and only the encoder (which watched the loop end without allocating) can state
+    /// the latter. Additive and `serde(default)`, so an existing `run.json` still parses
+    /// under `RunView`'s `deny_unknown_fields`.
+    ///
+    /// On the way out, `PredatesName` writes **nothing** under the key — the same silence it
+    /// decodes from — so a legacy row carried forward by a newer binary keeps meaning exactly
+    /// what it meant (the round-trip batteries in `supervisor` and `view` re-encode loaded
+    /// records). `Recorded` writes the bare string today's writer wrote; only `WroteNone`
+    /// states itself, as `{"wrote_none": null}` — a shape no record written before this
+    /// change can carry, which is what makes the two silences tellable after the fact.
+    #[serde(
+        default,
+        rename = "transcript_name",
+        skip_serializing_if = "Transcript::predates_the_name"
+    )]
+    pub transcript: Transcript,
+}
+
+/// What an Attempt states about the transcript it wrote. Three-valued because two of the
+/// facts it separates once shared one `None`: a record that predates the field and a record
+/// whose attempt ended before allocating a transcript both decode out of today's byte shapes
+/// as `transcript_name` absent or `null`, but they mean different things — one is about when
+/// the record was written, the other about how the attempt ended.
+///
+/// The wire key stays `transcript_name` — the key every record written before this change
+/// carries — via `#[serde(rename)]` on [`Attempt::transcript`]; the Rust name widens, the
+/// record grammar does not.
+///
+/// Decoding (the spell is load-bearing; see [`Attempt::transcript`]):
+/// - a string value decodes to `Recorded(name)`;
+/// - an explicit `null` **and** an absent key both decode to `PredatesName`;
+/// - `{"wrote_none": null}` — and only that — decodes to `WroteNone`: unreachable from any
+///   old byte shape by construction, it exists only because the encoder states it on the
+///   endpoint-resolution path, which no record written before this change can carry.
+///
+/// Encoding mirrors it: `Recorded` writes the bare string, `WroteNone` writes
+/// `{"wrote_none": null}`, and `PredatesName` is skipped at the field that holds it
+/// ([`Attempt::transcript`]) because its only content *is* silence-under-the-key.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Transcript {
+    /// The bare name of the transcript file this attempt wrote. A name, never a path: the
+    /// reader joins it onto the Run directory it already knows.
+    Recorded(String),
+    /// The record was written before `transcript_name` existed; the constructed
+    /// `messages-{n}.jsonl` fallback names this attempt's own transcript exactly.
+    PredatesName,
+    /// The attempt's lifecycle ended before any transcript was allocated — nothing was ever
+    /// written, so there is nothing to link. Reachable only from the encoder.
+    WroteNone,
+}
+
+/// The encoder is part of the spell: `Recorded` states its name under the record's own
+/// historical key (`transcript_name`), `WroteNone` serializes an explicit null under it — a
+/// stated fact, not a default — and `PredatesName` must never be written at all: it exists
+/// so old records' silence can be named in the reader, and encoding it as anything would
+/// forge a statement about when this record was written that the writer never had. A
+/// re-encoded old record carries nothing under the key again.
+impl serde::Serialize for Transcript {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Transcript::Recorded(name) => serializer.serialize_str(name),
+            Transcript::WroteNone => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("wrote_none", &Option::<()>::None)?;
+                map.end()
+            }
+            Transcript::PredatesName => Err(serde::ser::Error::custom(
+                "predates-the-name is written as silence under the key — skip the field, never encode a value",
+            )),
+        }
+    }
+}
+
+/// The decoder is the compatibility spell (Direction): today's writer serializes a bare
+/// `None` as `"transcript_name": null` — key present, value null — so absence-of-key and
+/// explicit null are the same fact on records already on disk, and both must land on
+/// `PredatesName`, never on `WroteNone`. An old record's silence is evidence about when it
+/// was written, never about how its attempt ended; `WroteNone` is reachable only through the
+/// encoder that watched the loop end without allocating.
+impl<'de> Deserialize<'de> for Transcript {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Transcript;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("the bare file name of a written transcript, or its absence")
+            }
+
+            /// An `Option` field deserializes through a temp `Option` per the serde
+            /// "deserialize an optional field" recipe — so a *present* string lands in the
+            /// some arm and must be forwarded for the real visit, or every record would
+            /// silently read as predating.
+            fn visit_some<D>(self, d: D) -> Result<Self::Value, D::Error>
+            where
+                D: serde::de::Deserializer<'de>,
+            {
+                struct SomeVisitor;
+                impl<'de> serde::de::Visitor<'de> for SomeVisitor {
+                    type Value = Transcript;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("the bare file name of a written transcript, or its absence")
+                    }
+
+                    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                        Ok(Transcript::PredatesName)
+                    }
+
+                    fn visit_none<E>(self) -> Result<Self::Value, E> {
+                        Ok(Transcript::PredatesName)
+                    }
+
+                    fn visit_some<D>(self, d: D) -> Result<Self::Value, D::Error>
+                    where
+                        D: serde::de::Deserializer<'de>,
+                    {
+                        d.deserialize_any(Visitor)
+                    }
+
+                    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                        Ok(Transcript::Recorded(v.to_owned()))
+                    }
+
+                    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+                    where
+                        A: serde::de::MapAccess<'de>,
+                    {
+                        Visitor.visit_map(map)
+                    }
+                }
+                d.deserialize_any(SomeVisitor)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(Transcript::PredatesName)
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(Transcript::PredatesName)
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(Transcript::Recorded(v.to_owned()))
+            }
+
+            /// The only stated fact: `{"wrote_none": null}`. Any other key is refused rather
+            /// than defaulted, so a future grammar grows this visitor on purpose.
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let key: String = map.next_key()?.ok_or_else(|| {
+                    serde::de::Error::custom("an empty transcript fact states nothing")
+                })?;
+                match key.as_str() {
+                    "wrote_none" => {
+                        let _: Option<serde::de::IgnoredAny> = map.next_value()?;
+                        Ok(Transcript::WroteNone)
+                    }
+                    other => Err(serde::de::Error::unknown_field(other, &["wrote_none"])),
+                }
+            }
+        }
+        deserializer.deserialize_option(Visitor)
+    }
+}
+
+impl Default for Transcript {
+    /// Absence-of-key means *the record predates the name*. Deliberately hand-written rather
+    /// than derived: deriving would read as if the variant were an arbitrary choice, where
+    /// this comment can say why silence on an old record must land here.
+    fn default() -> Self {
+        Transcript::PredatesName
+    }
+}
+
+impl Transcript {
+    /// The field-skip predicate: a predating row writes nothing under the key, because
+    /// silence-under-the-key *is* what predates-the-name means.
+    fn predates_the_name(&self) -> bool {
+        matches!(self, Transcript::PredatesName)
+    }
 }
 
 impl Attempt {
@@ -933,7 +1131,7 @@ mod tests {
             rate_limited: limited,
             result_tail: String::new(),
             fanout: Observed::Absent,
-            transcript_name: None,
+            transcript: Transcript::PredatesName,
         }
     }
 
@@ -1392,18 +1590,114 @@ mod tests {
         assert_eq!(decoded.mode, Mode::Resume);
         assert!(decoded.total_cost_usd.is_some());
         assert_eq!(
-            decoded.transcript_name, None,
+            decoded.transcript,
+            Transcript::PredatesName,
             "a record written before the name existed defaults it away, not into a wrong name"
+        );
+    }
+
+    /// The writer serializes a bare `None` as `"transcript_name": null` — key present, value
+    /// null — so every transcript-less row already on disk carries this exact byte shape.
+    /// It must land on `PredatesName`, indistinguishable in meaning from the absent-key case:
+    /// both mean *the record predates the name*, never *the attempt wrote none*.
+    #[test]
+    fn an_explicit_null_transcript_name_decodes_as_predating_the_name() {
+        let with_null = OLD_SHAPED_ATTEMPT.replace(
+            "\"fanout\": \"absent\"",
+            "\"transcript_name\": null, \"fanout\": \"absent\"",
+        );
+        assert!(with_null.contains("\"transcript_name\": null"));
+        let decoded: Attempt = serde_json::from_str(&with_null).expect("explicit null decodes");
+        assert_eq!(
+            decoded.transcript,
+            Transcript::PredatesName,
+            "an old writer's explicit silence is still silence about when the record was written, not about how the attempt ended"
         );
     }
 
     #[test]
     fn a_recorded_transcript_name_round_trips_through_the_record() {
         let named = Attempt {
-            transcript_name: Some("messages-2-2.jsonl".to_string()),
+            transcript: Transcript::Recorded("messages-2-2.jsonl".to_string()),
             ..shaped(true, Some(2.35), Some(37), false)
         };
         let text = serde_json::to_string(&named).unwrap();
         assert_eq!(serde_json::from_str::<Attempt>(&text).unwrap(), named);
+    }
+
+    /// Done-predicate assertion (b) read strictly: a record encoding the name decodes to
+    /// carries-that-name — where "encodes" is today's writer's historical shape, the bare
+    /// string under `transcript_name`, hand-written so the test cannot silently track a
+    /// grammar that drifted. Encode/decode symmetry alone would stay green through any
+    /// self-consistent spelling, including one old records could never produce.
+    #[test]
+    fn a_bare_transcript_name_under_the_key_decodes_to_the_carried_name() {
+        let text = OLD_SHAPED_ATTEMPT.replace(
+            "\"fanout\"",
+            "\"transcript_name\": \"messages-2-2.jsonl\", \"fanout\"",
+        );
+        assert!(text.contains("\"transcript_name\": \"messages-2-2.jsonl\""));
+        let decoded: Attempt = serde_json::from_str(&text).expect("bare-string shape decodes");
+        assert_eq!(
+            decoded.transcript,
+            Transcript::Recorded("messages-2-2.jsonl".to_string()),
+        );
+    }
+
+    /// The writer's spell is pinned on the wire, not just round-tripped: the bare string for
+    /// a carried name, and `{"wrote_none": null}` — a shape no record written before this
+    /// change can carry — for the stated fact.
+    #[test]
+    fn the_writer_states_a_carried_name_as_the_bare_string() {
+        let named = Attempt {
+            transcript: Transcript::Recorded("messages-2-2.jsonl".to_string()),
+            ..shaped(true, Some(2.35), Some(37), false)
+        };
+        assert!(
+            serde_json::to_string(&named)
+                .unwrap()
+                .contains("\"transcript_name\":\"messages-2-2.jsonl\""),
+            "a carried name must stay byte-compatible with today's writer"
+        );
+    }
+
+    #[test]
+    fn the_writer_states_wrote_none_as_the_explicit_object_and_nothing_else() {
+        let written = serde_json::to_string(&Attempt {
+            transcript: Transcript::WroteNone,
+            ..shaped(true, Some(2.35), Some(37), false)
+        })
+        .unwrap();
+        assert!(
+            written.contains("\"transcript_name\":{\"wrote_none\":null}"),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn a_predating_row_is_written_as_silence_under_the_key_again() {
+        let legacy = Attempt {
+            transcript: Transcript::PredatesName,
+            ..shaped(true, Some(2.35), Some(37), false)
+        };
+        assert!(
+            !serde_json::to_string(&legacy)
+                .unwrap()
+                .contains("transcript"),
+            "re-encoding an old row must not forge a statement about when it was written"
+        );
+    }
+
+    /// `WroteNone` is unreachable from any record written before this change — no byte shape
+    /// can produce it. Its round-trip pins that the encoder states it and the decoder reads
+    /// back exactly what was stated.
+    #[test]
+    fn a_wrote_none_transcript_round_trips_through_the_record() {
+        let unwritten = Attempt {
+            transcript: Transcript::WroteNone,
+            ..shaped(true, Some(2.35), Some(37), false)
+        };
+        let text = serde_json::to_string(&unwritten).unwrap();
+        assert_eq!(serde_json::from_str::<Attempt>(&text).unwrap(), unwritten);
     }
 }

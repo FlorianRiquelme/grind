@@ -591,7 +591,7 @@ fn attempt_list(run_id: &str, found: &RunView) -> String {
             .filter(|r| !r.is_empty())
             .map(|r| format!("<div class=\"g-asub\">{}</div>", esc(&r)))
             .unwrap_or_default();
-        let evidence = evidence_links(run_id, a.n, found.backend, a.transcript_name.as_deref());
+        let evidence = evidence_links(run_id, a.n, found.backend, &a.transcript);
         out.push_str(&format!(
             "<div class=\"g-a\"><div class=\"g-aline\"><span class=\"g-idx\">#{}</span>\
 <span class=\"g-verdict {vcls}\">{word}</span><span class=\"g-dur\">{}{}</span></div>\
@@ -623,18 +623,20 @@ fn attempt_list(run_id: &str, found: &RunView) -> String {
 /// links three files that were never written. This is a pure renderer with no filesystem
 /// access, so it names what each backend writes rather than checking what exists.
 ///
-/// `recorded` is the transcript file name the Attempt itself carries, and it wins over the
-/// computed one whenever it is there. A native attempt that re-entered after a crash allocated
-/// the first free slot — `messages-2-2.jsonl` — while `messages-2.jsonl` still holds the dead
-/// attempt's record, so the computed name puts another attempt's transcript under this row's
-/// heading (issue #156). The fallback stays for every record written before the name existed,
-/// and for the endpoint-resolution failure that returned before allocating a file at all. The
-/// claude-code trio ignores it: those three names are determined by `n` alone.
+/// `transcript` is the three-valued fact the Attempt itself carries, and each value renders
+/// its own row (issue #161): a recorded name wins over the computed one — a native attempt that
+/// re-entered after a crash allocated the first free slot, `messages-2-2.jsonl`, while
+/// `messages-2.jsonl` still holds the dead attempt's record, so the computed name would put
+/// another attempt's transcript under this row's heading (issue #156); every record written
+/// before the name existed keeps the constructed fallback, which names that attempt's own file
+/// exactly; and an attempt whose lifecycle ended before allocating anything renders no link at
+/// all — the URL today's fallback served was backed by nothing. The claude-code trio ignores
+/// the fact entirely: those three names are determined by `n` alone.
 fn evidence_links(
     run_id: &str,
     n: usize,
     backend: crate::runner::Backend,
-    recorded: Option<&str>,
+    transcript: &crate::attempt::Transcript,
 ) -> String {
     let run_id = esc(run_id);
     match backend {
@@ -643,15 +645,21 @@ fn evidence_links(
 <a class=\"g-link\" href=\"/raw/runs/{run_id}/attempt-{n}.stdout.json\">stdout.json</a>\
 <a class=\"g-link\" href=\"/raw/runs/{run_id}/attempt-{n}.stderr.log\">stderr.log</a></div>"
         ),
-        crate::runner::Backend::Native => {
-            let name = match recorded {
-                Some(recorded) => esc(recorded),
-                None => esc(&format!("messages-{n}.jsonl")),
-            };
-            format!(
-                "<div class=\"g-ev\"><a class=\"g-link\" href=\"/raw/runs/{run_id}/{name}\">messages.jsonl</a></div>"
-            )
-        }
+        crate::runner::Backend::Native => match transcript {
+            crate::attempt::Transcript::Recorded(name) => format!(
+                "<div class=\"g-ev\"><a class=\"g-link\" href=\"/raw/runs/{run_id}/{}\">messages.jsonl</a></div>",
+                esc(name)
+            ),
+            crate::attempt::Transcript::PredatesName => {
+                let name = esc(&format!("messages-{n}.jsonl"));
+                format!(
+                    "<div class=\"g-ev\"><a class=\"g-link\" href=\"/raw/runs/{run_id}/{name}\">messages.jsonl</a></div>"
+                )
+            }
+            // Nothing was ever written under this attempt's name, so there is nothing to
+            // link — and no placeholder stands in for one (issue #161).
+            crate::attempt::Transcript::WroteNone => String::new(),
+        },
     }
 }
 
@@ -1315,7 +1323,7 @@ mod tests {
             .position(|a| a.n == 2)
             .expect("an attempt 2");
         let mut retry = found.attempts[dead].clone();
-        retry.transcript_name = Some("messages-2-2.jsonl".to_string());
+        retry.transcript = crate::attempt::Transcript::Recorded("messages-2-2.jsonl".to_string());
         found.attempts = vec![found.attempts[dead].clone(), retry];
 
         let html = attempt_list("id", &found);
@@ -1339,24 +1347,115 @@ mod tests {
         let mut found = day_one();
         found.backend = crate::runner::Backend::Native;
         assert_eq!(
-            found.attempts[0].transcript_name, None,
+            found.attempts[0].transcript,
+            crate::attempt::Transcript::PredatesName,
             "fixture is old-shaped"
         );
         let html = attempt_list("id", &found);
         assert!(html.contains("messages-1.jsonl"), "{html}");
     }
 
+    /// The endpoint-resolution failure synthesizes its attempt before `allocate_transcript`
+    /// is reached, so no file was ever written under any name (issue #161). Today's fallback
+    /// serves `/raw/runs/<id>/messages-N.jsonl` for exactly these rows — a URL backed by
+    /// nothing, on the row where the reader most wants to know why no transcript exists.
+    ///
+    /// Pinned differentially: the wrote-none row must be byte-identical to the predates-name
+    /// row except for the evidence div, so the link alone disappears and everything else the
+    /// row ever carried stays.
+    #[test]
+    fn a_native_attempt_that_wrote_no_transcript_renders_no_link() {
+        let mut found = day_one();
+        found.backend = crate::runner::Backend::Native;
+        let dead = found
+            .attempts
+            .iter()
+            .position(|a| a.n == 2)
+            .expect("an attempt 2");
+        let base = found.attempts[dead].clone();
+        let mut wrote_none = base.clone();
+        wrote_none.transcript = crate::attempt::Transcript::WroteNone;
+        let mut predates = base.clone();
+        predates.transcript = crate::attempt::Transcript::PredatesName;
+
+        found.attempts = vec![wrote_none];
+        let without = attempt_list("id", &found);
+        found.attempts = vec![predates];
+        let fallback = attempt_list("id", &found);
+
+        assert!(
+            !without.contains("/raw/runs/id/messages-"),
+            "a transcript-less attempt must not render a link to a file that was never written: {without}"
+        );
+        assert!(
+            !without.contains("messages.jsonl"),
+            "no placeholder stands in for the missing link either: {without}"
+        );
+
+        // Everything but the link div survives verbatim.
+        let linked_segment_start = fallback
+            .find("<div class=\"g-ev\">")
+            .expect("the fallback row links");
+        let linked_segment_end = linked_segment_start
+            + fallback[linked_segment_start..]
+                .find("</div>")
+                .expect("the div closes")
+            + "</div>".len();
+        let fallback_minus_link = format!(
+            "{}{}",
+            &fallback[..linked_segment_start],
+            &fallback[linked_segment_end..]
+        );
+        assert_eq!(
+            without, fallback_minus_link,
+            "removing only the transcript link leaves the row byte-identical"
+        );
+        // And the row really does carry the things a reader needs: index, verdict,
+        // duration, and the terminal reason (`endpoint-resolution failure` sets
+        // `terminal_reason`; the fixture's attempt 2 carries none, so the row shows
+        // its `subtype`).
+        assert!(without.contains("#2"), "{without}");
+        assert!(without.contains("unparseable"), "{without}");
+        assert!(without.contains("4m"), "{without}");
+        let mut with_reason = base.clone();
+        with_reason.transcript = crate::attempt::Transcript::WroteNone;
+        with_reason.terminal_reason = Some("endpoint resolution failed: no key".to_string());
+        found.attempts = vec![with_reason];
+        let reasoned = attempt_list("id", &found);
+        assert!(
+            reasoned.contains("endpoint resolution failed"),
+            "the terminal reason survives on a wrote-none row: {reasoned}"
+        );
+        assert!(
+            !reasoned.contains("/raw/runs/id/messages-"),
+            "and still no transcript link: {reasoned}"
+        );
+    }
+
     /// The claude-code trio is determined by `n` alone, so a recorded name — which that
     /// adapter never sets — must not reach it even if one somehow appeared.
     #[test]
     fn a_claude_code_attempts_trio_ignores_any_recorded_transcript_name() {
-        let mut found = day_one();
+        let found = day_one();
         assert_eq!(found.backend, crate::runner::Backend::ClaudeCode);
-        found.attempts[0].transcript_name = Some("messages-1-2.jsonl".to_string());
-        let html = attempt_list("id", &found);
-        assert!(html.contains("attempt-1.prompt.txt"), "{html}");
-        assert!(html.contains("attempt-1.stdout.json"), "{html}");
-        assert!(html.contains("attempt-1.stderr.log"), "{html}");
-        assert!(!html.contains("messages-1-2.jsonl"), "{html}");
+        // The trio is determined by `n` alone, however the transcript fact stands: a
+        // recorded name that adapter never sets, and the wrote-none fact it never
+        // reaches either.
+        for wrote in [
+            crate::attempt::Transcript::Recorded("messages-1-2.jsonl".to_string()),
+            crate::attempt::Transcript::WroteNone,
+        ] {
+            let mut found = found.clone();
+            found.attempts[0].transcript = wrote;
+            let html = attempt_list("id", &found);
+            assert!(html.contains("attempt-1.prompt.txt"), "{html}");
+            assert!(html.contains("attempt-1.stdout.json"), "{html}");
+            assert!(html.contains("attempt-1.stderr.log"), "{html}");
+            assert!(!html.contains("messages-1-2.jsonl"), "{html}");
+            assert!(
+                !html.contains("/raw/runs/id/messages-"),
+                "the claude-code row never links any messages file at all: {html}"
+            );
+        }
     }
 }

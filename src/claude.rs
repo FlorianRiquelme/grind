@@ -489,7 +489,7 @@ pub fn classify(
                 && mentions_limit(&normalise(&format!("{stream_tail} {stderr}")))),
         result_tail: stream_tail,
         fanout: Observed::Unobservable(Reason::saying("the transcript was not read")),
-        transcript_name: None,
+        transcript: crate::attempt::Transcript::PredatesName,
     }
 }
 
