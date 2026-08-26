@@ -20,6 +20,8 @@
 //!   readers parse; positional assertions stop encoding a shape no real Run produces) |
 //! | a_completed_stage_without_the_sentinel_promises_nothing | — (issue #139: an ending
 //!   is never synthesized into a Run-level promise) |
+//! | a_declared_max_turns_ceiling_bounds_the_loop_below_the_fallback | — (issue #157:
+//!   the enforced turn limit is data served from docs/tiers.toml, not the constant) |
 //!
 //! Library-level parity suffices here; the full-binary native e2e stays out of scope
 //! this wave.
@@ -35,6 +37,10 @@ use grind::job::Job;
 use grind::rung;
 use grind::runner::{self, NativeAdapter, StageRunner};
 use serde_json::{Value, json};
+
+/// The compiled fallback the loop enforces when nothing is declared (`native.rs`'s
+/// `DEFAULT_MAX_TURNS`); the exhaustion scenario counts against it.
+const DEFAULT_FALLBACK_TURNS: usize = 32;
 
 /// One scripted reply. `Sse` answers 200 with an `text/event-stream` body;
 /// `Status` answers with a bare status + plain-text body (429 et al).
@@ -186,18 +192,22 @@ fn drive_attempt(server: &Server, run_dir: &Path, cwd: &Path, attempt_n: usize) 
         cwd,
         attempt_n,
         "Do the assigned stage work.",
+        None,
     )
 }
 
-/// The same seam with a caller-supplied stage prompt — `stage_invocation` composes the
+/// The same seam with a caller-supplied stage prompt and the adapter's per-stage turn
+/// ceiling (`None` keeps the loop's compiled fallback). `stage_invocation` composes the
 /// skill file verbatim ahead of the context block, so a prompt carrying real frontmatter
-/// is how `declared_skill` gets exercised end to end.
+/// is how `declared_skill` gets exercised end to end; the ceiling is the knob issue #157
+/// put on `NativeAdapter`, driven end to end by the exhaustion scenario below.
 fn drive_attempt_with_prompt(
     server: &Server,
     run_dir: &Path,
     cwd: &Path,
     attempt_n: usize,
     skill_text: &str,
+    max_turns: Option<usize>,
 ) -> Attempt {
     ensure_api_key();
 
@@ -254,6 +264,7 @@ fn drive_attempt_with_prompt(
         fast_model: None,
         strong_model: None,
         proto_override: None,
+        max_turns,
     }
     .run(&spec)
 }
@@ -695,6 +706,67 @@ fn malformed_tool_call_nudges_then_completes() {
     );
 }
 
+/// One scripted turn that never finishes: a native-mode reply whose tool call fails the
+/// fault check (no such tool), so the loop nudges and asks again — one request per turn,
+/// forever, until the ceiling stops it.
+fn non_final_turn() -> Reply {
+    Reply::Sse(sse(vec![chunk(
+        json!({"tool_calls": [tool_delta(0, Some("call_x"), Some("not_a_tool"), Some("{}"))]}),
+        Some("tool_calls"),
+        None,
+    )]))
+}
+
+/// The ceiling is data now: a declared per-stage bound must stop the loop even when the
+/// script carries more turns than it allows, and the bound arrives exactly where
+/// `supervisor`'s runner seam hands a tiers.toml-resolved value — `Some(low_limit)` on the
+/// adapter. With the compiled 32 still in force this scenario could not exhaust (four
+/// scripted turns are far short of it), so an exhausted transcript naming `{low_limit}` is
+/// itself the receipt that the override moved the ceiling.
+#[test]
+fn a_declared_max_turns_ceiling_bounds_the_loop_below_the_fallback() {
+    let (run_dir, cwd) = scratch("max-turns");
+    let low_limit = 3usize;
+
+    let script = vec![
+        non_final_turn(),
+        non_final_turn(),
+        non_final_turn(),
+        non_final_turn(),
+    ];
+    let server = Server::start(script);
+
+    let attempt = drive_attempt_with_prompt(
+        &server,
+        &run_dir,
+        &cwd,
+        1,
+        "Do the assigned stage work.",
+        Some(low_limit),
+    );
+
+    assert!(attempt.is_error, "{:?}", attempt.terminal_reason);
+    assert!(!attempt.done_promise);
+    assert_eq!(attempt.exit_code, Some(1));
+    assert!(!attempt.rate_limited);
+    assert!(attempt.parse_ok);
+    let reason = attempt.terminal_reason.as_deref().unwrap_or("");
+    assert!(
+        reason.contains("turn budget exhausted") && reason.contains(&low_limit.to_string()),
+        "the exhausted transcript names the limit that bound ({low_limit}): {reason}"
+    );
+    let received = server.bodies().len();
+    assert_eq!(
+        received, low_limit,
+        "one request per allowed turn, stopped at the declared ceiling; got {received}"
+    );
+    assert!(
+        received < DEFAULT_FALLBACK_TURNS,
+        "fewer requests than would exhaust the compiled fallback of {DEFAULT_FALLBACK_TURNS}"
+    );
+    assert_eq!(attempt.num_turns, Some(low_limit as u64));
+}
+
 /// A real stage prompt opens with the skill file verbatim — YAML frontmatter first — so
 /// production native transcripts begin with `skill_declared`, not `protocol_selected`.
 /// The harness prompt carried no frontmatter until now, which let positional assertions
@@ -712,7 +784,7 @@ fn frontmatter_prompt_declares_its_skill() {
         None,
     )]))]);
 
-    let attempt = drive_attempt_with_prompt(&server, &run_dir, &cwd, 1, skill_text);
+    let attempt = drive_attempt_with_prompt(&server, &run_dir, &cwd, 1, skill_text, None);
 
     assert!(!attempt.is_error, "{:?}", attempt.terminal_reason);
 

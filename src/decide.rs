@@ -783,6 +783,14 @@ pub enum Tier {
     T3,
 }
 
+impl Tier {
+    /// Every tier, in escalation order — the same order `Ord` derives. Lets a caller
+    /// enumerate the variants or decode a `Display` word back to its slot in an
+    /// index-matched table (`Tiers::max_turns_by_tier`) without hand-writing the four
+    /// names a second time.
+    pub const ALL: [Tier; 4] = [Tier::T0, Tier::T1, Tier::T2, Tier::T3];
+}
+
 impl std::fmt::Display for Tier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let word = match self {
@@ -1019,6 +1027,12 @@ pub struct Tiers {
     pub models_t1: BTreeMap<String, String>,
     pub models_t2: BTreeMap<String, String>,
     pub models_t3: BTreeMap<String, String>,
+    /// Per-stage hard ceilings on conversation turns for the native loop; an undeclared
+    /// stage reads `native::DEFAULT_MAX_TURNS` at the enforcement point, not from here.
+    pub max_turns: BTreeMap<String, usize>,
+    /// The same ceilings keyed stage-by-tier (`[max_turns.tN]`); index-matched to `Tier`,
+    /// consulted before the flat table.
+    pub max_turns_by_tier: [BTreeMap<String, usize>; 4],
 }
 
 impl Tiers {
@@ -1042,6 +1056,11 @@ impl Tiers {
 /// was raised to buy.
 impl Default for Tiers {
     fn default() -> Self {
+        fn turns(rows: [(&str, usize); 1]) -> BTreeMap<String, usize> {
+            rows.into_iter()
+                .map(|(stage, limit)| (stage.to_string(), limit))
+                .collect()
+        }
         fn models(review: &str) -> BTreeMap<String, String> {
             [
                 ("plan", "strong"),
@@ -1071,6 +1090,13 @@ impl Default for Tiers {
             models_t1: models("fast"),
             models_t2: models("strong"),
             models_t3: models("strong"),
+            max_turns: turns([("work", 32)]),
+            max_turns_by_tier: [
+                BTreeMap::new(),
+                BTreeMap::new(),
+                turns([("work", 16)]),
+                BTreeMap::new(),
+            ],
         }
     }
 }
@@ -1118,6 +1144,11 @@ pub fn tiers_from_toml(text: &str) -> Tiers {
             "models.t1" => insert(&mut tiers.models_t1, key, value),
             "models.t2" => insert(&mut tiers.models_t2, key, value),
             "models.t3" => insert(&mut tiers.models_t3, key, value),
+            "max_turns" => insert_turn(&mut tiers.max_turns, key, value),
+            "max_turns.t0" => insert_turn(&mut tiers.max_turns_by_tier[0], key, value),
+            "max_turns.t1" => insert_turn(&mut tiers.max_turns_by_tier[1], key, value),
+            "max_turns.t2" => insert_turn(&mut tiers.max_turns_by_tier[2], key, value),
+            "max_turns.t3" => insert_turn(&mut tiers.max_turns_by_tier[3], key, value),
             _ => {}
         }
     }
@@ -1134,6 +1165,14 @@ fn assign<T: std::str::FromStr>(field: &mut T, value: &str) {
 
 fn insert(map: &mut BTreeMap<String, String>, key: &str, value: &str) {
     map.insert(key.to_string(), value.to_string());
+}
+
+/// The `[max_turns]` sibling of `insert`: a malformed integer leaves the row out entirely,
+/// the same tolerance `assign` gives the scalar fields.
+fn insert_turn(map: &mut BTreeMap<String, usize>, key: &str, value: &str) {
+    if let Ok(parsed) = value.parse() {
+        map.insert(key.to_string(), parsed);
+    }
 }
 
 /// One row of a Decision's receipts: signal name, the value observed, and what it weighed
@@ -1447,6 +1486,33 @@ mod tier_tests {
     fn garbage_toml_falls_back_to_the_fail_closed_defaults() {
         let garbage = "this is not toml at all\n[[[\nkey without equals\n=== \n";
         assert_eq!(tiers_from_toml(garbage), Tiers::default());
+    }
+
+    #[test]
+    fn a_max_turns_row_parses_into_the_per_stage_table() {
+        let tiers = tiers_from_toml("[max_turns]\nwork = 7\n");
+        assert_eq!(tiers.max_turns.get("work"), Some(&7));
+    }
+
+    #[test]
+    fn a_tiered_max_turns_row_parses_into_that_tier_s_table() {
+        let tiers = tiers_from_toml("[max_turns.t3]\nreview = 9\n");
+        assert_eq!(
+            tiers.max_turns_by_tier[Tier::T3 as usize].get("review"),
+            Some(&9)
+        );
+    }
+
+    #[test]
+    fn a_malformed_max_turns_integer_is_skipped_not_default_inserted() {
+        let tiers = tiers_from_toml("[max_turns]\nsimplify = not_a_number\nreview = -1\n");
+        assert_eq!(tiers.max_turns.get("simplify"), None);
+        assert_eq!(tiers.max_turns.get("review"), None);
+        assert_eq!(
+            tiers.max_turns.get("work"),
+            Some(&32),
+            "the skipped row leaves the compiled default beside it untouched"
+        );
     }
 
     #[test]

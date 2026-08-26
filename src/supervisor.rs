@@ -209,9 +209,27 @@ impl RunRecord {
     }
 
     /// The one seam call (R1), bundling this Run's frozen backend selection so every call
-    /// site — ladder attempts, Ship's babysit round, and Reflect — constructs it identically
-    /// rather than repeating the same four-field clone three times.
-    fn runner(&self, home: &Path) -> Box<dyn runner::StageRunner> {
+    /// site — ladder attempts, Ship's babysit round, and Reflect — constructs it identically.
+    /// The stage context is what each call site already holds (`run_ladder_attempt` passes its
+    /// dispatching stage; Ship's babysit round and Reflect pass `None`), and it resolves this
+    /// attempt's per-stage turn ceiling from `docs/tiers.toml` once here: a stage-aware call
+    /// reads the latest decided tier on disk (diff-triage's decision, else triage's), so a
+    /// declared override moves the ceiling the native loop enforces while an undeclared stage
+    /// still reads the compiled fallback. No stage key means no entry can match — exactly the
+    /// behavior before ceilings were data. Resolution happens inside the stage map, so a
+    /// stage-less call never touches `docs/tiers.toml` or the Run state's decision files.
+    fn runner(
+        &self,
+        home: &Path,
+        run_dir: &Path,
+        stage: Option<Stage>,
+    ) -> Box<dyn runner::StageRunner> {
+        let max_turns = stage.map(|stage| {
+            let worktree = std::path::PathBuf::from(&self.worktree);
+            let tiers = load_tiers(&worktree);
+            let tier = latest_decided_tier(run_dir);
+            crate::native::max_turns_for(&stage.to_string(), tier.as_deref(), Some(&tiers))
+        });
         runner::runner_for(
             self.backend,
             &self.claude_bin,
@@ -221,6 +239,7 @@ impl RunRecord {
                 fast_model: self.fast_model_override.clone(),
                 strong_model: self.strong_model_override.clone(),
                 proto_override: self.proto_override,
+                max_turns,
             },
         )
     }
@@ -804,7 +823,7 @@ fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
     let denied = attempt::denied_for_reflect();
     let reflect_model = runner::StageModel::Class(runner::ModelClass::Strong);
     let run_dir_str = run_dir.display().to_string();
-    let runner = record.runner(&home);
+    let runner = record.runner(&home, run_dir, None);
     let spec = runner::RunSpec {
         invocation: &invocation,
         cwd: run_dir,
@@ -1008,6 +1027,21 @@ fn load_tiers(worktree: &Path) -> Tiers {
         Err(_) => Tiers::default(),
     }
 }
+
+/// The latest decided tier on disk for a stage-aware turn-ceiling lookup: diff-triage's
+/// decision when present, else triage's — both under the Run state dir's `stages/`, the
+/// same root `run_r_pass` writes to and `resolve_stage_model` reads. Absent or unreadable
+/// reads as no tiered entry — the same tolerant serde shape `resolve_stage_model` already
+/// uses.
+fn latest_decided_tier(run_dir: &Path) -> Option<String> {
+    let stages_dir = run_dir.join("stages");
+    world::read_to_string(&stages_dir.join("diff-triage").join("decision.json"))
+        .ok()
+        .or_else(|| world::read_to_string(&stages_dir.join("triage").join("decision.json")).ok())
+        .and_then(|text| serde_json::from_str::<decide::Decision>(&text).ok())
+        .map(|decision| decision.tier.to_string())
+}
+
 /// The Plan stage's own `plan-facts.json`, read tolerantly for both [R] passes. Absent or
 /// unparseable reads as `None`: at Triage that fails closed inside `select_tier` (plan is the
 /// pass's required fact); at Diff-triage it merely degrades the panel — Performance seats off
@@ -1306,7 +1340,7 @@ fn run_ladder_attempt(
         &format!("  [{started_at}] {stage} attempt {n} ({mode}) …"),
     );
     let denied = attempt::denied_for(stage);
-    let runner = record.runner(&home);
+    let runner = record.runner(&home, run_dir, Some(stage));
     let spec = runner::RunSpec {
         invocation: &invocation,
         cwd: worktree,
@@ -1379,7 +1413,7 @@ fn run_ship_babysit_attempt(
         .iter()
         .map(|glob| glob.to_string())
         .collect();
-    let runner = record.runner(&home);
+    let runner = record.runner(&home, run_dir, None);
     let spec = runner::RunSpec {
         invocation: &invocation,
         cwd: worktree,
@@ -1784,6 +1818,48 @@ mod tests {
             "a native-only host must not be refused for lacking `claude`"
         );
     }
+
+    /// The tier word the ceiling resolves from lives in the RUN STATE's stages tree, not the
+    /// target worktree (F0): diff-triage's decision outranks triage's, garbage parses as no
+    /// decision, and absence is none. Every case here roots at a run_dir-shaped temp tree.
+    #[test]
+    fn latest_decided_tier_reads_the_run_states_stages_tree() {
+        let home = world::temp_dir("latest-decided-tier");
+        let run_dir = home.join("runs").join("r1");
+        let write = |pass: &str, body: &str| {
+            world::create_dir_all(&run_dir.join("stages").join(pass))
+                .expect("a stages dir");
+            world::write_atomic(
+                &run_dir.join("stages").join(pass).join("decision.json"),
+                body,
+            )
+            .expect("a decision file");
+        };
+        let t2 = r#"{"tier":"t2","personas":[],"depth":{"reviewers":3},
+            "model_per_stage":{},"floor_from_plan":"t0","rationale":[]}"#;
+        let t1 = t2.replace("t2", "t1");
+
+        write("triage", &t1);
+        assert_eq!(
+            latest_decided_tier(&run_dir).as_deref(),
+            Some("t1"),
+            "triage's word alone resolves"
+        );
+        write("diff-triage", &t2);
+        assert_eq!(
+            latest_decided_tier(&run_dir).as_deref(),
+            Some("t2"),
+            "diff-triage outranks triage when both exist"
+        );
+        write("diff-triage", "not json at all");
+        assert_eq!(
+            latest_decided_tier(&run_dir),
+            None,
+            "an unparseable decision is no decision, never a silent fall-through"
+        );
+        world::remove_tree(&home);
+    }
+
 
     #[test]
     fn claude_code_backend_still_requires_the_claude_binary() {
