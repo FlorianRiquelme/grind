@@ -63,11 +63,21 @@ recorded in `evidence.json` — never as an extra key on the return, which stays
 `{"status": …}` — and it never silently blocks the return from being written, because Grind
 never gates (ADR-0003); it is a fact the Record carries forward to Fixes.
 
+## Commit when proven, not when done
+
+A unit's checkpoint is its commit, made by you the moment the unit's proof exists: green test
+output for the behavior plus its durable `units/<unit-id>.json` return on disk means the
+path-limited commit happens now, while composition of later units continues. Never batch a
+proven unit behind the stage's finish — several proven units held uncommitted are several
+landings a wall death could strand in a dirty tree. The measure of this rule is simple: at any
+instant, everything independently provable is already committed.
+
 ## Idempotent re-entry
 
-On re-entry, read this stage's own `units/` directory and the tree before doing anything else. A
-unit with a durable return already on disk and matching commits in the tree is done — do not redo
-it. Resume from the earliest unit lacking both.
+On re-entry, your prompt lists what already survived — commits on this branch beyond the base
+branch, and unit returns recorded under `units/`. Check those facts against the tree before doing
+anything else: a unit with both its durable return on disk and its matching commit in the log is
+done — do not redo it. Resume from the earliest unit lacking either.
 
 ## Descriptive language only
 
