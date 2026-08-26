@@ -65,8 +65,9 @@ never gates (ADR-0003); it is a fact the Record carries forward to Fixes.
 
 ## Commit when proven, not when done
 
-A unit's checkpoint is its commit, made by you the moment the unit's proof exists: green test
-output for the behavior plus its durable `units/<unit-id>.json` return on disk means the
+A unit's checkpoint is its commit, made by you the moment the unit's proof exists: green
+evidence for the behavior — a passing test, or whatever replacement verification a recorded
+no-test exception stands on — plus its durable `units/<unit-id>.json` return on disk means the
 path-limited commit happens now, while composition of later units continues. Never batch a
 proven unit behind the stage's finish — several proven units held uncommitted are several
 landings a wall death could strand in a dirty tree. The measure of this rule is simple: at any
