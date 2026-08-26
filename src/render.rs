@@ -11,6 +11,7 @@ use crate::attempt::Clearance;
 use crate::decide::{Decision, Stage, Verdict, VerifyContract};
 use crate::observe::{Observation, Observed, Outcome, RunOutcome, UNOBSERVABLE_MARK};
 use crate::rung::{ReturnStatus, StageEntry};
+use crate::runner::Backend;
 use crate::view::{Facts, Live, RosterRow, RunView, one_line};
 use std::path::Path;
 
@@ -685,11 +686,34 @@ fn line(out: &mut String, text: &str) {
     out.push('\n');
 }
 
+/// The Model row's answer, derived from the record so one record has one answer about what
+/// ran (#158). The pin names itself; a native Run with no pin answers from its own class
+/// declarations — the same derivation `supervisor::dispatch_banner` prints at dispatch,
+/// including the concrete id [`runner::DEFAULT_MODEL`] resolves to when neither class is
+/// declared, because that is what will run. A claude-code Run's session picks, and grind never
+/// sees it, so `(session default — unpinned)` stays honest there.
 fn model_of(found: &RunView) -> String {
-    found
-        .model
-        .clone()
-        .unwrap_or_else(|| "(session default — unpinned)".to_string())
+    match &found.model {
+        Some(pinned) => pinned.clone(),
+        None => match found.backend {
+            Backend::Native => {
+                let fast = found
+                    .fast_model_override
+                    .as_deref()
+                    .unwrap_or(crate::runner::DEFAULT_MODEL);
+                let strong = found
+                    .strong_model_override
+                    .as_deref()
+                    .unwrap_or(crate::runner::DEFAULT_MODEL);
+                if fast == strong {
+                    fast.to_string()
+                } else {
+                    format!("fast {fast} · strong {strong}")
+                }
+            }
+            Backend::ClaudeCode => "(session default — unpinned)".to_string(),
+        },
+    }
 }
 
 fn presence_word(here: &Observed<bool>) -> &'static str {
@@ -1244,6 +1268,137 @@ mod tests {
         }
         assert!(text.contains("furthest stage"));
         assert!(text.contains("commits ahead"));
+    }
+
+    // --- #158: the Handback's Model line answers from the record, the way the dispatch
+    // --- banner already does for the same fields.
+
+    /// The day-one record handed back as a native Run with the given class declarations and
+    /// Job pin. Same helpers as every handback test above; only the selection fields vary.
+    fn handed_back_native(
+        fast: Option<&str>,
+        strong: Option<&str>,
+        pinned: Option<&str>,
+    ) -> String {
+        let mut record = found();
+        record.backend = Backend::Native;
+        record.model = pinned.map(str::to_string);
+        record.fast_model_override = fast.map(str::to_string);
+        record.strong_model_override = strong.map(str::to_string);
+        handback(&facts_of(
+            record,
+            observation(),
+            Verdict::Completed,
+            coverage(),
+            None,
+        ))
+    }
+
+    /// The Handback's Model row, split into the row and the value it names after the fixed
+    /// label column, so each assertion below states exactly the bytes under test.
+    fn model_row(text: &str) -> (&str, &str) {
+        let row = text
+            .lines()
+            .find(|l| l.starts_with("Model"))
+            .expect("the Handback carries a Model row");
+        (row, row["Model".len()..].trim_start())
+    }
+
+    /// R1a: a native Run whose record declares one id for both classes renders that id, never
+    /// the unpinned fallback.
+    #[test]
+    fn a_native_run_with_a_declared_model_renders_it_instead_of_calling_itself_unpinned() {
+        let text = handed_back_native(Some("stealth/ox-alpha"), Some("stealth/ox-alpha"), None);
+        assert!(text.contains("Model    stealth/ox-alpha\n"), "{text}");
+        assert!(
+            !text.contains("(session default"),
+            "a declared model rendered as `(session default \u{2014} unpinned)` contradicts \"
+             the record it introduces:\n{text}"
+        );
+    }
+
+    /// R1b: the derived value is byte-identical to what the dispatch banner prints for the
+    /// same record. The banner row supervisor pins for these fields is
+    /// `  model stealth/ox-alpha`; the renderers label their rows differently (the Handback's
+    /// label column, the banner's two-space lowercase), so the comparable bytes are the
+    /// derived value (plan-review F-03).
+    #[test]
+    fn the_handbacks_declared_model_is_byte_identical_to_the_dispatch_banners() {
+        let text = handed_back_native(Some("stealth/ox-alpha"), Some("stealth/ox-alpha"), None);
+        let (row, value) = model_row(&text);
+        assert_eq!(value, "stealth/ox-alpha", "{row}");
+        assert_eq!(row, "Model    stealth/ox-alpha");
+    }
+
+    /// R1c: distinct class declarations split exactly as the banner splits them.
+    #[test]
+    fn a_split_declaration_renders_fast_and_strong_like_the_banner_splits_them() {
+        let text = handed_back_native(
+            Some("stealth/ox-alpha"),
+            Some("deepseek/deepseek-chat-v3.1"),
+            None,
+        );
+        let (row, value) = model_row(&text);
+        // The banner row for this same record is
+        // `  model fast stealth/ox-alpha \u{b7} strong deepseek/deepseek-chat-v3.1`.
+        assert_eq!(
+            value, "fast stealth/ox-alpha \u{b7} strong deepseek/deepseek-chat-v3.1",
+            "{row}"
+        );
+        assert_eq!(
+            row,
+            "Model    fast stealth/ox-alpha \u{b7} strong deepseek/deepseek-chat-v3.1"
+        );
+    }
+
+    /// R1d: neither class declared still names the concrete id `runner::DEFAULT_MODEL`
+    /// resolves to, because that is what will run.
+    #[test]
+    fn an_undeclared_native_run_names_the_concrete_default_that_will_run() {
+        let text = handed_back_native(None, None, None);
+        let (row, value) = model_row(&text);
+        // The banner row for this same record is `  model deepseek/deepseek-chat-v3.1`.
+        assert_eq!(value, crate::runner::DEFAULT_MODEL, "{row}");
+        assert_eq!(row, format!("Model    {}", crate::runner::DEFAULT_MODEL));
+    }
+
+    /// R1e: today's claude-code answer and the pin's precedence survive unchanged on both
+    /// backends.
+    #[test]
+    fn a_claude_code_record_still_reads_session_default_and_a_pin_still_names_itself() {
+        let mut record = found();
+        record.backend = Backend::ClaudeCode;
+        record.model = None;
+        let text = handback(&facts_of(
+            record,
+            observation(),
+            Verdict::Completed,
+            coverage(),
+            None,
+        ));
+        assert!(
+            text.contains("Model    (session default \u{2014} unpinned)\n"),
+            "{text}"
+        );
+
+        for backend in [Backend::Native, Backend::ClaudeCode] {
+            let mut record = found();
+            record.backend = backend;
+            record.model = Some("claude-opus-9".to_string());
+            record.fast_model_override = Some("stealth/ox-alpha".to_string());
+            record.strong_model_override = Some("deepseek/deepseek-chat-v3.1".to_string());
+            let text = handback(&facts_of(
+                record,
+                observation(),
+                Verdict::Completed,
+                coverage(),
+                None,
+            ));
+            assert!(
+                text.contains("Model    claude-opus-9\n"),
+                "on {backend:?}: {text}"
+            );
+        }
     }
 
     #[test]
