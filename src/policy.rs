@@ -853,4 +853,29 @@ mod tests {
         );
         assert_eq!(asked, Next::SleepThenReenter(Duration::from_secs(1800)));
     }
+
+    #[test]
+    fn a_completed_verdict_with_a_clear_rollup_stops_as_completed_and_never_re_enter() {
+        let attempts = [attempt(1, Mode::Dispatch, false)];
+        let found = next(
+            &attempts,
+            &Verdict::Completed,
+            &clear(),
+            0,
+            &budget(8, 1800),
+        );
+        assert_eq!(found, Next::Stop(Stop::Completed), "{found:?}");
+        assert_ne!(found, Next::Reenter, "{found:?}");
+    }
+
+    #[test]
+    fn a_completed_verdict_with_red_ci_still_buys_one_babysit_round_on_an_unspent_budget() {
+        let attempts = [attempt(1, Mode::Dispatch, false)];
+        let red = Observed::Present(true);
+        assert_eq!(
+            next(&attempts, &Verdict::Completed, &red, 0, &budget(8, 1800)),
+            Next::SpendCiBudget,
+            "the red path keeps its one bounded invocation"
+        );
+    }
 }
