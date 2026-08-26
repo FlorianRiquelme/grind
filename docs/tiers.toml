@@ -35,7 +35,9 @@ content_signal_t3 = 3
 # src/native.rs (`DEFAULT_MAX_TURNS`), mirrored into the parser's compiled default —
 # a stage missing from this table reads that fallback, never zero.
 [max_turns]
-work = 32
+work = 64
+validate = 48
+fixes = 96
 
 # Optional per-tier overrides, read as `[max_turns.tN]` for t0-t3. A tiered entry
 # outranks the flat row; this one differs from it on purpose — it is the receipt
