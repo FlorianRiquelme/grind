@@ -443,27 +443,15 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
 /// resolves to, because that is what will run.
 fn dispatch_banner(record: &RunRecord) -> Vec<String> {
     let mut lines = vec![format!("  backend {}", record.backend.as_str())];
-    lines.push(match &record.model {
-        Some(pinned) => format!("  model {pinned}"),
-        None => match record.backend {
-            Backend::Native => {
-                let fast = record
-                    .fast_model_override
-                    .as_deref()
-                    .unwrap_or(runner::DEFAULT_MODEL);
-                let strong = record
-                    .strong_model_override
-                    .as_deref()
-                    .unwrap_or(runner::DEFAULT_MODEL);
-                if fast == strong {
-                    format!("  model {fast}")
-                } else {
-                    format!("  model fast {fast} · strong {strong}")
-                }
-            }
-            Backend::ClaudeCode => "  model (session default — unpinned)".to_string(),
-        },
-    });
+    lines.push(format!(
+        "  model {}",
+        runner::declared_model(
+            record.backend,
+            record.model.as_deref(),
+            record.fast_model_override.as_deref(),
+            record.strong_model_override.as_deref(),
+        )
+    ));
     if record.backend == Backend::ClaudeCode {
         lines.push(format!("  claude {}", record.claude_bin));
     }
