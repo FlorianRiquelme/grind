@@ -162,7 +162,11 @@ fn session_id_from(run_id: &str, name: &str) -> String {
 /// skill text (read by the caller through `world` and handed in as `&str`, so this stays pure),
 /// where its returns and artifacts go, the worktree it runs in, the Job rows it is dispatched
 /// against, and the model this Run's tier resolved for it. `notes` is Plan-only injected
-/// notes/lessons text; every other stage leaves it `None` and it is never rendered.
+/// notes/lessons text; every other stage leaves it `None` and it is never rendered. `landed`
+/// is Work-only injected fact text — commits already on the branch and unit returns already on
+/// disk from earlier attempts (issue #170): per-unit commits are checkpoints, and re-entry must
+/// orient from those facts rather than rediscover state via `git status`; every other stage
+/// leaves it `None`.
 #[derive(Debug, Clone, Copy)]
 pub struct StageContext<'a> {
     pub stage: rung::Stage,
@@ -172,6 +176,7 @@ pub struct StageContext<'a> {
     pub job: &'a Job,
     pub model: Option<&'a str>,
     pub notes: Option<&'a str>,
+    pub landed: Option<&'a str>,
 }
 
 /// The two facts a stage invocation needs that [`Conditions`] does not carry the right shape
@@ -1297,6 +1302,7 @@ mod tests {
         job: &'a Job,
         model: Option<&'a str>,
         notes: Option<&'a str>,
+        landed: Option<&'a str>,
     ) -> StageContext<'a> {
         StageContext {
             stage,
@@ -1306,6 +1312,7 @@ mod tests {
             job,
             model,
             notes,
+            landed,
         }
     }
 
@@ -1345,7 +1352,7 @@ mod tests {
     #[test]
     fn a_stage_dispatch_opens_that_stages_own_session_with_no_plugin_flag() {
         let job = job();
-        let ctx = stage_ctx(rung::Stage::Work, &job, None, None);
+        let ctx = stage_ctx(rung::Stage::Work, &job, None, None, None);
         let invocation = stage_dispatch(&stage_conditions(), &ctx);
         let argv = invocation.argv();
         assert!(argv.contains(&"--session-id".to_string()));
@@ -1361,7 +1368,7 @@ mod tests {
     #[test]
     fn a_stage_resume_resumes_that_stages_own_session_with_no_plugin_flag() {
         let job = job();
-        let ctx = stage_ctx(rung::Stage::Review, &job, None, None);
+        let ctx = stage_ctx(rung::Stage::Review, &job, None, None, None);
         let invocation = stage_resume(&stage_conditions(), &ctx, None);
         let argv = invocation.argv();
         assert!(argv.contains(&"--resume".to_string()));
@@ -1377,7 +1384,7 @@ mod tests {
     #[test]
     fn a_stage_model_puts_the_model_flag_on_the_argv_and_absence_omits_it() {
         let job = job();
-        let with_model = stage_ctx(rung::Stage::Ship, &job, Some("claude-opus-5"), None);
+        let with_model = stage_ctx(rung::Stage::Ship, &job, Some("claude-opus-5"), None, None);
         let invocation = stage_dispatch(&stage_conditions(), &with_model);
         assert!(
             invocation
@@ -1386,7 +1393,7 @@ mod tests {
                 .any(|w| w[0] == "--model" && w[1] == "claude-opus-5")
         );
 
-        let without_model = stage_ctx(rung::Stage::Ship, &job, None, None);
+        let without_model = stage_ctx(rung::Stage::Ship, &job, None, None, None);
         let invocation = stage_dispatch(&stage_conditions(), &without_model);
         assert!(!invocation.argv().contains(&"--model".to_string()));
     }
@@ -1394,7 +1401,7 @@ mod tests {
     #[test]
     fn stage_invocation_routes_dispatch_and_resume_and_refuses_ci_babysit() {
         let job = job();
-        let ctx = stage_ctx(rung::Stage::Fixes, &job, None, None);
+        let ctx = stage_ctx(rung::Stage::Fixes, &job, None, None, None);
         let dispatched = stage_invocation(&stage_conditions(), &ctx, Mode::Dispatch, None);
         assert_eq!(dispatched.mode(), Mode::Dispatch);
         let resumed = stage_invocation(&stage_conditions(), &ctx, Mode::Resume, None);
@@ -1405,14 +1412,14 @@ mod tests {
     #[should_panic(expected = "babysit continues Ship's session")]
     fn stage_invocation_panics_on_ci_babysit() {
         let job = job();
-        let ctx = stage_ctx(rung::Stage::Ship, &job, None, None);
+        let ctx = stage_ctx(rung::Stage::Ship, &job, None, None, None);
         let _ = stage_invocation(&stage_conditions(), &ctx, Mode::CiBabysit, None);
     }
 
     #[test]
     fn a_stage_prompt_carries_the_skill_text_verbatim_and_the_bounded_context() {
         let job = job();
-        let ctx = stage_ctx(rung::Stage::Work, &job, None, None);
+        let ctx = stage_ctx(rung::Stage::Work, &job, None, None, None);
         let prompt = stage_dispatch(&stage_conditions(), &ctx)
             .prompt()
             .to_string();
@@ -1429,7 +1436,7 @@ mod tests {
     #[test]
     fn a_stage_resume_prompt_carries_the_stage_reentry_paragraph_and_no_dispatch_does() {
         let job = job();
-        let ctx = stage_ctx(rung::Stage::Work, &job, None, None);
+        let ctx = stage_ctx(rung::Stage::Work, &job, None, None, None);
         let resumed = stage_resume(&stage_conditions(), &ctx, None)
             .prompt()
             .to_string();
@@ -1444,7 +1451,7 @@ mod tests {
     #[test]
     fn a_stage_resume_prompt_carries_the_latest_clearance_when_given_and_nothing_otherwise() {
         let job = job();
-        let ctx = stage_ctx(rung::Stage::Fixes, &job, None, None);
+        let ctx = stage_ctx(rung::Stage::Fixes, &job, None, None, None);
         let note = "the CI runner was fixed";
         let cleared = a_clearance(note);
         let with_note = stage_resume(&stage_conditions(), &ctx, Some(&cleared))
@@ -1463,17 +1470,53 @@ mod tests {
     fn plan_alone_injects_notes_and_lessons_into_its_dispatch_prompt() {
         let job = job();
         let notes = "the last Run mistook a Wait for a crash; watch for that.";
-        let plan_ctx = stage_ctx(rung::Stage::Plan, &job, None, Some(notes));
+        let plan_ctx = stage_ctx(rung::Stage::Plan, &job, None, Some(notes), None);
         let plan_prompt = stage_dispatch(&stage_conditions(), &plan_ctx)
             .prompt()
             .to_string();
         assert!(plan_prompt.contains(notes));
 
-        let work_ctx = stage_ctx(rung::Stage::Work, &job, None, Some(notes));
+        let work_ctx = stage_ctx(rung::Stage::Work, &job, None, Some(notes), None);
         let work_prompt = stage_dispatch(&stage_conditions(), &work_ctx)
             .prompt()
             .to_string();
         assert!(!work_prompt.contains(notes));
+    }
+
+    #[test]
+    fn a_work_resume_prompt_carries_the_landed_work_block_and_nothing_without_it() {
+        let job = job();
+        let landed = "Commits on this branch beyond base (main):\n  abc1234 R6: constructor sweep";
+        let with_landed = stage_ctx(rung::Stage::Work, &job, None, None, Some(landed));
+        let prompt = stage_resume(&stage_conditions(), &with_landed, None)
+            .prompt()
+            .to_string();
+        assert!(prompt.contains("Work already proven on this branch from earlier attempts:"));
+        assert!(prompt.contains(landed));
+        assert!(prompt.contains("do not redo it"));
+
+        let without_landed = stage_ctx(rung::Stage::Work, &job, None, None, None);
+        let prompt = stage_resume(&stage_conditions(), &without_landed, None)
+            .prompt()
+            .to_string();
+        assert!(!prompt.contains("Work already proven on this branch"));
+    }
+
+    #[test]
+    fn landed_work_renders_only_for_the_work_stage_and_never_on_dispatch() {
+        let job = job();
+        let landed = "Commits on this branch beyond base (main):";
+        let review_ctx = stage_ctx(rung::Stage::Review, &job, None, None, Some(landed));
+        let resumed = stage_resume(&stage_conditions(), &review_ctx, None)
+            .prompt()
+            .to_string();
+        assert!(!resumed.contains(landed));
+
+        let work_ctx = stage_ctx(rung::Stage::Work, &job, None, None, Some(landed));
+        let dispatched = stage_dispatch(&stage_conditions(), &work_ctx)
+            .prompt()
+            .to_string();
+        assert!(!dispatched.contains(landed));
     }
 
     #[test]

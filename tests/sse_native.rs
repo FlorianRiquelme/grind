@@ -242,6 +242,7 @@ fn drive_attempt_with_prompt(
         job: &job,
         model: None,
         notes: None,
+        landed: None,
     };
     let invocation = claude::stage_invocation(&conditions, &ctx, Mode::Dispatch, None);
 

@@ -249,14 +249,16 @@ fn stage_dispatch_prompt(ctx: &StageContext) -> String {
 }
 
 /// The same bundle, with the stage-level re-entry paragraph (and, when one was recorded, the
-/// latest clearance note) composed after the context block.
+/// latest clearance note) composed after the context block — plus, for Work, the landed-work
+/// facts the caller gathered from the tree.
 fn stage_resume_prompt(ctx: &StageContext, cleared: Option<&Clearance>) -> String {
     format!(
-        "{skill}\n\n---\n\n{context}\n\n{reentry}{clearance}{notes}",
+        "{skill}\n\n---\n\n{context}\n\n{reentry}{clearance}{landed}{notes}",
         skill = ctx.skill_text,
         context = stage_context_block(ctx),
         reentry = STAGE_REENTRY_PROMPT,
         clearance = stage_clearance_paragraph(cleared),
+        landed = landed_work_block(ctx),
         notes = plan_notes_block(ctx),
     )
 }
@@ -309,6 +311,25 @@ never elsewhere.",
 fn plan_notes_block(ctx: &StageContext) -> String {
     match (ctx.stage, ctx.notes) {
         (rung::Stage::Plan, Some(notes)) => format!("\n\nNotes and lessons for this Run:\n{notes}"),
+        _ => String::new(),
+    }
+}
+
+/// **Default is silence**, Work-only, on Resume only (the caller reads it impure-side; this
+/// stays pure). Issue #170: per-unit commits are checkpoints, so a fresh Work attempt re-entering
+/// after a wall death must be told what is already proven on the branch — which commits landed
+/// beyond base, which durable unit returns sit under the stages directory — instead of leaving
+/// it to rediscover state via `git status` and risk redoing proven-but-uncommitted-appearing
+/// work. The facts are framed as an account to check against observation (ADR-0003), never as
+/// current truth to trust blind.
+fn landed_work_block(ctx: &StageContext) -> String {
+    match (ctx.stage, ctx.landed) {
+        (rung::Stage::Work, Some(facts)) if !facts.is_empty() => format!(
+            "\n\nWork already proven on this branch from earlier attempts:\n{facts}\n\nCheck \
+             this against what you now observe. A unit with both its durable return under your \
+             stages directory and its commit in the log is done — do not redo it; resume from \
+             the earliest unit lacking either."
+        ),
         _ => String::new(),
     }
 }

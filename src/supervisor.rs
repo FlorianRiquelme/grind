@@ -1315,6 +1315,57 @@ fn lessons_for(home: &Path, job: &Job) -> Option<String> {
     Some(text)
 }
 
+/// What earlier Work attempts already proved on this branch, read impure-side from the tree
+/// before [`StageContext`] is built (issue #170): per-unit commits are checkpoints, so a fresh
+/// re-entry must be handed the facts — commits beyond the Job's base branch, durable unit
+/// returns under `stages/work/units/` — rather than rediscover them via `git status`. Every
+/// source that cannot be observed contributes nothing (`git log` non-zero exit, absent units
+/// directory), the same fail-open register as `observe.rs`'s tree reading; with neither source
+/// yielding anything this is `None`, and silence renders.
+fn landed_work(record: &RunRecord, run_dir: &Path, worktree: &Path) -> Option<String> {
+    let log = world::run(
+        &words(&[
+            "git",
+            "log",
+            "--oneline",
+            &format!("{}..HEAD", record.job.base_branch),
+        ]),
+        Some(worktree),
+    );
+    let mut text = String::new();
+    if log.code == Some(0) && !log.stdout.trim().is_empty() {
+        let commits = log
+            .stdout
+            .trim()
+            .lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        text.push_str(&format!(
+            "Commits on this branch beyond base ({}):\n{commits}",
+            record.job.base_branch
+        ));
+    }
+    let units = world::list_dir(&run_dir.join("stages").join("work").join("units"))
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .collect::<Vec<_>>();
+    if !units.is_empty() {
+        let names = units
+            .iter()
+            .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!(
+            "Unit returns recorded under stages/work/units/: {names}"
+        ));
+    }
+    (!text.is_empty()).then_some(text)
+}
+
 /// One Attempt for one ladder rung: the stage's own session, dispatched fresh or resumed by
 /// whether its transcript already has lines, run through the same `attempt::run` raw-before-parse
 /// machinery every Attempt uses. After the child lands, its own return file (if now present)
@@ -1356,6 +1407,11 @@ fn run_ladder_attempt(
     } else {
         None
     };
+    let landed = if stage == Stage::Work {
+        landed_work(record, run_dir, worktree)
+    } else {
+        None
+    };
     let stages_dir_str = run_dir.join("stages").display().to_string();
     let ctx = StageContext {
         stage,
@@ -1365,6 +1421,7 @@ fn run_ladder_attempt(
         job: &record.job,
         model: claude_model_arg.as_deref(),
         notes: notes.as_deref(),
+        landed: landed.as_deref(),
     };
     let conditions = StageConditions {
         claude_bin: &record.claude_bin,
