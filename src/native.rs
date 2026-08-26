@@ -452,10 +452,11 @@ struct AttemptFacts<'a> {
     ending: Ending,
     usage: Option<Value>,
     denials: Vec<Value>,
-    /// The bare file name of the transcript this attempt wrote, when it got as far as
-    /// allocating one. `None` on the endpoint-resolution path, which returns before
-    /// `allocate_transcript` is ever reached and so leaves no file to name.
-    transcript_name: Option<String>,
+    /// The transcript fact this attempt states. Mid-loop synthesis names the exact slot
+    /// `allocate_transcript` handed out; the endpoint-resolution path returns before any
+    /// allocation exists and so states wrote-none — an ending that never reached the loop
+    /// has nothing under its name.
+    transcript: crate::attempt::Transcript,
 }
 
 /// Map the loop's outcome onto the record's currency, mirroring
@@ -512,7 +513,7 @@ fn synthesize(facts: AttemptFacts) -> Attempt {
         rate_limited: is_rate_limited(&payload),
         result_tail,
         fanout: Observed::Unobservable(Reason::saying("the native loop spawns no subagents")),
-        transcript_name: facts.transcript_name,
+        transcript: facts.transcript,
     }
 }
 
@@ -741,7 +742,7 @@ impl StageRunner for crate::runner::NativeAdapter {
                     ending: Ending::Failed(format!("endpoint resolution failed: {reason}")),
                     usage: None,
                     denials: Vec::new(),
-                    transcript_name: None,
+                    transcript: crate::attempt::Transcript::WroteNone,
                 });
             }
         };
@@ -923,9 +924,11 @@ impl StageRunner for crate::runner::NativeAdapter {
             ending,
             usage: usage_total,
             denials,
-            transcript_name: transcript_path
+            transcript: transcript_path
                 .file_name()
-                .map(|name| name.to_string_lossy().into_owned()),
+                .map(|name| name.to_string_lossy().into_owned())
+                .map(crate::attempt::Transcript::Recorded)
+                .unwrap_or(crate::attempt::Transcript::PredatesName),
         })
     }
 }
@@ -1094,6 +1097,60 @@ mod tests {
     use super::*;
     use crate::decide::Tiers;
     use serde_json::json;
+
+    /// An endpoint that cannot resolve ends the attempt before `allocate_transcript` is ever
+    /// reached — so no transcript file exists and there is nothing to link. The synthesized
+    /// Attempt must *state* wrote-none, not fall back to the legacy predates-the-name
+    /// spelling whose constructed name renders a link over a URL backed by nothing (#161).
+    #[test]
+    fn an_endpoint_resolution_failure_synthesizes_wrote_none() {
+        let invocation = crate::attempt::Invocation::build(
+            vec!["grind".to_string(), "attempt".to_string()],
+            "the prompt".to_string(),
+            Mode::Dispatch,
+        );
+        let model = crate::runner::StageModel::Class(crate::runner::ModelClass::Fast);
+        let run_dir = std::path::PathBuf::from("/nonexistent-run-dir-for-native-test");
+        let spec = RunSpec {
+            invocation: &invocation,
+            cwd: Path::new("."),
+            run_dir: &run_dir,
+            attempt_n: 3,
+            session_id: "session-1",
+            worktree: "/nonexistent-worktree-for-native-test",
+            model: &model,
+            denied_globs: &[],
+            file_label: FileLabel::Attempt,
+        };
+        let adapter = crate::runner::NativeAdapter {
+            endpoint_override: Some("http://localhost:9/v1".to_string()),
+            fast_model: None,
+            strong_model: None,
+            proto_override: None,
+            max_turns: None,
+        };
+
+        // No key in this test process's environment -> Endpoint::resolve fails before the
+        // loop allocates any transcript. If a developer machine happens to carry one, the
+        // error message below says so rather than failing confusingly.
+        crate::world::remove_var_for_test("OPENROUTER_API_KEY");
+        crate::world::remove_var_for_test("OPENAI_API_KEY");
+
+        let attempt = StageRunner::run(&adapter, &spec);
+
+        assert_eq!(
+            attempt.terminal_reason.as_deref(),
+            Some(
+                "endpoint resolution failed: no OPENROUTER_API_KEY / OPENAI_API_KEY in environment"
+            ),
+            "this test requires an unresolvable endpoint; if resolve started succeeding, its env changed"
+        );
+        assert_eq!(
+            attempt.transcript,
+            crate::attempt::Transcript::WroteNone,
+            "an attempt that ended before allocating anything must say it wrote none"
+        );
+    }
 
     /// The shipped calibration already declares exactly this shape — work at 64 flat,
     /// 16 tiered — so the scenario reads the real data instead of restating it.
@@ -1469,7 +1526,7 @@ mod tests {
             ending: Ending::Completed("shipped it".into()),
             usage: Some(json!({"prompt_tokens": 10, "cost": 0.03183387})),
             denials: vec![],
-            transcript_name: None,
+            transcript: crate::attempt::Transcript::PredatesName,
         });
         assert_eq!(attempt.exit_code, Some(0));
         assert!(!attempt.is_error);
@@ -1495,7 +1552,7 @@ mod tests {
             ending: Ending::Completed("PR is open, stopping here. <promise>DONE</promise>".into()),
             usage: None,
             denials: vec![],
-            transcript_name: None,
+            transcript: crate::attempt::Transcript::PredatesName,
         });
         assert!(promised.done_promise);
 
@@ -1508,7 +1565,7 @@ mod tests {
             ending: Ending::Completed("plan written and verified.".into()),
             usage: None,
             denials: vec![],
-            transcript_name: None,
+            transcript: crate::attempt::Transcript::PredatesName,
         });
         assert!(!unpromised.done_promise);
     }
@@ -1524,7 +1581,7 @@ mod tests {
             ending: Ending::Failed("HTTP 429: rate limit exceeded, resets at 17:00".into()),
             usage: None,
             denials: vec![],
-            transcript_name: None,
+            transcript: crate::attempt::Transcript::PredatesName,
         });
         assert!(attempt.rate_limited);
         assert!(
@@ -1544,7 +1601,7 @@ mod tests {
             ending: Ending::Completed("shipped it".into()),
             usage: Some(json!({"prompt_tokens": 10, "cost": 0.03183387})),
             denials: vec![],
-            transcript_name: None,
+            transcript: crate::attempt::Transcript::PredatesName,
         });
         assert_eq!(attempt.total_cost_usd, Some(0.031_833_87));
         assert!(!attempt.is_wait());
@@ -1561,7 +1618,7 @@ mod tests {
             ending: Ending::Completed("shipped it".into()),
             usage: Some(json!({"prompt_tokens": 10})),
             denials: vec![],
-            transcript_name: None,
+            transcript: crate::attempt::Transcript::PredatesName,
         });
         assert!(!attempt.is_wait());
     }
@@ -1579,7 +1636,7 @@ mod tests {
             ),
             usage: None,
             denials: vec![],
-            transcript_name: None,
+            transcript: crate::attempt::Transcript::PredatesName,
         });
         assert_eq!(limited.exit_code, Some(1));
         assert!(limited.is_error);
@@ -1599,7 +1656,7 @@ mod tests {
             ending: Ending::Failed("stream failed: connection reset".into()),
             usage: None,
             denials: vec![],
-            transcript_name: None,
+            transcript: crate::attempt::Transcript::PredatesName,
         });
         assert!(!plain.rate_limited);
         assert_eq!(plain.result_tail, "stream failed: connection reset");
@@ -1617,7 +1674,7 @@ mod tests {
             ending: Ending::Completed(long.clone()),
             usage: None,
             denials: vec![],
-            transcript_name: None,
+            transcript: crate::attempt::Transcript::PredatesName,
         });
         assert_eq!(attempt.result_tail.chars().count(), TAIL_CHARS);
         assert!(long.ends_with(&attempt.result_tail));
