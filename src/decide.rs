@@ -235,6 +235,14 @@ pub fn signals_of(observation: &Observation) -> RawSignals {
 /// The fold. Completion is **observed rather than declared**, and the DONE promise is neither
 /// necessary nor sufficient — two Runs finished a pipeline without emitting it, and a session
 /// that believes it finished can emit it against nothing.
+///
+/// Boundary on the check rollup (`no_check_pending`): a pending-but-not-failed rollup
+/// (`Present(false)`) corroborates once the four deliverable signals — `pr_open`, `tree_clean`,
+/// `pr_head_matches_job_branch`, `pr_base_matches_declared` — are all `Present(true)`; before
+/// that it keeps its plain reading and holds completion open. An absent rollup still reads
+/// unmet and an unobservable one still blinds, so the three-valuedness passes through
+/// untouched. Which checks exist or pass stays an observed fact; nothing here turns it into a
+/// gate (ADR-0003).
 pub fn verdict(signals: &RawSignals, done_promise: bool) -> Verdict {
     let RawSignals {
         pr_open,
@@ -254,9 +262,25 @@ pub fn verdict(signals: &RawSignals, done_promise: bool) -> Verdict {
         ("PR base matches declared branch", pr_base_matches_declared),
     ];
 
+    // The four signals that say the deliverable exists. A pending-but-not-failed check rollup
+    // corroborates once all four are Present(true): Grind hands off at an open PR (ADR-0003),
+    // and waiting past that point is spend without a decision. Before that point — no PR, a
+    // dirty tree, or head/base rows mismatched — pending still holds the Run open. The rollup
+    // state itself stays recorded and surfaced through the observation either way.
+    let deliverable_present = matches!(pr_open, Observed::Present(true))
+        && matches!(tree_clean, Observed::Present(true))
+        && matches!(pr_head_matches_job_branch, Observed::Present(true))
+        && matches!(pr_base_matches_declared, Observed::Present(true));
+
     let mut blind = Vec::new();
     let mut unmet = Vec::new();
     for (name, signal) in named {
+        if name == "no check pending"
+            && deliverable_present
+            && matches!(signal, Observed::Present(false))
+        {
+            continue;
+        }
         match signal {
             Observed::Present(true) => {}
             Observed::Present(false) => unmet.push(name.to_string()),
