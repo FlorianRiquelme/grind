@@ -112,10 +112,10 @@ ln -s <path-to-this-repo>/skills/enqueue ~/.claude/skills/enqueue
 - [`tests/`](tests/) — every safety property, including the compile-fail carrier, which shells out
   to `rustc` rather than taking a dev-dependency.
 - [`docs/adr/`](docs/adr/) — eighteen accepted decisions constraining almost every change here.
-- [`docs/findings/`](docs/findings/) — five dogfood Runs' measurements, `0001`–`0005`.
+- [`docs/findings/`](docs/findings/) — six dogfood Runs' measurements, `0001`–`0006`.
 - [`docs/provisioned-host.md`](docs/provisioned-host.md) — what a host owes before a Dispatch
   succeeds on it.
-- [`CLAUDE.md`](CLAUDE.md) and [`CONTEXT.md`](CONTEXT.md) — contributor constraints, and the
+- [`AGENTS.md`](AGENTS.md) and [`CONTEXT.md`](CONTEXT.md) — contributor constraints, and the
   glossary of defined terms this file borrows without redefining.
 
 `just verify` is the one definition of checked: fmt, clippy, tests, and musl cross-builds, run by

@@ -935,7 +935,7 @@ mod tests {
         assert!(
             !attempt.is_wait(),
             "parse_ok == false must never read as a Wait — that clause is what keeps a crash \
-             from looping for free (CLAUDE.md)"
+             from looping for free (AGENTS.md)"
         );
     }
 }

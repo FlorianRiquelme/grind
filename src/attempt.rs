@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Weakening the list is **intent**, and no carrier defends against intent. What is typeable is
 /// the narrower, omission-shaped property below: every invocation carries them. The contents
-/// stay prose, in `CLAUDE.md`, where they already are.
+/// stay prose, in `AGENTS.md`, where they already are.
 pub const DENIED_TOOLS: [&str; 29] = [
     "Bash(gh pr merge*)",
     "Bash(git push --force*)",

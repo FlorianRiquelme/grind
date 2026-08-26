@@ -118,7 +118,7 @@ fn renaming_a_required_row_on_either_side_fails_and_names_the_row() {
 #[test]
 fn no_file_in_the_repo_still_claims_this_seam_is_untested() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for named in ["CLAUDE.md", "skills/enqueue/SKILL.md"] {
+    for named in ["AGENTS.md", "skills/enqueue/SKILL.md"] {
         let text = fs::read_to_string(root.join(named)).expect("a readable file");
         for claim in ["nothing tests that seam", "nothing tests the seam"] {
             assert!(

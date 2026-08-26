@@ -28,7 +28,7 @@ The diff, the relevant plan units, and this file. Nothing else.
   or raw file contents that could carry a secret.
 - **SEC-4 — DENIED_TOOLS coverage on a new site.** A new or modified tool-invocation call site is
   checked against the deny list in `src/attempt.rs` for a bypassable spelling — this is the persona
-  seat for the property CLAUDE.md calls "widening the list is safe; narrowing it is not," read in
+  seat for the property AGENTS.md calls "widening the list is safe; narrowing it is not," read in
   the other direction: does this diff add a capability the list doesn't yet reach.
 - **SEC-5 — Deserialization trust boundary.** A `serde` parse of data crossing a trust boundary
   (Job issue body, subprocess stdout, a persona's own findings file) uses strict parsing
