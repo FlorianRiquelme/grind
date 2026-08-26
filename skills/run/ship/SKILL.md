@@ -75,7 +75,7 @@ promotion out of `candidate` is a human's or Reflect's later act, never this sta
 ## Never
 
 - Never merge the PR, force-push, rebase, hard-reset, or delete a branch. `DENIED_TOOLS`
-  (`CLAUDE.md`) refuses every spelling of these at the tool layer regardless of what this prompt
+  (`AGENTS.md`) refuses every spelling of these at the tool layer regardless of what this prompt
   says — but do not reach for them expecting the barrier to save you; the shape a Run pushes in
   is its own branch, plain push, nothing else.
 - Never invent a base or branch this Run prefers over the Job's declared rows.

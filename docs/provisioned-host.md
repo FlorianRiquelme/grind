@@ -243,7 +243,7 @@ with your GitHub credentials?"*.
 
 The Run inherits both credentials and Grind cannot decide otherwise — `GH_TOKEN=""` is a silent
 no-op and `GH_CONFIG_DIR` is plumbing, not a boundary. So `DENIED_TOOLS` is the entire barrier
-between a Run and merging its own PR, permanently and by construction. See #37 and `CLAUDE.md`.
+between a Run and merging its own PR, permanently and by construction. See #37 and `AGENTS.md`.
 
 ## Steps with no boolean
 

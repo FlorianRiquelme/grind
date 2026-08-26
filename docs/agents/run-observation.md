@@ -67,6 +67,32 @@ On a native Run, `transcript` names the **newest-written** `messages-N.jsonl` un
 own directory — the attempt in flight. Earlier attempts' files sit beside it, and `progress`
 spans all of them.
 
+## Terminality signals
+
+A Run's recorded `state` is one of eight snake_case values — the `State` enum in
+`src/supervisor.rs`, declared in walk order: `dispatched`, `rate_limited`, `died`,
+`completed`, `uncorroborated`, `unobserved`, `exhausted`, `blocked`. None is `running`: a
+killed supervisor leaves no live-looking record, which is why liveness is observed, never
+assumed. Five are terminal — `completed`, `uncorroborated`, `unobserved`, `exhausted`,
+`blocked` — written together by `finish_run` from the walk's `Stop`s and never re-entered by
+`resume_all`. Two mean only *between stages*: `rate_limited`, where the supervisor saves,
+sleeps out the recorded `limit_sleep_seconds` (1800 s unless refined downward) and re-enters
+free of charge, since a Wait spends no attempt budget; and `died`.
+
+`died` is not `exhausted`. It is written at one site only, announcing *"ended without a DONE
+promise — re-entering at the stage that died"* and looping on immediately, so it survives on
+disk solely while the supervisor itself is interrupted — completing `resume_all`'s boot-time
+re-entry trio beside `dispatched` and `rate_limited`. Exhaustion is instead the walk
+*finishing* with its attempt budget spent: final, and like `blocked` it dispatches no Reflect,
+so nothing ever mines those transcripts. Archiving a `died` Run abandons a walk that intends
+to return.
+
+Before trusting any of this file state, prove the supervisor exited first: `kill -0` against
+the record's supervisor pid must fail — writes land *before* every sleep and re-entry, so a
+fresh `rate_limited` beside a live pid is a nap, not a crash. A poller capped around 3600 s
+can expire inside a single 1800 s nap; re-arm rather than conclude, and take the final read of
+the record only once the process is gone.
+
 ## Boundaries
 
 - **Status is pull-only and writes nothing.** Never save what `grind status` loads; the

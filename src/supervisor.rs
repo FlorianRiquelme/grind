@@ -1899,8 +1899,7 @@ mod tests {
         let home = world::temp_dir("latest-decided-tier");
         let run_dir = home.join("runs").join("r1");
         let write = |pass: &str, body: &str| {
-            world::create_dir_all(&run_dir.join("stages").join(pass))
-                .expect("a stages dir");
+            world::create_dir_all(&run_dir.join("stages").join(pass)).expect("a stages dir");
             world::write_atomic(
                 &run_dir.join("stages").join(pass).join("decision.json"),
                 body,
@@ -1931,7 +1930,6 @@ mod tests {
         );
         world::remove_tree(&home);
     }
-
 
     #[test]
     fn claude_code_backend_still_requires_the_claude_binary() {

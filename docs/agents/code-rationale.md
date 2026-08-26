@@ -6,7 +6,7 @@ and the primary reader re-reads the code anyway. What remains in-source is doc c
 in a function description — invariants, external-system quirks, and bug history. Anchors name
 the symbol each note was extracted beside; symbols move, so grep before trusting one.
 
-New code ships comment-free (CLAUDE.md → Agent skills → Code comments). Record such knowledge
+New code ships comment-free (AGENTS.md → Agent skills → Code comments). Record such knowledge
 here, or in an ADR when it decides something.
 
 ## src/supervisor.rs
@@ -208,7 +208,7 @@ here, or in an ADR when it decides something.
 - **write_file_is_refused_under_report_only_denials…(tests)**: Cross-backend naming: the
   native toolkit calls its writer `write_file`, so report-only denial sets must carry that
   name itself, not just claude-code's `Write`/`Edit`.
-- **DENIED_TOOLS matcher history**: see CLAUDE.md → "DENIED_TOOLS … safety property" for the
+- **DENIED_TOOLS matcher history**: see AGENTS.md → "DENIED_TOOLS … safety property" for the
   full story (position-independent globs, `-f` inside branch names, sh/bash/-c/-eval outer
   refusals, suffix-candidate generation).
 
@@ -230,7 +230,7 @@ here, or in an ADR when it decides something.
   glob_matches/subcommands_of from crate::tools rather than keeping local copies: a previously
   hand-maintained twin drifted silently while `just verify` stayed green, and tools' copy is
   the native backend's entire enforcement barrier.
-- **DENIED_TOOLS glob specifics**: see CLAUDE.md → "DENIED_TOOLS … safety property".
+- **DENIED_TOOLS glob specifics**: see AGENTS.md → "DENIED_TOOLS … safety property".
 
 ## src/native.rs
 
