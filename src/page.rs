@@ -1436,7 +1436,7 @@ mod tests {
     /// adapter never sets — must not reach it even if one somehow appeared.
     #[test]
     fn a_claude_code_attempts_trio_ignores_any_recorded_transcript_name() {
-        let mut found = day_one();
+        let found = day_one();
         assert_eq!(found.backend, crate::runner::Backend::ClaudeCode);
         // The trio is determined by `n` alone, however the transcript fact stands: a
         // recorded name that adapter never sets, and the wrote-none fact it never
