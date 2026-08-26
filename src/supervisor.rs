@@ -209,9 +209,18 @@ impl RunRecord {
     }
 
     /// The one seam call (R1), bundling this Run's frozen backend selection so every call
-    /// site — ladder attempts, Ship's babysit round, and Reflect — constructs it identically
-    /// rather than repeating the same four-field clone three times.
-    fn runner(&self, home: &Path) -> Box<dyn runner::StageRunner> {
+    /// site — ladder attempts, Ship's babysit round, and Reflect — constructs it identically.
+    /// The stage context is what each call site already holds (`run_ladder_attempt` passes its
+    /// dispatching stage; Ship's babysit round and Reflect pass `None`), and it resolves this
+    /// attempt's per-stage turn ceiling from `docs/tiers.toml` once here: a stage-aware call
+    /// reads the latest decided tier on disk (diff-triage's decision, else triage's), so a
+    /// declared override moves the ceiling the native loop enforces while an undeclared stage
+    /// still reads the compiled fallback. No stage key means no entry can match — exactly the
+    /// behavior before ceilings were data.
+    fn runner(&self, home: &Path, stage: Option<Stage>) -> Box<dyn runner::StageRunner> {
+        let worktree = std::path::PathBuf::from(&self.worktree);
+        let tiers = load_tiers(&worktree);
+        let tier = stage.and_then(|_| latest_decided_tier(&worktree));
         runner::runner_for(
             self.backend,
             &self.claude_bin,
@@ -221,6 +230,8 @@ impl RunRecord {
                 fast_model: self.fast_model_override.clone(),
                 strong_model: self.strong_model_override.clone(),
                 proto_override: self.proto_override,
+                max_turns: stage
+                    .map(|stage| native_max_turns_for(stage, tier.as_deref(), Some(&tiers))),
             },
         )
     }
@@ -816,7 +827,8 @@ fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
     let denied = attempt::denied_for_reflect();
     let reflect_model = runner::StageModel::Class(runner::ModelClass::Strong);
     let run_dir_str = run_dir.display().to_string();
-    let runner = record.runner(&home);
+    // No stage key: Reflect resolves exactly as it did before turn ceilings were data.
+    let runner = record.runner(&home, None);
     let spec = runner::RunSpec {
         invocation: &invocation,
         cwd: run_dir,
@@ -1019,6 +1031,24 @@ fn load_tiers(worktree: &Path) -> Tiers {
         Ok(text) => decide::tiers_from_toml(&text),
         Err(_) => Tiers::default(),
     }
+}
+
+/// The latest decided tier on disk for a stage-aware turn-ceiling lookup:
+/// diff-triage's decision when present, else triage's. Absent or unreadable reads as no
+/// tiered entry — the same tolerant serde shape `resolve_stage_model` already uses.
+fn latest_decided_tier(worktree: &Path) -> Option<String> {
+    let stages_dir = worktree.join("stages");
+    world::read_to_string(&stages_dir.join("diff-triage").join("decision.json"))
+        .ok()
+        .or_else(|| world::read_to_string(&stages_dir.join("triage").join("decision.json")).ok())
+        .and_then(|text| serde_json::from_str::<decide::Decision>(&text).ok())
+        .map(|decision| decision.tier.to_string())
+}
+
+/// The supervisor-side call into [`crate::native`]'s resolution order: the stage-times-tier
+/// entry when present, then the flat per-stage entry, then the loop's compiled fallback.
+fn native_max_turns_for(stage: Stage, tier: Option<&str>, tiers: Option<&Tiers>) -> usize {
+    crate::native::max_turns_for(&stage.to_string(), tier, tiers)
 }
 /// The Plan stage's own `plan-facts.json`, read tolerantly for both [R] passes. Absent or
 /// unparseable reads as `None`: at Triage that fails closed inside `select_tier` (plan is the
@@ -1318,7 +1348,7 @@ fn run_ladder_attempt(
         &format!("  [{started_at}] {stage} attempt {n} ({mode}) …"),
     );
     let denied = attempt::denied_for(stage);
-    let runner = record.runner(&home);
+    let runner = record.runner(&home, Some(stage));
     let spec = runner::RunSpec {
         invocation: &invocation,
         cwd: worktree,
@@ -1391,7 +1421,8 @@ fn run_ship_babysit_attempt(
         .iter()
         .map(|glob| glob.to_string())
         .collect();
-    let runner = record.runner(&home);
+    // No stage key: the CI-babysit round resolves exactly as it did before ceilings were data.
+    let runner = record.runner(&home, None);
     let spec = runner::RunSpec {
         invocation: &invocation,
         cwd: worktree,

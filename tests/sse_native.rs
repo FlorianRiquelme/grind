@@ -20,6 +20,8 @@
 //!   readers parse; positional assertions stop encoding a shape no real Run produces) |
 //! | a_completed_stage_without_the_sentinel_promises_nothing | — (issue #139: an ending
 //!   is never synthesized into a Run-level promise) |
+//! | a_declared_max_turns_ceiling_bounds_the_loop_below_the_fallback | — (issue #157:
+//!   the enforced turn limit is data served from docs/tiers.toml, not the constant) |
 //!
 //! Library-level parity suffices here; the full-binary native e2e stays out of scope
 //! this wave.
@@ -35,6 +37,10 @@ use grind::job::Job;
 use grind::rung;
 use grind::runner::{self, NativeAdapter, StageRunner};
 use serde_json::{Value, json};
+
+/// The compiled fallback the loop enforces when nothing is declared (`native.rs`'s
+/// `DEFAULT_MAX_TURNS`); the exhaustion scenario counts against it.
+const DEFAULT_FALLBACK_TURNS: usize = 32;
 
 /// One scripted reply. `Sse` answers 200 with an `text/event-stream` body;
 /// `Status` answers with a bare status + plain-text body (429 et al).
@@ -199,6 +205,38 @@ fn drive_attempt_with_prompt(
     attempt_n: usize,
     skill_text: &str,
 ) -> Attempt {
+    drive_attempt_configured(server, run_dir, cwd, attempt_n, skill_text, None)
+}
+
+/// The same seam with the adapter's per-stage turn ceiling set (`None` keeps the loop's
+/// compiled fallback) — the knob issue #157 put on `NativeAdapter`, driven end to end by
+/// the exhaustion scenario below.
+#[allow(clippy::too_many_arguments)]
+fn drive_attempt_with_max_turns(
+    server: &Server,
+    run_dir: &Path,
+    cwd: &Path,
+    attempt_n: usize,
+    max_turns: Option<usize>,
+) -> Attempt {
+    drive_attempt_configured(
+        server,
+        run_dir,
+        cwd,
+        attempt_n,
+        "Do the assigned stage work.",
+        max_turns,
+    )
+}
+
+fn drive_attempt_configured(
+    server: &Server,
+    run_dir: &Path,
+    cwd: &Path,
+    attempt_n: usize,
+    skill_text: &str,
+    max_turns: Option<usize>,
+) -> Attempt {
     ensure_api_key();
 
     let job = Job {
@@ -254,6 +292,7 @@ fn drive_attempt_with_prompt(
         fast_model: None,
         strong_model: None,
         proto_override: None,
+        max_turns,
     }
     .run(&spec)
 }
@@ -693,6 +732,61 @@ fn malformed_tool_call_nudges_then_completes() {
             .expect("string final")
             .contains("DONE")
     );
+}
+
+/// One scripted turn that never finishes: a native-mode reply whose tool call fails the
+/// fault check (no such tool), so the loop nudges and asks again — one request per turn,
+/// forever, until the ceiling stops it.
+fn non_final_turn() -> Reply {
+    Reply::Sse(sse(vec![chunk(
+        json!({"tool_calls": [tool_delta(0, Some("call_x"), Some("not_a_tool"), Some("{}"))]}),
+        Some("tool_calls"),
+        None,
+    )]))
+}
+
+#[test]
+fn a_declared_max_turns_ceiling_bounds_the_loop_below_the_fallback() {
+    let (run_dir, cwd) = scratch("max-turns");
+    let low_limit = 3usize;
+
+    // More non-final turns scripted than the low limit allows: the loop must stop on the
+    // declared ceiling, not run the script dry.
+    let script = vec![
+        non_final_turn(),
+        non_final_turn(),
+        non_final_turn(),
+        non_final_turn(),
+    ];
+    let server = Server::start(script);
+
+    // The override is the point: `Some(low_limit)` on the adapter literal, exactly where
+    // supervisor::record.runner hands a tiers.toml-resolved value.
+    let attempt = drive_attempt_with_max_turns(&server, &run_dir, &cwd, 1, Some(low_limit));
+
+    assert!(attempt.is_error, "{:?}", attempt.terminal_reason);
+    assert!(!attempt.done_promise);
+    assert_eq!(attempt.exit_code, Some(1));
+    assert!(!attempt.rate_limited);
+    assert!(attempt.parse_ok);
+    let reason = attempt.terminal_reason.as_deref().unwrap_or("");
+    assert!(
+        reason.contains("turn budget exhausted") && reason.contains(&low_limit.to_string()),
+        "the exhausted transcript names the limit that bound ({low_limit}): {reason}"
+    );
+    // The receipt that the override moved the ceiling: with the compiled 32 still in force
+    // this scenario could not exhaust — four scripted turns are far short of it. The count
+    // is also strictly under what exhausting the fallback would demand.
+    let received = server.bodies().len();
+    assert_eq!(
+        received, low_limit,
+        "one request per allowed turn, stopped at the declared ceiling; got {received}"
+    );
+    assert!(
+        received < DEFAULT_FALLBACK_TURNS,
+        "fewer requests than would exhaust the compiled fallback of {DEFAULT_FALLBACK_TURNS}"
+    );
+    assert_eq!(attempt.num_turns, Some(low_limit as u64));
 }
 
 /// A real stage prompt opens with the skill file verbatim — YAML frontmatter first — so

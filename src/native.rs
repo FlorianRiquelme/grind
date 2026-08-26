@@ -21,8 +21,40 @@ use crate::tools::{self, GateDecision, GateLayer, RawCall, ToolDef, ToolRegistry
 use crate::view::{Live, one_line};
 use crate::world;
 
-/// Hard ceiling on conversation turns per attempt; exhaustion is loud, never a stop.
-const MAX_TURNS: usize = 32;
+/// The absent-entry fallback for the per-stage turn ceiling read from `docs/tiers.toml`
+/// (`Tiers::max_turns` / `max_turns_by_tier`); exhaustion is loud, never a stop. One name,
+/// one meaning: what a stage with no declared row still enforces, fail-closed as before.
+const DEFAULT_MAX_TURNS: usize = 32;
+
+/// The turn ceiling this attempt enforces: the stage's tiered entry when present, else its
+/// flat per-stage entry, else [`DEFAULT_MAX_TURNS`]. A missing or absent `Tiers` reads as
+/// the fallback — the same fail-closed direction every other absent input takes. Pure, so
+/// the resolution order is unit-testable with no I/O.
+pub(crate) fn max_turns_for(
+    stage: &str,
+    tier: Option<&str>,
+    tiers: Option<&crate::decide::Tiers>,
+) -> usize {
+    let Some(tiers) = tiers else {
+        return DEFAULT_MAX_TURNS;
+    };
+    // Tiered first, then flat, then the compiled fallback — linear, so the order reads
+    // top to bottom exactly as it resolves.
+    let tiered = tier.and_then(|tier| match tier {
+        "t0" => Some(0),
+        "t1" => Some(1),
+        "t2" => Some(2),
+        "t3" => Some(3),
+        _ => None,
+    });
+    if let Some(limit) = tiered.and_then(|index| tiers.max_turns_by_tier[index].get(stage)) {
+        return *limit;
+    }
+    if let Some(limit) = tiers.max_turns.get(stage) {
+        return *limit;
+    }
+    DEFAULT_MAX_TURNS
+}
 /// Network tries per turn before the attempt fails (POC parity).
 const RETRY_ATTEMPTS: usize = 3;
 /// Linear backoff between retries: `backoff_secs * failure_number`.
@@ -646,6 +678,9 @@ impl StageRunner for crate::runner::NativeAdapter {
     fn run(&self, spec: &RunSpec) -> Attempt {
         let n = spec.attempt_n;
         let started_at = world::now_iso();
+        // Resolved once per attempt: `None` keeps the compiled fallback, so a caller that
+        // knows nothing about tiers behaves byte-for-byte as before this field existed.
+        let max_turns = self.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
 
         let model_id = spec
             .model
@@ -701,8 +736,8 @@ impl StageRunner for crate::runner::NativeAdapter {
         let mut denials: Vec<Value> = Vec::new();
 
         let ending = loop {
-            if turns_used >= MAX_TURNS {
-                break Ending::Failed(format!("turn budget exhausted ({MAX_TURNS})"));
+            if turns_used >= max_turns {
+                break Ending::Failed(format!("turn budget exhausted ({max_turns})"));
             }
             turns_used += 1;
 
@@ -1006,7 +1041,41 @@ pub fn live(run_dir: &Path, now_epoch: u64) -> Live {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decide::Tiers;
     use serde_json::json;
+
+    #[test]
+    fn a_tiered_max_turns_entry_wins_over_the_flat_one() {
+        let tiers = Tiers {
+            max_turns: [("work".to_string(), 32)].into_iter().collect(),
+            max_turns_by_tier: [
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::new(),
+                [("work".to_string(), 16)].into_iter().collect(),
+                std::collections::BTreeMap::new(),
+            ],
+            ..Tiers::default()
+        };
+        assert_eq!(
+            max_turns_for("work", Some("t2"), Some(&tiers)),
+            16,
+            "the stage-times-tier entry outranks the flat per-stage entry"
+        );
+    }
+
+    #[test]
+    fn a_flat_max_turns_entry_wins_over_the_fallback() {
+        let tiers = Tiers {
+            max_turns: [("review".to_string(), 5)].into_iter().collect(),
+            ..Tiers::default()
+        };
+        assert_eq!(max_turns_for("review", None, Some(&tiers)), 5);
+    }
+
+    #[test]
+    fn an_absent_tiers_reads_as_the_compiled_fallback() {
+        assert_eq!(max_turns_for("work", Some("t2"), None), DEFAULT_MAX_TURNS);
+    }
 
     /// One attempt's transcript as `NativeAdapter` appends it: the skill row, the wire latch,
     /// then the tool-call / tool-result alternation a working attempt consists of.

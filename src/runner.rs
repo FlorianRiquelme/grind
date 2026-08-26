@@ -467,6 +467,9 @@ pub struct NativeAdapter {
     /// A declared wire mode (`Selection::proto_override`) — when present, skips the probe
     /// entirely and latches from the declaration (ADR-0018).
     pub proto_override: Option<ProtoMode>,
+    /// The resolved per-stage turn ceiling for this attempt's stage (`None` keeps the loop's
+    /// compiled fallback), resolved by the caller from `docs/tiers.toml`.
+    pub max_turns: Option<usize>,
 }
 
 /// Everything [`runner_for`] needs from the layout-declared selection (ADR-0017) beyond
@@ -478,6 +481,9 @@ pub struct NativeConfig {
     pub fast_model: Option<String>,
     pub strong_model: Option<String>,
     pub proto_override: Option<ProtoMode>,
+    /// The stage-resolved turn ceiling handed to [`NativeAdapter`] verbatim; `None` is the
+    /// undeclared answer and keeps the loop's compiled fallback.
+    pub max_turns: Option<usize>,
 }
 
 /// The ONE backend branch in the codebase (R1). Everything downstream calls this.
@@ -497,6 +503,7 @@ pub fn runner_for(
             fast_model: native.fast_model,
             strong_model: native.strong_model,
             proto_override: native.proto_override,
+            max_turns: native.max_turns,
         }),
     }
 }
