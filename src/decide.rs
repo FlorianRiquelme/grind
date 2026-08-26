@@ -648,16 +648,47 @@ mod tests {
         assert_eq!(seen.checks_red, Observed::Present(true));
     }
 
+    /// (a) of the amended boundary: pending checks still yield `Incomplete` when the
+    /// deliverable does not exist. The PR is absent, so the deliverable signals are not all
+    /// `Present(true)` and a pending rollup keeps its plain reading.
     #[test]
-    fn a_pending_check_holds_completion_open_and_an_absent_one_does_not() {
+    fn a_pending_check_still_holds_completion_open_when_the_pr_is_absent() {
         let mut seen = observation();
+        seen.pr = Observed::Absent;
+        seen.pr_head_matches_job_branch = Observed::Present(false);
+        seen.pr_base_matches_declared = Observed::Present(false);
         seen.checks_pending = Observed::Present(true);
         assert!(matches!(
             verdict(&signals_of(&seen), false),
-            Verdict::Incomplete(_)
+            Verdict::Incomplete(unmet) if unmet.contains(&"no check pending".to_string())
         ));
+    }
+
+    /// (b) of the amended boundary: an absent rollup — which `signals_of` maps to
+    /// `no_check_pending = Present(true)` — completes when the deliverable exists.
+    #[test]
+    fn an_absent_rollup_completes_when_the_deliverable_exists() {
+        let mut seen = observation();
         seen.checks_pending = Observed::Absent;
         assert_eq!(verdict(&signals_of(&seen), false), Verdict::Completed);
+    }
+
+    /// (c) the Job's own scenario: the deliverable exists — PR open, tree clean, head and base
+    /// rows matching — and the visible check rollup is pending-but-not-failed
+    /// (`no_check_pending = Present(false)`). The verdict reads `Completed`, so the Run reaches
+    /// its terminal state naming the PR open instead of re-entering until the budget dies.
+    #[test]
+    fn a_pending_but_not_failed_rollup_completes_once_the_deliverable_exists() {
+        let signals = RawSignals {
+            pr_open: Observed::Present(true),
+            tree_clean: Observed::Present(true),
+            commits_ahead: Observed::Present(true),
+            no_check_pending: Observed::Present(false),
+            pr_head_matches_job_branch: Observed::Present(true),
+            pr_base_matches_declared: Observed::Present(true),
+        };
+        assert_eq!(verdict(&signals, false), Verdict::Completed);
+        assert_eq!(verdict(&signals, true), Verdict::Completed);
     }
 
     #[test]
