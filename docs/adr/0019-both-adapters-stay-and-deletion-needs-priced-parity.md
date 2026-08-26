@@ -52,8 +52,11 @@ grounded in no priced comparison. Deferred, not dismissed.
 Stated as falsifiable conditions, so revisiting is evidence review rather than relitigation:
 
 - **Flip default**: at least one fully charged native batch (≥5 runs) on Jobs comparable to a
-  known claude-code baseline, recording real `total_cost_usd`, matching or beating claude-code's
-  unattended-completion rate (baseline: 2/2 clean records, one manual finalize).
+  known claude-code baseline — every included Run's attempts reporting non-null
+  `total_cost_usd` — matching or beating claude-code's **clean-record rate**, defined as a Run
+  recorded `completed` requiring no human work beyond the merge click (no branch salvage, no
+  manual PR finalization). The same rule counts both sides; on the surviving records the
+  baseline is 1 of 2 (#80 clean; #87's PR was finalized by hand), native's is 2 of 5.
 - **Cross-backend tier routing**: first fix the signal it would key on (#166); then show the
   strong-tier stages carry spend where pricing beats claude-code per-turn.
 - **Deletion**: all of the above plus the salvage loop becoming unnecessary across a batch —
@@ -63,13 +66,15 @@ Stated as falsifiable conditions, so revisiting is evidence review rather than r
 ## Consequences
 
 - `~/.grind/agent` remains the sole selection surface (ADR-0017 stands). Absent file = claude-code.
-- Every future Run record prices itself through `usage.cost`; findings docs can quote real spend
-  from this day forward. The operator has fixed the measurement problem's input side: all future
-  native Runs go out on `z-ai/glm-5.3-flash` ($0.075/M input, $0.25/M output per
-  [OpenRouter](https://openrouter.ai/z-ai/glm-5.3-flash#providers)) — no more uncharged rides on
-  the stealth slug behind every $0.00 batch row. Combined with
-  [#140](https://github.com/FlorianRiquelme/grind/pull/140)'s wired cost, the next native batch
-  is the first whose flip criteria above can be evaluated as written.
+- Pricing is wired but not unconditional: native attempt synthesis passes `usage: None` on
+  endpoint-failure paths (`src/native.rs`, `synthesize`), so a record is only *measured* when
+  its attempts report non-null `total_cost_usd`. Future native Runs go out on
+  `z-ai/glm-5.3-flash` at $0.075/M input and $0.25/M output per
+  [OpenRouter](https://openrouter.ai/z-ai/glm-5.3-flash#providers) — a 50% promotional rate
+  against Z.ai's $0.15/$0.50 list, expiring September 9, 2026 (UTC+8), after which a batch
+  prices itself at double. That ends the uncharged stealth-slug rides behind every $0.00 batch
+  row; [#140](https://github.com/FlorianRiquelme/grind/pull/140)'s wired cost makes the next
+  native batch the first whose flip criteria above are evaluable as written.
 - grind no longer needs more native evidence to stay as-is; it needs charged evidence to change.
 
 The verdict is recorded with the evidence that exists, deliberately short of certainty: nothing

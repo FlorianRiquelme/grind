@@ -19,7 +19,6 @@ non-zero spend after [#140](https://github.com/FlorianRiquelme/grind/pull/140) w
 | Total turns | 63 + 4 + 4 = **71** | 149 + 6×1 + 51 = **206** | **1,822** |
 | Total spend | **$38.18** | **$132.98** | **$0.00 recorded** (unwired; see below) |
 | Wall clock | ≈ 27 min | ≈ 14 h 50 m, ~11 h of it 429-sleeping | hours, concurrent |
-| PR | [#84](https://github.com/FlorianRiquelme/grind/pull/84) **merged** | [#89](https://github.com/FlorianRiquelme/grind/pull/89) **merged** | 5/5 **merged**: [#159](https://github.com/FlorianRiquelme/grind/pull/159), [#160](https://github.com/FliorianRiquelme/grind/pull/160), [#162](https://github.com/FlorianRiquelme/grind/pull/162), [#163](https://github.com/FlorianRiquelme/grind/pull/163), [#164](https://github.com/FlorianRiquelme/grind/pull/164) |
 | Human touch after the fact | merge click only (merge tools denied to the agent) | PR finalized by hand; issue closed ~6 h after last attempt | three branches pushed, CodeRabbit-triaged and merged by hand |
 
 ## What the comparison says
@@ -57,8 +56,10 @@ between the machine and the operator.
 
 - **No cost-per-quality claim across backends.** Native spend during the batch is unrecorded;
   the sole priced native run is a different model on a different Job class. That channel is now
-  open: future native Runs go out on `z-ai/glm-5.3-flash` at $0.075/M input and $0.25/M output,
-  so the next batch produces priced rows this audit could only wish for.
+  open: future native Runs go out on `z-ai/glm-5.3-flash`, whose $0.075/M input and $0.25/M
+  output are a **50% promotional rate** (Z.ai list price: $0.15/$0.50) expiring 24:00 on
+  September 9, 2026 UTC+8 — so the next batch produces priced rows this audit could only wish
+  for, and any batch after the promo ends prices itself at double.
 - **n = 2 vs n = 5, different Jobs, different models, different nights.** Nothing here normalizes
   across those axes.
 - **claude-code was never dogfooded post-seam.** Its two records predate the `StageRunner` seam,
