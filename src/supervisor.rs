@@ -2585,6 +2585,53 @@ mod tests {
     }
 
     #[test]
+    fn a_created_worktree_is_born_exactly_at_the_handoff_sha() {
+        let repo = a_clone_with_one_commit("born-at-sha");
+        let sha = rev_parse(&repo, "HEAD").unwrap();
+        let worktree = adopt_or_create_worktree(&repo, "feat/81-at-sha", Some(&sha))
+            .expect("a fresh branch dispatches");
+        assert_eq!(
+            rev_parse(&worktree, "HEAD").as_deref(),
+            Some(sha.as_str()),
+            "creation must start from the declared Handoff SHA, not from whatever HEAD points at"
+        );
+        world::remove_tree(&repo);
+    }
+
+    #[test]
+    fn an_absent_handoff_sha_creates_at_the_default_start_point_and_the_gate_names_it() {
+        let repo = a_clone_with_one_commit("absent-sha");
+        let head = rev_parse(&repo, "HEAD").unwrap();
+        // A well-formed SHA that resolves to nothing inside this clone — the shape of a
+        // Handoff SHA the clone has never fetched.
+        let ghost = "0123456789abcdef0123456789abcdef01234567";
+        let worktree = adopt_or_create_worktree(&repo, "feat/81-absent-sha", Some(ghost))
+            .expect("an unresolvable Handoff SHA never becomes a new way to refuse creation");
+        assert_eq!(
+            rev_parse(&worktree, "HEAD").as_deref(),
+            Some(head.as_str()),
+            "the default start point stands when the SHA object is absent locally"
+        );
+        // Downstream, the same absence reaches the reachability gate as merge-base exit 128.
+        // Today's arm for that exit is a refusal ("not an object") — pinned beside the gate
+        // itself in src/job.rs; here only the seam's own promise is pinned: creation stayed
+        // best-effort above, and whichever arm the gate answers with, it names the absence
+        // rather than proceeding over it (checked and recorded, judged downstream per ADR-0003).
+        let spoken = match job::reachability(true, Some(128), false, &head, ghost) {
+            job::Reachability::Note(note) => note,
+            job::Reachability::Refuse(refusal) => refusal.to_string(),
+            job::Reachability::Proceed => {
+                panic!("an absent object must never read as a clean bill of health")
+            }
+        };
+        assert!(
+            spoken.contains("not an object"),
+            "the gate names the absent object: {spoken}"
+        );
+        world::remove_tree(&repo);
+    }
+
+    #[test]
     fn the_detached_resume_child_logs_beside_the_record_it_reenters() {
         let path = resume_log_path(Path::new("/home/op/.grind/runs/20260821-000000-snapper-90"));
         assert_eq!(
