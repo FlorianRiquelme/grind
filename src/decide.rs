@@ -232,6 +232,21 @@ pub fn signals_of(observation: &Observation) -> RawSignals {
     }
 }
 
+/// Whether the deliverable itself exists: the PR open, the tree clean, and both head/base rows
+/// matching. The check rollup corroborates against this — Grind hands off at an open PR
+/// (ADR-0003), and waiting past that point is spend without a decision.
+fn deliverable_present(
+    pr_open: &Observed<bool>,
+    tree_clean: &Observed<bool>,
+    pr_head_matches_job_branch: &Observed<bool>,
+    pr_base_matches_declared: &Observed<bool>,
+) -> bool {
+    matches!(pr_open, Observed::Present(true))
+        && matches!(tree_clean, Observed::Present(true))
+        && matches!(pr_head_matches_job_branch, Observed::Present(true))
+        && matches!(pr_base_matches_declared, Observed::Present(true))
+}
+
 /// The fold. Completion is **observed rather than declared**, and the DONE promise is neither
 /// necessary nor sufficient — two Runs finished a pipeline without emitting it, and a session
 /// that believes it finished can emit it against nothing.
@@ -262,22 +277,16 @@ pub fn verdict(signals: &RawSignals, done_promise: bool) -> Verdict {
         ("PR base matches declared branch", pr_base_matches_declared),
     ];
 
-    // The four signals that say the deliverable exists. A pending-but-not-failed check rollup
-    // corroborates once all four are Present(true): Grind hands off at an open PR (ADR-0003),
-    // and waiting past that point is spend without a decision. Before that point — no PR, a
-    // dirty tree, or head/base rows mismatched — pending still holds the Run open. The rollup
-    // state itself stays recorded and surfaced through the observation either way.
-    let deliverable_present = matches!(pr_open, Observed::Present(true))
-        && matches!(tree_clean, Observed::Present(true))
-        && matches!(pr_head_matches_job_branch, Observed::Present(true))
-        && matches!(pr_base_matches_declared, Observed::Present(true));
-
     let mut blind = Vec::new();
     let mut unmet = Vec::new();
+    let corroborating = deliverable_present(
+        pr_open,
+        tree_clean,
+        pr_head_matches_job_branch,
+        pr_base_matches_declared,
+    );
     for (name, signal) in named {
-        if name == "no check pending"
-            && deliverable_present
-            && matches!(signal, Observed::Present(false))
+        if name == "no check pending" && corroborating && matches!(signal, Observed::Present(false))
         {
             continue;
         }
@@ -679,16 +688,10 @@ mod tests {
     /// its terminal state naming the PR open instead of re-entering until the budget dies.
     #[test]
     fn a_pending_but_not_failed_rollup_completes_once_the_deliverable_exists() {
-        let signals = RawSignals {
-            pr_open: Observed::Present(true),
-            tree_clean: Observed::Present(true),
-            commits_ahead: Observed::Present(true),
-            no_check_pending: Observed::Present(false),
-            pr_head_matches_job_branch: Observed::Present(true),
-            pr_base_matches_declared: Observed::Present(true),
-        };
-        assert_eq!(verdict(&signals, false), Verdict::Completed);
-        assert_eq!(verdict(&signals, true), Verdict::Completed);
+        let mut seen = observation();
+        seen.checks_pending = Observed::Present(true);
+        assert_eq!(verdict(&signals_of(&seen), false), Verdict::Completed);
+        assert_eq!(verdict(&signals_of(&seen), true), Verdict::Completed);
     }
 
     #[test]
