@@ -712,6 +712,20 @@ pub fn remove_var_for_test(name: &str) {
     unsafe { std::env::remove_var(name) };
 }
 
+/// Serializes process-environment mutation across parallel unit tests: every test that
+/// touches credential variables — and every test whose assertions depend on what an
+/// environment read returns — holds this guard for its whole body, so two tests racing
+/// a fixture's `set_var_for_test` against `Endpoint::resolve` cannot make each other
+/// intermittent.
+#[cfg(test)]
+pub fn env_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

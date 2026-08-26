@@ -975,19 +975,25 @@ mod tests {
 
     /// Sets one environment variable for the test's duration and clears it on drop, even on
     /// panic — via `world::set_var_for_test`/`remove_var_for_test` rather than `std::env`
-    /// directly, so `std::env` stays named in `world` alone (`tests/topology.rs`).
-    struct EnvVarGuard(&'static str);
+    /// directly, so `std::env` stays named in `world` alone (`tests/topology.rs`). Holds
+    /// world's env guard for its whole lifetime, so a parallel test's resolution-sensitive
+    /// assertions cannot observe this fixture half-installed.
+    struct EnvVarGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        name: &'static str,
+    }
 
     impl EnvVarGuard {
         fn set(name: &'static str, value: &str) -> Self {
+            let lock = crate::world::env_test_guard();
             crate::world::set_var_for_test(name, value);
-            Self(name)
+            Self { _lock: lock, name }
         }
     }
 
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
-            crate::world::remove_var_for_test(self.0);
+            crate::world::remove_var_for_test(self.name);
         }
     }
 

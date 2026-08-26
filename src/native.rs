@@ -1133,6 +1133,7 @@ mod tests {
         // No key in this test process's environment -> Endpoint::resolve fails before the
         // loop allocates any transcript. If a developer machine happens to carry one, the
         // error message below says so rather than failing confusingly.
+        let _env = crate::world::env_test_guard();
         crate::world::remove_var_for_test("OPENROUTER_API_KEY");
         crate::world::remove_var_for_test("OPENAI_API_KEY");
 
