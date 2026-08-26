@@ -591,7 +591,7 @@ fn attempt_list(run_id: &str, found: &RunView) -> String {
             .filter(|r| !r.is_empty())
             .map(|r| format!("<div class=\"g-asub\">{}</div>", esc(&r)))
             .unwrap_or_default();
-        let evidence = evidence_links(run_id, a.n, found.backend);
+        let evidence = evidence_links(run_id, a.n, found.backend, a.transcript_name.as_deref());
         out.push_str(&format!(
             "<div class=\"g-a\"><div class=\"g-aline\"><span class=\"g-idx\">#{}</span>\
 <span class=\"g-verdict {vcls}\">{word}</span><span class=\"g-dur\">{}{}</span></div>\
@@ -622,7 +622,20 @@ fn attempt_list(run_id: &str, found: &RunView) -> String {
 /// only `messages-N.jsonl` in the run dir — rendering the claude-code trio for a native attempt
 /// links three files that were never written. This is a pure renderer with no filesystem
 /// access, so it names what each backend writes rather than checking what exists.
-fn evidence_links(run_id: &str, n: usize, backend: crate::runner::Backend) -> String {
+///
+/// `recorded` is the transcript file name the Attempt itself carries, and it wins over the
+/// computed one whenever it is there. A native attempt that re-entered after a crash allocated
+/// the first free slot — `messages-2-2.jsonl` — while `messages-2.jsonl` still holds the dead
+/// attempt's record, so the computed name puts another attempt's transcript under this row's
+/// heading (issue #156). The fallback stays for every record written before the name existed,
+/// and for the endpoint-resolution failure that returned before allocating a file at all. The
+/// claude-code trio ignores it: those three names are determined by `n` alone.
+fn evidence_links(
+    run_id: &str,
+    n: usize,
+    backend: crate::runner::Backend,
+    recorded: Option<&str>,
+) -> String {
     let run_id = esc(run_id);
     match backend {
         crate::runner::Backend::ClaudeCode => format!(
@@ -630,9 +643,12 @@ fn evidence_links(run_id: &str, n: usize, backend: crate::runner::Backend) -> St
 <a class=\"g-link\" href=\"/raw/runs/{run_id}/attempt-{n}.stdout.json\">stdout.json</a>\
 <a class=\"g-link\" href=\"/raw/runs/{run_id}/attempt-{n}.stderr.log\">stderr.log</a></div>"
         ),
-        crate::runner::Backend::Native => format!(
-            "<div class=\"g-ev\"><a class=\"g-link\" href=\"/raw/runs/{run_id}/messages-{n}.jsonl\">messages.jsonl</a></div>"
-        ),
+        crate::runner::Backend::Native => {
+            let name = esc(&recorded.map_or_else(|| format!("messages-{n}.jsonl"), str::to_string));
+            format!(
+                "<div class=\"g-ev\"><a class=\"g-link\" href=\"/raw/runs/{run_id}/{name}\">messages.jsonl</a></div>"
+            )
+        }
     }
 }
 
@@ -1281,5 +1297,63 @@ mod tests {
             !html.contains("attempt-1.stderr.log"),
             "the native adapter never writes this file: {html}"
         );
+    }
+    /// The row must present the file this attempt actually wrote. A re-entered attempt 2 that
+    /// found slot 1 taken writes `messages-2-2.jsonl`, and the computed `messages-2.jsonl` is
+    /// the *dead* attempt's transcript — a link under attempt 2's own heading to somebody
+    /// else's record (issue #156).
+    #[test]
+    fn a_native_attempt_links_the_transcript_name_it_recorded() {
+        let mut found = day_one();
+        found.backend = crate::runner::Backend::Native;
+        let dead = found
+            .attempts
+            .iter()
+            .position(|a| a.n == 2)
+            .expect("an attempt 2");
+        let mut retry = found.attempts[dead].clone();
+        retry.transcript_name = Some("messages-2-2.jsonl".to_string());
+        found.attempts = vec![found.attempts[dead].clone(), retry];
+
+        let html = attempt_list("id", &found);
+        assert_eq!(
+            html.matches("/raw/runs/id/messages-2-2.jsonl").count(),
+            1,
+            "the retry links the file it wrote: {html}"
+        );
+        assert_eq!(
+            html.matches("/raw/runs/id/messages-2.jsonl\"").count(),
+            1,
+            "the slot-1 file belongs to the attempt that died, and to it alone: {html}"
+        );
+    }
+
+    /// Every record written before the name was recorded, and every attempt that died before
+    /// allocating one, carries `None` — the computed name is what those rows have always
+    /// linked and it stays exactly right for them.
+    #[test]
+    fn a_native_attempt_with_no_recorded_name_falls_back_to_the_computed_one() {
+        let mut found = day_one();
+        found.backend = crate::runner::Backend::Native;
+        assert_eq!(
+            found.attempts[0].transcript_name, None,
+            "fixture is old-shaped"
+        );
+        let html = attempt_list("id", &found);
+        assert!(html.contains("messages-1.jsonl"), "{html}");
+    }
+
+    /// The claude-code trio is determined by `n` alone, so a recorded name — which that
+    /// adapter never sets — must not reach it even if one somehow appeared.
+    #[test]
+    fn a_claude_code_attempts_trio_ignores_any_recorded_transcript_name() {
+        let mut found = day_one();
+        assert_eq!(found.backend, crate::runner::Backend::ClaudeCode);
+        found.attempts[0].transcript_name = Some("messages-1-2.jsonl".to_string());
+        let html = attempt_list("id", &found);
+        assert!(html.contains("attempt-1.prompt.txt"), "{html}");
+        assert!(html.contains("attempt-1.stdout.json"), "{html}");
+        assert!(html.contains("attempt-1.stderr.log"), "{html}");
+        assert!(!html.contains("messages-1-2.jsonl"), "{html}");
     }
 }

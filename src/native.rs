@@ -423,6 +423,10 @@ struct AttemptFacts<'a> {
     ending: Ending,
     usage: Option<Value>,
     denials: Vec<Value>,
+    /// The bare file name of the transcript this attempt wrote, when it got as far as
+    /// allocating one. `None` on the endpoint-resolution path, which returns before
+    /// `allocate_transcript` is ever reached and so leaves no file to name.
+    transcript_name: Option<String>,
 }
 
 /// Map the loop's outcome onto the record's currency, mirroring
@@ -479,6 +483,7 @@ fn synthesize(facts: AttemptFacts) -> Attempt {
         rate_limited: is_rate_limited(&payload),
         result_tail,
         fanout: Observed::Unobservable(Reason::saying("the native loop spawns no subagents")),
+        transcript_name: facts.transcript_name,
     }
 }
 
@@ -701,6 +706,7 @@ impl StageRunner for crate::runner::NativeAdapter {
                     ending: Ending::Failed(format!("endpoint resolution failed: {reason}")),
                     usage: None,
                     denials: Vec::new(),
+                    transcript_name: None,
                 });
             }
         };
@@ -882,6 +888,9 @@ impl StageRunner for crate::runner::NativeAdapter {
             ending,
             usage: usage_total,
             denials,
+            transcript_name: transcript_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
         })
     }
 }
@@ -1369,6 +1378,7 @@ mod tests {
             ending: Ending::Completed("shipped it".into()),
             usage: Some(json!({"prompt_tokens": 10, "cost": 0.03183387})),
             denials: vec![],
+            transcript_name: None,
         });
         assert_eq!(attempt.exit_code, Some(0));
         assert!(!attempt.is_error);
@@ -1394,6 +1404,7 @@ mod tests {
             ending: Ending::Completed("PR is open, stopping here. <promise>DONE</promise>".into()),
             usage: None,
             denials: vec![],
+            transcript_name: None,
         });
         assert!(promised.done_promise);
 
@@ -1406,6 +1417,7 @@ mod tests {
             ending: Ending::Completed("plan written and verified.".into()),
             usage: None,
             denials: vec![],
+            transcript_name: None,
         });
         assert!(!unpromised.done_promise);
     }
@@ -1421,6 +1433,7 @@ mod tests {
             ending: Ending::Failed("HTTP 429: rate limit exceeded, resets at 17:00".into()),
             usage: None,
             denials: vec![],
+            transcript_name: None,
         });
         assert!(attempt.rate_limited);
         assert!(
@@ -1440,6 +1453,7 @@ mod tests {
             ending: Ending::Completed("shipped it".into()),
             usage: Some(json!({"prompt_tokens": 10, "cost": 0.03183387})),
             denials: vec![],
+            transcript_name: None,
         });
         assert_eq!(attempt.total_cost_usd, Some(0.031_833_87));
         assert!(!attempt.is_wait());
@@ -1456,6 +1470,7 @@ mod tests {
             ending: Ending::Completed("shipped it".into()),
             usage: Some(json!({"prompt_tokens": 10})),
             denials: vec![],
+            transcript_name: None,
         });
         assert!(!attempt.is_wait());
     }
@@ -1473,6 +1488,7 @@ mod tests {
             ),
             usage: None,
             denials: vec![],
+            transcript_name: None,
         });
         assert_eq!(limited.exit_code, Some(1));
         assert!(limited.is_error);
@@ -1492,6 +1508,7 @@ mod tests {
             ending: Ending::Failed("stream failed: connection reset".into()),
             usage: None,
             denials: vec![],
+            transcript_name: None,
         });
         assert!(!plain.rate_limited);
         assert_eq!(plain.result_tail, "stream failed: connection reset");
@@ -1509,6 +1526,7 @@ mod tests {
             ending: Ending::Completed(long.clone()),
             usage: None,
             denials: vec![],
+            transcript_name: None,
         });
         assert_eq!(attempt.result_tail.chars().count(), TAIL_CHARS);
         assert!(long.ends_with(&attempt.result_tail));
