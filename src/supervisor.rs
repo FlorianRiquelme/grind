@@ -306,6 +306,23 @@ pub fn take_lock(home: &Path, target_repo: &str, branch: &str) -> Result<LockHan
     }
 }
 
+/// The Anchor artifact must exist in the worktree at the point dispatch commits to. The
+/// pre-repair check runs at whatever HEAD the adopted worktree had; a fast-forward onto the
+/// Handoff SHA can move that HEAD onto a tree without the artifact (the Handoff commit
+/// deleted it) or onto one that finally has it (an earlier state lacked it and the pre-check
+/// refused a valid Job). Both orders are wrong, so the same gate is re-proven after any
+/// repair that moved HEAD — CodeRabbit's review of #160's sibling, filed on #155.
+fn require_anchor_present(worktree: &Path, anchor: &str, handoff_sha: &str) -> Result<(), Refusal> {
+    if world::exists(&worktree.join(anchor)) {
+        return Ok(());
+    }
+    Err(Refusal::saying(format!(
+        "the Anchor artifact `{anchor}` is not in `{}` at {handoff_sha}, so nothing is \
+         dispatched onto it",
+        worktree.display()
+    )))
+}
+
 /// The only path that starts a Run. Grind never selects; a human names a Job.
 pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
     let home = world::home().ok_or_else(|| Refusal::saying("$HOME is unset"))?;
@@ -346,7 +363,7 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
 
     let _lock = take_lock(&home, &job.target_repo, &job.branch)?;
 
-    let worktree = adopt_or_create_worktree(&repo_path, &job.branch)?;
+    let worktree = adopt_or_create_worktree(&repo_path, &job.branch, Some(&job.handoff_sha))?;
     let dirty = world::run(&words(&["git", "status", "--porcelain"]), Some(&worktree));
     if dirty.code != Some(0) {
         return Err(Refusal::saying(format!(
@@ -383,27 +400,9 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         ],
         Some(&worktree),
     );
-    match job::reachability(
-        fetched.code == Some(0),
-        contains.code,
-        reverse.code == Some(0),
-        &head.stdout,
-        &job.handoff_sha,
-    ) {
-        job::Reachability::Proceed => {}
-        job::Reachability::Note(note) => world::print_line(&format!("  note: {note}")),
-        job::Reachability::Refuse(refusal) => return Err(refusal),
-    }
 
-    if !world::exists(&worktree.join(&job.anchor)) {
-        return Err(Refusal::saying(format!(
-            "the Anchor artifact `{}` is not in the worktree at {}, so nothing is dispatched \
-             onto it",
-            job.anchor,
-            worktree.display()
-        )));
-    }
-
+    require_anchor_present(&worktree, &job.anchor, &job.handoff_sha)?;
+    let anchor = job.anchor.clone();
     let run_id = format!(
         "{}-{}-{}",
         world::now_stamp(),
@@ -442,6 +441,46 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
     };
     let run_dir = job::runs_dir(&home).join(&run_id);
     world::create_dir_all(&run_dir).map_err(Refusal::saying)?;
+
+    let handoff_sha = record.job.handoff_sha.as_str();
+    match job::reachability(
+        fetched.code == Some(0),
+        contains.code,
+        reverse.code == Some(0),
+        &head.stdout,
+        handoff_sha,
+    ) {
+        job::Reachability::Proceed => {}
+        job::Reachability::Note(note) => world::print_line(&format!("  note: {note}")),
+        // The behind case is the one refusal whose fix is mechanical: the worktree is
+        // simply missing commits it is *supposed* to contain. Move it to the Handoff SHA
+        // itself — through the worktree's own path, since a merge aimed at the clone would
+        // move the shared branch ref without touching this checkout — and let every other
+        // arm refuse exactly as it did. A fast-forward that fails for any reason falls back
+        // to today's refusal, so this stays a repair attempt, never a new way to proceed.
+        job::Reachability::Refuse(refusal) if is_behind_case(&refusal.to_string()) => {
+            let ff = world::run(
+                &words(&["git", "merge", "--ff-only", handoff_sha]),
+                Some(&worktree),
+            );
+            if ff.code == Some(0) {
+                let moved = world::run(&words(&["git", "rev-parse", "HEAD"]), Some(&worktree));
+                say(
+                    &run_dir,
+                    &format!(
+                        "  fast-forwarded {} from {} to {}",
+                        worktree.display(),
+                        short(head.stdout.trim()),
+                        short(moved.stdout.trim()),
+                    ),
+                );
+                require_anchor_present(&worktree, &anchor, handoff_sha)?;
+            } else {
+                return Err(refusal);
+            }
+        }
+        job::Reachability::Refuse(refusal) => return Err(refusal),
+    }
     record.save(&record_path(&run_dir))?;
 
     point_at_this_host(&record);
@@ -1647,7 +1686,11 @@ fn skills_hash(files: &[(String, Vec<u8>)]) -> String {
     format!("{hash:016x}")
 }
 
-fn adopt_or_create_worktree(repo_path: &Path, branch: &str) -> Result<PathBuf, Refusal> {
+fn adopt_or_create_worktree(
+    repo_path: &Path,
+    branch: &str,
+    handoff_sha: Option<&str>,
+) -> Result<PathBuf, Refusal> {
     let listed = world::run(
         &words(&["git", "worktree", "list", "--porcelain"]),
         Some(repo_path),
@@ -1681,6 +1724,20 @@ fn adopt_or_create_worktree(repo_path: &Path, branch: &str) -> Result<PathBuf, R
         argv.push("-b".to_string());
         argv.push(branch.to_string());
         argv.push(wanted.display().to_string());
+        // Freeze discipline: when the declared Handoff SHA resolves to an object inside
+        // this clone, the fresh worktree is born exactly there — not at whatever HEAD
+        // points at today. When it does not resolve, today's default start point stands
+        // and the reachability gate speaks afterward; creation stays best-effort, never
+        // a new way to refuse.
+        if let Some(sha) = handoff_sha {
+            let known = world::run(
+                &words(&["git", "cat-file", "-e", &format!("{sha}^{{commit}}")]),
+                Some(repo_path),
+            );
+            if known.code == Some(0) {
+                argv.push(sha.to_string());
+            }
+        }
     } else {
         argv.push(wanted.display().to_string());
         argv.push(branch.to_string());
@@ -1694,6 +1751,21 @@ fn adopt_or_create_worktree(repo_path: &Path, branch: &str) -> Result<PathBuf, R
     }
     world::print_line(&format!("  created worktree: {}", wanted.display()));
     Ok(wanted)
+}
+
+/// Whether a [`job::Reachability::Refuse`] is exactly the behind case — the one refusal
+/// whose remedy (a plain fast-forward to the Handoff SHA) Dispatch can perform itself.
+/// Distinguished by prose rather than an enum arm because that is all the value carries;
+/// the full-sentence shape is what keeps the other refusals ("not in the history", "not an
+/// object", an unreadable merge-base exit) out of this repair.
+/// The abbreviation the reachability gate speaks in (`job::short`'s shape), kept local so
+/// the gate's vocabulary stays private to `src/job.rs` and this repair adds nothing there.
+fn short(sha: &str) -> String {
+    sha.chars().take(8).collect()
+}
+
+fn is_behind_case(refusal: &str) -> bool {
+    refusal.starts_with("worktree HEAD ") && refusal.contains(" is behind Handoff SHA ")
 }
 
 /// **The account that leaves the host**, posted on the Job issue at every terminal state.
@@ -2546,7 +2618,8 @@ mod tests {
     fn a_branch_that_exists_nowhere_dispatches_a_worktree() {
         let repo = a_clone_with_one_commit("fresh");
         let branch = "feat/81-brand-new";
-        let worktree = adopt_or_create_worktree(&repo, branch).expect("a fresh branch dispatches");
+        let worktree =
+            adopt_or_create_worktree(&repo, branch, None).expect("a fresh branch dispatches");
         assert_eq!(worktree, job::worktree_to_create(&repo, branch));
         assert!(
             rev_parse(&repo, &format!("refs/heads/{branch}")).is_some(),
@@ -2569,7 +2642,8 @@ mod tests {
         let sha = rev_parse(&repo, "HEAD").unwrap();
         let branched = world::run(&words(&["git", "branch", "side"]), Some(&repo));
         assert_eq!(branched.code, Some(0));
-        let worktree = adopt_or_create_worktree(&repo, "side").expect("an existing ref dispatches");
+        let worktree =
+            adopt_or_create_worktree(&repo, "side", None).expect("an existing ref dispatches");
         assert_eq!(rev_parse(&worktree, "HEAD").as_deref(), Some(sha.as_str()));
         world::remove_tree(&repo);
     }
@@ -2577,12 +2651,158 @@ mod tests {
     #[test]
     fn the_worktree_adopted_is_the_one_the_branch_already_holds() {
         let repo = a_clone_with_one_commit("adopted");
-        let first = adopt_or_create_worktree(&repo, "feat/81-twice").unwrap();
-        let second = adopt_or_create_worktree(&repo, "feat/81-twice").unwrap();
+        let first = adopt_or_create_worktree(&repo, "feat/81-twice", None).unwrap();
+        let second = adopt_or_create_worktree(&repo, "feat/81-twice", None).unwrap();
         assert_eq!(
             world::resolve_link(&first).unwrap(),
             world::resolve_link(&second).unwrap()
         );
+        world::remove_tree(&repo);
+    }
+
+    #[test]
+    fn a_created_worktree_is_born_exactly_at_the_handoff_sha() {
+        let repo = a_clone_with_one_commit("born-at-sha");
+        let sha = rev_parse(&repo, "HEAD").unwrap();
+        let worktree = adopt_or_create_worktree(&repo, "feat/81-at-sha", Some(&sha))
+            .expect("a fresh branch dispatches");
+        assert_eq!(
+            rev_parse(&worktree, "HEAD").as_deref(),
+            Some(sha.as_str()),
+            "creation must start from the declared Handoff SHA, not from whatever HEAD points at"
+        );
+        world::remove_tree(&repo);
+    }
+
+    #[test]
+    fn an_absent_handoff_sha_creates_at_the_default_start_point_and_the_gate_names_it() {
+        let repo = a_clone_with_one_commit("absent-sha");
+        let head = rev_parse(&repo, "HEAD").unwrap();
+        // A well-formed SHA that resolves to nothing inside this clone — the shape of a
+        // Handoff SHA the clone has never fetched.
+        let ghost = "0123456789abcdef0123456789abcdef01234567";
+        let worktree = adopt_or_create_worktree(&repo, "feat/81-absent-sha", Some(ghost))
+            .expect("an unresolvable Handoff SHA never becomes a new way to refuse creation");
+        assert_eq!(
+            rev_parse(&worktree, "HEAD").as_deref(),
+            Some(head.as_str()),
+            "the default start point stands when the SHA object is absent locally"
+        );
+        // Downstream, the same absence reaches the reachability gate as merge-base exit 128.
+        // Today's arm for that exit is a refusal ("not an object") — pinned beside the gate
+        // itself in src/job.rs; here only the seam's own promise is pinned: creation stayed
+        // best-effort above, and whichever arm the gate answers with, it names the absence
+        // rather than proceeding over it (checked and recorded, judged downstream per ADR-0003).
+        let spoken = match job::reachability(true, Some(128), false, &head, ghost) {
+            job::Reachability::Note(note) => note,
+            job::Reachability::Refuse(refusal) => refusal.to_string(),
+            job::Reachability::Proceed => {
+                panic!("an absent object must never read as a clean bill of health")
+            }
+        };
+        assert!(
+            spoken.contains("not an object"),
+            "the gate names the absent object: {spoken}"
+        );
+        world::remove_tree(&repo);
+    }
+
+    /// The ordering the fast-forward repair demands: the gate is proven at the pre-repair
+    /// HEAD, then re-proven once HEAD moved onto the Handoff SHA. A Handoff commit that
+    /// deletes the artifact must stop the dispatch that just repaired itself; one that
+    /// restores it must un-stop a Job the stale tree had wrongly refused.
+    #[test]
+    fn the_anchor_gate_reproves_after_a_fast_forward_moves_head() {
+        let repo = a_clone_with_one_commit("anchor-order");
+        let git = |args: &[&str]| {
+            let mut argv = vec!["git".to_string()];
+            argv.extend(args.iter().map(|a| a.to_string()));
+            let out = world::run(&argv, Some(&repo));
+            assert!(
+                out.code == Some(0),
+                "git {args:?}: {}",
+                out.stderr.lines().next().unwrap_or("no output")
+            );
+        };
+
+        world::write(&repo.join("anchor.md"), "the artifact").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=grind-155",
+            "-c",
+            "user.email=grind@local",
+            "commit",
+            "-m",
+            "anchor",
+        ]);
+        let with_anchor = rev_parse(&repo, "HEAD").unwrap();
+        git(&["rm", "anchor.md"]);
+        git(&[
+            "-c",
+            "user.name=grind-155",
+            "-c",
+            "user.email=grind@local",
+            "commit",
+            "-m",
+            "deleted",
+        ]);
+        let without_anchor = rev_parse(&repo, "HEAD").unwrap();
+
+        let worktree = adopt_or_create_worktree(&repo, "feat/155-anchor-order", Some(&with_anchor))
+            .expect("a resolvable Handoff SHA dispatches creation");
+        require_anchor_present(&worktree, "anchor.md", &with_anchor)
+            .expect("the pre-repair HEAD still carries the artifact");
+        let ff = world::run(
+            &words(&["git", "merge", "--ff-only", &without_anchor]),
+            Some(&worktree),
+        );
+        assert_eq!(ff.code, Some(0), "the repair fast-forward must succeed");
+        let said = require_anchor_present(&worktree, "anchor.md", &without_anchor)
+            .expect_err("a Handoff commit deleting the Anchor stops the dispatch");
+        assert!(said.to_string().contains("anchor.md"), "{said}");
+        world::remove_tree(&repo);
+    }
+
+    #[test]
+    fn a_fast_forward_onto_a_tree_that_restores_the_anchor_unstops_the_job() {
+        let repo = a_clone_with_one_commit("anchor-restore");
+        let before = rev_parse(&repo, "HEAD").unwrap();
+        world::write(&repo.join("anchor.md"), "the artifact").unwrap();
+        let git = |args: &[&str]| {
+            let mut argv = vec!["git".to_string()];
+            argv.extend(args.iter().map(|a| a.to_string()));
+            let out = world::run(&argv, Some(&repo));
+            assert!(
+                out.code == Some(0),
+                "git {args:?}: {}",
+                out.stderr.lines().next().unwrap_or("no output")
+            );
+        };
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=grind-155",
+            "-c",
+            "user.email=grind@local",
+            "commit",
+            "-m",
+            "restored",
+        ]);
+        let after = rev_parse(&repo, "HEAD").unwrap();
+
+        let worktree = adopt_or_create_worktree(&repo, "feat/155-anchor-restore", Some(&before))
+            .expect("creation at the stale SHA stands");
+        assert!(
+            require_anchor_present(&worktree, "anchor.md", &before).is_err(),
+            "the stale tree honestly refuses — this was the false refusal"
+        );
+        world::run(
+            &words(&["git", "merge", "--ff-only", &after]),
+            Some(&worktree),
+        );
+        require_anchor_present(&worktree, "anchor.md", &after)
+            .expect("the restored artifact unstops the valid Job");
         world::remove_tree(&repo);
     }
 
