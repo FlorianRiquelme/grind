@@ -1831,6 +1831,48 @@ mod tests {
         );
     }
 
+    /// The tier word the ceiling resolves from lives in the RUN STATE's stages tree, not the
+    /// target worktree (F0): diff-triage's decision outranks triage's, garbage parses as no
+    /// decision, and absence is none. Every case here roots at a run_dir-shaped temp tree.
+    #[test]
+    fn latest_decided_tier_reads_the_run_states_stages_tree() {
+        let home = world::temp_dir("latest-decided-tier");
+        let run_dir = home.join("runs").join("r1");
+        let write = |pass: &str, body: &str| {
+            world::create_dir_all(&run_dir.join("stages").join(pass))
+                .expect("a stages dir");
+            world::write_atomic(
+                &run_dir.join("stages").join(pass).join("decision.json"),
+                body,
+            )
+            .expect("a decision file");
+        };
+        let t2 = r#"{"tier":"t2","personas":[],"depth":{"reviewers":3},
+            "model_per_stage":{},"floor_from_plan":"t0","rationale":[]}"#;
+        let t1 = t2.replace("t2", "t1");
+
+        write("triage", &t1);
+        assert_eq!(
+            latest_decided_tier(&run_dir).as_deref(),
+            Some("t1"),
+            "triage's word alone resolves"
+        );
+        write("diff-triage", &t2);
+        assert_eq!(
+            latest_decided_tier(&run_dir).as_deref(),
+            Some("t2"),
+            "diff-triage outranks triage when both exist"
+        );
+        write("diff-triage", "not json at all");
+        assert_eq!(
+            latest_decided_tier(&run_dir),
+            None,
+            "an unparseable decision is no decision, never a silent fall-through"
+        );
+        world::remove_tree(&home);
+    }
+
+
     #[test]
     fn claude_code_backend_still_requires_the_claude_binary() {
         let items = required_dispatch_items(Backend::ClaudeCode);
