@@ -1273,15 +1273,16 @@ mod tests {
     // --- #158: the Handback's Model line answers from the record, the way the dispatch
     // --- banner already does for the same fields.
 
-    /// The day-one record handed back as a native Run with the given class declarations and
-    /// Job pin. Same helpers as every handback test above; only the selection fields vary.
-    fn handed_back_native(
+    /// The day-one record handed back on `backend` with the given class declarations and Job
+    /// pin. Same helpers as every handback test above; only the selection fields vary.
+    fn handed_back_as(
+        backend: Backend,
         fast: Option<&str>,
         strong: Option<&str>,
         pinned: Option<&str>,
     ) -> String {
         let mut record = found();
-        record.backend = Backend::Native;
+        record.backend = backend;
         record.model = pinned.map(str::to_string);
         record.fast_model_override = fast.map(str::to_string);
         record.strong_model_override = strong.map(str::to_string);
@@ -1308,7 +1309,12 @@ mod tests {
     /// the unpinned fallback.
     #[test]
     fn a_native_run_with_a_declared_model_renders_it_instead_of_calling_itself_unpinned() {
-        let text = handed_back_native(Some("stealth/ox-alpha"), Some("stealth/ox-alpha"), None);
+        let text = handed_back_as(
+            Backend::Native,
+            Some("stealth/ox-alpha"),
+            Some("stealth/ox-alpha"),
+            None,
+        );
         assert!(text.contains("Model    stealth/ox-alpha\n"), "{text}");
         assert!(
             !text.contains("(session default"),
@@ -1324,7 +1330,12 @@ mod tests {
     /// derived value (plan-review F-03).
     #[test]
     fn the_handbacks_declared_model_is_byte_identical_to_the_dispatch_banners() {
-        let text = handed_back_native(Some("stealth/ox-alpha"), Some("stealth/ox-alpha"), None);
+        let text = handed_back_as(
+            Backend::Native,
+            Some("stealth/ox-alpha"),
+            Some("stealth/ox-alpha"),
+            None,
+        );
         let (row, value) = model_row(&text);
         assert_eq!(value, "stealth/ox-alpha", "{row}");
         assert_eq!(row, "Model    stealth/ox-alpha");
@@ -1333,7 +1344,8 @@ mod tests {
     /// R1c: distinct class declarations split exactly as the banner splits them.
     #[test]
     fn a_split_declaration_renders_fast_and_strong_like_the_banner_splits_them() {
-        let text = handed_back_native(
+        let text = handed_back_as(
+            Backend::Native,
             Some("stealth/ox-alpha"),
             Some("deepseek/deepseek-chat-v3.1"),
             None,
@@ -1355,7 +1367,7 @@ mod tests {
     /// resolves to, because that is what will run.
     #[test]
     fn an_undeclared_native_run_names_the_concrete_default_that_will_run() {
-        let text = handed_back_native(None, None, None);
+        let text = handed_back_as(Backend::Native, None, None, None);
         let (row, value) = model_row(&text);
         // The banner row for this same record is `  model deepseek/deepseek-chat-v3.1`.
         assert_eq!(value, crate::runner::DEFAULT_MODEL, "{row}");
@@ -1382,18 +1394,12 @@ mod tests {
         );
 
         for backend in [Backend::Native, Backend::ClaudeCode] {
-            let mut record = found();
-            record.backend = backend;
-            record.model = Some("claude-opus-9".to_string());
-            record.fast_model_override = Some("stealth/ox-alpha".to_string());
-            record.strong_model_override = Some("deepseek/deepseek-chat-v3.1".to_string());
-            let text = handback(&facts_of(
-                record,
-                observation(),
-                Verdict::Completed,
-                coverage(),
-                None,
-            ));
+            let text = handed_back_as(
+                backend,
+                Some("stealth/ox-alpha"),
+                Some("deepseek/deepseek-chat-v3.1"),
+                Some("claude-opus-9"),
+            );
             assert!(
                 text.contains("Model    claude-opus-9\n"),
                 "on {backend:?}: {text}"
