@@ -644,7 +644,10 @@ fn evidence_links(
 <a class=\"g-link\" href=\"/raw/runs/{run_id}/attempt-{n}.stderr.log\">stderr.log</a></div>"
         ),
         crate::runner::Backend::Native => {
-            let name = esc(&recorded.map_or_else(|| format!("messages-{n}.jsonl"), str::to_string));
+            let name = match recorded {
+                Some(recorded) => esc(recorded),
+                None => esc(&format!("messages-{n}.jsonl")),
+            };
             format!(
                 "<div class=\"g-ev\"><a class=\"g-link\" href=\"/raw/runs/{run_id}/{name}\">messages.jsonl</a></div>"
             )

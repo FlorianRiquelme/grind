@@ -320,17 +320,13 @@ fn transcript_slot(name: &str) -> Option<(usize, usize)> {
 /// `messages-2.jsonl`, which would make attempt 10 look older than attempt 2
 /// the moment a run passes nine attempts.
 fn scan_latch(run_dir: &Path, own: &Path) -> Option<ProtoMode> {
-    let own = own.file_name().map(|n| n.to_string_lossy().into_owned());
     let mut numbered: Vec<((usize, usize), PathBuf)> = Vec::new();
     for path in world::list_with_extension(run_dir, "jsonl") {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if own.as_deref() == Some(name.as_str()) {
+        let name = path.file_name();
+        if name == own.file_name() {
             continue;
         }
-        let Some(key) = transcript_slot(&name) else {
+        let Some(key) = name.and_then(|n| n.to_str()).and_then(transcript_slot) else {
             continue;
         };
         numbered.push((key, path));
