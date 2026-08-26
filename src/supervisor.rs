@@ -287,6 +287,23 @@ pub fn take_lock(home: &Path, target_repo: &str, branch: &str) -> Result<LockHan
     }
 }
 
+/// The Anchor artifact must exist in the worktree at the point dispatch commits to. The
+/// pre-repair check runs at whatever HEAD the adopted worktree had; a fast-forward onto the
+/// Handoff SHA can move that HEAD onto a tree without the artifact (the Handoff commit
+/// deleted it) or onto one that finally has it (an earlier state lacked it and the pre-check
+/// refused a valid Job). Both orders are wrong, so the same gate is re-proven after any
+/// repair that moved HEAD — CodeRabbit's review of #160's sibling, filed on #155.
+fn require_anchor_present(worktree: &Path, anchor: &str, handoff_sha: &str) -> Result<(), Refusal> {
+    if world::exists(&worktree.join(anchor)) {
+        return Ok(());
+    }
+    Err(Refusal::saying(format!(
+        "the Anchor artifact `{anchor}` is not in `{}` at {handoff_sha}, so nothing is \
+         dispatched onto it",
+        worktree.display()
+    )))
+}
+
 /// The only path that starts a Run. Grind never selects; a human names a Job.
 pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
     let home = world::home().ok_or_else(|| Refusal::saying("$HOME is unset"))?;
@@ -365,15 +382,9 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         Some(&worktree),
     );
 
-    if !world::exists(&worktree.join(&job.anchor)) {
-        return Err(Refusal::saying(format!(
-            "the Anchor artifact `{}` is not in the worktree at {}, so nothing is dispatched \
-             onto it",
-            job.anchor,
-            worktree.display()
-        )));
-    }
-
+    require_anchor_present(&worktree, &job.anchor, &job.handoff_sha)?;
+    let anchor = job.anchor.clone();
+    let handoff_sha = job.handoff_sha.clone();
     let run_id = format!(
         "{}-{}-{}",
         world::now_stamp(),
@@ -445,6 +456,7 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
                         short(moved.stdout.trim()),
                     ),
                 );
+                require_anchor_present(&worktree, &anchor, &handoff_sha)?;
             } else {
                 return Err(refusal);
             }
@@ -2628,6 +2640,105 @@ mod tests {
             spoken.contains("not an object"),
             "the gate names the absent object: {spoken}"
         );
+        world::remove_tree(&repo);
+    }
+
+    /// The ordering the fast-forward repair demands: the gate is proven at the pre-repair
+    /// HEAD, then re-proven once HEAD moved onto the Handoff SHA. A Handoff commit that
+    /// deletes the artifact must stop the dispatch that just repaired itself; one that
+    /// restores it must un-stop a Job the stale tree had wrongly refused.
+    #[test]
+    fn the_anchor_gate_reproves_after_a_fast_forward_moves_head() {
+        let repo = a_clone_with_one_commit("anchor-order");
+        let git = |args: &[&str]| {
+            let mut argv = vec!["git".to_string()];
+            argv.extend(args.iter().map(|a| a.to_string()));
+            let out = world::run(&argv, Some(&repo));
+            assert!(
+                out.code == Some(0),
+                "git {args:?}: {}",
+                out.stderr.lines().next().unwrap_or("no output")
+            );
+        };
+
+        world::write(&repo.join("anchor.md"), "the artifact").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=grind-155",
+            "-c",
+            "user.email=grind@local",
+            "commit",
+            "-m",
+            "anchor",
+        ]);
+        let with_anchor = rev_parse(&repo, "HEAD").unwrap();
+        git(&["rm", "anchor.md"]);
+        git(&[
+            "-c",
+            "user.name=grind-155",
+            "-c",
+            "user.email=grind@local",
+            "commit",
+            "-m",
+            "deleted",
+        ]);
+        let without_anchor = rev_parse(&repo, "HEAD").unwrap();
+
+        let worktree = adopt_or_create_worktree(&repo, "feat/155-anchor-order", Some(&with_anchor))
+            .expect("a resolvable Handoff SHA dispatches creation");
+        require_anchor_present(&worktree, "anchor.md", &with_anchor)
+            .expect("the pre-repair HEAD still carries the artifact");
+        let ff = world::run(
+            &words(&["git", "merge", "--ff-only", &without_anchor]),
+            Some(&worktree),
+        );
+        assert_eq!(ff.code, Some(0), "the repair fast-forward must succeed");
+        let said = require_anchor_present(&worktree, "anchor.md", &without_anchor)
+            .expect_err("a Handoff commit deleting the Anchor stops the dispatch");
+        assert!(said.to_string().contains("anchor.md"), "{said}");
+        world::remove_tree(&repo);
+    }
+
+    #[test]
+    fn a_fast_forward_onto_a_tree_that_restores_the_anchor_unstops_the_job() {
+        let repo = a_clone_with_one_commit("anchor-restore");
+        let before = rev_parse(&repo, "HEAD").unwrap();
+        world::write(&repo.join("anchor.md"), "the artifact").unwrap();
+        let git = |args: &[&str]| {
+            let mut argv = vec!["git".to_string()];
+            argv.extend(args.iter().map(|a| a.to_string()));
+            let out = world::run(&argv, Some(&repo));
+            assert!(
+                out.code == Some(0),
+                "git {args:?}: {}",
+                out.stderr.lines().next().unwrap_or("no output")
+            );
+        };
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=grind-155",
+            "-c",
+            "user.email=grind@local",
+            "commit",
+            "-m",
+            "restored",
+        ]);
+        let after = rev_parse(&repo, "HEAD").unwrap();
+
+        let worktree = adopt_or_create_worktree(&repo, "feat/155-anchor-restore", Some(&before))
+            .expect("creation at the stale SHA stands");
+        assert!(
+            require_anchor_present(&worktree, "anchor.md", &before).is_err(),
+            "the stale tree honestly refuses — this was the false refusal"
+        );
+        world::run(
+            &words(&["git", "merge", "--ff-only", &after]),
+            Some(&worktree),
+        );
+        require_anchor_present(&worktree, "anchor.md", &after)
+            .expect("the restored artifact unstops the valid Job");
         world::remove_tree(&repo);
     }
 
