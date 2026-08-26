@@ -6,7 +6,7 @@ globs:
   - "README.md"
   - "AGENTS.md"
 condition:
-  - "(?i)\\b(seventeen|eighteen|nineteen|twenty([- ]?(one|two|three|four|five|nine))?|thirty)\\b"
+  - "(?i)\\b(seventeen|eighteen|nineteen|twenty([- ]?(one|two|three|four|five|six|seven|eight|nine))?|thirty)\\b"
   - "(?i)(rung|stage)s?\\b.*\\b(list|map|count)"
   - "docs/(adr|findings)/"
 interruptMode: never
