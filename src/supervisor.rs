@@ -230,8 +230,9 @@ impl RunRecord {
                 fast_model: self.fast_model_override.clone(),
                 strong_model: self.strong_model_override.clone(),
                 proto_override: self.proto_override,
-                max_turns: stage
-                    .map(|stage| native_max_turns_for(stage, tier.as_deref(), Some(&tiers))),
+                max_turns: stage.map(|stage| {
+                    crate::native::max_turns_for(&stage.to_string(), tier.as_deref(), Some(&tiers))
+                }),
             },
         )
     }
@@ -1045,11 +1046,6 @@ fn latest_decided_tier(worktree: &Path) -> Option<String> {
         .map(|decision| decision.tier.to_string())
 }
 
-/// The supervisor-side call into [`crate::native`]'s resolution order: the stage-times-tier
-/// entry when present, then the flat per-stage entry, then the loop's compiled fallback.
-fn native_max_turns_for(stage: Stage, tier: Option<&str>, tiers: Option<&Tiers>) -> usize {
-    crate::native::max_turns_for(&stage.to_string(), tier, tiers)
-}
 /// The Plan stage's own `plan-facts.json`, read tolerantly for both [R] passes. Absent or
 /// unparseable reads as `None`: at Triage that fails closed inside `select_tier` (plan is the
 /// pass's required fact); at Diff-triage it merely degrades the panel — Performance seats off

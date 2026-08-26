@@ -783,6 +783,14 @@ pub enum Tier {
     T3,
 }
 
+impl Tier {
+    /// Every tier, in escalation order — the same order `Ord` derives. Lets a caller
+    /// enumerate the variants or decode a `Display` word back to its slot in an
+    /// index-matched table (`Tiers::max_turns_by_tier`) without hand-writing the four
+    /// names a second time.
+    pub const ALL: [Tier; 4] = [Tier::T0, Tier::T1, Tier::T2, Tier::T3];
+}
+
 impl std::fmt::Display for Tier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let word = match self {

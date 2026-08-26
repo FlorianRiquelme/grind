@@ -39,15 +39,14 @@ pub(crate) fn max_turns_for(
         return DEFAULT_MAX_TURNS;
     };
     // Tiered first, then flat, then the compiled fallback — linear, so the order reads
-    // top to bottom exactly as it resolves.
-    let tiered = tier.and_then(|tier| match tier {
-        "t0" => Some(0),
-        "t1" => Some(1),
-        "t2" => Some(2),
-        "t3" => Some(3),
-        _ => None,
+    // top to bottom exactly as it resolves. The word is `Tier`'s own Display output, so
+    // one position over that table covers it instead of re-encoding "t0".."t3" here.
+    let tier_index = tier.and_then(|word| {
+        crate::decide::Tier::ALL
+            .iter()
+            .position(|known| known.to_string() == *word)
     });
-    if let Some(limit) = tiered.and_then(|index| tiers.max_turns_by_tier[index].get(stage)) {
+    if let Some(limit) = tier_index.and_then(|index| tiers.max_turns_by_tier[index].get(stage)) {
         return *limit;
     }
     if let Some(limit) = tiers.max_turns.get(stage) {
@@ -1046,21 +1045,20 @@ mod tests {
 
     #[test]
     fn a_tiered_max_turns_entry_wins_over_the_flat_one() {
-        let tiers = Tiers {
-            max_turns: [("work".to_string(), 32)].into_iter().collect(),
-            max_turns_by_tier: [
-                std::collections::BTreeMap::new(),
-                std::collections::BTreeMap::new(),
-                [("work".to_string(), 16)].into_iter().collect(),
-                std::collections::BTreeMap::new(),
-            ],
-            ..Tiers::default()
-        };
+        // The shipped calibration already declares exactly this shape — work at 32 flat,
+        // 16 tiered — so the scenario reads the real data instead of restating it.
+        let tiers = Tiers::default();
+        assert_eq!(max_turns_for("work", None, Some(&tiers)), 32);
         assert_eq!(
             max_turns_for("work", Some("t2"), Some(&tiers)),
             16,
             "the stage-times-tier entry outranks the flat per-stage entry"
         );
+    }
+
+    #[test]
+    fn an_undeclared_stage_reads_as_the_compiled_fallback() {
+        assert_eq!(max_turns_for("review", None, Some(&Tiers::default())), 32);
     }
 
     #[test]
