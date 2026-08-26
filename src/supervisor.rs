@@ -364,17 +364,6 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         ],
         Some(&worktree),
     );
-    match job::reachability(
-        fetched.code == Some(0),
-        contains.code,
-        reverse.code == Some(0),
-        &head.stdout,
-        &job.handoff_sha,
-    ) {
-        job::Reachability::Proceed => {}
-        job::Reachability::Note(note) => world::print_line(&format!("  note: {note}")),
-        job::Reachability::Refuse(refusal) => return Err(refusal),
-    }
 
     if !world::exists(&worktree.join(&job.anchor)) {
         return Err(Refusal::saying(format!(
@@ -423,6 +412,45 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
     };
     let run_dir = job::runs_dir(&home).join(&run_id);
     world::create_dir_all(&run_dir).map_err(Refusal::saying)?;
+
+    let handoff_sha = record.job.handoff_sha.as_str();
+    match job::reachability(
+        fetched.code == Some(0),
+        contains.code,
+        reverse.code == Some(0),
+        &head.stdout,
+        handoff_sha,
+    ) {
+        job::Reachability::Proceed => {}
+        job::Reachability::Note(note) => world::print_line(&format!("  note: {note}")),
+        // The behind case is the one refusal whose fix is mechanical: the worktree is
+        // simply missing commits it is *supposed* to contain. Move it to the Handoff SHA
+        // itself — through the worktree's own path, since a merge aimed at the clone would
+        // move the shared branch ref without touching this checkout — and let every other
+        // arm refuse exactly as it did. A fast-forward that fails for any reason falls back
+        // to today's refusal, so this stays a repair attempt, never a new way to proceed.
+        job::Reachability::Refuse(refusal) if is_behind_case(&refusal.to_string()) => {
+            let ff = world::run(
+                &words(&["git", "merge", "--ff-only", handoff_sha]),
+                Some(&worktree),
+            );
+            if ff.code == Some(0) {
+                let moved = world::run(&words(&["git", "rev-parse", "HEAD"]), Some(&worktree));
+                say(
+                    &run_dir,
+                    &format!(
+                        "  fast-forwarded {} from {} to {}",
+                        worktree.display(),
+                        short(head.stdout.trim()),
+                        short(moved.stdout.trim()),
+                    ),
+                );
+            } else {
+                return Err(refusal);
+            }
+        }
+        job::Reachability::Refuse(refusal) => return Err(refusal),
+    }
     record.save(&record_path(&run_dir))?;
 
     point_at_this_host(&record);
@@ -1690,6 +1718,21 @@ fn adopt_or_create_worktree(
     }
     world::print_line(&format!("  created worktree: {}", wanted.display()));
     Ok(wanted)
+}
+
+/// Whether a [`job::Reachability::Refuse`] is exactly the behind case — the one refusal
+/// whose remedy (a plain fast-forward to the Handoff SHA) Dispatch can perform itself.
+/// Distinguished by prose rather than an enum arm because that is all the value carries;
+/// the full-sentence shape is what keeps the other refusals ("not in the history", "not an
+/// object", an unreadable merge-base exit) out of this repair.
+/// The abbreviation the reachability gate speaks in (`job::short`'s shape), kept local so
+/// the gate's vocabulary stays private to `src/job.rs` and this repair adds nothing there.
+fn short(sha: &str) -> String {
+    sha.chars().take(8).collect()
+}
+
+fn is_behind_case(refusal: &str) -> bool {
+    refusal.starts_with("worktree HEAD ") && refusal.contains(" is behind Handoff SHA ")
 }
 
 /// **The account that leaves the host**, posted on the Job issue at every terminal state.

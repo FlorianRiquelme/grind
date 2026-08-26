@@ -1612,6 +1612,81 @@ fn a_handoff_sha_off_this_worktrees_history_refuses() {
 }
 
 #[test]
+fn a_worktree_behind_the_handoff_sha_is_fast_forwarded_and_the_run_proceeds() {
+    let box_ = sandbox("behind-fast-forward");
+    box_.scenario(&["success_done"]);
+
+    // An adopted worktree one fast-forward behind the declared Handoff SHA. An attached
+    // worktree's HEAD resolves through its branch, so the drift lives between hosts, not
+    // inside one checkout: origin's branch rides ahead while this clone's branch ref stays
+    // where it was, and the declared Handoff SHA names the origin tip. The extra commit is
+    // built by plumbing and pushed as a bare SHA — the local branch ref never moves, the
+    // worktree stays clean, and `git fetch` brings the tip within reach. Behind, not
+    // diverged, found by adoption rather than creation, so the repair Dispatch performs is
+    // the fast-forward and nothing else.
+    let clone = box_.clone_path();
+    let worktree = box_
+        .home
+        .join(".grind/repos")
+        .join(OWNER)
+        .join(NAME)
+        .join(".claude/worktrees/grind-feat-28-slice-1b-agent-surface-screensource-seam");
+    git(&clone, &["checkout", "-q", "main"]);
+    git(
+        &clone,
+        &["worktree", "add", worktree.to_str().expect("utf-8"), BRANCH],
+    );
+    let parked = git(&worktree, &["rev-parse", "HEAD"]);
+    git(
+        &clone,
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("{parked}:refs/heads/{BRANCH}"),
+        ],
+    );
+    let tree = git(&worktree, &["rev-parse", "HEAD^{tree}"]);
+    let ahead = git(
+        &clone,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &parked,
+            "-m",
+            "another host moved the branch on",
+        ],
+    );
+    git(
+        &clone,
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("{ahead}:refs/heads/{BRANCH}"),
+        ],
+    );
+    box_.handoff_becomes(&ahead);
+
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+    assert_eq!(
+        git(&box_.worktree_path(), &["rev-parse", "HEAD"]),
+        ahead,
+        "Dispatch moved the adopted worktree to the declared Handoff SHA itself"
+    );
+    let log = fs::read_to_string(box_.run_dir().join("supervisor.log")).expect("a supervisor log");
+    assert!(
+        log.contains(&format!(
+            "fast-forwarded {}",
+            box_.worktree_path().display()
+        )),
+        "the movement performed is said beside the record:\n{log}"
+    );
+}
+
+#[test]
 fn the_handoff_sha_the_job_names_is_what_commits_are_counted_from() {
     let box_ = sandbox("handoff");
     assert_eq!(box_.handoff_sha.len(), 40);
