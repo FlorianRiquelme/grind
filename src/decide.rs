@@ -1090,8 +1090,6 @@ impl Default for Tiers {
             models_t1: models("fast"),
             models_t2: models("strong"),
             models_t3: models("strong"),
-            // Mirrors docs/tiers.toml's [max_turns] rows byte for byte, like every other
-            // field above; the absent-entry fallback itself lives in native.rs.
             max_turns: turns([("work", 32)]),
             max_turns_by_tier: [
                 BTreeMap::new(),
@@ -1502,6 +1500,18 @@ mod tier_tests {
         assert_eq!(
             tiers.max_turns_by_tier[Tier::T3 as usize].get("review"),
             Some(&9)
+        );
+    }
+
+    #[test]
+    fn a_malformed_max_turns_integer_is_skipped_not_default_inserted() {
+        let tiers = tiers_from_toml("[max_turns]\nsimplify = not_a_number\nreview = -1\n");
+        assert_eq!(tiers.max_turns.get("simplify"), None);
+        assert_eq!(tiers.max_turns.get("review"), None);
+        assert_eq!(
+            tiers.max_turns.get("work"),
+            Some(&32),
+            "the skipped row leaves the compiled default beside it untouched"
         );
     }
 

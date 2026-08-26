@@ -717,13 +717,17 @@ fn non_final_turn() -> Reply {
     )]))
 }
 
+/// The ceiling is data now: a declared per-stage bound must stop the loop even when the
+/// script carries more turns than it allows, and the bound arrives exactly where
+/// `supervisor`'s runner seam hands a tiers.toml-resolved value — `Some(low_limit)` on the
+/// adapter. With the compiled 32 still in force this scenario could not exhaust (four
+/// scripted turns are far short of it), so an exhausted transcript naming `{low_limit}` is
+/// itself the receipt that the override moved the ceiling.
 #[test]
 fn a_declared_max_turns_ceiling_bounds_the_loop_below_the_fallback() {
     let (run_dir, cwd) = scratch("max-turns");
     let low_limit = 3usize;
 
-    // More non-final turns scripted than the low limit allows: the loop must stop on the
-    // declared ceiling, not run the script dry.
     let script = vec![
         non_final_turn(),
         non_final_turn(),
@@ -732,8 +736,6 @@ fn a_declared_max_turns_ceiling_bounds_the_loop_below_the_fallback() {
     ];
     let server = Server::start(script);
 
-    // The override is the point: `Some(low_limit)` on the adapter literal, exactly where
-    // supervisor::record.runner hands a tiers.toml-resolved value.
     let attempt = drive_attempt_with_prompt(
         &server,
         &run_dir,
@@ -753,9 +755,6 @@ fn a_declared_max_turns_ceiling_bounds_the_loop_below_the_fallback() {
         reason.contains("turn budget exhausted") && reason.contains(&low_limit.to_string()),
         "the exhausted transcript names the limit that bound ({low_limit}): {reason}"
     );
-    // The receipt that the override moved the ceiling: with the compiled 32 still in force
-    // this scenario could not exhaust — four scripted turns are far short of it. The count
-    // is also strictly under what exhausting the fallback would demand.
     let received = server.bodies().len();
     assert_eq!(
         received, low_limit,

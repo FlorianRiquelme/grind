@@ -30,6 +30,11 @@ const DEFAULT_MAX_TURNS: usize = 32;
 /// flat per-stage entry, else [`DEFAULT_MAX_TURNS`]. A missing or absent `Tiers` reads as
 /// the fallback — the same fail-closed direction every other absent input takes. Pure, so
 /// the resolution order is unit-testable with no I/O.
+///
+/// The tier word is `Tier`'s own Display output, decoded by position over
+/// [`crate::decide::Tier::ALL`] rather than re-encoded here; a word outside those
+/// spellings decodes to no tiered lookup at all and falls through to the flat entry,
+/// then the fallback.
 pub(crate) fn max_turns_for(
     stage: &str,
     tier: Option<&str>,
@@ -38,9 +43,6 @@ pub(crate) fn max_turns_for(
     let Some(tiers) = tiers else {
         return DEFAULT_MAX_TURNS;
     };
-    // Tiered first, then flat, then the compiled fallback — linear, so the order reads
-    // top to bottom exactly as it resolves. The word is `Tier`'s own Display output, so
-    // one position over that table covers it instead of re-encoding "t0".."t3" here.
     let tier_index = tier.and_then(|word| {
         crate::decide::Tier::ALL
             .iter()
@@ -674,11 +676,14 @@ impl StageRunner for crate::runner::NativeAdapter {
         Backend::Native
     }
 
+    /// Resolves the turn ceiling once per attempt. `Option` here separates *absent* from
+    /// *declared*: only `None` takes [`DEFAULT_MAX_TURNS`]; a declared limit — including a
+    /// declared zero — passes through untouched and is enforced exactly as it stands, so a
+    /// caller that knows nothing about tiers behaves byte-for-byte as before this field
+    /// existed.
     fn run(&self, spec: &RunSpec) -> Attempt {
         let n = spec.attempt_n;
         let started_at = world::now_iso();
-        // Resolved once per attempt: `None` keeps the compiled fallback, so a caller that
-        // knows nothing about tiers behaves byte-for-byte as before this field existed.
         let max_turns = self.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
 
         let model_id = spec
@@ -1043,10 +1048,10 @@ mod tests {
     use crate::decide::Tiers;
     use serde_json::json;
 
+    /// The shipped calibration already declares exactly this shape — work at 32 flat,
+    /// 16 tiered — so the scenario reads the real data instead of restating it.
     #[test]
     fn a_tiered_max_turns_entry_wins_over_the_flat_one() {
-        // The shipped calibration already declares exactly this shape — work at 32 flat,
-        // 16 tiered — so the scenario reads the real data instead of restating it.
         let tiers = Tiers::default();
         assert_eq!(max_turns_for("work", None, Some(&tiers)), 32);
         assert_eq!(
@@ -1073,6 +1078,29 @@ mod tests {
     #[test]
     fn an_absent_tiers_reads_as_the_compiled_fallback() {
         assert_eq!(max_turns_for("work", Some("t2"), None), DEFAULT_MAX_TURNS);
+    }
+
+    #[test]
+    fn an_unknown_tier_word_skips_the_tiered_table_and_falls_through() {
+        assert_eq!(
+            max_turns_for("work", Some("t9"), Some(&Tiers::default())),
+            32
+        );
+        let tiers = Tiers {
+            max_turns: [("work".to_string(), 8)].into_iter().collect(),
+            max_turns_by_tier: [
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::new(),
+                [("work".to_string(), 4)].into_iter().collect(),
+                std::collections::BTreeMap::new(),
+            ],
+            ..Tiers::default()
+        };
+        assert_eq!(
+            max_turns_for("work", Some("t9"), Some(&tiers)),
+            8,
+            "a word outside Tier::ALL's spellings decodes to no tiered lookup — the flat entry wins"
+        );
     }
 
     /// One attempt's transcript as `NativeAdapter` appends it: the skill row, the wire latch,

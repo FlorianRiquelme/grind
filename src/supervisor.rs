@@ -216,14 +216,18 @@ impl RunRecord {
     /// reads the latest decided tier on disk (diff-triage's decision, else triage's), so a
     /// declared override moves the ceiling the native loop enforces while an undeclared stage
     /// still reads the compiled fallback. No stage key means no entry can match — exactly the
-    /// behavior before ceilings were data.
-    fn runner(&self, home: &Path, stage: Option<Stage>) -> Box<dyn runner::StageRunner> {
-        // Resolved inside the map, so a stage-less call (Reflect, Ship's babysit round)
-        // never touches `docs/tiers.toml` or the decision files at all.
+    /// behavior before ceilings were data. Resolution happens inside the stage map, so a
+    /// stage-less call never touches `docs/tiers.toml` or the Run state's decision files.
+    fn runner(
+        &self,
+        home: &Path,
+        run_dir: &Path,
+        stage: Option<Stage>,
+    ) -> Box<dyn runner::StageRunner> {
         let max_turns = stage.map(|stage| {
             let worktree = std::path::PathBuf::from(&self.worktree);
             let tiers = load_tiers(&worktree);
-            let tier = latest_decided_tier(&worktree);
+            let tier = latest_decided_tier(run_dir);
             crate::native::max_turns_for(&stage.to_string(), tier.as_deref(), Some(&tiers))
         });
         runner::runner_for(
@@ -831,8 +835,7 @@ fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
     let denied = attempt::denied_for_reflect();
     let reflect_model = runner::StageModel::Class(runner::ModelClass::Strong);
     let run_dir_str = run_dir.display().to_string();
-    // No stage key: Reflect resolves exactly as it did before turn ceilings were data.
-    let runner = record.runner(&home, None);
+    let runner = record.runner(&home, run_dir, None);
     let spec = runner::RunSpec {
         invocation: &invocation,
         cwd: run_dir,
@@ -1037,11 +1040,13 @@ fn load_tiers(worktree: &Path) -> Tiers {
     }
 }
 
-/// The latest decided tier on disk for a stage-aware turn-ceiling lookup:
-/// diff-triage's decision when present, else triage's. Absent or unreadable reads as no
-/// tiered entry — the same tolerant serde shape `resolve_stage_model` already uses.
-fn latest_decided_tier(worktree: &Path) -> Option<String> {
-    let stages_dir = worktree.join("stages");
+/// The latest decided tier on disk for a stage-aware turn-ceiling lookup: diff-triage's
+/// decision when present, else triage's — both under the Run state dir's `stages/`, the
+/// same root `run_r_pass` writes to and `resolve_stage_model` reads. Absent or unreadable
+/// reads as no tiered entry — the same tolerant serde shape `resolve_stage_model` already
+/// uses.
+fn latest_decided_tier(run_dir: &Path) -> Option<String> {
+    let stages_dir = run_dir.join("stages");
     world::read_to_string(&stages_dir.join("diff-triage").join("decision.json"))
         .ok()
         .or_else(|| world::read_to_string(&stages_dir.join("triage").join("decision.json")).ok())
@@ -1347,7 +1352,7 @@ fn run_ladder_attempt(
         &format!("  [{started_at}] {stage} attempt {n} ({mode}) …"),
     );
     let denied = attempt::denied_for(stage);
-    let runner = record.runner(&home, Some(stage));
+    let runner = record.runner(&home, run_dir, Some(stage));
     let spec = runner::RunSpec {
         invocation: &invocation,
         cwd: worktree,
@@ -1420,8 +1425,7 @@ fn run_ship_babysit_attempt(
         .iter()
         .map(|glob| glob.to_string())
         .collect();
-    // No stage key: the CI-babysit round resolves exactly as it did before ceilings were data.
-    let runner = record.runner(&home, None);
+    let runner = record.runner(&home, run_dir, None);
     let spec = runner::RunSpec {
         invocation: &invocation,
         cwd: worktree,
