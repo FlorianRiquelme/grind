@@ -330,6 +330,8 @@ an external-system quirk or a bug context that must survive belongs in
 `docs/agents/code-rationale.md` — or an ADR, if it decides something. Prose beside code rots
 faster than the code changes, and the reader here re-reads the code anyway.
 
+Inline-comment additions to `.rs` files are hard-blocked at edit time by the `.omp/hooks/pre/no-inline-comments.ts` pre-tool hook.
+
 ### Agent-facility guardrails
 
 Agent instructions for assistants on this repo live in this file and in TTSR guardrails under
@@ -340,6 +342,7 @@ triggers match, never an always-on token cost. Seven exist today: `denied-tools-
 `widen-grammar-sweep-declarations`. When a constraint above ("Constraints that are easy to
 violate") is forgettable-but-critical and scoped to specific files/symbols/commands, encode it
 there too instead of expecting every violating edit to pass through this file.
+Beyond these declarative rules, three pre-tool hooks under `.omp/hooks/pre/` (`no-inline-comments.ts`, `denied-tools-mirror.ts`, `prefer-just-verify.ts`) hard-block violating tool calls in interactive sessions, and the `verify-fixer` subagent under `.omp/agents/` performs scoped `just verify` failure repair.
 
 ### Domain docs
 
