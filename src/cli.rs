@@ -513,6 +513,26 @@ fn declared_clones(home: &Path) -> Vec<(String, PathBuf)> {
     found
 }
 
+/// One `df -Pk` reading for `~/.grind` plus one per declared clone — doctor takes no Job, so
+/// this is per-clone rather than per-Job (mirrors `supervisor`'s own, Job-scoped, builder;
+/// `cli` does not share it, per `check_presence`'s own doc comment).
+fn disk_readings(home: &Path, clones: &[(String, PathBuf)]) -> Vec<(String, world::Completed)> {
+    let mut readings = vec![(
+        "~/.grind".to_string(),
+        world::run(
+            &words(&["df", "-Pk", &job::grind_dir(home).display().to_string()]),
+            None,
+        ),
+    )];
+    for (name, path) in clones {
+        readings.push((
+            format!("~/.grind/repos/{name}"),
+            world::run(&words(&["df", "-Pk", &path.display().to_string()]), None),
+        ));
+    }
+    readings
+}
+
 fn check(home: &Path, clones: &[(String, PathBuf)], check: Check) -> Observed<Outcome> {
     check_with_probe(home, clones, check, net::probe_endpoint)
 }
@@ -564,6 +584,9 @@ fn check_with_probe(
             &world::run(&words(&["git", "--version"]), None),
             job::GIT_VERSION_FLOOR,
         ),
+        Check::DiskHeadroom => {
+            observe::disk_headroom(&disk_readings(home, clones), job::DISK_HEADROOM_FLOOR_GIB)
+        }
         Check::SkillsPresent => {
             let root = job::grind_dir(home).join("skills").join("run");
             let names: Vec<String> = world::list_dir(&root)
@@ -891,6 +914,29 @@ mod tests {
         assert!(!agent_key_declared(Err(
             "OPENROUTER_API_KEY not set".to_string()
         )));
+    }
+
+    #[test]
+    fn disk_headroom_on_a_home_that_does_not_exist_is_could_not_observe() {
+        let home = Path::new("/nowhere/that/exists");
+        let outcome = check_with_probe(home, &[], job::Check::DiskHeadroom, |_endpoint| false);
+        assert!(
+            matches!(outcome, Observed::Unobservable(_)),
+            "a nonexistent home must read as could-not-observe, not satisfied or unsatisfied"
+        );
+    }
+
+    #[test]
+    fn disk_headroom_against_this_hosts_real_disk_is_unsatisfied_above_an_absurd_floor() {
+        let Some(home) = world::home() else {
+            panic!("this test needs a real home directory on the test-running machine");
+        };
+        let readings = disk_readings(&home, &[]);
+        let outcome = observe::disk_headroom(&readings, 1_000_000);
+        assert!(
+            matches!(outcome, Observed::Present(Outcome::Unsatisfied(_))),
+            "no real disk has a million GiB free, so an absurd floor must name a shortfall"
+        );
     }
 
     #[test]
