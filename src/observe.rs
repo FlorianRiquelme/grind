@@ -2662,7 +2662,7 @@ README.md
     const DARWIN_DF_16_GIB: &str = "Filesystem   1024-blocks      Used Available Capacity  Mounted on\n/dev/disk3s5   482797652 418198096  16967316    97%    /System/Volumes/Data\n";
     const DARWIN_DF_2_GIB: &str = "Filesystem   1024-blocks      Used Available Capacity  Mounted on\n/dev/disk3s5   482797652 418198096  2097152    97%    /System/Volumes/Data\n";
     const DARWIN_DF_AUTO_HOME: &str = "Filesystem      1024-blocks Used Available Capacity Mounted on\nmap auto_home             0    0         0      100% /System/Volumes/Data/home\n";
-    const GNU_DF_50_GIB: &str = "Filesystem     1024-blocks    Used Available Use% Mounted on\n/dev/sda1       103080992 45000000  52859312  47% /\n";
+    const GNU_DF_50_GIB: &str = "Filesystem     1024-blocks    Used Available Capacity Mounted on\n/dev/sda1       103080992 45000000  52859312  47% /\n";
 
     #[test]
     fn disk_headroom_with_no_readings_is_could_not_observe() {
@@ -2773,7 +2773,7 @@ README.md
     }
 
     #[test]
-    fn disk_headroom_reads_a_gnu_style_use_percent_header_the_same_way() {
+    fn disk_headroom_reads_a_gnu_style_line_the_same_way() {
         let readings = vec![("/".to_string(), completed(GNU_DF_50_GIB, "", Some(0)))];
         assert!(matches!(
             disk_headroom(&readings, 5),
