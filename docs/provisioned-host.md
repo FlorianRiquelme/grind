@@ -214,6 +214,14 @@ of its own: the two checks above already cover what a native Dispatch needs befo
 Attempt, and a declared model id or protocol is only as good as the Attempt that actually
 calls the endpoint with it.
 
+- **Disk headroom on the filesystem holding `~/.grind`.** — *doctor* — `df -kP` against that
+  filesystem, compared with an authored floor of 10 GiB
+  ([#165](https://github.com/FlorianRiquelme/grind/issues/165)). Space is observable before any
+  Run starts — unlike key validity (#37's ruling above) — so a host below the floor reads
+  unsatisfied like any other unmet item. Space *consumed mid-Run* is not predicted, though:
+  ADR-0004 has the supervisor re-enter rather than forecast, and a disk that fills under a live
+  Run surfaces as that Run's outcome, on its own record.
+
 ## Credentials
 
 [#37](https://github.com/FlorianRiquelme/grind/issues/37)'s six steps, verbatim in substance. All

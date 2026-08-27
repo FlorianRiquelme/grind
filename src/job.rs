@@ -442,6 +442,10 @@ pub enum Check {
     /// The OpenAI-compatible endpoint answers a connection-level probe (`net::probe_endpoint`,
     /// R9). No key resolves the endpoint, so without one this check cannot even be tried.
     EndpointReachable,
+    /// The filesystem holding `~/.grind` has at least [`DISK_HEADROOM_FLOOR_KIB`] free —
+    /// `df -kP` against that volume, classified by `observe::disk_headroom`. Space is
+    /// observable before a Run starts; the floor itself is authored, not measured (#165).
+    DiskHeadroom,
     /// No honest boolean exists. Rendered as unchecked, with no boolean beside it.
     NoBoolean,
 }
@@ -533,6 +537,12 @@ pub fn host_items() -> &'static [HostItem] {
             doc_anchor: "The agent endpoint answers.",
         },
         HostItem {
+            name: "disk headroom",
+            depth: Depth::Doctor,
+            check: Check::DiskHeadroom,
+            doc_anchor: "Disk headroom on the filesystem holding `~/.grind`.",
+        },
+        HostItem {
             name: "credential: gh auth store",
             depth: Depth::Doctor,
             check: Check::GhAuthStore,
@@ -597,6 +607,12 @@ pub fn dispatch_subset() -> Vec<&'static HostItem> {
         .filter(|item| item.depth == Depth::Dispatch)
         .collect()
 }
+
+/// The disk-headroom floor doctor demands on the filesystem holding `~/.grind`: 10 GiB free,
+/// measured in `df -kP`'s 1024-block units. Authored, not measured — chosen as generous working
+/// room for clones, runs and locks, the way [`GIT_VERSION_FLOOR`] is inherited rather than
+/// invented (#165).
+pub const DISK_HEADROOM_FLOOR_KIB: u64 = 10_485_760; // 10 GiB
 
 /// The floor `git` inherits from SSH commit signing. Not invented here — nothing else in Grind
 /// needs a recent git.
@@ -1269,6 +1285,37 @@ mod tests {
             !dispatch_subset().iter().any(|i| i.name == item.name),
             "no dispatch path may consult the boot one-shot"
         );
+    }
+
+    #[test]
+    fn new_disk_headroom_item_appears_exactly_once_with_doctor_depth() {
+        let matches: Vec<&HostItem> = host_items()
+            .iter()
+            .filter(|i| i.name == "disk headroom")
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "`disk headroom` must appear exactly once in host_items()"
+        );
+        assert_eq!(
+            matches[0].depth,
+            Depth::Doctor,
+            "space on the host is observed by `grind doctor` alone"
+        );
+    }
+
+    #[test]
+    fn disk_headroom_is_absent_from_the_dispatch_subset() {
+        assert!(
+            !dispatch_subset().iter().any(|i| i.name == "disk headroom"),
+            "no dispatch path may consult the disk headroom check"
+        );
+    }
+
+    #[test]
+    fn disk_headroom_floor_kib_pins_the_authored_threshold() {
+        assert_eq!(DISK_HEADROOM_FLOOR_KIB, 10_485_760);
     }
 
     #[test]
