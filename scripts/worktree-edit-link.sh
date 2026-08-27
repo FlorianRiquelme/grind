@@ -24,11 +24,16 @@ if [ "$#" -lt 1 ]; then
 fi
 
 if [ "${2:-}" = "--rm" ]; then
+    if [ -d "$1" ]; then
+        RM_TARGET=$(cd "$1" && pwd)
+    else
+        RM_TARGET=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+    fi
     for link in .worktree-*; do
         [ -L "$link" ] || continue
         target=$(readlink "$link")
         case "$target" in
-            "$1"/*|"$1") rm "$link" && echo "removed $link" ;;
+            "$RM_TARGET"/*|"$RM_TARGET") rm "$link" && echo "removed $link" ;;
         esac
     done
     exit 0
@@ -37,9 +42,8 @@ WT=$(cd "$1" && pwd)
 NAME=$(basename "$WT")
 PREFIX=".worktree-${NAME}-"
 ROOT=$(pwd)
-
 for entry in "$WT"/* "$WT"/.[!.]* "$WT"/..?*; do
-    [ -e "$entry" ] || continue
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
     base=$(basename "$entry")
     [ "$base" = ".git" ] && continue
     link="$PREFIX$base"
