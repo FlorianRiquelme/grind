@@ -161,6 +161,15 @@ struct RunRecord {
     strong_model_override: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proto_override: Option<runner::ProtoMode>,
+    /// The omp backend's own environment conditions, snapshotted at readiness like
+    /// `claude_bin` above (ADR-0017): the resolved binary path — `GRIND_OMP_BIN`, else the
+    /// bun default — and whatever `<bin> --version` printed on its first line. Both `None`
+    /// on every claude-code/native record, and both may be absent on an omp record whose
+    /// binary could not be asked; absence is recorded rather than guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    omp_bin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    omp_version: Option<String>,
 }
 
 /// Frozen once, at dispatch — never re-resolved, for the same reason the plugin pin never was:
@@ -240,6 +249,7 @@ impl RunRecord {
                 strong_model: self.strong_model_override.clone(),
                 proto_override: self.proto_override,
                 max_turns,
+                omp_bin: self.omp_bin.clone(),
             },
         )
     }
@@ -361,6 +371,15 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
     let repo_path = job::repo_path(&home, &job.target_repo);
     let claude_bin = job::claude_bin(&home);
 
+    // The omp backend's snapshot, taken beside `claude_bin`'s and only for its own
+    // backend: readiness already demanded the binary executable, so this reads the version
+    // while the world is known good rather than mid-Run.
+    let (omp_bin, omp_version) = if selection.backend == Backend::Omp {
+        omp_snapshot(&home)
+    } else {
+        (None, None)
+    };
+
     let _lock = take_lock(&home, &job.target_repo, &job.branch)?;
 
     let worktree = adopt_or_create_worktree(&repo_path, &job.branch, Some(&job.handoff_sha))?;
@@ -437,6 +456,8 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         fast_model_override: selection.fast_model,
         strong_model_override: selection.strong_model,
         proto_override: selection.proto_override,
+        omp_bin,
+        omp_version,
         job,
     };
     let run_dir = job::runs_dir(&home).join(&run_id);
@@ -492,13 +513,13 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
 
     supervise(&mut record, &run_dir)
 }
-
 /// The lines a Dispatch says about itself, read off the record it just wrote (#141). Every line
 /// must be true of the Run it introduces: a banner contradicting its own record costs exactly
 /// the trust the record exists to provide. The claude binary is named only under the backend
 /// that spawns one; a native Run names its declared models rather than calling itself
 /// unpinned — and an undeclared class still names the concrete id [`runner::DEFAULT_MODEL`]
-/// resolves to, because that is what will run.
+/// resolves to, because that is what will run. An omp Run names its binary and version only
+/// when readiness actually heard a version, by the same rule.
 fn dispatch_banner(record: &RunRecord) -> Vec<String> {
     let mut lines = vec![format!("  backend {}", record.backend.as_str())];
     lines.push(format!(
@@ -513,7 +534,46 @@ fn dispatch_banner(record: &RunRecord) -> Vec<String> {
     if record.backend == Backend::ClaudeCode {
         lines.push(format!("  claude {}", record.claude_bin));
     }
+    // The same truthfulness rule the claude line carries: the binary line exists to say
+    // what this Run will execute under, so it names both only when the snapshot actually
+    // heard a version — an omp binary that answered nothing gets no line rather than one
+    // its first Attempt would contradict.
+    if record.backend == Backend::Omp
+        && let (Some(bin), Some(version)) = (&record.omp_bin, &record.omp_version)
+    {
+        lines.push(format!("  omp {bin} ({version})"));
+    }
     lines
+}
+
+/// The omp backend's binary/version snapshot, resolved once at readiness like every other
+/// environment-varying condition. The binary is [`job::omp_bin`]'s resolution; the version
+/// is whatever `<bin> --version` printed on its first line with a leading `omp/` stripped —
+/// and only that. A child that will not run yields no version rather than a guessed one:
+/// the record then says *this Run's omp could not be asked*, which the banner honors by
+/// staying silent, instead of a version the spawn would contradict.
+fn omp_snapshot(home: &Path) -> (Option<String>, Option<String>) {
+    let bin = job::omp_bin(home);
+    let out = world::run(&[bin.clone(), "--version".to_string()], None);
+    let version = if out.code == Some(0) {
+        omp_version_line(&out.stdout)
+    } else {
+        None
+    };
+    (Some(bin), version)
+}
+
+/// The pure half of [`omp_snapshot`], over `<bin> --version`'s stdout: the first line, a
+/// leading `omp/` stripped, empty meaning none. Split from the spawn so the three readings
+/// are string literals here rather than processes.
+fn omp_version_line(stdout: &str) -> Option<String> {
+    let line = stdout.lines().next().unwrap_or("").trim();
+    let stripped = line.strip_prefix("omp/").unwrap_or(line);
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped.to_string())
+    }
 }
 
 /// The identity to record beside a pid. `Absent` and `Unobservable` are the same fact at *this*
@@ -1580,14 +1640,19 @@ fn refuse_unless_host_ready(home: &Path, job: &Job, backend: Backend) -> Result<
 }
 
 /// The dispatch subset, narrowed to what this Dispatch's declared backend actually needs.
-/// `claude binary` is `Backend::ClaudeCode`'s requirement, never `Backend::Native`'s — a
-/// native-only host carries no `bin/claude` and dispatching onto it must not be refused for a
-/// binary its backend never runs. Every other dispatch-depth item is backend-agnostic, so this
+/// Each binary item belongs to the one adapter that spawns it: `claude binary` is
+/// `Backend::ClaudeCode`'s requirement and `omp binary` is `Backend::Omp`'s — a host lacking
+/// either still dispatches every other backend, because a binary its backend never runs must
+/// not be able to refuse it. Everything else at dispatch depth is backend-agnostic, so this
 /// is the one filter rather than a per-backend list.
 fn required_dispatch_items(backend: Backend) -> Vec<&'static job::HostItem> {
     job::dispatch_subset()
         .into_iter()
-        .filter(|item| !(item.check == job::Check::ClaudeBinary && backend == Backend::Native))
+        .filter(|item| match item.check {
+            job::Check::ClaudeBinary => backend == Backend::ClaudeCode,
+            job::Check::OmpBinary => backend == Backend::Omp,
+            _ => true,
+        })
         .collect()
 }
 
@@ -1651,6 +1716,9 @@ fn check_presence(home: &Path, job: &Job, check: job::Check) -> Observed<ItemOut
         ),
         job::Check::ClaudeBinary => {
             obs::claude_binary(world::is_executable(&job::claude_bin(home)), None)
+        }
+        job::Check::OmpBinary => {
+            obs::omp_binary(world::is_executable(&PathBuf::from(job::omp_bin(home))))
         }
         job::Check::GitVersionFloor => obs::git_version_floor(
             &world::run(&words(&["git", "--version"]), None),
@@ -1973,7 +2041,7 @@ mod tests {
             Some("t1"),
             "triage's word alone resolves"
         );
-        write("diff-triage", &t2);
+        write("diff-triage", t2);
         assert_eq!(
             latest_decided_tier(&run_dir).as_deref(),
             Some("t2"),
@@ -1995,17 +2063,32 @@ mod tests {
     }
 
     #[test]
-    fn narrowing_by_backend_drops_no_other_item() {
+    fn narrowing_by_backend_drops_only_the_foreign_binary() {
+        let whole = job::dispatch_subset().len();
+        let items = |backend| required_dispatch_items(backend);
         assert_eq!(
-            required_dispatch_items(Backend::ClaudeCode).len(),
-            job::dispatch_subset().len()
+            items(Backend::ClaudeCode).len(),
+            whole - 1,
+            "claude-code drops `omp binary` and nothing else"
         );
         assert_eq!(
-            required_dispatch_items(Backend::Native).len(),
-            job::dispatch_subset().len() - 1
+            items(Backend::Omp).len(),
+            whole - 1,
+            "omp drops `claude binary` and nothing else"
+        );
+        assert_eq!(
+            items(Backend::Native).len(),
+            whole - 2,
+            "native runs neither binary, so both drop"
         );
     }
 
+    #[test]
+    fn an_omp_version_strips_the_leading_prefix_and_silence_is_no_version() {
+        assert_eq!(omp_version_line("omp/18.0.6\n").as_deref(), Some("18.0.6"));
+        assert_eq!(omp_version_line("18.0.6\n").as_deref(), Some("18.0.6"));
+        assert_eq!(omp_version_line(""), None);
+    }
     #[test]
     fn claude_code_needs_no_native_credential_preflight() {
         assert_eq!(
@@ -2511,6 +2594,12 @@ mod tests {
         written.fast_model_override = Some("stealth/ox-alpha".to_string());
         written.strong_model_override = Some("deepseek/deepseek-chat-v3.1".to_string());
         written.proto_override = Some(runner::ProtoMode::Text);
+        // The omp snapshot fields are `skip_serializing_if = "Option::is_none"`, so a
+        // roundtrip that leaves them `None` would pass while proving nothing: the carrier
+        // rule (ADR-0017) only holds when the fixture carries values and the bytes are
+        // asserted to contain the keys.
+        written.omp_bin = Some("/Users/operator/.bun/bin/omp".to_string());
+        written.omp_version = Some("18.0.6".to_string());
         let bytes = serde_json::to_string(&written).expect("serialise");
         let read: crate::view::RunView = serde_json::from_str(&bytes)
             .expect("the reader must accept every field the writer emits");
@@ -2536,6 +2625,15 @@ mod tests {
         assert_eq!(read.fast_model_override, written.fast_model_override);
         assert_eq!(read.strong_model_override, written.strong_model_override);
         assert_eq!(read.proto_override, written.proto_override);
+        assert_eq!(read.omp_bin, written.omp_bin);
+        assert_eq!(read.omp_version, written.omp_version);
+        let body = serde_json::from_str::<serde_json::Value>(&bytes).expect("the bytes");
+        for key in ["omp_bin", "omp_version"] {
+            assert!(
+                body.get(key).is_some(),
+                "a valued snapshot field must survive serialisation as `{key}`"
+            );
+        }
     }
 
     #[test]

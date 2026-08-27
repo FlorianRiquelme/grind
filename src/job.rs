@@ -341,6 +341,20 @@ pub fn claude_bin(home: &Path) -> PathBuf {
     grind_dir(home).join("bin").join("claude")
 }
 
+/// Where the omp harness CLI lives, mirroring [`claude_bin`] but layout-defaulting rather
+/// than layout-naming: omp installs under bun's own bin directory, so that is the fallback
+/// path, and `GRIND_OMP_BIN` is the one escape hatch — a host fact like any other, read
+/// through `world` alone (ADR-0008).
+pub fn omp_bin(home: &Path) -> String {
+    world::var("GRIND_OMP_BIN").unwrap_or_else(|_| {
+        home.join(".bun")
+            .join("bin")
+            .join("omp")
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
 pub fn runs_dir(home: &Path) -> PathBuf {
     grind_dir(home).join("runs")
 }
@@ -403,6 +417,11 @@ pub enum Check {
     DeclaredClone,
     OneClonePerRepo,
     ClaudeBinary,
+    /// The omp harness CLI resolves — `GRIND_OMP_BIN`, else `~/.bun/bin/omp` — and is
+    /// executable. `Backend::Omp`'s requirement, the exact shape [`Check::ClaudeBinary`] is
+    /// for `Backend::ClaudeCode`: demanded at dispatch depth only when that backend is
+    /// declared, so an omp-less host can still dispatch either other backend.
+    OmpBinary,
     OnPath(&'static str),
     GitVersionFloor,
     /// The ten stage skill directories under `~/.grind/skills/run` (ADR-0015), replacing the
@@ -458,6 +477,12 @@ pub fn host_items() -> &'static [HostItem] {
             depth: Depth::Dispatch,
             check: Check::ClaudeBinary,
             doc_anchor: "`bin/claude` is executable and is not a shim.",
+        },
+        HostItem {
+            name: "omp binary",
+            depth: Depth::Dispatch,
+            check: Check::OmpBinary,
+            doc_anchor: "`~/.bun/bin/omp` is executable, or `GRIND_OMP_BIN` names it.",
         },
         HostItem {
             name: "git on PATH",
@@ -1277,6 +1302,35 @@ mod tests {
         assert_eq!(agent_file(home), Path::new("/home/op/.grind/agent"));
         assert_eq!(runs_dir(home), Path::new("/home/op/.grind/runs"));
         assert_eq!(locks_dir(home), Path::new("/home/op/.grind/locks"));
+    }
+
+    #[test]
+    fn the_omp_binary_is_a_dispatch_depth_item_of_its_own_backend() {
+        let item = host_items()
+            .iter()
+            .find(|i| i.check == Check::OmpBinary)
+            .expect("the omp binary is listed");
+        assert_eq!(item.depth, Depth::Dispatch);
+        assert!(
+            dispatch_subset()
+                .iter()
+                .any(|i| i.check == Check::OmpBinary)
+        );
+    }
+
+    #[test]
+    fn omp_bin_falls_back_to_buns_bin_directory_without_an_override() {
+        let _guard = world::env_test_guard();
+        world::remove_var_for_test("GRIND_OMP_BIN");
+        assert_eq!(omp_bin(Path::new("/home/op")), "/home/op/.bun/bin/omp");
+    }
+
+    #[test]
+    fn omp_bin_prefers_grind_omp_bin_over_the_layout_default() {
+        let _guard = world::env_test_guard();
+        world::set_var_for_test("GRIND_OMP_BIN", "/opt/omp/bin/omp");
+        assert_eq!(omp_bin(Path::new("/home/op")), "/opt/omp/bin/omp");
+        world::remove_var_for_test("GRIND_OMP_BIN");
     }
 
     /// A throwaway home with `~/.grind/agent` laid out, removed when the test ends.

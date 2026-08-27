@@ -91,6 +91,8 @@ pub enum Backend {
     ClaudeCode,
     #[serde(rename = "native")]
     Native,
+    #[serde(rename = "omp")]
+    Omp,
 }
 
 impl Backend {
@@ -98,6 +100,7 @@ impl Backend {
         match self {
             Self::ClaudeCode => "claude-code",
             Self::Native => "native",
+            Self::Omp => "omp",
         }
     }
 
@@ -107,8 +110,10 @@ impl Backend {
         match s {
             "claude-code" => Ok(Self::ClaudeCode),
             "native" => Ok(Self::Native),
+            "omp" => Ok(Self::Omp),
             other => Err(format!(
-                "unknown agent backend {other:?} (expected \"claude-code\" or \"native\")"
+                "unknown agent backend {other:?} \
+                 (expected \"claude-code\", \"native\" or \"omp\")"
             )),
         }
     }
@@ -127,8 +132,8 @@ pub enum ProtoMode {
 /// One `~/.grind/agent` line: `<backend> [<base-url>] [key=value ...]` (ADR-0017, extended).
 /// The base-url token — bare, no `=` — is the hermetic-test / self-hosting seam kept for
 /// backward compatibility with the grammar ADR-0017 first shipped; `base-url=`, `model=`,
-/// `fast=`, `strong=` and `proto=` are the key/value extensions. Credentials never appear
-/// here (env only).
+/// `fast=`, `strong=` and `proto=` are the key/value extensions (`fast=`/`strong=` only,
+/// no positional or endpoint, on an omp line). Credentials never appear here (env only).
 #[derive(Clone, Debug, Default)]
 pub struct Selection {
     pub backend: Backend,
@@ -178,6 +183,45 @@ impl Selection {
                     tokens.join(" ")
                 ))
             };
+        }
+
+        if backend == Backend::Omp {
+            let mut fast: Option<String> = None;
+            let mut strong: Option<String> = None;
+            for token in tokens {
+                let Some((key, value)) = token.split_once('=') else {
+                    return Err(format!(
+                        "omp takes no positional arguments, found {token:?} \
+                         (expected `omp [fast=<id>] [strong=<id>]`)"
+                    ));
+                };
+                if value.is_empty() {
+                    return Err(format!("`{key}=` has an empty value on the agent line"));
+                }
+                match key {
+                    "fast" if fast.is_some() => {
+                        return Err("duplicate `fast` on the agent line".to_string());
+                    }
+                    "fast" => fast = Some(value.to_string()),
+                    "strong" if strong.is_some() => {
+                        return Err("duplicate `strong` on the agent line".to_string());
+                    }
+                    "strong" => strong = Some(value.to_string()),
+                    other => {
+                        return Err(format!(
+                            "unknown key {other:?} on an omp agent line \
+                             (expected \"fast\" or \"strong\")"
+                        ));
+                    }
+                }
+            }
+            return Ok(Self {
+                backend,
+                endpoint_override: None,
+                fast_model: fast,
+                strong_model: strong,
+                proto_override: None,
+            });
         }
 
         let mut endpoint_override = None;
@@ -368,7 +412,7 @@ pub(crate) fn declared_model(
         return pinned.to_string();
     }
     match backend {
-        Backend::Native => {
+        Backend::Native | Backend::Omp => {
             let fast = fast_override.unwrap_or(DEFAULT_MODEL);
             let strong = strong_override.unwrap_or(DEFAULT_MODEL);
             if fast == strong {
@@ -380,10 +424,7 @@ pub(crate) fn declared_model(
         Backend::ClaudeCode => "(session default — unpinned)".to_string(),
     }
 }
-
 /// Which key pays for the endpoint being dialled — the pure half of [`Endpoint::resolve`], so
-/// the refusal below is testable from literals with no environment.
-///
 /// The two keys are not interchangeable. `OPENROUTER_API_KEY` names its own host, so it pairs
 /// with the default. `OPENAI_API_KEY` does not: pairing it with the *default* base url would
 /// send an OpenAI secret to openrouter.ai on every turn of every attempt — a credential
@@ -501,6 +542,19 @@ pub struct NativeAdapter {
     pub max_turns: Option<usize>,
 }
 
+/// Adapter #3: hosts the omp harness CLI instead of extending the native loop (#176).
+/// Default-off until priced parity (ADR-0019); nothing about the other two adapters
+/// changes with its arrival.
+pub struct OmpAdapter {
+    /// The snapshotted binary path (RunRecord.omp_bin).
+    pub bin: String,
+    /// Host-declared model id for `StageModel::Class(ModelClass::Fast)` — the omp line's
+    /// `fast=`, routed to `--model` (never a provider id invented by grind).
+    pub fast_model: Option<String>,
+    /// Host-declared model id for `StageModel::Class(ModelClass::Strong)` (`strong=`).
+    pub strong_model: Option<String>,
+}
+
 /// Everything [`runner_for`] needs from the layout-declared selection (ADR-0017) beyond
 /// `backend` and `claude_bin`, bundled so the factory's signature does not grow a new
 /// parameter every time the `~/.grind/agent` grammar gains a key.
@@ -513,6 +567,11 @@ pub struct NativeConfig {
     /// The stage-resolved turn ceiling handed to [`NativeAdapter`] verbatim; `None` is the
     /// undeclared answer and keeps the loop's compiled fallback.
     pub max_turns: Option<usize>,
+    /// The omp binary snapshotted into the RunRecord at readiness, handed through so
+    /// [`runner_for`]'s signature stays fixed. `None` falls back to `~/.bun/bin/omp` under
+    /// `home` — the same default [`crate::job::omp_bin`] records, kept here as one
+    /// expression rather than a second module dependency.
+    pub omp_bin: Option<String>,
 }
 
 /// The ONE backend branch in the codebase (R1). Everything downstream calls this.
@@ -534,6 +593,17 @@ pub fn runner_for(
             proto_override: native.proto_override,
             max_turns: native.max_turns,
         }),
+        Backend::Omp => Box::new(OmpAdapter {
+            bin: native.omp_bin.unwrap_or_else(|| {
+                home.join(".bun")
+                    .join("bin")
+                    .join("omp")
+                    .to_string_lossy()
+                    .into_owned()
+            }),
+            fast_model: native.fast_model,
+            strong_model: native.strong_model,
+        }),
     }
 }
 
@@ -541,31 +611,33 @@ pub fn runner_for(
 mod tests {
     use super::*;
 
-    /// The one derivation both surfaces render from: the pin wins outright, a native Run's
-    /// equal class declarations collapse to one id, split declarations name both sides, and
-    /// an undeclared class names what [`DEFAULT_MODEL`] resolves to — while a claude-code
-    /// Run stays honestly `(session default — unpinned)`, because grind never sees its
-    /// session's picks.
+    /// The one derivation both surfaces render from: the pin wins outright, a native or
+    /// omp Run's equal class declarations collapse to one id, split declarations name both
+    /// sides, and an undeclared class names what [`DEFAULT_MODEL`] resolves to — while a
+    /// claude-code Run stays honestly `(session default — unpinned)`, because grind never
+    /// sees its session's picks.
     #[test]
     fn declared_model_answers_from_the_record_and_never_from_a_surface() {
-        for backend in [Backend::Native, Backend::ClaudeCode] {
+        for backend in [Backend::Native, Backend::Omp] {
             assert_eq!(
                 declared_model(backend, Some("pinned/id"), Some("other"), None),
                 "pinned/id",
                 "the pin wins on every backend"
             );
+            assert_eq!(
+                declared_model(backend, None, Some("a/b"), Some("a/b")),
+                "a/b"
+            );
+            assert_eq!(
+                declared_model(backend, None, Some("a/b"), Some("c/d")),
+                "fast a/b · strong c/d"
+            );
+            assert_eq!(declared_model(backend, None, None, None), DEFAULT_MODEL);
         }
         assert_eq!(
-            declared_model(Backend::Native, None, Some("a/b"), Some("a/b")),
-            "a/b"
-        );
-        assert_eq!(
-            declared_model(Backend::Native, None, Some("a/b"), Some("c/d")),
-            "fast a/b · strong c/d"
-        );
-        assert_eq!(
-            declared_model(Backend::Native, None, None, None),
-            DEFAULT_MODEL
+            declared_model(Backend::ClaudeCode, Some("pinned/id"), None, None),
+            "pinned/id",
+            "the pin wins on every backend"
         );
         assert_eq!(
             declared_model(Backend::ClaudeCode, None, None, None),
@@ -782,7 +854,69 @@ mod tests {
             "{refused}"
         );
     }
+    /// The omp line is claude-code's register with two class keys: bare it parses as the
+    /// default, and only `fast=`/`strong=` model ids may follow.
+    #[test]
+    fn a_bare_omp_line_still_parses_with_no_overrides() {
+        let s = Selection::parse_line("omp").expect("bare omp");
+        assert_eq!(s.backend, Backend::Omp);
+        assert_eq!(s.endpoint_override, None);
+        assert_eq!(s.fast_model, None);
+        assert_eq!(s.strong_model, None);
+        assert_eq!(s.proto_override, None);
+    }
 
+    #[test]
+    fn omp_fast_and_strong_keys_populate_the_class_declarations() {
+        let s = Selection::parse_line("omp fast=x/glm-flash strong=y/glm-max").expect("omp keys");
+        assert_eq!(s.fast_model.as_deref(), Some("x/glm-flash"));
+        assert_eq!(s.strong_model.as_deref(), Some("y/glm-max"));
+    }
+
+    #[test]
+    fn omp_refuses_any_positional_token_like_claude_code() {
+        let refused =
+            Selection::parse_line("omp https://example.invalid/v1").expect_err("must refuse");
+        assert!(
+            refused.contains("omp takes no positional arguments"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn omp_refuses_unknown_keys_by_name() {
+        let refused = Selection::parse_line("omp base-url=https://x").expect_err("must refuse");
+        assert!(
+            refused.contains("unknown key") && refused.contains("base-url"),
+            "{refused}"
+        );
+        let refused = Selection::parse_line("omp proto=text").expect_err("must refuse");
+        assert!(refused.contains("proto"), "{refused}");
+    }
+
+    #[test]
+    fn omp_refuses_duplicate_class_keys() {
+        let refused = Selection::parse_line("omp fast=a fast=b").expect_err("must refuse");
+        assert!(
+            refused.contains("duplicate") && refused.contains("fast"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn omp_refuses_an_empty_value_like_the_shared_rule() {
+        let refused = Selection::parse_line("omp fast=").expect_err("must refuse");
+        assert!(refused.contains("empty value"), "{refused}");
+    }
+
+    #[test]
+    fn backend_parse_accepts_omp_and_names_all_three_backends_in_its_refusal() {
+        assert_eq!(Backend::parse("omp"), Ok(Backend::Omp));
+        let refused = Backend::parse("opus").expect_err("must refuse");
+        for expected in ["claude-code", "native", "omp"] {
+            assert!(refused.contains(expected), "{expected} missing: {refused}");
+        }
+    }
     #[test]
     fn claude_code_arg_maps_pinned_verbatim_fast_to_the_alias_strong_to_no_flag() {
         assert_eq!(

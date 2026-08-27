@@ -195,3 +195,39 @@ first Dispatch that declared a model or a wire mode, as a `run.json` that `grind
 dashboard could not parse: the two places a human looks precisely when they want reassurance.
 **An optional field on the record must be given a value in that test, or it is not covered at
 all.** The attribute that keeps legacy records parsing is the same one that hides the gap.
+
+## Amendment (2026-08-27): `omp` — a third grammar token whose harness owns the loop
+
+Epic [#176](https://github.com/FlorianRiquelme/grind/issues/176) adds adapter #3 over the same
+seam, hosting the omp harness CLI instead of extending the native loop: omp already ships what
+#171 asked grind to build (batch-parallel subagent spawns, headless-yolo children, deterministic
+sibling transcripts), so reimplementing them native-side would duplicate the host. The seam and
+the snapshot rules are untouched — this is one more arm in the one branch — but three facts make
+the omp arm's shape worth recording rather than leaving it discoverable in code.
+
+**The identity model bends because omp accepts no preset session id.** Claude Code takes
+`--session-id <uuid>`, which is why `attempt::stage_session_id`'s FNV ids work as argv. omp
+mints its own. Grind therefore carries the FNV id as a **directory**: each stage sessions under
+`runs/<run-id>/sessions/<stage-session-id>/`, dispatching fresh and resuming with
+`--resume <suffix>` against whatever session file that directory already holds. Determinism
+lives in the path instead of in the child's id; ADR-0002's freeze instinct is honored by
+snapshotting `<bin> --version` into the record (`omp_bin`, `omp_version` — mirrored on `RunView`
+under the same carrier rule as every optional field above).
+
+**Transcripts copy home before they count.** Empirically (v18.0.6), an explicit
+`--session-dir` is *usually* honored flat, *sometimes* ignored for the encoded-cwd bucket under
+`~/.omp/agent/sessions/` — so harvest walks the stage dir newest-first with the home bucket as
+an mtime fallback, then copies the winner into the run dir and records that copy. The
+evidence-tree rule survives by construction, not by trust; resume against the grind-owned copy
+is proven to attach and append in place. The claude-code-only ban on deriving outside paths
+gains its second exception-by-design, for the same reason as the first: the alternative is
+pretending the tree contains facts it does not.
+
+**Tool denials do not carry over, loudly.** omp has no deny-list flag; `--tools` allowlisting
+coarsens the claude globs' intent and its builtin-name surface drifts under grind's control.
+This amendment records the gap instead of papering over it: omp attempts run `--auto-approve`
+unrestricted in P1, and the panels' write-protection rides P3's dogfood either choosing a
+validated per-family allowlist or shipping the extension hook (`pi.on('tool_call')`, fail-closed)
+that enforces the globs verbatim. The default backend is untouched; nothing about the other two
+adapters changes ([ADR-0019](0019-both-adapters-stay-and-deletion-needs-priced-parity.md) still
+owns deletion).

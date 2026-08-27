@@ -235,6 +235,9 @@ fn live_for(home: &Path, run_id: &str, found: &view::RunView) -> view::Live {
         runner::Backend::Native => {
             native::live(&job::runs_dir(home).join(run_id), world::now_epoch())
         }
+        runner::Backend::Omp => {
+            crate::omp::live(&job::runs_dir(home).join(run_id), world::now_epoch())
+        }
     }
 }
 

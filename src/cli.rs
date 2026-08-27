@@ -387,6 +387,9 @@ fn live_for(home: &Path, run_id: &str, found: &view::RunView) -> view::Live {
         runner::Backend::Native => {
             native::live(&job::runs_dir(home).join(run_id), world::now_epoch())
         }
+        runner::Backend::Omp => {
+            crate::omp::live(&job::runs_dir(home).join(run_id), world::now_epoch())
+        }
     }
 }
 
@@ -552,6 +555,9 @@ fn check_with_probe(
                     .map(|p| p.to_string_lossy().into_owned())
                     .as_deref(),
             )
+        }
+        Check::OmpBinary => {
+            observe::omp_binary(world::is_executable(&PathBuf::from(job::omp_bin(home))))
         }
         Check::OnPath(tool) => observe::on_path(tool, &resolves(tool)),
         Check::GitVersionFloor => observe::git_version_floor(

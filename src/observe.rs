@@ -1218,6 +1218,19 @@ pub fn claude_binary(executable: bool, resolved: Option<&str>) -> Observed<Outco
     satisfied("executable, and not a shim")
 }
 
+/// The omp harness CLI is executable. Mirrors [`claude_binary`] minus the shim clause: that
+/// check asserts loudly because a terminal's `claude` shim is a documented hazard on this
+/// laptop, and no such story exists for omp — inventing the same assertion here would be a
+/// precondition that fails for no reason. Presence only, resolved by the caller: which path
+/// was tested (`GRIND_OMP_BIN` or the bun default) is the caller's sentence, not this one's.
+pub fn omp_binary(executable: bool) -> Observed<Outcome> {
+    if executable {
+        satisfied("the omp binary is executable")
+    } else {
+        unsatisfied("the omp binary is missing or not executable")
+    }
+}
+
 /// A provider API key is in the environment — **presence only**, never the values, and
 /// never a validity judgement: only an attempt to use a key can classify it. Both backends'
 /// readiness is reported regardless of which backend a Run selected (R9) — doctor takes no
@@ -2067,6 +2080,19 @@ mod tests {
             claude_binary(false, None),
             Observed::Present(Outcome::Unsatisfied(_))
         ));
+    }
+
+    #[test]
+    fn the_omp_binary_classifies_presence_alone() {
+        assert!(matches!(
+            omp_binary(true),
+            Observed::Present(Outcome::Satisfied(_))
+        ));
+        let missing = omp_binary(false);
+        let Observed::Present(Outcome::Unsatisfied(said)) = missing else {
+            panic!("a missing binary is unsatisfied, never absent: {missing:?}");
+        };
+        assert!(said.contains("omp"), "{said}");
     }
 
     #[test]

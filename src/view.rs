@@ -85,6 +85,16 @@ pub struct RunView {
     pub strong_model_override: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proto_override: Option<crate::runner::ProtoMode>,
+    /// The omp backend's own snapshot: the resolved binary path and its reported version.
+    /// Both default to absent because every claude-code/native record — and any omp Run whose
+    /// binary could not be asked at readiness — carries neither key, which is the honest
+    /// answer rather than a blank one. Mirrored only because this struct is
+    /// `deny_unknown_fields`: the first `run.json` an omp Dispatch writes would fail to parse
+    /// everywhere a human looks without them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omp_bin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omp_version: Option<String>,
 }
 
 /// The read-only mirror of `supervisor::Provenance`. Field names duplicated by design, the same

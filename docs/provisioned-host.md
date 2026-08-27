@@ -61,6 +61,11 @@ like housekeeping here is what withdraws the guarantee.
   laptop `which -a claude` returns cmux's shim *first, twice*, from under `$TMPDIR`, so
   `ln -s $(which claude)` points at the wrong file and the Run silently inherits that terminal's
   session hooks — reproducible nowhere, with nothing printed.
+- **`~/.bun/bin/omp` is executable, or `GRIND_OMP_BIN` names it.** — *dispatch* — Only a Run whose
+  `~/.grind/agent` line declares `omp` is ever refused for this: the same backend-scoped narrowing
+  `bin/claude` already has, mirrored rather than shared because omp installs under bun's `bin`
+  directory, not Grind's layout (ADR-0017). Presence only; version probing happens once at
+  readiness and lands on the record (#176).
 - **`runs/` and `locks/` are Grind's**, created on demand. Nothing to provision. Run state lives
   here rather than inside a checkout, so *never committed*
   ([#8](https://github.com/FlorianRiquelme/grind/issues/8)) holds because it is outside any git
