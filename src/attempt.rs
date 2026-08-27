@@ -720,8 +720,6 @@ mod tests {
 
     fn is_denied(command: &str) -> bool {
         let (subs, complete) = subcommands_of(command);
-        // Fail closed, mirroring `tools::gate`: an incompletely searched command is a refusal,
-        // never a silent allow.
         assert!(complete, "test commands must be fully searchable");
         subs.iter().any(|sub| {
             DENIED_TOOLS.iter().any(|glob| {

@@ -175,33 +175,17 @@ pub enum GateDecision {
 pub fn gate(denied_globs: &[String], raw: RawCall) -> GateDecision {
     let args: Value = serde_json::from_str(&raw.arguments_json).unwrap_or(Value::Null);
     let command = || args["command"].as_str().unwrap_or_default();
+    let mut bash_coverage_complete = true;
     for glob in denied_globs {
-        let (denied, complete) = match glob.strip_prefix("Bash(").and_then(|g| g.strip_suffix(')'))
-        {
-            Some(pattern) => {
-                if raw.name != "bash" {
-                    (false, true)
-                } else {
-                    let (subs, complete) = subcommands_of(command());
-                    (subs.iter().any(|sub| glob_matches(pattern, sub)), complete)
-                }
+        let denied = match glob.strip_prefix("Bash(").and_then(|g| g.strip_suffix(')')) {
+            Some(pattern) if raw.name == "bash" => {
+                let (subs, complete) = subcommands_of(command());
+                bash_coverage_complete &= complete;
+                subs.iter().any(|sub| glob_matches(pattern, sub))
             }
-            None => (glob_matches(glob, &raw.name), true),
+            Some(_) => false,
+            None => glob_matches(glob, &raw.name),
         };
-        // Fail closed when the suffix walk could not search every token start: the glob
-        // anchored at an uncovered start had no candidate to match, so an allow here would
-        // rest on silence, not on a search (#179, CodeRabbit Security/Major). Sits inside the
-        // per-glob loop so a genuine match still names its glob; only the untouched case
-        // carries the coverage reason.
-        if raw.name == "bash" && !complete {
-            return GateDecision::Denied(GateReport {
-                layer: GateLayer::DeniedGlob,
-                tool: raw.name.clone(),
-                reason: "command too large to search completely; refusing rather than \
-                         allowing an unsearched command"
-                    .to_string(),
-            });
-        }
         if denied {
             return GateDecision::Denied(GateReport {
                 layer: GateLayer::DeniedGlob,
@@ -209,6 +193,15 @@ pub fn gate(denied_globs: &[String], raw: RawCall) -> GateDecision {
                 reason: format!("tool call matched denied glob `{glob}`"),
             });
         }
+    }
+    if raw.name == "bash" && !bash_coverage_complete {
+        return GateDecision::Denied(GateReport {
+            layer: GateLayer::DeniedGlob,
+            tool: raw.name.clone(),
+            reason: "command too large to search completely; refusing rather than \
+                     allowing an unsearched command"
+                .to_string(),
+        });
     }
     if matches!(raw.name.as_str(), "read_file" | "write_file")
         && !resolves_within(args["path"].as_str().unwrap_or_default())
@@ -1131,11 +1124,6 @@ mod tests {
             .iter()
             .map(|g| g.to_string())
             .collect();
-        // An ordinary commit with a 32 KiB message. Its quoted payload is a piece the suffix
-        // budget cannot cover, so fail-closed refuses it (#179, CodeRabbit Security/Major):
-        // a command too large to search completely is denied, never silently allowed. The
-        // stack-overflow protection this test originally pinned lives on in
-        // `glob_matches_is_the_iterative_form_of_the_recursion_it_replaced`.
         let command = format!("git commit -m \"{}\"", "detail ".repeat(8 * 1024));
         assert_eq!(
             denied_layer(gate(
@@ -1156,11 +1144,6 @@ mod tests {
             .iter()
             .map(|g| g.to_string())
             .collect();
-        // 53 tokens whose suffix set sums to ~9 KiB: the walk covers every start of the piece
-        // inside the budget, so an ordinary multi-token command is not collateral damage of
-        // fail-closed. (Coverage cost is quadratic in token count — a piece whose *full*
-        // suffix set exceeds the budget, like the 32 KiB quoted message in
-        // `a_long_benign_command_line_is_denied_rather_than_partially_searched`, is denied.)
         let command = format!("git commit -m {}", vec!["detail"; 50].join(" "));
         allowed_layer(gate(
             &all_denials,
@@ -1193,6 +1176,32 @@ mod tests {
             "the whole-piece candidate starts with X=1 and the tail exhausts the \
              budget before the git suffix is reached — this must not be an allow"
         );
+    }
+
+    #[test]
+    fn a_coverage_refusal_yields_to_a_genuine_glob_match_that_names_its_glob() {
+        let decision = gate(
+            &denied_globs(&["Bash(gh pr merge*)", "Bash(git push --force*)"]),
+            call(
+                "bash",
+                &serde_json::json!({ "command": format!(
+                    "git push --force origin main {}",
+                    vec!["AAA=1"; 2_000].join(" ")
+                ) })
+                .to_string(),
+            ),
+        );
+        match decision {
+            GateDecision::Denied(report) => {
+                assert!(
+                    report.reason.contains("git push --force*"),
+                    "a later glob that genuinely matches must name itself, \
+                     not the coverage fallback: {:?}",
+                    report.reason
+                );
+            }
+            GateDecision::Allowed(raw) => panic!("unexpectedly allowed: {}", raw.name),
+        }
     }
 
     #[test]
