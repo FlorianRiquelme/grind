@@ -1315,7 +1315,7 @@ fn parse_git_version(output: &str) -> Option<(u64, u64)> {
 /// absent, and what `df` said on the way out never reaches the reason (KTD16): those are
 /// facts about the check. Only a readable count yields a verdict, spelled `>=` so a reading
 /// exactly at the floor satisfies.
-pub fn disk_headroom(raw: &crate::world::Completed, floor_kib: u64) -> Observed<Outcome> {
+pub fn disk_headroom(raw: &Completed, floor_kib: u64) -> Observed<Outcome> {
     if raw.code != Some(0) {
         return Observed::Unobservable(Reason::saying(
             "`df -kP` did not run to completion, so there is no capacity reading to classify",
@@ -1326,8 +1326,7 @@ pub fn disk_headroom(raw: &crate::world::Completed, floor_kib: u64) -> Observed<
             "`df -kP` printed no second line, so there is no data row to read",
         ));
     };
-    let fields: Vec<&str> = row.split_whitespace().collect();
-    let Some(available) = fields.get(3) else {
+    let Some(available) = row.split_whitespace().nth(3) else {
         return Observed::Unobservable(Reason::saying(
             "the `df -kP` row stops before the Available column",
         ));
