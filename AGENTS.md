@@ -204,13 +204,18 @@ unsatisfiable by construction and gets deleted by whoever trips it next (ledger 
   widening can turn an allow into a refusal but never the reverse.
 
   Suffix generation costs work proportional to tokens considered times piece length, so the
-  number of a piece's leading tokens that each start their own candidate is capped
-  (`tools::MAX_SUFFIX_TOKENS`, 64) — a real wrapper stack is under ten tokens deep before the
-  wrapped verb, so the cap only bounds the cost of a long ordinary command line (a full `cargo`
-  invocation) and never affects anything this barrier is meant to catch. One false refusal is
-  accepted, unchanged from the prior round: a quoted string that happens to spell a denied
-  command as a literal rather than as an invocation (`git commit -m "git push --force"` is
-  refused, since the quoted text matches `Bash(git push*--force*)`).
+  cumulative bytes of candidates one piece may generate are budgeted
+  (`tools::SUFFIX_BUDGET_BYTES`, 32 KiB) — generation stops once the bytes already produced
+  would pass it. This replaced a fixed 64-token cap (#169, CodeRabbit review `ac7d370d`,
+  Security/Major): the cap dropped *every* candidate starting past token 64, so a denied verb
+  behind a longer benign prefix escaped suffix dropping entirely, while a real wrapper stack is
+  under ten tokens deep before the wrapped verb. The budget keeps short pieces fully covered and
+  still bounds the cost of a long ordinary command line; what is accepted is the same
+  constructed-input class as before, at a larger and priced boundary (a verb padded behind ~250+
+  assignment tokens instead of 65). One false refusal is accepted, unchanged from the prior
+  round: a quoted string that happens to spell a denied command as a literal rather than as an
+  invocation (`git commit -m "git push --force"` is refused, since the quoted text matches
+  `Bash(git push*--force*)`).
 
   **The first twelve each anchor their flag immediately after the verb, and git accepts the flag
   anywhere.** `git push origin --force`, `git push origin main --force`,

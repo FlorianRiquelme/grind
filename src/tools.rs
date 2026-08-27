@@ -367,9 +367,10 @@ pub(crate) fn glob_matches(pattern: &str, candidate: &str) -> bool {
 /// own candidate, recursively re-run through this same pipeline so a substitution nested inside
 /// another is still found.
 ///
-/// **Bounded, not unbounded.** Suffix generation costs work proportional to (tokens considered) ×
-/// (piece length), so the number of a piece's leading tokens that each start their own candidate
-/// is capped at [`MAX_SUFFIX_TOKENS`] — see its own doc for why that cap is safe.
+/// **Bounded, not unbounded.** Suffix generation costs work proportional to (tokens considered)
+/// × (piece length), so the cumulative bytes of the suffix candidates one piece may generate are
+/// capped at [`SUFFIX_BUDGET_BYTES`] — see its own doc for why a budget bounds the cost while
+/// still yielding verb-starting candidates for long benign prefixes.
 ///
 /// This accepts a documented false refusal, unchanged from the prior round: a quoted span that
 /// happens to spell a denied command as a string literal rather than as an invocation (`git
@@ -409,43 +410,51 @@ pub(crate) fn subcommands_of(command: &str) -> Vec<String> {
     }
     candidates
 }
-
-/// Bound on how many of a piece's leading tokens each contribute their own token-suffix
-/// candidate in [`subcommands_of`]. Suffix generation costs work proportional to (tokens
-/// considered) × (piece length) — every candidate is a fresh substring — so this keeps one gated
-/// tool call bounded rather than quadratic in an arbitrarily long command line (a full `cargo`
-/// invocation, a long commit message, both realistic).
+/// Bound on how many bytes of token-suffix candidates one piece may generate in
+/// [`subcommands_of`]. Suffix generation costs work proportional to (tokens considered) × (piece
+/// length) — every candidate is a fresh substring — so this keeps one gated tool call bounded
+/// rather than quadratic in an arbitrarily long command line (a full `cargo` invocation, a long
+/// commit message, both realistic).
 ///
-/// 64 is far deeper than any real wrapper stack: `nice`, `stdbuf`, `setsid`, `env` and `timeout`
-/// chained together is under ten tokens before the wrapped verb, so nothing this barrier is
-/// meant to catch is affected by the cap. The accepted cost is symmetric with this module's other
-/// disclaimer: a forbidden verb padded behind more leading tokens than the cap allows is not
-/// found by suffix dropping alone — the same kind of gap already accepted for a determined
-/// adversary constructing shell syntax by hand, not for an unthinking or accidental invocation.
-const MAX_SUFFIX_TOKENS: usize = 64;
+/// A byte budget replaces the earlier fixed leading-token cap (`MAX_SUFFIX_TOKENS`, 64; #169,
+/// CodeRabbit review `ac7d370d`, Security/Major): that cap dropped *every* candidate starting
+/// past token 64, so a denied verb behind a longer benign prefix escaped suffix dropping
+/// entirely. Generation walks a piece's starts left to right and stops once the bytes already
+/// produced would exceed this budget — short pieces get full coverage, and a forbidden verb
+/// keeps yielding its own candidate until its prefix alone exhausts the budget (~250 six-byte
+/// assignment tokens vs 65 under the old cap). What is accepted is the same constructed-input
+/// class as before, at a larger and now *priced* boundary: a verb padded behind a prefix worth
+/// more than this many bytes of suffixes is not found by suffix dropping alone. A single-token
+/// piece has no drops to skip and still contributes itself whole. `push_with_basename`'s
+/// variants add at most one further copy per candidate, so total emission stays under twice
+/// this budget.
+const SUFFIX_BUDGET_BYTES: usize = 32 * 1024;
 
-/// Every token-boundary suffix of `piece`, up to [`MAX_SUFFIX_TOKENS`] of them: `piece` itself
-/// (dropping no leading tokens), then the piece with its first token dropped, then its first two
-/// dropped, and so on. The general replacement for the old wrapper-name list and
-/// leading-assignment stripper: both special-cased *which* leading tokens to drop (`env`, `nice`,
-/// a `NAME=value` pair); this drops every possible prefix of leading tokens instead, so no
-/// wrapper — however it is spelled, however many options it takes — needs naming for its
-/// remainder to surface as a candidate.
+/// Every token-boundary suffix of `piece`, until the bytes already emitted stop the walk:
+/// `piece` itself (dropping no leading tokens), then the piece with its first token dropped,
+/// then its first two dropped, and so on — bounded by [`SUFFIX_BUDGET_BYTES`]. The general
+/// replacement for the old wrapper-name list and leading-assignment stripper: both special-cased
+/// *which* leading tokens to drop (`env`, `nice`, a `NAME=value` pair); this drops every
+/// possible prefix of leading tokens instead, so no wrapper — however it is spelled, however
+/// many options it takes — needs naming for its remainder to surface as a candidate.
 fn token_suffixes(piece: &str) -> Vec<String> {
-    let mut starts = Vec::with_capacity(MAX_SUFFIX_TOKENS);
+    let mut out = Vec::new();
+    let mut emitted = 0usize;
     let mut in_token = false;
     for (i, ch) in piece.char_indices() {
         if ch.is_whitespace() {
             in_token = false;
         } else if !in_token {
             in_token = true;
-            starts.push(i);
-            if starts.len() == MAX_SUFFIX_TOKENS {
+            let suffix = &piece[i..];
+            if !out.is_empty() && emitted + suffix.len() > SUFFIX_BUDGET_BYTES {
                 break;
             }
+            emitted += suffix.len();
+            out.push(suffix.to_string());
         }
     }
-    starts.into_iter().map(|i| piece[i..].to_string()).collect()
+    out
 }
 
 /// Push `candidate`, plus — when its first whitespace-delimited token contains a `/` — a second
@@ -784,6 +793,64 @@ mod tests {
                 "`{command}` must be denied"
             );
         }
+    }
+
+    #[test]
+    fn a_denied_verb_behind_a_sixty_five_token_prefix_is_still_found() {
+        // Regression for #169: the old `MAX_SUFFIX_TOKENS` cap (64) dropped every suffix
+        // starting past token 64, so a glob anchored at the verb refused nothing here.
+        let all_denials: Vec<String> = crate::attempt::DENIED_TOOLS
+            .iter()
+            .map(|g| g.to_string())
+            .collect();
+        let command = format!(
+            "{} git push --force origin main",
+            (1..=65)
+                .map(|i| format!("A{i}={i}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert!(
+            subcommands_of(&command)
+                .iter()
+                .any(|c| c.starts_with("git push --force")),
+            "suffix generation must yield the verb-starting candidate"
+        );
+        let decision = gate(
+            &all_denials,
+            call(
+                "bash",
+                &serde_json::json!({ "command": command }).to_string(),
+            ),
+        );
+        assert_eq!(
+            denied_layer(decision),
+            GateLayer::DeniedGlob,
+            "a denied verb behind a 65-token benign prefix must be refused"
+        );
+    }
+
+    #[test]
+    fn suffix_generation_stays_within_the_byte_budget_per_piece() {
+        let piece = vec!["tok"; 8000].join(" "); // 4× the budget in one piece
+        let suffixes = token_suffixes(&piece);
+        assert!(
+            suffixes.len() < 8000,
+            "the walk must stop, not cover every start"
+        );
+        let emitted: usize = suffixes.iter().map(|s| s.len()).sum();
+        assert!(
+            emitted <= SUFFIX_BUDGET_BYTES,
+            "{emitted} bytes of suffixes exceed the {SUFFIX_BUDGET_BYTES}-byte budget"
+        );
+    }
+
+    #[test]
+    fn a_single_oversized_token_still_contributes_itself_whole() {
+        let piece = format!("{}-git", "z".repeat(SUFFIX_BUDGET_BYTES * 2));
+        let suffixes = token_suffixes(&piece);
+        assert_eq!(suffixes.len(), 1);
+        assert_eq!(suffixes[0], piece);
     }
 
     #[test]
