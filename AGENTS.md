@@ -219,9 +219,14 @@ unsatisfiable by construction and gets deleted by whoever trips it next (ledger 
   padding sits *before* a hidden verb, so the verb's own suffix is short and is reached at once.
   Longest-first made coverage non-monotone in padding length — 93 six-byte padding tokens hid the
   verb while 92 and 94 did not — which is why the test pins the rule (1 through 5,000 padding
-  tokens, all refused) rather than a boundary number. What stays accepted is narrow and
-  structural: a start buried inside a piece over 32 KiB with thousands of tokens still to its
-  right — not the front, not the tail.
+  tokens, all refused) rather than a boundary number. A third was the silence itself: when the
+  budget did stop the walk early, a glob anchored at an uncovered start matched nothing and the
+  gate read that silence as an allow (`X=1 git push --force origin main <thousands of trailing
+  benign tokens>` was allowed). Coverage is now **fail-closed**: `token_suffixes` reports when
+  the walk stopped early, `subcommands_of` propagates that, and `gate` refuses the call — an
+  unsearchable command never reaches the shell. The priced collateral: coverage cost is
+  quadratic in token count, so a piece whose full suffix set exceeds 32 KiB (roughly 100+
+  six-byte tokens, or a large quoted payload) is refused outright, benign or not.
 
   `tools::glob_matches` is **iterative for the same class of reason**: the natural recursive
   wildcard match costs a stack frame per candidate byte, so a `*` scanning a long tail overflowed

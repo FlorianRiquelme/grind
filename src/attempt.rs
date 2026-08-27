@@ -719,7 +719,11 @@ mod tests {
     use crate::tools::{glob_matches, subcommands_of};
 
     fn is_denied(command: &str) -> bool {
-        subcommands_of(command).iter().any(|sub| {
+        let (subs, complete) = subcommands_of(command);
+        // Fail closed, mirroring `tools::gate`: an incompletely searched command is a refusal,
+        // never a silent allow.
+        assert!(complete, "test commands must be fully searchable");
+        subs.iter().any(|sub| {
             DENIED_TOOLS.iter().any(|glob| {
                 let pattern = glob
                     .strip_prefix("Bash(")
