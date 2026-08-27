@@ -931,6 +931,9 @@ mod tests {
         let Some(home) = world::home() else {
             panic!("this test needs a real home directory on the test-running machine");
         };
+        world::create_dir_all(&job::grind_dir(&home)).expect(
+            "a provisioned host guarantees ~/.grind; a bare CI runner does not, so make it",
+        );
         let readings = disk_readings(&home, &[]);
         let outcome = observe::disk_headroom(&readings, 1_000_000);
         assert!(
@@ -944,6 +947,9 @@ mod tests {
         let Some(home) = world::home() else {
             panic!("this test needs a real home directory on the test-running machine");
         };
+        world::create_dir_all(&job::grind_dir(&home)).expect(
+            "a provisioned host guarantees ~/.grind; a bare CI runner does not, so make it",
+        );
         let clones = vec![
             ("owner/repo-a".to_string(), home.clone()),
             ("owner/repo-b".to_string(), home.clone()),
