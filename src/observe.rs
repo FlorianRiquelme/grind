@@ -1299,6 +1299,51 @@ fn parse_git_version(output: &str) -> Option<(u64, u64)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
+/// Free space on the filesystem holding the grind directory, from `df -kP`, against an
+/// authored floor — `job::DISK_HEADROOM_FLOOR_KIB` names the number; this function only
+/// reads it, so a threshold change never touches a parser (the same split
+/// [`git_version_floor`] draws between its floor argument and its own text).
+///
+/// The columns are read **by position**, from whitespace splitting: POSIX `df` output
+/// localizes its headers like any other command, so a header cannot be trusted to name its
+/// own columns and fixed positions are the only shape every locale produces. Line two's
+/// fourth field is the Available count in 1 KiB blocks; everything after it — Capacity, and
+/// mountpoints whose path contains spaces — belongs to later columns and is ignored rather
+/// than parsed.
+///
+/// A call that did not cleanly succeed is **could not observe**, never unsatisfied or
+/// absent, and what `df` said on the way out never reaches the reason (KTD16): those are
+/// facts about the check. Only a readable count yields a verdict, spelled `>=` so a reading
+/// exactly at the floor satisfies.
+pub fn disk_headroom(raw: &crate::world::Completed, floor_kib: u64) -> Observed<Outcome> {
+    if raw.code != Some(0) {
+        return Observed::Unobservable(Reason::saying(
+            "`df -kP` did not run to completion, so there is no capacity reading to classify",
+        ));
+    }
+    let Some(row) = raw.stdout.lines().nth(1) else {
+        return Observed::Unobservable(Reason::saying(
+            "`df -kP` printed no second line, so there is no data row to read",
+        ));
+    };
+    let fields: Vec<&str> = row.split_whitespace().collect();
+    let Some(available) = fields.get(3) else {
+        return Observed::Unobservable(Reason::saying(
+            "the `df -kP` row stops before the Available column",
+        ));
+    };
+    let Ok(available_kib) = available.parse::<u64>() else {
+        return Observed::Unobservable(Reason::saying(
+            "the Available column of `df -kP` is not a whole number",
+        ));
+    };
+    if available_kib >= floor_kib {
+        satisfied(&format!("{available_kib} KiB free beside the grind directory"))
+    } else {
+        unsatisfied(&format!("{available_kib} KiB free is below the {floor_kib} KiB floor"))
+    }
+}
+
 /// `gh auth status`. A headless box stores the token in plaintext `hosts.yml`; a laptop uses a
 /// keyring. Both are satisfied — what is checked is that a token store exists at all.
 pub fn gh_auth_store(completed: &Completed) -> Observed<Outcome> {
@@ -2106,6 +2151,108 @@ mod tests {
             git_version_floor(&completed("git version 2.20.1\n", "", Some(0)), floor),
             Observed::Present(Outcome::Unsatisfied(_))
         ));
+    }
+
+    /// One plausible `df -kP` answer with room to spare, riding the edge of the format's
+    /// quirks: a multi-word mountpoint trailing the Capacity column.
+    fn df_with(available: u64) -> Completed {
+        completed(
+            &format!(
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
+                 /dev/disk1s1 20485760 9999999 {available} 49% /System/Volumes/Data\n"
+            ),
+            "",
+            Some(0),
+        )
+    }
+
+    #[test]
+    fn space_above_the_disk_headroom_floor_is_satisfied_and_names_the_free_kib() {
+        let Observed::Present(Outcome::Satisfied(said)) = disk_headroom(&df_with(9_501_500_272), 10_485_760)
+        else {
+            panic!("free space far above the floor is satisfied");
+        };
+        assert!(said.contains("9501500272"), "{said}");
+    }
+
+    #[test]
+    fn space_exactly_at_the_disk_headroom_floor_is_still_satisfied() {
+        assert!(matches!(
+            disk_headroom(&df_with(10_485_760), 10_485_760),
+            Observed::Present(Outcome::Satisfied(_))
+        ));
+    }
+
+    #[test]
+    fn one_kib_below_the_disk_headroom_floor_is_unsatisfied_and_names_both_numbers() {
+        let Observed::Present(Outcome::Unsatisfied(said)) =
+            disk_headroom(&df_with(10_485_759), 10_485_760)
+        else {
+            panic!("free space below the floor is unsatisfied");
+        };
+        assert!(said.contains("10485759"), "{said}");
+        assert!(said.contains("10485760"), "{said}");
+    }
+
+    #[test]
+    fn malformed_df_output_reads_could_not_observe_never_a_verdict_on_the_disk_headroom_check() {
+        let blind = [
+            // A call that never got a usable answer is a fact about the check, not about the
+            // disk — including when stdout rode along or stderr explains why.
+            completed("", "", Some(1)),
+            completed(
+                "",
+                "df: /System/Volumes/Data: No such file or directory\n",
+                Some(1),
+            ),
+            completed(
+                "df: illegal option -- k\nUsage: df [-hkn] [file ...]\n",
+                "",
+                Some(2),
+            ),
+            // Header only: the data row every column lives in is missing.
+            completed(
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n",
+                "",
+                Some(0),
+            ),
+            // A row too short to carry an Available column…
+            completed(
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
+                 /dev/disk1s1 20485760 9999999\n",
+                "",
+                Some(0),
+            ),
+            // …and a fourth field that is some other column's rendering (the Capacity
+            // percent) rather than a count.
+            completed(
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
+                 /dev/disk1s1 20485760 9999999 49% /System/Volumes/Data\n",
+                "",
+                Some(0),
+            ),
+            // BusyBox-style placeholder where a number should be.
+            completed(
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
+                 /dev/disk1s1 20485760 9999999 -- /System/Volumes/Data\n",
+                "",
+                Some(0),
+            ),
+        ];
+        for df in blind {
+            match disk_headroom(&df, 10_485_760) {
+                Observed::Unobservable(reason) => {
+                    let said = reason.to_string();
+                    assert!(
+                        !said.contains("/dev/disk1s1")
+                            && !said.contains("illegal option")
+                            && !said.contains("No such file"),
+                        "raw child output must never reach a reason: {said}"
+                    );
+                }
+                other => panic!("a blind reading must withhold the verdict, not give one: {other:?}"),
+            }
+        }
     }
 
     #[test]
