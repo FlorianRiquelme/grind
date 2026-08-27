@@ -2800,4 +2800,28 @@ README.md
         assert!(said.contains("~/.grind/repos/o/n"), "{said}");
         assert!(!said.contains("holding ~/.grind,"), "{said}");
     }
+
+    /// Does not re-check `Check::DiskHeadroom`'s depth or its presence in
+    /// `job::dispatch_subset()` (owned by a test in `src/job.rs`), and does not re-check the
+    /// dispatch-depth presence arm (owned by a test in `src/supervisor.rs`). This test's only
+    /// job is the refusal-shape mirror between the two classifiers, from literals.
+    #[test]
+    fn the_disk_headroom_refusal_and_the_api_key_refusal_are_the_same_value_shape() {
+        let disk = disk_headroom(
+            &[(
+                "~/.grind".to_string(),
+                completed(
+                    "Filesystem   1024-blocks      Used Available Capacity  Mounted on\n/dev/disk3s5   482797652 418198096  2097152    97%    /System/Volumes/Data\n",
+                    "",
+                    Some(0),
+                ),
+            )],
+            5,
+        );
+        let key = agent_key_present(false, false);
+        assert!(matches!(disk, Observed::Present(Outcome::Unsatisfied(_))));
+        assert!(matches!(key, Observed::Present(Outcome::Unsatisfied(_))));
+        assert!(!matches!(disk, Observed::Absent));
+        assert!(!matches!(key, Observed::Absent));
+    }
 }
