@@ -11,10 +11,11 @@
 #   scripts/worktree-edit-link.sh <worktree-dir>       # create links, print them
 #   scripts/worktree-edit-link.sh <worktree-dir> --rm  # remove links (cleanup)
 #
-# <worktree-dir> is the worktree root (e.g. ../grind-179). Every top-level directory
-# and regular file of the worktree that is NOT tracked in this checkout gets a
-# session-root link named .worktree-<name>-<entry>; files tracked here (AGENTS.md,
-# justfile, ...) are left alone so this checkout stays pristine.
+# <worktree-dir> is the worktree root (e.g. ../grind-179). Every top-level entry of
+# the worktree except `.git` gets a session-root link named .worktree-<name>-<entry>,
+# unless that name is already taken in this checkout (tracked files like AGENTS.md
+# are left alone so this checkout stays pristine). Cleanup only ever touches links
+# whose target is the worktree named on the command line.
 set -eu
 
 if [ "$#" -lt 1 ]; then
@@ -22,31 +23,29 @@ if [ "$#" -lt 1 ]; then
     exit 2
 fi
 
-WT=$(cd "$1" && pwd)
-ROOT=$(pwd)
-NAME=$(basename "$WT")
-PREFIX=".worktree-${NAME}-"
-
 if [ "${2:-}" = "--rm" ]; then
-    for link in "$PREFIX"*; do
-        [ -L "$link" ] && rm "$link" && echo "removed $link"
+    for link in .worktree-*; do
+        [ -L "$link" ] || continue
+        target=$(readlink "$link")
+        case "$target" in
+            "$1"/*|"$1") rm "$link" && echo "removed $link" ;;
+        esac
     done
-    git checkout -- . 2>/dev/null || true
     exit 0
 fi
+WT=$(cd "$1" && pwd)
+NAME=$(basename "$WT")
+PREFIX=".worktree-${NAME}-"
+ROOT=$(pwd)
 
-[ -d "$WT/.git" ] || [ -f "$WT/.git" ] || { echo "not a worktree: $WT" >&2; exit 1; }
-
-for entry in "$WT"/*; do
+for entry in "$WT"/* "$WT"/.[!.]* "$WT"/..?*; do
+    [ -e "$entry" ] || continue
     base=$(basename "$entry")
+    [ "$base" = ".git" ] && continue
     link="$PREFIX$base"
-    [ -e "$ROOT/$base" ] && continue
-    [ -e "$ROOT/$link" ] && continue
-    if [ -d "$entry" ]; then
-        ln -s "$entry" "$link"
-    else
-        ln -s "$entry" "$link"
-    fi
+    [ -e "$ROOT/$base" ] || [ -L "$ROOT/$base" ] && continue
+    [ -e "$ROOT/$link" ] || [ -L "$ROOT/$link" ] && continue
+    ln -s "$entry" "$link"
     echo "linked $link -> $entry"
 done
 echo "edit through $ROOT/$PREFIX* paths; run '$0 $1 --rm' when the work merges"
