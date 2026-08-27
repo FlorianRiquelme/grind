@@ -310,15 +310,36 @@ fn resolves_within(raw: &str) -> bool {
 /// hand-written duplicate to check the forbidden-spelling table against, and nothing bound the
 /// two, so they could drift while `just verify` stayed green. `attempt`'s tests import this one
 /// instead, so the table validates the matcher grind actually runs.
+///
+/// **Iterative on purpose.** The obvious recursive form (`'*'` arm recursing on `&c[1..]`) costs
+/// one stack frame per candidate byte, so a `*` scanning a long tail overflows the stack — a
+/// 32 KiB argument reached it, and the gate is the last thing that may crash a Run. This is the
+/// standard two-pointer wildcard match: remember the last `*` and the candidate position it was
+/// first tried at, and on a later mismatch resume one byte further along. Same language as the
+/// recursion it replaces — `*` the only wildcard, full-string, byte-exact otherwise — in O(1)
+/// space and no frames.
 pub(crate) fn glob_matches(pattern: &str, candidate: &str) -> bool {
-    fn rec(p: &[u8], c: &[u8]) -> bool {
-        match p.first() {
-            None => c.is_empty(),
-            Some(b'*') => rec(&p[1..], c) || (!c.is_empty() && rec(p, &c[1..])),
-            Some(head) => c.first() == Some(head) && rec(&p[1..], &c[1..]),
+    let (p, c) = (pattern.as_bytes(), candidate.as_bytes());
+    let (mut pi, mut ci) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut resume = 0usize;
+    while ci < c.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            resume = ci;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == c[ci] {
+            pi += 1;
+            ci += 1;
+        } else if let Some(last) = star {
+            pi = last + 1;
+            resume += 1;
+            ci = resume;
+        } else {
+            return false;
         }
     }
-    rec(pattern.as_bytes(), candidate.as_bytes())
+    p[pi..].iter().all(|b| *b == b'*')
 }
 
 /// Split a compound shell command the way the documented matcher does, before per-subcommand
@@ -419,49 +440,68 @@ pub(crate) fn subcommands_of(command: &str) -> Vec<String> {
 /// A byte budget replaces the earlier fixed leading-token cap (`MAX_SUFFIX_TOKENS`, 64; #169,
 /// CodeRabbit review `ac7d370d`, Security/Major): that cap dropped *every* candidate starting
 /// past token 64, so a denied verb behind a longer benign prefix escaped suffix dropping
-/// entirely. Generation walks a piece's starts left to right and stops once the bytes already
-/// produced would exceed this budget — short pieces get full coverage, and a forbidden verb
-/// keeps yielding its own candidate until its prefix alone exhausts the budget.
+/// entirely.
 ///
-/// **The boundary is quadratic in token count, not linear.** Each successive suffix is nearly as
-/// long as the last, so a prefix of `n` tokens averaging `w` bytes (plus a separator) emits
-/// roughly `n²·w/2` bytes before the verb's own start is reached: the budget is spent by
-/// `n ≈ sqrt(2·32 KiB / w)`. Measured against a `git push --force origin main` payload, the verb
-/// still yields its candidate behind **92** six-byte assignment tokens (`AAA=AA`) and no longer
-/// does at 93 — 99 at five bytes, 120 at three — against 65 under the old cap. Pinned on the
-/// refusal side by `a_denied_verb_at_the_documented_budget_boundary_is_refused`, which stays true
-/// under any later budget increase. What is accepted is the same constructed-input class as
-/// before, at a larger and now *priced* boundary: a verb padded behind a prefix worth more than
-/// this many bytes of suffixes is not found by suffix dropping alone. Reaching ~250 tokens would
-/// cost ~7× this budget for no threat-model gain, since a real wrapper stack is under ten tokens
-/// deep. A single-token piece has no drops to skip and still contributes itself whole.
-/// `push_with_basename`'s variants add at most one further copy per candidate, so total emission
-/// stays under twice this budget.
+/// **Two candidates are unconditional, then the budget spends shortest-first.** The piece itself
+/// is always emitted, whatever its length and without being charged when it alone exceeds the
+/// budget — it is what a front-anchored glob matches when the denied verb sits at the front of a
+/// huge command line (`git push --force origin main <32 KiB of arguments>`), and charging it
+/// would starve every later candidate. The remaining starts are then walked **from the end
+/// toward the front**, adding while the budget holds.
+///
+/// Shortest-first is a correctness property, not a micro-optimization. Padding sits *before* a
+/// hidden verb, so the verb's own suffix is short and is reached almost immediately; only starts
+/// buried under a >32 KiB run of *later* tokens go uncovered. Emitting longest-first instead made
+/// coverage non-monotone in padding length: the padding's own long suffixes spent the budget
+/// before the verb's short one was reached, so 93 six-byte padding tokens hid the verb while 92
+/// and 94 did not. `a_denied_verb_behind_any_length_of_padding_is_refused` pins the rule the
+/// reordering buys — 1 through 5,000 padding tokens all refused — instead of pinning one
+/// arithmetic accident.
+///
+/// What remains accepted is narrow and structural: a token start sitting deep inside a piece
+/// larger than this budget, with thousands of tokens still to its right. Not the front (always a
+/// candidate) and not the tail (covered shortest-first). A single-token piece has no drops to
+/// skip and still contributes itself whole. `push_with_basename`'s variants add at most one
+/// further copy per candidate, so total emission stays under twice this budget plus the piece.
 const SUFFIX_BUDGET_BYTES: usize = 32 * 1024;
 
-/// Every token-boundary suffix of `piece`, until the bytes already emitted stop the walk:
-/// `piece` itself (dropping no leading tokens), then the piece with its first token dropped,
-/// then its first two dropped, and so on — bounded by [`SUFFIX_BUDGET_BYTES`]. The general
+/// Every token-boundary suffix of `piece` the budget affords: `piece` itself always, then the
+/// shortest suffix, the next shortest, and so on toward the front while
+/// [`SUFFIX_BUDGET_BYTES`] holds — see that constant for why the piece is unconditional and why
+/// the walk runs from the end. Order within the returned set carries no meaning; `gate` asks
+/// whether *any* candidate matches. The general
 /// replacement for the old wrapper-name list and leading-assignment stripper: both special-cased
 /// *which* leading tokens to drop (`env`, `nice`, a `NAME=value` pair); this drops every
 /// possible prefix of leading tokens instead, so no wrapper — however it is spelled, however
 /// many options it takes — needs naming for its remainder to surface as a candidate.
 fn token_suffixes(piece: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut emitted = 0usize;
+    let mut starts = Vec::new();
     let mut in_token = false;
     for (i, ch) in piece.char_indices() {
         if ch.is_whitespace() {
             in_token = false;
         } else if !in_token {
             in_token = true;
-            let suffix = &piece[i..];
-            if !out.is_empty() && emitted + suffix.len() > SUFFIX_BUDGET_BYTES {
-                break;
-            }
-            emitted += suffix.len();
-            out.push(suffix.to_string());
+            starts.push(i);
         }
+    }
+    let mut out = Vec::new();
+    let mut emitted = 0usize;
+    let Some(&front) = starts.first() else {
+        return out;
+    };
+    let whole = &piece[front..];
+    out.push(whole.to_string());
+    if whole.len() <= SUFFIX_BUDGET_BYTES {
+        emitted = whole.len();
+    }
+    for &i in starts.iter().skip(1).rev() {
+        let suffix = &piece[i..];
+        if emitted + suffix.len() > SUFFIX_BUDGET_BYTES {
+            break;
+        }
+        emitted += suffix.len();
+        out.push(suffix.to_string());
     }
     out
 }
@@ -840,14 +880,42 @@ mod tests {
     }
 
     #[test]
-    fn a_denied_verb_at_the_documented_budget_boundary_is_refused() {
+    fn a_denied_verb_behind_any_length_of_padding_is_refused() {
+        let all_denials: Vec<String> = crate::attempt::DENIED_TOOLS
+            .iter()
+            .map(|g| g.to_string())
+            .collect();
+        // 92/93 were the cumulative-budget boundary when the walk emitted longest-first, and 93
+        // was a hole: the padding's own long suffixes spent the budget before the verb's short
+        // one was reached. Shortest-first has no such band, so padding length stops mattering.
+        for pad in [1usize, 65, 92, 93, 94, 1_000, 5_000] {
+            let command = format!(
+                "{} git push --force origin main",
+                vec!["AAA=AA"; pad].join(" ")
+            );
+            assert_eq!(
+                denied_layer(gate(
+                    &all_denials,
+                    call(
+                        "bash",
+                        &serde_json::json!({ "command": command }).to_string(),
+                    ),
+                )),
+                GateLayer::DeniedGlob,
+                "a verb behind {pad} padding tokens must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_over_budget_leading_token_still_yields_the_verb_candidate() {
         let all_denials: Vec<String> = crate::attempt::DENIED_TOOLS
             .iter()
             .map(|g| g.to_string())
             .collect();
         let command = format!(
             "{} git push --force origin main",
-            vec!["AAA=AA"; 92].join(" ")
+            "z".repeat(SUFFIX_BUDGET_BYTES + 1)
         );
         assert_eq!(
             denied_layer(gate(
@@ -858,7 +926,30 @@ mod tests {
                 ),
             )),
             GateLayer::DeniedGlob,
-            "the boundary SUFFIX_BUDGET_BYTES documents must be the boundary it has"
+            "one over-budget leading token must not spend the whole walk"
+        );
+    }
+
+    #[test]
+    fn an_over_budget_piece_still_yields_the_verb_at_its_own_front() {
+        let all_denials: Vec<String> = crate::attempt::DENIED_TOOLS
+            .iter()
+            .map(|g| g.to_string())
+            .collect();
+        let command = format!(
+            "git push --force origin main {}",
+            "z".repeat(SUFFIX_BUDGET_BYTES + 1)
+        );
+        assert_eq!(
+            denied_layer(gate(
+                &all_denials,
+                call(
+                    "bash",
+                    &serde_json::json!({ "command": command }).to_string(),
+                ),
+            )),
+            GateLayer::DeniedGlob,
+            "the piece itself is always a candidate, however long its tail"
         );
     }
 
@@ -939,6 +1030,61 @@ mod tests {
                 "subcommand split must catch `{command}`"
             );
         }
+    }
+
+    #[test]
+    fn the_iterative_matcher_accepts_exactly_what_the_recursion_did() {
+        fn rec(p: &[u8], c: &[u8]) -> bool {
+            match p.first() {
+                None => c.is_empty(),
+                Some(b'*') => rec(&p[1..], c) || (!c.is_empty() && rec(p, &c[1..])),
+                Some(head) => c.first() == Some(head) && rec(&p[1..], &c[1..]),
+            }
+        }
+        fn words(alphabet: &[u8], max: usize) -> Vec<String> {
+            let mut out = vec![String::new()];
+            let mut frontier = vec![String::new()];
+            for _ in 0..max {
+                frontier = frontier
+                    .iter()
+                    .flat_map(|w| {
+                        alphabet
+                            .iter()
+                            .map(|b| format!("{w}{}", *b as char))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                out.extend(frontier.iter().cloned());
+            }
+            out
+        }
+        let patterns = words(b"ab*", 4);
+        let candidates = words(b"ab", 4);
+        for pattern in &patterns {
+            for candidate in &candidates {
+                assert_eq!(
+                    glob_matches(pattern, candidate),
+                    rec(pattern.as_bytes(), candidate.as_bytes()),
+                    "{pattern:?} vs {candidate:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_benign_command_line_is_matched_without_crashing_the_gate() {
+        let all_denials: Vec<String> = crate::attempt::DENIED_TOOLS
+            .iter()
+            .map(|g| g.to_string())
+            .collect();
+        let command = format!("git commit -m \"{}\"", "detail ".repeat(8 * 1024));
+        allowed_layer(gate(
+            &all_denials,
+            call(
+                "bash",
+                &serde_json::json!({ "command": command }).to_string(),
+            ),
+        ));
     }
 
     #[test]

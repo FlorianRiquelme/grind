@@ -205,18 +205,31 @@ unsatisfiable by construction and gets deleted by whoever trips it next (ledger 
 
   Suffix generation costs work proportional to tokens considered times piece length, so the
   cumulative bytes of candidates one piece may generate are budgeted
-  (`tools::SUFFIX_BUDGET_BYTES`, 32 KiB) — generation stops once the bytes already produced
-  would pass it. This replaced a fixed 64-token cap (#169, CodeRabbit review `ac7d370d`,
-  Security/Major): the cap dropped *every* candidate starting past token 64, so a denied verb
-  behind a longer benign prefix escaped suffix dropping entirely, while a real wrapper stack is
-  under ten tokens deep before the wrapped verb. The budget keeps short pieces fully covered and
-  still bounds the cost of a long ordinary command line; what is accepted is the same
-  constructed-input class as before, at a larger and priced boundary. **That boundary is
-  quadratic in token count, not linear** — each successive suffix is nearly as long as the last,
-  so a prefix of `n` tokens averaging `w` bytes exhausts the budget at `n ≈ sqrt(2·32 KiB / w)`:
-  measured, a verb behind **92** six-byte assignment tokens is still refused and one behind 93 is
-  not (99 at five bytes, 120 at three), against 65 under the old cap. Reaching ~250 tokens would
-  cost ~7× the budget for no threat-model gain. One false refusal is accepted, unchanged from the
+  (`tools::SUFFIX_BUDGET_BYTES`, 32 KiB). This replaced a fixed 64-token cap (#169, CodeRabbit
+  review `ac7d370d`, Security/Major): the cap dropped *every* candidate starting past token 64, so
+  a denied verb behind a longer benign prefix escaped suffix dropping entirely, while a real
+  wrapper stack is under ten tokens deep before the wrapped verb.
+
+  **Two things about how that budget is spent are load-bearing, and both were bugs first** (#179,
+  CodeRabbit Security/Major). The piece itself is emitted unconditionally and is *not* charged
+  when it alone exceeds the budget — it is the candidate a front-anchored glob matches when the
+  verb sits at the front of a huge command line, and charging it let one over-budget leading token
+  (`<32 KiB token> git push --force origin main`) consume the whole walk, which **was an allow**.
+  And the remaining starts are walked **from the end toward the front**, shortest suffix first:
+  padding sits *before* a hidden verb, so the verb's own suffix is short and is reached at once.
+  Longest-first made coverage non-monotone in padding length — 93 six-byte padding tokens hid the
+  verb while 92 and 94 did not — which is why the test pins the rule (1 through 5,000 padding
+  tokens, all refused) rather than a boundary number. What stays accepted is narrow and
+  structural: a start buried inside a piece over 32 KiB with thousands of tokens still to its
+  right — not the front, not the tail.
+
+  `tools::glob_matches` is **iterative for the same class of reason**: the natural recursive
+  wildcard match costs a stack frame per candidate byte, so a `*` scanning a long tail overflowed
+  the stack — an ordinary `git commit -m "<32 KiB message>"` reached it, and a gate that panics
+  refuses nothing. The two-pointer form accepts the same language (pinned by a differential test
+  against the recursion it replaced) in no frames.
+
+  One false refusal is accepted, unchanged from the
   prior round: a quoted string that happens to spell a denied command as a literal rather than as an
   invocation (`git commit -m "git push --force"` is refused, since the quoted text matches
   `Bash(git push*--force*)`).
