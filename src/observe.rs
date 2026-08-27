@@ -1312,11 +1312,14 @@ pub fn disk_headroom(readings: &[(String, Completed)], floor_gib: u64) -> Observ
     let mut seen_lines: Vec<&str> = Vec::new();
     let mut tightest: Option<(&str, u64)> = None;
     for (label, completed) in readings {
-        let Some(gib) = parse_available_gib(&completed.stdout) else {
-            return Observed::Unobservable(Reason::saying(&format!("df -Pk {label}: unreadable")));
+        let unreadable =
+            || Observed::Unobservable(Reason::saying(&format!("df -Pk {label}: unreadable")));
+        let Some(data_line) = data_line_of(&completed.stdout) else {
+            return unreadable();
         };
-        let data_line =
-            data_line_of(&completed.stdout).expect("parsed above, so a data line exists");
+        let Some(gib) = parse_available_gib(data_line) else {
+            return unreadable();
+        };
         if seen_lines.contains(&data_line) {
             continue;
         }
@@ -1360,8 +1363,7 @@ fn data_line_of(stdout: &str) -> Option<&str> {
     found
 }
 
-fn parse_available_gib(stdout: &str) -> Option<u64> {
-    let line = data_line_of(stdout)?;
+fn parse_available_gib(line: &str) -> Option<u64> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let percent_index = tokens.iter().position(|t| t.ends_with('%'))?;
     if percent_index == 0 {
