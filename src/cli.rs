@@ -965,4 +965,55 @@ mod tests {
             "a call that did not run to completion withholds the verdict"
         );
     }
+
+    /// The DiskHeadroom arm must answer exactly as its composition says: spawn `df -kP` on
+    /// the grind directory, hand the `Completed` to the classifier with the pinned floor.
+    /// Reproducing that composition independently (never through the arm) and demanding
+    /// equality pins the argv words, the directory step, and the floor constant at *this*
+    /// callsite (#165).
+    #[test]
+    fn the_disk_headroom_arm_answers_through_check_with_probe() {
+        let home = world::temp_dir("cli-disk-headroom-arm");
+        world::create_dir_all(&job::grind_dir(&home)).expect("a scratch grind directory");
+
+        let answered = check_with_probe(&home, &[], Check::DiskHeadroom, |_endpoint| false);
+        let dir = job::grind_dir(&home).display().to_string();
+        let ground_truth = observe::disk_headroom(
+            &world::run(&words(&["df", "-kP", &dir]), None),
+            job::DISK_HEADROOM_FLOOR_KIB,
+        );
+
+        // Two live `df` spawns never land on the same free-KiB figure, so the *rendered
+        // bytes* cannot be pinned; what must agree is the verdict itself and the reading it
+        // names — the same volume, the same column, read twice microseconds apart.
+        let free_kib_named = |outcome: &Outcome| -> u64 {
+            let (text, why) = match outcome {
+                Outcome::Satisfied(text) => (text, "satisfied"),
+                Outcome::Unsatisfied(text) => (text, "unsatisfied"),
+                Outcome::Unchecked(text) => (text, "unchecked"),
+            };
+            text.split_whitespace()
+                .find_map(|token| token.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("{why} must name a KiB figure: {text}"))
+        };
+        match (&answered, &ground_truth) {
+            (Observed::Present(outcome), Observed::Present(truth)) => {
+                let (read_by_the_arm, read_directly) =
+                    (free_kib_named(outcome), free_kib_named(truth));
+                let drift = read_by_the_arm.abs_diff(read_directly);
+                assert!(
+                    drift <= read_by_the_arm.max(read_directly) / 100,
+                    "the same volume read twice must agree: {outcome:?} vs {truth:?}",
+                );
+            }
+            _ => {
+                assert_eq!(
+                    answered, ground_truth,
+                    "off the happy path the arm's verdict must still match the composition"
+                );
+            }
+        }
+
+        world::remove_tree(&home);
+    }
 }
