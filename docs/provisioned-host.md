@@ -72,6 +72,16 @@ housekeeping here is what withdraws the guarantee.
   here rather than inside a checkout, so *never committed*
   ([#8](https://github.com/FlorianRiquelme/grind/issues/8)) holds because it is outside any git
   repo, not because a `.gitignore` line says so.
+- **The volumes holding `~/.grind` and each declared clone have room left.** — *dispatch,
+  doctor* — The floor is `job::DISK_HEADROOM_FLOOR_GIB`, 5 GiB. It is read with `df -Pk` against
+  `~/.grind` itself and, separately, against every declared clone — never against `$HOME` or `/`,
+  since a clone under `repos/<owner>/<name>` can be a symlink onto a volume neither of those two
+  paths would describe. Falling short of the floor on either volume refuses the Dispatch and
+  turns up in `grind doctor`, the same item read at two depths. A `df` call that cannot resolve or
+  whose output cannot be parsed reads as could-not-observe rather than unsatisfied: it means the
+  question went unanswered, not that the answer was no. The floor is flat rather than scaled by
+  how many Runs share the host; whether it should instead be per-Run and multiplied by declared
+  concurrency is open, since nothing on the host today declares that number.
 
 ## Executables
 

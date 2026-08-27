@@ -1621,22 +1621,23 @@ fn announce(run_dir: &Path, record: &RunRecord, observation: &Observation, verdi
 
 fn refuse_unless_host_ready(home: &Path, job: &Job, backend: Backend) -> Result<(), Refusal> {
     for item in required_dispatch_items(backend) {
-        let found = check_presence(home, job, item.check);
-        match found {
-            Observed::Present(ItemOutcome::Satisfied(_))
-            | Observed::Present(ItemOutcome::Unchecked(_)) => {}
-            Observed::Present(ItemOutcome::Unsatisfied(said)) => {
-                return Err(Refusal::saying(format!("host: {}: {said}", item.name)));
-            }
-            Observed::Absent => {
-                return Err(Refusal::saying(format!("host: {}: absent", item.name)));
-            }
-            Observed::Unobservable(reason) => {
-                return Err(Refusal::saying(format!("host: {}: {reason}", item.name)));
-            }
-        }
+        refusal_for(item.name, check_presence(home, job, item.check))?;
     }
     Ok(())
+}
+
+/// The per-item mapping `refuse_unless_host_ready` folds over its list with, pulled out so a
+/// test can assert against a single item's outcome directly without dispatching a whole Job.
+fn refusal_for(name: &str, found: Observed<ItemOutcome>) -> Result<(), Refusal> {
+    match found {
+        Observed::Present(ItemOutcome::Satisfied(_))
+        | Observed::Present(ItemOutcome::Unchecked(_)) => Ok(()),
+        Observed::Present(ItemOutcome::Unsatisfied(said)) => {
+            Err(Refusal::saying(format!("host: {name}: {said}")))
+        }
+        Observed::Absent => Err(Refusal::saying(format!("host: {name}: absent"))),
+        Observed::Unobservable(reason) => Err(Refusal::saying(format!("host: {name}: {reason}"))),
+    }
 }
 
 /// The dispatch subset, narrowed to what this Dispatch's declared backend actually needs.
@@ -1729,8 +1730,39 @@ fn check_presence(home: &Path, job: &Job, check: job::Check) -> Observed<ItemOut
             &world::run(&words(&["sh", "-c", &format!("command -v {tool}")]), None),
         ),
         job::Check::SkillsPresent => obs::skills_present(&skill_dir_names(home)),
+        job::Check::DiskHeadroom => obs::disk_headroom(
+            &disk_readings(home, &job.target_repo),
+            job::DISK_HEADROOM_FLOOR_GIB,
+        ),
         other => obs::unchecked(&format!("{other:?} is not a dispatch-depth check")),
     }
+}
+
+/// `~/.grind` and the Job's own clone — the shallower, Job-scoped reading of the same item
+/// `cli::disk_readings` reads more broadly for doctor. Deliberately not shared, for the reason
+/// `check_presence`'s own doc comment gives: dispatch depth (no network, presence only) differs
+/// per item from doctor's relaxed checks.
+fn disk_readings(home: &Path, target_repo: &str) -> Vec<(String, world::Completed)> {
+    vec![
+        (
+            "~/.grind".to_string(),
+            world::run(
+                &words(&["df", "-Pk", &job::grind_dir(home).display().to_string()]),
+                None,
+            ),
+        ),
+        (
+            format!("~/.grind/repos/{target_repo}"),
+            world::run(
+                &words(&[
+                    "df",
+                    "-Pk",
+                    &job::repo_path(home, target_repo).display().to_string(),
+                ]),
+                None,
+            ),
+        ),
+    ]
 }
 
 /// `~/.grind/skills/run` — the host skill root ADR-0015 declares (decision 1). Provisioning
@@ -2013,6 +2045,67 @@ mod tests {
         assert!(
             !items.iter().any(|i| i.check == job::Check::ClaudeBinary),
             "a native-only host must not be refused for lacking `claude`"
+        );
+    }
+
+    fn job() -> Job {
+        Job {
+            issue: 28,
+            url: "https://github.com/FlorianRiquelme/snapper/issues/28".to_string(),
+            title: "Slice 1b".to_string(),
+            labels: vec![],
+            target_repo: "o/n".to_string(),
+            branch: "feat/28-slice-1b".to_string(),
+            handoff_sha: "9d1f4c7a".to_string(),
+            anchor: "docs/plans/a.md".to_string(),
+            intent: None,
+            model: None,
+            done_predicate: "just verify is green".to_string(),
+            base_branch: "main".to_string(),
+            verify_entrypoint: "just verify".to_string(),
+            declared_hot_paths: vec![],
+        }
+    }
+
+    #[test]
+    fn check_presence_answers_for_disk_headroom_never_unchecked() {
+        let home = Path::new("/nowhere/that/exists");
+        let job = job();
+        let found = check_presence(home, &job, job::Check::DiskHeadroom);
+        assert!(
+            matches!(found, Observed::Unobservable(_)),
+            "a df against a nonexistent path should read as unobservable, got {found:?}"
+        );
+    }
+
+    #[test]
+    fn every_dispatch_depth_item_gets_a_non_unchecked_answer_from_check_presence() {
+        let home = Path::new("/nowhere/that/exists");
+        let job = job();
+        for item in job::dispatch_subset() {
+            let found = check_presence(home, &job, item.check);
+            assert!(
+                !matches!(found, Observed::Present(ItemOutcome::Unchecked(_))),
+                "{} fell through check_presence's wildcard arm and silently never refuses a \
+                 Dispatch",
+                item.name
+            );
+        }
+    }
+
+    #[test]
+    fn refusal_for_the_disk_item_reads_host_disk_headroom_said() {
+        let result = refusal_for(
+            "disk headroom",
+            Observed::Present(ItemOutcome::Unsatisfied(
+                "2 GiB free on the volume holding ~/.grind is below the 5 GiB floor".to_string(),
+            )),
+        );
+        let err = result.expect_err("an unsatisfied disk item must refuse");
+        assert_eq!(
+            err.to_string(),
+            "host: disk headroom: 2 GiB free on the volume holding ~/.grind is below the 5 GiB \
+             floor"
         );
     }
 

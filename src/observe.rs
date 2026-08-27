@@ -1299,6 +1299,81 @@ fn parse_git_version(output: &str) -> Option<(u64, u64)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
+/// `df -Pk <path>` free space against a floor, dispatch's own reading rule.
+pub fn disk_headroom(readings: &[(String, Completed)], floor_gib: u64) -> Observed<Outcome> {
+    if readings.is_empty() {
+        return Observed::Unobservable(Reason::saying("df -Pk: no path to measure"));
+    }
+    for (_, completed) in readings {
+        if completed.code != Some(0) {
+            return Observed::Unobservable(Reason::of("df -Pk", completed));
+        }
+    }
+    let mut seen_lines: Vec<&str> = Vec::new();
+    let mut tightest: Option<(&str, u64)> = None;
+    for (label, completed) in readings {
+        let unreadable =
+            || Observed::Unobservable(Reason::saying(&format!("df -Pk {label}: unreadable")));
+        let Some(data_line) = data_line_of(&completed.stdout) else {
+            return unreadable();
+        };
+        let Some(gib) = parse_available_gib(data_line) else {
+            return unreadable();
+        };
+        if seen_lines.contains(&data_line) {
+            continue;
+        }
+        seen_lines.push(data_line);
+        if tightest.is_none_or(|(_, tightest_gib)| gib < tightest_gib) {
+            tightest = Some((label, gib));
+        }
+    }
+    let (label, gib) = tightest.expect("at least one reading parsed, checked above");
+    if gib >= floor_gib {
+        satisfied(&format!(
+            "{gib} GiB free on the volume holding {label}, at or above {floor_gib} GiB"
+        ))
+    } else {
+        unsatisfied(&format!(
+            "{gib} GiB free on the volume holding {label} is below the {floor_gib} GiB floor"
+        ))
+    }
+}
+
+fn data_line_of(stdout: &str) -> Option<&str> {
+    let mut found: Option<&str> = None;
+    for line in stdout.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+        let percent_positions: Vec<usize> = tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.ends_with('%'))
+            .map(|(i, _)| i)
+            .collect();
+        if percent_positions.len() == 1 && percent_positions[0] != 0 {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(line);
+        }
+    }
+    found
+}
+
+fn parse_available_gib(line: &str) -> Option<u64> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let percent_index = tokens.iter().position(|t| t.ends_with('%'))?;
+    if percent_index == 0 {
+        return None;
+    }
+    let available = tokens[percent_index - 1];
+    let kib: u64 = available.parse().ok()?;
+    Some(kib / 1024 / 1024)
+}
+
 /// `gh auth status`. A headless box stores the token in plaintext `hosts.yml`; a laptop uses a
 /// keyring. Both are satisfied — what is checked is that a token store exists at all.
 pub fn gh_auth_store(completed: &Completed) -> Observed<Outcome> {
@@ -2584,5 +2659,171 @@ README.md
         let found = native_freshness(&[], 1_785_000_000);
         assert!(matches!(found, Observed::Unobservable(_)), "{found:?}");
         assert_ne!(found, Observed::Present(0));
+    }
+
+    const DARWIN_DF_16_GIB: &str = "Filesystem   1024-blocks      Used Available Capacity  Mounted on\n/dev/disk3s5   482797652 418198096  16967316    97%    /System/Volumes/Data\n";
+    const DARWIN_DF_2_GIB: &str = "Filesystem   1024-blocks      Used Available Capacity  Mounted on\n/dev/disk3s5   482797652 418198096  2097152    97%    /System/Volumes/Data\n";
+    const DARWIN_DF_AUTO_HOME: &str = "Filesystem      1024-blocks Used Available Capacity Mounted on\nmap auto_home             0    0         0      100% /System/Volumes/Data/home\n";
+    const GNU_DF_50_GIB: &str = "Filesystem     1024-blocks    Used Available Capacity Mounted on\n/dev/sda1       103080992 45000000  52859312  47% /\n";
+
+    #[test]
+    fn disk_headroom_with_no_readings_is_could_not_observe() {
+        let found = disk_headroom(&[], 5);
+        assert!(matches!(found, Observed::Unobservable(_)), "{found:?}");
+    }
+
+    #[test]
+    fn disk_headroom_route_nonzero_exit_is_could_not_observe_via_reason_of() {
+        let readings = vec![(
+            "~/.grind".to_string(),
+            completed("", "df: /nonexistent: No such file or directory\n", Some(1)),
+        )];
+        let found = disk_headroom(&readings, 5);
+        let Observed::Unobservable(reason) = found else {
+            panic!("a df that could not answer must be could-not-observe: {found:?}");
+        };
+        assert!(reason.to_string().starts_with("df -Pk:"), "{reason}");
+    }
+
+    #[test]
+    fn disk_headroom_route_header_only_is_could_not_observe() {
+        let readings = vec![(
+            "~/.grind".to_string(),
+            completed(
+                "Filesystem   1024-blocks      Used Available Capacity  Mounted on\n",
+                "",
+                Some(0),
+            ),
+        )];
+        assert!(matches!(
+            disk_headroom(&readings, 5),
+            Observed::Unobservable(_)
+        ));
+        let empty_readings = vec![("~/.grind".to_string(), completed("", "", Some(0)))];
+        assert!(matches!(
+            disk_headroom(&empty_readings, 5),
+            Observed::Unobservable(_)
+        ));
+    }
+
+    #[test]
+    fn disk_headroom_route_more_than_one_data_line_is_could_not_observe() {
+        let two_lines = "Filesystem   1024-blocks      Used Available Capacity  Mounted on\n/dev/disk3s5   482797652 418198096  16967316    97%    /System/Volumes/Data\n/dev/disk3s6   482797652 418198096  16967316    97%    /System/Volumes/Other\n";
+        let readings = vec![("~/.grind".to_string(), completed(two_lines, "", Some(0)))];
+        assert!(matches!(
+            disk_headroom(&readings, 5),
+            Observed::Unobservable(_)
+        ));
+    }
+
+    #[test]
+    fn disk_headroom_route_percent_token_at_line_start_is_could_not_observe_never_a_panic() {
+        let readings = vec![("~/.grind".to_string(), completed("97% \n", "", Some(0)))];
+        assert!(matches!(
+            disk_headroom(&readings, 5),
+            Observed::Unobservable(_)
+        ));
+    }
+
+    #[test]
+    fn disk_headroom_route_unparseable_available_is_could_not_observe() {
+        let dash = "Filesystem   1024-blocks      Used Available Capacity  Mounted on\n/dev/disk3s5   482797652 418198096  -    97%    /System/Volumes/Data\n";
+        let readings = vec![("~/.grind".to_string(), completed(dash, "", Some(0)))];
+        assert!(matches!(
+            disk_headroom(&readings, 5),
+            Observed::Unobservable(_)
+        ));
+    }
+
+    #[test]
+    fn disk_headroom_satisfied_above_the_floor() {
+        let readings = vec![(
+            "~/.grind".to_string(),
+            completed(DARWIN_DF_16_GIB, "", Some(0)),
+        )];
+        assert!(matches!(
+            disk_headroom(&readings, 5),
+            Observed::Present(Outcome::Satisfied(_))
+        ));
+    }
+
+    #[test]
+    fn disk_headroom_unsatisfied_below_the_floor_names_free_gib_and_floor() {
+        let readings = vec![(
+            "~/.grind".to_string(),
+            completed(DARWIN_DF_2_GIB, "", Some(0)),
+        )];
+        let found = disk_headroom(&readings, 5);
+        let Observed::Present(Outcome::Unsatisfied(said)) = found else {
+            panic!("2 GiB free is below a 5 GiB floor: {found:?}");
+        };
+        assert!(said.contains("2 GiB"), "{said}");
+        assert!(said.contains("5 GiB"), "{said}");
+    }
+
+    #[test]
+    fn disk_headroom_reads_a_seven_field_darwin_line_as_a_real_zero_not_a_misread_used_column() {
+        let readings = vec![(
+            "~/.grind".to_string(),
+            completed(DARWIN_DF_AUTO_HOME, "", Some(0)),
+        )];
+        let found = disk_headroom(&readings, 1);
+        let Observed::Present(Outcome::Unsatisfied(said)) = found else {
+            panic!("0 GiB free is a real reading, not an unreadable one: {found:?}");
+        };
+        assert!(said.contains("0 GiB"), "{said}");
+    }
+
+    #[test]
+    fn disk_headroom_reads_a_gnu_style_line_the_same_way() {
+        let readings = vec![("/".to_string(), completed(GNU_DF_50_GIB, "", Some(0)))];
+        assert!(matches!(
+            disk_headroom(&readings, 5),
+            Observed::Present(Outcome::Satisfied(_))
+        ));
+    }
+
+    #[test]
+    fn disk_headroom_over_two_readings_the_tightest_volume_decides_and_is_named() {
+        let readings = vec![
+            (
+                "~/.grind".to_string(),
+                completed(DARWIN_DF_16_GIB, "", Some(0)),
+            ),
+            (
+                "~/.grind/repos/o/n".to_string(),
+                completed(DARWIN_DF_2_GIB, "", Some(0)),
+            ),
+        ];
+        let found = disk_headroom(&readings, 5);
+        let Observed::Present(Outcome::Unsatisfied(said)) = found else {
+            panic!("the tighter reading is below the floor: {found:?}");
+        };
+        assert!(said.contains("~/.grind/repos/o/n"), "{said}");
+        assert!(!said.contains("holding ~/.grind,"), "{said}");
+    }
+
+    /// Does not re-check `Check::DiskHeadroom`'s depth or its presence in
+    /// `job::dispatch_subset()` (owned by a test in `src/job.rs`), and does not re-check the
+    /// dispatch-depth presence arm (owned by a test in `src/supervisor.rs`). This test's only
+    /// job is the refusal-shape mirror between the two classifiers, from literals.
+    #[test]
+    fn the_disk_headroom_refusal_and_the_api_key_refusal_are_the_same_value_shape() {
+        let disk = disk_headroom(
+            &[(
+                "~/.grind".to_string(),
+                completed(
+                    "Filesystem   1024-blocks      Used Available Capacity  Mounted on\n/dev/disk3s5   482797652 418198096  2097152    97%    /System/Volumes/Data\n",
+                    "",
+                    Some(0),
+                ),
+            )],
+            5,
+        );
+        let key = agent_key_present(false, false);
+        assert!(matches!(disk, Observed::Present(Outcome::Unsatisfied(_))));
+        assert!(matches!(key, Observed::Present(Outcome::Unsatisfied(_))));
+        assert!(!matches!(disk, Observed::Absent));
+        assert!(!matches!(key, Observed::Absent));
     }
 }
