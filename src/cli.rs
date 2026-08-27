@@ -635,6 +635,13 @@ fn check_with_probe(
         Check::EndpointReachable => {
             observe::endpoint_reachable(probe_declared_endpoint(job::read_selection(home), probe))
         }
+        Check::DiskHeadroom => {
+            let dir = job::grind_dir(home).display().to_string();
+            observe::disk_headroom(
+                &world::run(&words(&["df", "-kP", &dir]), None),
+                job::DISK_HEADROOM_FLOOR_KIB,
+            )
+        }
         Check::NoBoolean => observe::unchecked(
             "performed during provisioning; every available check would be a guess",
         ),
@@ -906,5 +913,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// One plausible `df -kP` answer as literals — no spawning, the same `Completed`
+    /// shape the arm's `world::run` would hand to the classifier (#165).
+    fn df_with(available: u64) -> world::Completed {
+        world::Completed {
+            stdout: format!(
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
+                 /dev/disk1s1 20485760 9999999 {available} 49% /System/Volumes/Data\n"
+            ),
+            stderr: String::new(),
+            code: Some(0),
+        }
+    }
+
+    #[test]
+    fn the_disk_headroom_arm_mirrors_the_classifier_it_names() {
+        let dir = job::grind_dir(&PathBuf::from("/home/everyhost"))
+            .display()
+            .to_string();
+        assert!(dir.ends_with(".grind"), "{dir}");
+
+        let Observed::Present(Outcome::Satisfied(said)) =
+            observe::disk_headroom(&df_with(10_485_761), job::DISK_HEADROOM_FLOOR_KIB)
+        else {
+            panic!("free space above the floor is satisfied");
+        };
+        assert!(said.contains("10485761"), "{said}");
+
+        let Observed::Present(Outcome::Unsatisfied(short)) =
+            observe::disk_headroom(&df_with(10_485_759), job::DISK_HEADROOM_FLOOR_KIB)
+        else {
+            panic!("free space one KiB below the floor is unsatisfied");
+        };
+        assert!(
+            short.contains("10485759") && short.contains("10485760"),
+            "{short}"
+        );
+
+        let blind = world::Completed {
+            stdout: String::new(),
+            stderr: format!("df: {dir}: No such file or directory\n"),
+            code: Some(1),
+        };
+        assert!(
+            matches!(
+                observe::disk_headroom(&blind, job::DISK_HEADROOM_FLOOR_KIB),
+                Observed::Unobservable(_)
+            ),
+            "a call that did not run to completion withholds the verdict"
+        );
     }
 }
