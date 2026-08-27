@@ -940,6 +940,35 @@ mod tests {
     }
 
     #[test]
+    fn disk_readings_appends_one_labeled_reading_per_declared_clone() {
+        let Some(home) = world::home() else {
+            panic!("this test needs a real home directory on the test-running machine");
+        };
+        let clones = vec![
+            ("owner/repo-a".to_string(), home.clone()),
+            ("owner/repo-b".to_string(), home.clone()),
+        ];
+        let readings = disk_readings(&home, &clones);
+        let labels: Vec<&str> = readings.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "~/.grind",
+                "~/.grind/repos/owner/repo-a",
+                "~/.grind/repos/owner/repo-b",
+            ],
+            "one ~/.grind reading plus one per declared clone, labeled by name"
+        );
+        for (label, completed) in &readings {
+            assert_eq!(
+                completed.code,
+                Some(0),
+                "`df -Pk` against a real path ({label}) must succeed"
+            );
+        }
+    }
+
+    #[test]
     fn the_driver_answers_for_every_item_on_the_list() {
         let home = Path::new("/nowhere/that/exists");
         for item in job::host_items() {
