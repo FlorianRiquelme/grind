@@ -24,6 +24,8 @@
   "worktree": "/Users/operator/Repos/mine/snapper/.claude/worktrees/grind-feat-28-slice-1b",
   "session_id": "d51b4c39-ce1d-449b-8366-04b9b1aa6573",
   "claude_bin": "/Users/operator/.grind/bin/claude",
+  "omp_bin": "/Users/operator/.bun/bin/omp",
+  "omp_version": "18.0.6",
   "model": null,
   "denied_tools": [
     "Bash(gh pr merge*)",

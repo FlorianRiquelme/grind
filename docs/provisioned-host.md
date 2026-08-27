@@ -33,9 +33,11 @@ lock.
 ## Layout
 
 `~/.grind/` is the host's Grind directory, and **its layout is the declaration** — there is no
-config file, no environment override, and nothing to keep in sync. `$HOME` is the only variable,
-and it is the dispatching user's. See ADR-0008 before changing any of this; the tidy-up that looks
-like housekeeping here is what withdraws the guarantee.
+config file and nothing to keep in sync. `$HOME` is the only variable that moves the layout
+itself, and it is the dispatching user's. One deliberate exception exists and is documented where
+it appears: `GRIND_OMP_BIN` names an alternative omp binary because bun does not install into a
+Grind-owned path (#176). See ADR-0008 before changing any of this; the tidy-up that looks like
+housekeeping here is what withdraws the guarantee.
 
 ```
 ~/.grind/
@@ -61,6 +63,11 @@ like housekeeping here is what withdraws the guarantee.
   laptop `which -a claude` returns cmux's shim *first, twice*, from under `$TMPDIR`, so
   `ln -s $(which claude)` points at the wrong file and the Run silently inherits that terminal's
   session hooks — reproducible nowhere, with nothing printed.
+- **`~/.bun/bin/omp` is executable, or `GRIND_OMP_BIN` names it.** — *dispatch* — Only a Run whose
+  `~/.grind/agent` line declares `omp` is ever refused for this: the same backend-scoped narrowing
+  `bin/claude` already has, mirrored rather than shared because omp installs under bun's `bin`
+  directory, not Grind's layout (ADR-0017). Presence only; version probing happens once at
+  readiness and lands on the record (#176).
 - **`runs/` and `locks/` are Grind's**, created on demand. Nothing to provision. Run state lives
   here rather than inside a checkout, so *never committed*
   ([#8](https://github.com/FlorianRiquelme/grind/issues/8)) holds because it is outside any git

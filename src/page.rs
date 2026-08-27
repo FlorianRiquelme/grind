@@ -660,6 +660,16 @@ fn evidence_links(
             // link — and no placeholder stands in for one (issue #161).
             crate::attempt::Transcript::WroteNone => String::new(),
         },
+        crate::runner::Backend::Omp => match transcript {
+            crate::attempt::Transcript::Recorded(name) => format!(
+                "<div class=\"g-ev\"><a class=\"g-link\" href=\"/raw/runs/{run_id}/{}\">sessions.jsonl</a></div>",
+                esc(name)
+            ),
+            // A session file that never materialized links nothing (issue #161's rule).
+            crate::attempt::Transcript::WroteNone | crate::attempt::Transcript::PredatesName => {
+                String::new()
+            }
+        },
     }
 }
 

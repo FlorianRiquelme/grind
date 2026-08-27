@@ -443,10 +443,12 @@ pub fn try_lock(path: &Path) -> TryLock {
     }
 }
 
-/// `$HOME` is the only environment variable Grind reads, and there is no override. A unit with
-/// a different `User=` resolves a different `~/.grind` and fails loudly — which is the point
-/// (ADR-0008). `GRIND_HOME` would be the same mechanism that made a temp directory unsafe,
-/// moved to the root of the tree.
+/// `$HOME` is the only environment variable that moves the layout itself, and there is no
+/// override for it. A unit with a different `User=` resolves a different `~/.grind` and fails
+/// loudly — which is the point (ADR-0008). `GRIND_HOME` would be the same mechanism that made a
+/// temp directory unsafe, moved to the root of the tree. The one sanctioned exception, scoped to
+/// a single fact rather than the root: `GRIND_OMP_BIN` names an alternative omp binary because
+/// bun does not install into a Grind-owned path (#176, ADR-0017 amendment).
 pub fn home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
