@@ -33,9 +33,11 @@ lock.
 ## Layout
 
 `~/.grind/` is the host's Grind directory, and **its layout is the declaration** — there is no
-config file, no environment override, and nothing to keep in sync. `$HOME` is the only variable,
-and it is the dispatching user's. See ADR-0008 before changing any of this; the tidy-up that looks
-like housekeeping here is what withdraws the guarantee.
+config file and nothing to keep in sync. `$HOME` is the only variable that moves the layout
+itself, and it is the dispatching user's. One deliberate exception exists and is documented where
+it appears: `GRIND_OMP_BIN` names an alternative omp binary because bun does not install into a
+Grind-owned path (#176). See ADR-0008 before changing any of this; the tidy-up that looks like
+housekeeping here is what withdraws the guarantee.
 
 ```
 ~/.grind/

@@ -157,6 +157,7 @@ pub fn route(req: &Request, home: &Path) -> Response {
         ["f", "runs", id] => run_response(home, id, true),
         ["f", "runs", id, "log"] => log_delta(home, id, req.query.as_deref()),
         ["raw", "runs", id, file] => raw_file(home, id, file),
+        ["raw", "runs", id, "sessions", sid, file] => raw_session(home, id, sid, file),
         ["raw", "runs", id, "stages", "reflect", kind, name]
             if matches!(*kind, "jobs" | "diffs") =>
         {
@@ -341,6 +342,27 @@ fn raw_reflect(home: &Path, id: &str, kind: &str, name: &str) -> Response {
         .join("stages")
         .join("reflect")
         .join(kind)
+        .join(name);
+    match world::read_bytes(&path) {
+        Ok(bytes) => text(bytes, Vec::new()),
+        Err(_) => plain(Status::NotFound),
+    }
+}
+
+/// An omp adapter transcript under `sessions/<stage-id>/<file>.jsonl` inside the Run's own
+/// directory (issue #176). The two-directory nesting mirrors the harness's per-stage layout;
+/// the constraint stays as narrow as [`raw_reflect`]'s: exactly `sessions/<sid>/<name>`, one
+/// filename deep, `.jsonl` only. `parse_request`'s [`fs_safe`] gate has already refused `.` ,
+/// `..`, absolute components, and every byte outside `[A-Za-z0-9._-]` in each segment, so the
+/// joined path cannot escape the run directory; anything else reads as not-here.
+fn raw_session(home: &Path, id: &str, sid: &str, name: &str) -> Response {
+    if !name.ends_with(".jsonl") {
+        return plain(Status::NotFound);
+    }
+    let path = job::runs_dir(home)
+        .join(id)
+        .join("sessions")
+        .join(sid)
         .join(name);
     match world::read_bytes(&path) {
         Ok(bytes) => text(bytes, Vec::new()),
@@ -1039,6 +1061,40 @@ mod tests {
         assert_eq!(resp.content_type, "text/plain; charset=utf-8");
         assert_eq!(resp.cache, Cache::NoStore);
         assert_eq!(resp.body, b"# drafted issue body\n");
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn an_omp_session_transcript_serves_from_its_stage_directory() {
+        let home = scratch("serve-raw-session");
+        let stage = job::runs_dir(&home)
+            .join("abc")
+            .join("sessions")
+            .join("aabbccdd");
+        world::create_dir_all(&stage).unwrap();
+        world::write_atomic(&stage.join("2026.jsonl"), "{\"type\":\"session\"}\n").unwrap();
+        let ok = route(
+            &parse_request(&get("/raw/runs/abc/sessions/aabbccdd/2026.jsonl")).unwrap(),
+            &home,
+        );
+        assert_eq!(ok.status, Status::Ok);
+        assert_eq!(ok.body, b"{\"type\":\"session\"}\n");
+        // Anything that is not a `.jsonl` name under `sessions/<sid>/` reads as not-here.
+        let not_jsonl = route(
+            &parse_request(&get("/raw/runs/abc/sessions/aabbccdd/run.json")).unwrap(),
+            &home,
+        );
+        let missing = route(
+            &parse_request(&get("/raw/runs/abc/sessions/aabbccdd/gone.jsonl")).unwrap(),
+            &home,
+        );
+        assert_eq!(not_jsonl.status, Status::NotFound);
+        assert_eq!(missing.status, Status::NotFound);
+        // A segment's bytes outside `[A-Za-z0-9._-]` never reach the handler at all.
+        assert_eq!(
+            parse_request(&get("/raw/runs/abc/sessions/../aa/2026.jsonl")),
+            Err(Status::NotFound)
+        );
         world::remove_tree(&home);
     }
 

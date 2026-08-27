@@ -199,11 +199,12 @@ all.** The attribute that keeps legacy records parsing is the same one that hide
 ## Amendment (2026-08-27): `omp` — a third grammar token whose harness owns the loop
 
 Epic [#176](https://github.com/FlorianRiquelme/grind/issues/176) adds adapter #3 over the same
-seam, hosting the omp harness CLI instead of extending the native loop: omp already ships what
-#171 asked grind to build (batch-parallel subagent spawns, headless-yolo children, deterministic
-sibling transcripts), so reimplementing them native-side would duplicate the host. The seam and
-the snapshot rules are untouched — this is one more arm in the one branch — but three facts make
-the omp arm's shape worth recording rather than leaving it discoverable in code.
+seam, hosting the omp harness CLI instead of extending the native loop: the harness already
+ships every mechanism from issue #171 — batch-parallel subagent spawns,
+headless-yolo children, deterministic sibling transcripts — so reimplementing them
+native-side would duplicate the host. The seam and the snapshot rules are untouched; this is
+one more arm in the one branch. But three facts about the host make the omp arm's shape worth
+recording rather than leaving it discoverable in code.
 
 **The identity model bends because omp accepts no preset session id.** Claude Code takes
 `--session-id <uuid>`, which is why `attempt::stage_session_id`'s FNV ids work as argv. omp
