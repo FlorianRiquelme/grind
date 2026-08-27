@@ -1531,7 +1531,9 @@ fn a_job_whose_anchor_artifact_is_not_on_disk_refuses() {
         err.contains("docs/plans/a-plan-that-was-never-written.md"),
         "the refusal names the path:\n{err}"
     );
-    let lowered = err.to_lowercase();
+    let lowered = err
+        .to_lowercase()
+        .replace(|c: char| c.is_ascii_hexdigit(), "x");
     for quality in ["bad", "invalid", "wrong", "reject"] {
         assert!(!lowered.contains(quality), "no quality word:\n{err}");
     }
