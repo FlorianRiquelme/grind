@@ -21,9 +21,11 @@ caught:
 | **doctor** | Verified by `grind doctor`, run by hand after provisioning. The full list, including the live checks. |
 | **step** | Performed during provisioning, with no honest boolean behind it. Not checked, because any check would be a guess. |
 
-**`grind doctor` and the dispatch-time checks are decided, not built.** They arrive with the Rust
-base (ADR-0005); until then the marks say how each item *will* be caught, and the list is worked by
-hand. Both entrypoints share one item list and differ only in depth.
+**What these marks once promised, `grind doctor` now checks.** Built incrementally with the Rust
+base (ADR-0005), each *doctor* item below carries a live check verified against observed ground
+whenever doctor runs; only the *step* marks remain what they document — performed during
+provisioning, worked by hand, no honest boolean behind any of them. Both entrypoints share one
+item list and differ only in depth.
 
 Checking is not gating (ADR-0003). A host failing a precondition has not been judged, and nothing
 here blocks a PR on the strength of a finding — a refused Dispatch is incoherent input, the same
