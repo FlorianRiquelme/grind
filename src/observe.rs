@@ -1338,9 +1338,13 @@ pub fn disk_headroom(raw: &crate::world::Completed, floor_kib: u64) -> Observed<
         ));
     };
     if available_kib >= floor_kib {
-        satisfied(&format!("{available_kib} KiB free beside the grind directory"))
+        satisfied(&format!(
+            "{available_kib} KiB free beside the grind directory"
+        ))
     } else {
-        unsatisfied(&format!("{available_kib} KiB free is below the {floor_kib} KiB floor"))
+        unsatisfied(&format!(
+            "{available_kib} KiB free is below the {floor_kib} KiB floor"
+        ))
     }
 }
 
@@ -2168,7 +2172,8 @@ mod tests {
 
     #[test]
     fn space_above_the_disk_headroom_floor_is_satisfied_and_names_the_free_kib() {
-        let Observed::Present(Outcome::Satisfied(said)) = disk_headroom(&df_with(9_501_500_272), 10_485_760)
+        let Observed::Present(Outcome::Satisfied(said)) =
+            disk_headroom(&df_with(9_501_500_272), 10_485_760)
         else {
             panic!("free space far above the floor is satisfied");
         };
@@ -2250,7 +2255,9 @@ mod tests {
                         "raw child output must never reach a reason: {said}"
                     );
                 }
-                other => panic!("a blind reading must withhold the verdict, not give one: {other:?}"),
+                other => {
+                    panic!("a blind reading must withhold the verdict, not give one: {other:?}")
+                }
             }
         }
     }
