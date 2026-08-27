@@ -421,13 +421,22 @@ pub(crate) fn subcommands_of(command: &str) -> Vec<String> {
 /// past token 64, so a denied verb behind a longer benign prefix escaped suffix dropping
 /// entirely. Generation walks a piece's starts left to right and stops once the bytes already
 /// produced would exceed this budget — short pieces get full coverage, and a forbidden verb
-/// keeps yielding its own candidate until its prefix alone exhausts the budget (~250 six-byte
-/// assignment tokens vs 65 under the old cap). What is accepted is the same constructed-input
-/// class as before, at a larger and now *priced* boundary: a verb padded behind a prefix worth
-/// more than this many bytes of suffixes is not found by suffix dropping alone. A single-token
-/// piece has no drops to skip and still contributes itself whole. `push_with_basename`'s
-/// variants add at most one further copy per candidate, so total emission stays under twice
-/// this budget.
+/// keeps yielding its own candidate until its prefix alone exhausts the budget.
+///
+/// **The boundary is quadratic in token count, not linear.** Each successive suffix is nearly as
+/// long as the last, so a prefix of `n` tokens averaging `w` bytes (plus a separator) emits
+/// roughly `n²·w/2` bytes before the verb's own start is reached: the budget is spent by
+/// `n ≈ sqrt(2·32 KiB / w)`. Measured against a `git push --force origin main` payload, the verb
+/// still yields its candidate behind **92** six-byte assignment tokens (`AAA=AA`) and no longer
+/// does at 93 — 99 at five bytes, 120 at three — against 65 under the old cap. Pinned on the
+/// refusal side by `a_denied_verb_at_the_documented_budget_boundary_is_refused`, which stays true
+/// under any later budget increase. What is accepted is the same constructed-input class as
+/// before, at a larger and now *priced* boundary: a verb padded behind a prefix worth more than
+/// this many bytes of suffixes is not found by suffix dropping alone. Reaching ~250 tokens would
+/// cost ~7× this budget for no threat-model gain, since a real wrapper stack is under ten tokens
+/// deep. A single-token piece has no drops to skip and still contributes itself whole.
+/// `push_with_basename`'s variants add at most one further copy per candidate, so total emission
+/// stays under twice this budget.
 const SUFFIX_BUDGET_BYTES: usize = 32 * 1024;
 
 /// Every token-boundary suffix of `piece`, until the bytes already emitted stop the walk:
@@ -827,6 +836,29 @@ mod tests {
             denied_layer(decision),
             GateLayer::DeniedGlob,
             "a denied verb behind a 65-token benign prefix must be refused"
+        );
+    }
+
+    #[test]
+    fn a_denied_verb_at_the_documented_budget_boundary_is_refused() {
+        let all_denials: Vec<String> = crate::attempt::DENIED_TOOLS
+            .iter()
+            .map(|g| g.to_string())
+            .collect();
+        let command = format!(
+            "{} git push --force origin main",
+            vec!["AAA=AA"; 92].join(" ")
+        );
+        assert_eq!(
+            denied_layer(gate(
+                &all_denials,
+                call(
+                    "bash",
+                    &serde_json::json!({ "command": command }).to_string(),
+                ),
+            )),
+            GateLayer::DeniedGlob,
+            "the boundary SUFFIX_BUDGET_BYTES documents must be the boundary it has"
         );
     }
 
