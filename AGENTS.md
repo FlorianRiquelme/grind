@@ -204,13 +204,40 @@ unsatisfiable by construction and gets deleted by whoever trips it next (ledger 
   widening can turn an allow into a refusal but never the reverse.
 
   Suffix generation costs work proportional to tokens considered times piece length, so the
-  number of a piece's leading tokens that each start their own candidate is capped
-  (`tools::MAX_SUFFIX_TOKENS`, 64) — a real wrapper stack is under ten tokens deep before the
-  wrapped verb, so the cap only bounds the cost of a long ordinary command line (a full `cargo`
-  invocation) and never affects anything this barrier is meant to catch. One false refusal is
-  accepted, unchanged from the prior round: a quoted string that happens to spell a denied
-  command as a literal rather than as an invocation (`git commit -m "git push --force"` is
-  refused, since the quoted text matches `Bash(git push*--force*)`).
+  cumulative bytes of candidates one piece may generate are budgeted
+  (`tools::SUFFIX_BUDGET_BYTES`, 32 KiB). This replaced a fixed 64-token cap (#169, CodeRabbit
+  review `ac7d370d`, Security/Major): the cap dropped *every* candidate starting past token 64, so
+  a denied verb behind a longer benign prefix escaped suffix dropping entirely, while a real
+  wrapper stack is under ten tokens deep before the wrapped verb.
+
+  **Two things about how that budget is spent are load-bearing, and both were bugs first** (#179,
+  CodeRabbit Security/Major). The piece itself is emitted unconditionally and is *not* charged
+  when it alone exceeds the budget — it is the candidate a front-anchored glob matches when the
+  verb sits at the front of a huge command line, and charging it let one over-budget leading token
+  (`<32 KiB token> git push --force origin main`) consume the whole walk, which **was an allow**.
+  And the remaining starts are walked **from the end toward the front**, shortest suffix first:
+  padding sits *before* a hidden verb, so the verb's own suffix is short and is reached at once.
+  Longest-first made coverage non-monotone in padding length — 93 six-byte padding tokens hid the
+  verb while 92 and 94 did not — which is why the test pins the rule (1 through 5,000 padding
+  tokens, all refused) rather than a boundary number. A third was the silence itself: when the
+  budget did stop the walk early, a glob anchored at an uncovered start matched nothing and the
+  gate read that silence as an allow (`X=1 git push --force origin main <thousands of trailing
+  benign tokens>` was allowed). Coverage is now **fail-closed**: `token_suffixes` reports when
+  the walk stopped early, `subcommands_of` propagates that, and `gate` refuses the call — an
+  unsearchable command never reaches the shell. The priced collateral: coverage cost is
+  quadratic in token count, so a piece whose full suffix set exceeds 32 KiB (roughly 100+
+  six-byte tokens, or a large quoted payload) is refused outright, benign or not.
+
+  `tools::glob_matches` is **iterative for the same class of reason**: the natural recursive
+  wildcard match costs a stack frame per candidate byte, so a `*` scanning a long tail overflowed
+  the stack — an ordinary `git commit -m "<32 KiB message>"` reached it, and a gate that panics
+  refuses nothing. The two-pointer form accepts the same language (pinned by a differential test
+  against the recursion it replaced) in no frames.
+
+  One false refusal is accepted, unchanged from the
+  prior round: a quoted string that happens to spell a denied command as a literal rather than as an
+  invocation (`git commit -m "git push --force"` is refused, since the quoted text matches
+  `Bash(git push*--force*)`).
 
   **The first twelve each anchor their flag immediately after the verb, and git accepts the flag
   anywhere.** `git push origin --force`, `git push origin main --force`,
