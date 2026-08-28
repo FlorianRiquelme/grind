@@ -95,6 +95,15 @@ pub struct RunView {
     pub omp_bin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub omp_version: Option<String>,
+    /// The composite per-class routing (ADR-0017, composite amendment), mirrored read-only
+    /// like every writer field. Absent = every class rides the line backend, which is both
+    /// the pre-composite record's shape and the pure legacy line's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_routes: Option<crate::runner::ClassRoutes>,
+    /// The claude-code binary's reported version when claude-code participated in this
+    /// Run — the read-only mirror of the writer's field of the same name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_version: Option<String>,
 }
 
 /// The read-only mirror of `supervisor::Provenance`. Field names duplicated by design, the same

@@ -53,6 +53,12 @@ pub struct Job {
     /// branch contract out. No validator: it is prose.
     pub intent: Option<String>,
     pub model: Option<String>,
+    /// The Job's own agent declaration: a profile name from `~/.grind/agents/`, or one
+    /// full agent line (ADR-0017, composite amendment). Wins over the repo binding and
+    /// the host default; `#[serde(default)]` for the same pre-cutover reason as
+    /// `done_predicate` — absence genuinely means a record from before this row existed.
+    #[serde(default)]
+    pub agent: Option<String>,
     /// How the Run will know this is done, stated so a machine could grade it. Consumed by the
     /// stage machinery (ADR-0015) — the Plan stage inherits it, plan review grades it, the PR
     /// body renders its verdict; parsed and recorded here. `#[serde(default)]` because a record
@@ -180,6 +186,7 @@ pub fn from_issue_json(raw: &str) -> Result<Job, Refusal> {
     validate_anchor(&anchor)?;
     let intent = optional("intent");
     let model = optional("model");
+    let agent = optional("agent");
     let done_predicate = required("done predicate")?;
     let base_branch = required("base branch")?;
     let verify_entrypoint = required("verify entrypoint")?;
@@ -197,6 +204,7 @@ pub fn from_issue_json(raw: &str) -> Result<Job, Refusal> {
         handoff_sha,
         anchor,
         intent,
+        agent,
         model,
         done_predicate,
         base_branch,
@@ -392,6 +400,85 @@ pub fn read_selection(home: &Path) -> Result<runner::Selection, String> {
         _ => Err(format!("expected one line, found {}", lines.len())),
     };
     parsed.map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// `~/.grind/agents/` — the profile library (ADR-0017, composite amendment): one file per
+/// profile, the same one-line grammar as `agent`. Doctor seeds the defaults once when the
+/// directory is absent; user-editable, never rewritten.
+pub fn agents_dir(home: &Path) -> PathBuf {
+    grind_dir(home).join("agents")
+}
+
+/// `<repo>/agent` — the repo binding: one line, a profile name or a full agent line.
+pub fn repo_agent_file(repo_path: &Path) -> PathBuf {
+    repo_path.join("agent")
+}
+
+/// The profile file for `name`, whose shape is `[a-z0-9][a-z0-9-]*` — a directory
+/// segment, so a name that would escape the library refuses here rather than at the fs.
+pub fn profile_file(home: &Path, name: &str) -> Result<PathBuf, String> {
+    let _ = (home, name);
+    todo!("wave-1 slice B")
+}
+
+/// Exactly what doctor seeds when `~/.grind/agents` is absent: the workhorse default the
+/// host already runs, and the opus-plan composite the epic exists to enable. Never
+/// rewritten, never seeded over an existing directory.
+pub const SEED_PROFILES: [(&str, &str); 2] = [
+    (
+        "glm",
+        "omp fast=openrouter/z-ai/glm-5.3-flash strong=openrouter/z-ai/glm-5.3-flash",
+    ),
+    (
+        "opus-plan",
+        "omp fast=openrouter/z-ai/glm-5.3-flash strong=claude-code/claude-opus-5",
+    ),
+];
+
+/// `true` = seeded now; `false` = the directory already existed. Only real fs errors are
+/// errors; an existing library is never touched.
+pub fn seed_agent_profiles(home: &Path) -> Result<bool, String> {
+    let _ = home;
+    todo!("wave-1 slice B")
+}
+
+/// One line that is either a profile name (dereferenced through `~/.grind/agents/<name>`)
+/// or a full agent line (its first token parses as a `Backend`). Loud on an invalid name,
+/// a missing profile, an unreadable file, an unparseable line. An empty or blank line is
+/// the default selection — the file names a deviation, nothing else.
+pub fn deref_agent_line(home: &Path, line: &str) -> Result<runner::Selection, String> {
+    let _ = (home, line);
+    todo!("wave-1 slice B")
+}
+
+/// Where the winning agent declaration came from. Banner and doctor observability only —
+/// never serialized into any record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentSource {
+    JobPin,
+    Repo,
+    Host,
+}
+
+/// The precedence chain resolved fresh at dispatch (never on resume): the Job's `Agent`
+/// pin, else the repo's `agent` file, else the host default. The host file is read first
+/// and loudly regardless of which tier wins — a malformed `~/.grind/agent` refuses even
+/// when a Job pin would have won, because a host fact stays loud (ADR-0017).
+#[derive(Debug, Clone)]
+pub struct ResolvedAgent {
+    pub selection: runner::Selection,
+    pub source: AgentSource,
+    /// The profile name when the winning declaration dereferenced one, else `None`.
+    pub profile: Option<String>,
+}
+
+pub fn resolve_agent(
+    home: &Path,
+    repo_path: Option<&Path>,
+    job_agent: Option<&str>,
+) -> Result<ResolvedAgent, String> {
+    let _ = (home, repo_path, job_agent);
+    todo!("wave-1 slice B")
 }
 
 /// How an item is caught. `docs/provisioned-host.md` is the operative list and these three
