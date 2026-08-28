@@ -51,6 +51,7 @@ impl StageRunner for crate::runner::OmpAdapter {
             spec.model,
             self.fast_model.as_deref(),
             self.strong_model.as_deref(),
+            &self.routes,
         ) {
             argv.push("--model".to_string());
             argv.push(id);
@@ -115,18 +116,32 @@ impl StageRunner for crate::runner::OmpAdapter {
         attempt.with_fanout(fanout)
     }
 }
-
 /// The `--model` flag this stage-model resolves to, or `None` for no flag at all.
 ///
 /// [`StageModel::native_id`]'s semantics with one omp twist: a job pin crosses verbatim
-/// and the host-declared class models resolve their own classes, but an **undeclared**
-/// class omits the flag instead of falling back to a provider id grind invented — the
-/// harness's own default model is the honest answer, not [`DEFAULT_MODEL`].
-fn model_flag(model: &StageModel, fast: Option<&str>, strong: Option<&str>) -> Option<String> {
-    match model {
-        StageModel::Pinned(id) => Some(id.clone()),
-        StageModel::Class(ModelClass::Fast) => fast.map(str::to_string),
-        StageModel::Class(ModelClass::Strong) => strong.map(str::to_string),
+/// and a route naming omp resolves its class — a `None` id omitting the flag instead of
+/// falling back to a provider id grind invented — but an **undeclared** class omits the
+/// flag too; the harness's own default model is the honest answer, not
+/// [`crate::runner::DEFAULT_MODEL`].
+fn model_flag(
+    model: &StageModel,
+    fast: Option<&str>,
+    strong: Option<&str>,
+    routes: &crate::runner::ClassRoutes,
+) -> Option<String> {
+    let class = match model {
+        StageModel::Pinned(id) => return Some(id.clone()),
+        StageModel::Class(class) => *class,
+    };
+    match routes.for_class(class) {
+        Some(crate::runner::Route {
+            backend: crate::runner::Backend::Omp,
+            id,
+        }) => id.clone(),
+        _ => match class {
+            ModelClass::Fast => fast.map(str::to_string),
+            ModelClass::Strong => strong.map(str::to_string),
+        },
     }
 }
 
@@ -939,19 +954,85 @@ mod tests {
         let pinned = StageModel::Pinned("z-ai/glm-5.3-flash".to_string());
         let fast = StageModel::Class(ModelClass::Fast);
         let strong = StageModel::Class(ModelClass::Strong);
+        let none = crate::runner::ClassRoutes::default();
         assert_eq!(
-            model_flag(&pinned, None, None).as_deref(),
+            model_flag(&pinned, None, None, &none).as_deref(),
             Some("z-ai/glm-5.3-flash")
         );
         assert_eq!(
-            model_flag(&fast, Some("qwen/qwen3-max"), None).as_deref(),
+            model_flag(&fast, Some("qwen/qwen3-max"), None, &none).as_deref(),
             Some("qwen/qwen3-max")
         );
-        assert_eq!(model_flag(&fast, None, None), None, "undeclared = no flag");
-        assert_eq!(model_flag(&strong, None, None), None);
         assert_eq!(
-            model_flag(&strong, None, Some("deepseek/deepseek-chat-v3.1")).as_deref(),
+            model_flag(&fast, None, None, &none),
+            None,
+            "undeclared = no flag"
+        );
+        assert_eq!(model_flag(&strong, None, None, &none), None);
+        assert_eq!(
+            model_flag(&strong, None, Some("deepseek/deepseek-chat-v3.1"), &none).as_deref(),
             Some("deepseek/deepseek-chat-v3.1")
+        );
+    }
+
+    /// A route naming omp resolves the class — a declared id becomes the flag, a `None`
+    /// id stays no-flag (the harness's own default, never a grind-invented id) — and
+    /// routes naming other backends fall back to the legacy fields, pinned verbatim.
+    #[test]
+    fn the_model_flag_resolves_routes_naming_omp() {
+        let id_route = |backend: crate::runner::Backend, id: Option<&str>| crate::runner::Route {
+            backend,
+            id: id.map(str::to_string),
+        };
+        let routed = crate::runner::ClassRoutes {
+            fast: Some(id_route(
+                crate::runner::Backend::Omp,
+                Some("z-ai/glm-5.3-flash"),
+            )),
+            strong: Some(id_route(crate::runner::Backend::Omp, None)),
+        };
+        assert_eq!(
+            model_flag(&StageModel::Class(ModelClass::Fast), None, None, &routed).as_deref(),
+            Some("z-ai/glm-5.3-flash")
+        );
+        assert_eq!(
+            model_flag(
+                &StageModel::Class(ModelClass::Strong),
+                Some("legacy/id"),
+                None,
+                &routed
+            ),
+            None,
+            "an omp route with no id is no flag, never the legacy field"
+        );
+        assert_eq!(
+            model_flag(
+                &StageModel::Pinned("pinned/id".to_string()),
+                None,
+                None,
+                &routed
+            )
+            .as_deref(),
+            Some("pinned/id"),
+            "the pin crosses verbatim regardless of routes"
+        );
+        let foreign = crate::runner::ClassRoutes {
+            fast: Some(id_route(
+                crate::runner::Backend::ClaudeCode,
+                Some("claude/alias"),
+            )),
+            strong: None,
+        };
+        assert_eq!(
+            model_flag(
+                &StageModel::Class(ModelClass::Fast),
+                Some("legacy/fast"),
+                None,
+                &foreign
+            )
+            .as_deref(),
+            Some("legacy/fast"),
+            "routes naming other backends fall back to the legacy fields"
         );
     }
 

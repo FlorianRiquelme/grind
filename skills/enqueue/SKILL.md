@@ -57,6 +57,11 @@ check it against evidence.
 (ADR-0012), so this row exists only when the human names one in the session. Leave it out rather
 than guessing from a diff or a directory name.
 
+**Agent** is asked-for too: a profile name from `~/.grind/agents/` (doctor seeds `glm` and
+`opus-plan`), or one full agent line (ADR-0017, composite amendment). It pins the Run's agent
+over the repo's `agent` file and the host default; write `none` (or omit the row) when the
+human does not name one — never invent a profile.
+
 ## 2. Refuse a Job on the default branch
 
 If the derived branch **is** the repo's default branch, stop. Do not file. `job::validate_branch`

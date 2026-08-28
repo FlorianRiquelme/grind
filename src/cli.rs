@@ -474,6 +474,7 @@ fn doctor() -> i32 {
         })
         .collect();
     print(&render::doctor(&hostname(), &lines));
+    print(&agent_line_of(&home));
 
     let unmet = results.iter().any(|(_, _, outcome)| {
         matches!(
@@ -658,6 +659,11 @@ fn check_with_probe(
         Check::EndpointReachable => {
             observe::endpoint_reachable(probe_declared_endpoint(job::read_selection(home), probe))
         }
+        Check::AgentProfiles => match job::seed_agent_profiles(home) {
+            Ok(seeded) => agent_profiles_outcome(home, seeded),
+            Err(said) => observe::unsatisfied(said),
+        },
+        Check::RepoAgentDeclarations => repo_agent_declarations_outcome(home),
         Check::NoBoolean => observe::unchecked(
             "performed during provisioning; every available check would be a guess",
         ),
@@ -679,6 +685,108 @@ fn probe_declared_endpoint(
             .ok()
             .map(|endpoint| probe(&endpoint))
     })
+}
+
+/// The resolved host selection as one doctor line: `agent: <backend>[ fast <b>/<id>][
+/// strong <b>/<id>]`, where a bare value (a route naming the line backend) renders its id
+/// without the prefix — the prefix would lie about a routing that does not exist. Every
+/// class appears: an undeclared class still names the concrete id it resolves to, because
+/// truthfulness means naming what will run, not only what was spelled. A declaration that
+/// cannot be read is the loud refusal, never a guessed line.
+fn agent_line_of(home: &Path) -> String {
+    let selection = match job::read_selection(home) {
+        Ok(selection) => selection,
+        Err(said) => return render::refusal(&said),
+    };
+    let mut line = format!("  agent: {}", selection.backend.as_str());
+    for (class, route) in [
+        ("fast", selection.class_route(runner::ModelClass::Fast)),
+        ("strong", selection.class_route(runner::ModelClass::Strong)),
+    ] {
+        let segment = if route.backend == selection.backend {
+            match route.id {
+                Some(id) => id,
+                None => format!("({} default)", selection.backend.as_str()),
+            }
+        } else {
+            match route.id {
+                Some(id) => format!("{}/{}", route.backend.as_str(), id),
+                None => format!("{} (its default)", route.backend.as_str()),
+            }
+        };
+        line.push_str(&format!(" {class} {segment}"));
+    }
+    format!("{line}\n")
+}
+
+/// The `agent profiles` item's verdict: the library must exist (doctor seeds it when
+/// absent, and never seeds over an existing one) and every regular file directly inside
+/// it must be a valid profile — a name of the declared shape whose first line parses as
+/// one agent selection. The first failure names the file and stops; subdirectories pass
+/// over, because a profile is a file.
+fn agent_profiles_outcome(home: &Path, seeded_now: bool) -> Observed<Outcome> {
+    let dir = job::agents_dir(home);
+    let mut names: Vec<String> = Vec::new();
+    for entry in world::list_dir(&dir) {
+        if !entry.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().and_then(|n| n.to_str()) else {
+            return observe::unsatisfied(format!(
+                "a file under {} has an unreadable name",
+                dir.display()
+            ));
+        };
+        names.push(name.to_string());
+        if let Err(said) = job::profile_file(home, name) {
+            return observe::unsatisfied(format!("{entry:?}: {said}"));
+        }
+        let text = match world::read_to_string(&entry) {
+            Ok(text) => text,
+            Err(said) => return observe::unsatisfied(format!("{entry:?}: {said}")),
+        };
+        if let Err(said) = job::deref_agent_line(home, &text) {
+            return observe::unsatisfied(format!("{entry:?}: {said}"));
+        }
+    }
+    let seeding = if seeded_now {
+        " (seeded now with `glm` and `opus-plan`)"
+    } else {
+        ""
+    };
+    observe::satisfied(format!(
+        "every profile in ~/.grind/agents/ parses{seeding}: {}",
+        names.join(", ")
+    ))
+}
+
+/// The `repo agent files` item's verdict: every declared clone's `agent` file that is
+/// present must deref to a readable selection — a profile name or one full agent line.
+/// An absent file passes: the repo binding is optional, and absence is the host default.
+fn repo_agent_declarations_outcome(home: &Path) -> Observed<Outcome> {
+    let mut checked = 0usize;
+    for owner in world::list_dir(&job::grind_dir(home).join("repos")) {
+        for clone in world::list_dir(&owner) {
+            if !clone.is_dir() {
+                continue;
+            }
+            let file = job::repo_agent_file(&clone);
+            if !world::exists(&file) {
+                continue;
+            }
+            let text = match world::read_to_string(&file) {
+                Ok(text) => text,
+                Err(said) => return observe::unsatisfied(format!("{file:?}: {said}")),
+            };
+            if let Err(said) = job::deref_agent_line(home, &text) {
+                return observe::unsatisfied(format!("{file:?}: {said}"));
+            }
+            checked += 1;
+        }
+    }
+    observe::satisfied(format!(
+        "{checked} repo agent file(s) present, all deref to a readable selection"
+    ))
 }
 
 /// Whether a provisioned key is actually present, for the doctor's `AgentKeyPresent` item.

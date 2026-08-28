@@ -222,6 +222,7 @@ fn drive_attempt_with_prompt(
         anchor: "Ship the harness behind one seam.".to_string(),
         intent: None,
         model: None,
+        agent: None,
         done_predicate: "PR is open".to_string(),
         base_branch: "main".to_string(),
         verify_entrypoint: "cargo test".to_string(),

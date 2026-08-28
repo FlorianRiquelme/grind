@@ -8,6 +8,12 @@
 # It serves one shape per attempt, from a scenario file, and records the argv it was given so
 # the literal flags of every attempt can be asserted afterwards.
 F="${HOME:?}/.fake"
+# A `--version` probe (the dispatch snapshot) is not an attempt: it answers the first
+# line of a real claude's version output and never touches the counter or the argv log.
+if [ "$1" = "--version" ]; then
+  echo "1.2.3 (Claude Code)"
+  exit 0
+fi
 cat >"$F/last-prompt.txt"           # save the prompt (a ladder shape reads its context block)
 N=$(cat "$F/counter" 2>/dev/null || echo 0)
 N=$((N + 1))
