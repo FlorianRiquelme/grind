@@ -293,11 +293,11 @@ pub(crate) fn classify(
         parse_ok,
         subtype: frames.subtype,
         stop_reason: frames.stop_reason,
+        total_cost_usd: frames.saw_usage.then_some(frames.cost),
+        num_turns: frames.saw_frame.then_some(frames.turns),
+        usage: frames.last_usage,
         api_error_status: frames.api_error_status,
         terminal_reason: frames.terminal_reason,
-        num_turns: frames.saw_frame.then_some(frames.turns),
-        total_cost_usd: frames.saw_frame.then_some(frames.cost),
-        usage: frames.last_usage,
         permission_denials: Vec::new(),
         done_promise: frames.all_texts.iter().any(|t| t.contains(DONE_PROMISE)),
         // The claude.rs fallback logic with no payload to ask first: only a raw stream
@@ -321,6 +321,11 @@ struct Frames {
     turns: u64,
     cost: f64,
     last_usage: Option<serde_json::Value>,
+    /// At least one frame carried a usage object. Distinguishes "the stream
+    /// exposed no spend channel" (`false` → `total_cost_usd: None`, the honest
+    /// undeclared answer) from "spend was zero" — the manufactured non-null
+    /// `$0.00` the old `saw_frame` gate produced is worse than either.
+    saw_usage: bool,
     stop_reason: Option<String>,
     subtype: Option<String>,
     api_error_status: Option<String>,
@@ -347,17 +352,6 @@ impl Frames {
                 self.turns += 1;
                 self.final_texts.clear();
             }
-            Some("turn_end") => {
-                if let Some(total) = value
-                    .get("usage")
-                    .and_then(|usage| usage.get("cost"))
-                    .and_then(|cost| cost.get("total"))
-                    .and_then(|total| total.as_f64())
-                {
-                    self.cost += total;
-                }
-                self.last_usage = value.get("usage").cloned().or(self.last_usage.take());
-            }
             Some("message_end") => {
                 if let Some((stop, texts)) = assistant_of(value) {
                     if let Some(stop) = stop {
@@ -367,6 +361,23 @@ impl Frames {
                         self.final_texts = texts.clone();
                         self.all_texts.extend(texts);
                     }
+                }
+                // Real omp v18 carries spend on assistant `message_end` frames
+                // (`message.usage.cost.total`), not on `turn_end` — run 178's
+                // transcripts have usage-free `turn_end`s, and the P0 spike's
+                // turn-borne shape is the doc claim this refutes. Custom-role
+                // messages (subagent preludes, reminders) carry no usage and
+                // contribute nothing, the same tolerate-and-skip rule the whole
+                // fold follows.
+                if let Some(total) = value
+                    .pointer("/message/usage/cost/total")
+                    .and_then(|total| total.as_f64())
+                {
+                    self.cost += total;
+                }
+                if let Some(usage) = value.pointer("/message/usage") {
+                    self.saw_usage = true;
+                    self.last_usage = Some(usage.clone());
                 }
             }
             _ => {}
@@ -709,8 +720,10 @@ pub fn live(run_dir: &Path, now_epoch: u64) -> Live {
 mod tests {
     use super::*;
 
-    /// A healthy two-turn session: junk line, per-turn cost rows, a final assistant
-    /// message carrying the promise, and an `agent_end` closing over assistant work.
+    /// A healthy two-turn session: junk line, per-message usage rows on the
+    /// assistant `message_end` frames (the real omp v18 spend channel — run 178's
+    /// transcripts carry usage-free `turn_end`s), a final assistant message
+    /// carrying the promise, and an `agent_end` closing over assistant work.
     const PONG: &str = concat!(
         r#"{"type":"session","version":3,"id":"5f0c2e1a-0000-4000-8000-000000000001"}"#,
         "\n",
@@ -720,17 +733,17 @@ mod tests {
         "\n",
         r#"{"type":"message_end","message":{"role":"user","content":"ping"}}"#,
         "\n",
-        r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"checking"}],"stopReason":"toolUse"}}"#,
+        r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"checking"}],"stopReason":"toolUse","usage":{"input":1000,"output":200,"cacheRead":0,"cacheWrite":0,"cost":{"input":0.01,"output":0.02,"cacheRead":0.0,"cacheWrite":0.0,"total":0.03}}}}"#,
         "\n",
-        r#"{"type":"turn_end","usage":{"cost":{"input":0.01,"output":0.02,"cacheRead":0.0,"cacheWrite":0.0,"total":0.03}}}"#,
+        r#"{"type":"turn_end"}"#,
         "\n",
         r#"not json at all <<<"#,
         "\n",
         r#"{"type":"turn_start","n":2}"#,
         "\n",
-        r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"all green <promise>DONE</promise>"}],"stopReason":"endTurn"}}"#,
+        r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"all green <promise>DONE</promise>"}],"stopReason":"endTurn","usage":{"input":2000,"output":400,"cacheRead":0,"cacheWrite":0,"cost":{"input":0.02,"output":0.02,"cacheRead":0.0,"cacheWrite":0.0,"total":0.04}}}}"#,
         "\n",
-        r#"{"type":"turn_end","usage":{"cost":{"input":0.02,"output":0.02,"cacheRead":0.0,"cacheWrite":0.0,"total":0.04}}}"#,
+        r#"{"type":"turn_end"}"#,
         "\n",
         r#"{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"all green"}]}]}"#,
     );
@@ -813,6 +826,28 @@ mod tests {
         assert!(attempt.is_error, "!parse_ok is an error regardless of exit");
         assert_eq!(attempt.num_turns, None);
         assert_eq!(attempt.total_cost_usd, None);
+    }
+
+    #[test]
+    fn a_stream_without_any_usage_frames_records_none_not_a_zero() {
+        // Run 178's real shape: frames flow, no message ever carries usage —
+        // the old `saw_frame` gate manufactured a non-null `$0.00` here.
+        let attempt = classified(
+            concat!(
+                r#"{"type":"turn_start","n":1}"#,
+                "\n",
+                r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"endTurn"}}"#,
+                "\n",
+                r#"{"type":"turn_end"}"#,
+                "\n",
+                r#"{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}"#,
+            ),
+            "",
+            Some(0),
+        );
+        assert!(attempt.parse_ok);
+        assert_eq!(attempt.total_cost_usd, None);
+        assert_eq!(attempt.usage, None);
     }
 
     #[test]
