@@ -353,6 +353,10 @@ impl Frames {
                 self.final_texts.clear();
             }
             Some("message_end") => {
+                // Usage accounting rides the assistant branch: spend belongs to
+                // assistant turns, and a custom-role frame (subagent preludes,
+                // reminders) that ever carried a usage object must not pollute
+                // the ledger or the last-usage snapshot.
                 if let Some((stop, texts)) = assistant_of(value) {
                     if let Some(stop) = stop {
                         self.stop_reason = Some(stop);
@@ -361,23 +365,21 @@ impl Frames {
                         self.final_texts = texts.clone();
                         self.all_texts.extend(texts);
                     }
-                }
-                // Real omp v18 carries spend on assistant `message_end` frames
-                // (`message.usage.cost.total`), not on `turn_end` — run 178's
-                // transcripts have usage-free `turn_end`s, and the P0 spike's
-                // turn-borne shape is the doc claim this refutes. Custom-role
-                // messages (subagent preludes, reminders) carry no usage and
-                // contribute nothing, the same tolerate-and-skip rule the whole
-                // fold follows.
-                if let Some(total) = value
-                    .pointer("/message/usage/cost/total")
-                    .and_then(|total| total.as_f64())
-                {
-                    self.cost += total;
-                }
-                if let Some(usage) = value.pointer("/message/usage") {
-                    self.saw_usage = true;
-                    self.last_usage = Some(usage.clone());
+                    // Real omp v18 carries spend on assistant `message_end`
+                    // frames (`message.usage.cost.total`), not on `turn_end` —
+                    // run 178's transcripts have usage-free `turn_end`s, and
+                    // the P0 spike's turn-borne shape is the doc claim this
+                    // refutes.
+                    if let Some(total) = value
+                        .pointer("/message/usage/cost/total")
+                        .and_then(|total| total.as_f64())
+                    {
+                        self.cost += total;
+                    }
+                    if let Some(usage) = value.pointer("/message/usage") {
+                        self.saw_usage = true;
+                        self.last_usage = Some(usage.clone());
+                    }
                 }
             }
             _ => {}
@@ -848,6 +850,36 @@ mod tests {
         assert!(attempt.parse_ok);
         assert_eq!(attempt.total_cost_usd, None);
         assert_eq!(attempt.usage, None);
+    }
+
+    #[test]
+    fn a_non_assistant_message_end_with_usage_is_not_accounted() {
+        // A custom-role frame that ever carries a usage object must not
+        // pollute the ledger or the last-usage snapshot — spend belongs to
+        // assistant turns only.
+        let attempt = classified(
+            concat!(
+                r#"{"type":"message_end","message":{"role":"custom","customType":"eager-task-prelude","content":"<system-reminder>spawn</system-reminder>","usage":{"input":99999,"output":99999,"cost":{"total":99.0}}}}"#,
+                "\n",
+                r#"{"type":"turn_start","n":1}"#,
+                "\n",
+                r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"endTurn","usage":{"input":10,"output":20,"cost":{"total":0.02}}}}"#,
+                "\n",
+                r#"{"type":"turn_end"}"#,
+                "\n",
+                r#"{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}"#,
+            ),
+            "",
+            Some(0),
+        );
+        assert!(attempt.parse_ok);
+        assert_eq!(attempt.total_cost_usd, Some(0.02));
+        assert_eq!(
+            attempt
+                .usage
+                .and_then(|u| u.pointer("/cost/total").cloned()),
+            Some(serde_json::json!(0.02))
+        );
     }
 
     #[test]
