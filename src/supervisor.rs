@@ -1036,7 +1036,7 @@ fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
     let denied = attempt::denied_for_reflect();
     let reflect_model = runner::StageModel::Class(runner::ModelClass::Strong);
     let run_dir_str = run_dir.display().to_string();
-    let (_backend, runner) = record.runner(&home, run_dir, None, &reflect_model);
+    let (reflect_backend, runner) = record.runner(&home, run_dir, None, &reflect_model);
     let spec = runner::RunSpec {
         invocation: &invocation,
         cwd: run_dir,
@@ -1057,7 +1057,7 @@ fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
         model: None,
         cost_usd: classified.total_cost_usd,
         turns: classified.num_turns,
-        backend: None,
+        backend: Some(reflect_backend),
     });
     let _ = record.save(path);
 }
@@ -1390,6 +1390,14 @@ fn run_r_pass(
     if world::read_to_string(&stages_dir.join("triage").join("grade.json")).is_ok() {
         artifact_paths.push("stages/triage/grade.json".to_string());
     }
+    let empty = runner::ClassRoutes::default();
+    let grade_backend = record
+        .class_routes
+        .as_ref()
+        .unwrap_or(&empty)
+        .for_class(runner::ModelClass::Strong)
+        .map(|route| route.backend)
+        .unwrap_or(record.backend);
     match grader {
         Some(attempt) => record.push_stage_entry(rung::StageEntry {
             name,
@@ -1400,7 +1408,7 @@ fn run_r_pass(
                 .claude_code_arg(&record.class_routes.clone().unwrap_or_default()),
             cost_usd: attempt.total_cost_usd,
             turns: attempt.num_turns,
-            backend: None,
+            backend: Some(grade_backend),
         }),
         None => record.push_stage_entry(rung::StageEntry {
             name,
