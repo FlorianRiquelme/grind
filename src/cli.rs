@@ -1084,9 +1084,9 @@ mod tests {
 
     #[test]
     fn the_driver_answers_for_every_item_on_the_list() {
-        let home = Path::new("/nowhere/that/exists");
+        let home = world::temp_dir("doctor-list");
         for item in job::host_items() {
-            let outcome = check_with_probe(home, &[], item.check, |_endpoint| false);
+            let outcome = check_with_probe(&home, &[], item.check, |_endpoint| false);
             if item.depth == Depth::Step {
                 assert!(
                     matches!(outcome, Observed::Present(Outcome::Unchecked(_))),
@@ -1095,5 +1095,6 @@ mod tests {
                 );
             }
         }
+        world::remove_tree(&home);
     }
 }

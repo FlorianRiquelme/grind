@@ -468,6 +468,13 @@ pub fn seed_agent_profiles(home: &Path) -> Result<bool, String> {
 /// a missing profile, an unreadable file, an unparseable line. An empty or blank line is
 /// the default selection — the file names a deviation, nothing else.
 pub fn deref_agent_line(home: &Path, line: &str) -> Result<runner::Selection, String> {
+    // The same one-line discipline `read_selection` holds the host file to: a repo
+    // binding or a profile file carrying two non-blank lines is two declarations in one
+    // file, and second-reading it would pick a winner silently.
+    let declared_lines: Vec<&str> = line.lines().filter(|l| !l.trim().is_empty()).collect();
+    if declared_lines.len() > 1 {
+        return Err(format!("expected one line, found {}", declared_lines.len()));
+    }
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return runner::Selection::parse_line("");
@@ -491,11 +498,18 @@ pub fn deref_agent_line(home: &Path, line: &str) -> Result<runner::Selection, St
         ));
     }
     let text = world::read_to_string(&path)?;
-    let declared = text
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .ok_or_else(|| format!("profile file {} carries no line", path.display()))?;
-    runner::Selection::parse_line(declared).map_err(|e| format!("{}: {e}", path.display()))
+    let profile_lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    match profile_lines.as_slice() {
+        [] => Err(format!("profile file {} carries no line", path.display())),
+        [only] => {
+            runner::Selection::parse_line(only).map_err(|e| format!("{}: {e}", path.display()))
+        }
+        many => Err(format!(
+            "{}: expected one line, found {}",
+            path.display(),
+            many.len()
+        )),
+    }
 }
 
 /// Where the winning agent declaration came from. Banner and doctor observability only —
@@ -1719,6 +1733,24 @@ mod tests {
         let home = home_with_profiles(&[("glm", SEED_PROFILES[0].1)]);
         let refusal = deref_agent_line(&home, "glm (the cheap one)").expect_err("must refuse");
         assert!(refusal.contains("one token"), "{refusal}");
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn a_declaration_with_two_non_blank_lines_refuses_rather_than_second_reading_it() {
+        let refusal =
+            deref_agent_line(&PathBuf::from("/nowhere"), "native\ncodex").expect_err("must refuse");
+        assert!(refusal.contains("expected one line, found 2"), "{refusal}");
+    }
+
+    #[test]
+    fn a_profile_file_with_two_lines_refuses_rather_than_reading_only_the_first() {
+        let home = home_with_profiles(&[]);
+        world::create_dir_all(&agents_dir(&home)).expect("the library");
+        world::write(&agents_dir(&home).join("split"), "omp\nclaude-code\n")
+            .expect("a two-line profile");
+        let refusal = deref_agent_line(&home, "split").expect_err("must refuse");
+        assert!(refusal.contains("expected one line, found 2"), "{refusal}");
         world::remove_tree(&home);
     }
 
