@@ -86,12 +86,9 @@ fn the_templates_table_carries_an_intent_row_and_the_parser_reads_it() {
 fn the_templates_agent_row_reads_none_and_round_trips_when_named() {
     let template = template();
 
-    // The example table writes `none`, so the parser must read no pin at all.
     let job =
         grind::job::from_issue_json(&as_issue(&example_table(&template))).expect("a readable Job");
     assert_eq!(job.agent, None, "`none` must read as no Agent pin");
-
-    // A named profile round-trips into Job.agent.
     let pinned =
         example_table(&template).replace("| **Agent** | `none` |", "| **Agent** | `opus-plan` |");
     assert_ne!(
@@ -100,7 +97,11 @@ fn the_templates_agent_row_reads_none_and_round_trips_when_named() {
         "the Agent row must exist to rename"
     );
     let job = grind::job::from_issue_json(&as_issue(&pinned)).expect("a readable Job");
-    assert_eq!(job.agent.as_deref(), Some("opus-plan"));
+    assert_eq!(
+        job.agent.as_deref(),
+        Some("opus-plan"),
+        "a named profile must round-trip into the Agent pin"
+    );
 }
 
 #[test]
