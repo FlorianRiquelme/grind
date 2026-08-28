@@ -287,6 +287,15 @@ is deliberately stacked on another open branch; a worktree forked behind main si
 convention and doc changes (observed: #150 opened without seeing the CodeRabbit-triage
 section #149 had just added).
 
+When an agent session is rooted in this checkout, the harness's Edit tool can reject worktree
+paths with a stale snapshot hash ("hash #XXXX is not from this session") even immediately after
+a fresh read — same-relative-path files in the two checkouts collide in its snapshot cache
+(observed across every read/edit cycle on #179). Bridge it instead of fighting it:
+`scripts/worktree-edit-link.sh ../grind-<issue>` links the worktree's top level under
+`.worktree-grind-<issue>-*` paths with absolute targets, and reads/edits go through those. Run
+it with `--rm` once the work merges — the links are session scaffolding, and a relative symlink
+target silently resolves into *this* checkout instead of the worktree.
+
 ### CodeRabbit triage
 
 Every PR gets an automatic CodeRabbit bot review a few minutes after opening, and every inline
