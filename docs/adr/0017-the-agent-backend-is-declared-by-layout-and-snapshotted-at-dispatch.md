@@ -84,7 +84,8 @@ At dispatch, the supervisor resolves the selection once and writes `backend` and
 The native adapter appends `messages-N.jsonl` for attempt N, mirroring the `attempt-N.*`
 convention, into the Run's own directory under `~/.grind/runs/<run-id>/`. An attempt re-entered
 after an earlier attempt with the same number died unrecorded appends to
-`messages-N-{K}.jsonl` (`reflect-messages-{N}-{K}.jsonl` likewise) — the first name in slot
+`messages-N-{K}.jsonl` (`reflect-messages-{N}-{K}.jsonl` likewise; the Triage grader's
+transcripts follow the same slot rules as `grade-messages-{N}-{K}.jsonl`, ADR-0020) — the first name in slot
 order that does not exist yet, so a resumed retry never recycles a dead attempt's transcript:
 allocation never opens an existing file for writing, and nothing already on disk is truncated. Lines
 are `{"event": "<snake_name>", "value": {...}}`, identical shape to the POC's log: the variants

@@ -286,10 +286,12 @@ fn log_offset(query: Option<&str>) -> Option<u64> {
     Some(0)
 }
 
-/// Whitelisted evidence, verbatim (R5). Three whole names plus `attempt-N.<suffix>` with
-/// N all digits, and `messages-N[-K].jsonl` where K orders same-slot retries; every
-/// near-miss — a `.bak`, a non-numeric attempt, a second retry group, anything else —
-/// reads as not-here and leaks nothing.
+/// Whitelisted evidence, verbatim (R5). Three whole names plus `attempt-N.<suffix>`,
+/// `reflect-N.<suffix>` and `grade-N.<suffix>` with N all digits, and the transcript
+/// families `messages-N[-K].jsonl`, `reflect-messages-N[-K].jsonl`,
+/// `grade-messages-N[-K].jsonl` where K orders same-slot retries; every near-miss —
+/// a `.bak`, a non-numeric attempt, a second retry group, anything else — reads as
+/// not-here and leaks nothing.
 fn raw_file(home: &Path, id: &str, file: &str) -> Response {
     if !evidence_allowed(file) {
         return plain(Status::NotFound);
@@ -307,11 +309,13 @@ fn evidence_allowed(file: &str) -> bool {
     if WHOLE.contains(&file) {
         return true;
     }
-    const NUMBERED: [(&str, &[&str], bool); 4] = [
+    const NUMBERED: [(&str, &[&str], bool); 6] = [
         ("attempt-", &SPAWNED, false),
         ("reflect-", &SPAWNED, false),
+        ("grade-", &SPAWNED, false),
         ("messages-", &[".jsonl"], true),
         ("reflect-messages-", &[".jsonl"], true),
+        ("grade-messages-", &[".jsonl"], true),
     ];
     NUMBERED.iter().any(|(prefix, suffixes, retried)| {
         suffixes.iter().any(|suffix| {
@@ -975,10 +979,15 @@ mod tests {
             "reflect-3.prompt.txt",
             "reflect-3.stdout.json",
             "reflect-3.stderr.log",
+            "grade-2.prompt.txt",
+            "grade-2.stdout.json",
+            "grade-2.stderr.log",
             "messages-7.jsonl",
             "reflect-messages-3.jsonl",
             "messages-2-2.jsonl",
             "reflect-messages-1-3.jsonl",
+            "grade-messages-1.jsonl",
+            "grade-messages-1-2.jsonl",
         ] {
             world::write_atomic(&run_dir.join(name), "evidence bytes\n").unwrap();
             let target = format!("/raw/runs/abc/{name}");
@@ -1007,6 +1016,9 @@ mod tests {
             "messages-1.jsonl.bak",
             "reflect-.prompt.txt",
             "reflect-messages-x.jsonl",
+            "grade-.prompt.txt",
+            "grade-messages-x.jsonl",
+            "grade-messages--1.jsonl",
             "messages-2-x.jsonl",
             "messages--2.jsonl",
             "messages-2-2-3.jsonl",

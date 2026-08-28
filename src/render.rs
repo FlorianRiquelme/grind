@@ -2069,6 +2069,7 @@ mod tests {
                 value: "180".to_string(),
                 weight: "t1".to_string(),
             }],
+            graded: None,
         }
     }
 

@@ -34,10 +34,16 @@ content_signal_t3 = 3
 # (issue #157): exhaustion is loud, never a stop. The absent-entry fallback lives in
 # src/native.rs (`DEFAULT_MAX_TURNS`), mirrored into the parser's compiled default —
 # a stage missing from this table reads that fallback, never zero.
+# Since #166 the Triage grader joins this table: one turn is the whole job — read the
+# context block, write `stages/triage/grade.json`. A grader that cannot land its verdict in
+# one turn has failed at the job, and its exhaustion is loud (a failed Attempt in the
+# record) but never blocking: the supervisor fails closed to the static tier the thresholds
+# already computed.
 [max_turns]
 work = 64
 validate = 48
 fixes = 96
+grade = 1
 
 # Optional per-tier overrides, read as `[max_turns.tN]` for t0-t3. A tiered entry
 # outranks the flat row; this one differs from it on purpose — it is the receipt

@@ -8,7 +8,7 @@ executes plans the human is not present for, and stops at an open PR.
 - **`CONTEXT.md`** — the glossary. Job, Enqueue, Dispatch, Run, Handoff SHA, Anchor
   artifact, Handback and the rest are defined terms with explicit `_Avoid_` lists. Use them;
   don't drift to the synonyms they rule out.
-- **`docs/adr/`** — nineteen accepted decisions that constrain almost every change here.
+- **`docs/adr/`** — twenty accepted decisions that constrain almost every change here.
 - **`docs/provisioned-host.md`** — what a host must guarantee before a Dispatch succeeds on
   it: the `~/.grind/` layout, the executables, the six credential steps, and which items are
   checked at dispatch, by `grind doctor`, or not at all. Read it before provisioning anything.
@@ -113,7 +113,9 @@ unsatisfiable by construction and gets deleted by whoever trips it next (ledger 
   project or milestone, on any repo — `world`'s stated invariant is *one place, two writes*, and
   both writes are comments. `QUEUE_LABEL` erased a triage fact to record a queue fact.
   `tests/topology.rs` carries the absence of every classifying flag.
-- **Grind owns the ladder** (ADR-0015). The supervisor walks the ten stage rungs itself — Plan,
+- **Grind owns the ladder** (ADR-0015; ADR-0020 amends the Triage tier call: an LLM grader
+  judges the tier, the static table is the recorded prior; Diff-triage stays a zero-token Rust
+  pass). The supervisor walks the ten stage rungs itself — Plan,
   Triage, Plan-review, Work, Simplify, Diff-triage, Review, Validate, Fixes, Ship — one Attempt
   per stage rather than one Attempt per `lfg` mega-session. Everything a stage does lives in its
   own authored skill under `skills/run/`, read by the caller through `world` and composed into

@@ -1255,7 +1255,7 @@ impl Default for Tiers {
             models_t1: models("fast"),
             models_t2: models("strong"),
             models_t3: models("strong"),
-            max_turns: turns(&[("work", 64), ("validate", 48), ("fixes", 96)]),
+            max_turns: turns(&[("work", 64), ("validate", 48), ("fixes", 96), ("grade", 1)]),
             max_turns_by_tier: [
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -1359,15 +1359,6 @@ pub struct PlanReviewDepth {
     pub reviewers: usize,
 }
 
-fn depth_for(tier: Tier) -> PlanReviewDepth {
-    let reviewers = match tier {
-        Tier::T0 | Tier::T1 => 1,
-        Tier::T2 => 2,
-        Tier::T3 => 3,
-    };
-    PlanReviewDepth { reviewers }
-}
-
 /// Which of the two free tier-selection passes is calling `select_tier`. Triage runs on plan
 /// facts alone (preliminary, floor-setting); Diff-triage runs on the real diff and can only
 /// raise what Triage set. The pass is what tells `select_tier` whose facts were *required* —
@@ -1377,6 +1368,18 @@ fn depth_for(tier: Tier) -> PlanReviewDepth {
 pub enum Pass {
     Triage,
     DiffTriage,
+}
+
+/// How many plan reviewers a Run's plan-review stage seats, per tier. Public because the
+/// grader override (issue #166) rebuilds the Decision at the grader's own tier in
+/// `supervisor.rs` — the roster depth must come from this one table, never a duplicated
+/// match in a second module that could drift from it (ADR-0006's single-source rule).
+pub fn depth_for(tier: Tier) -> PlanReviewDepth {
+    match tier {
+        Tier::T0 | Tier::T1 => PlanReviewDepth { reviewers: 1 },
+        Tier::T2 => PlanReviewDepth { reviewers: 2 },
+        Tier::T3 => PlanReviewDepth { reviewers: 3 },
+    }
 }
 
 /// A tier call's full receipt: the tier itself, the roster it buys, how deep plan review runs,
@@ -1389,6 +1392,31 @@ pub struct Decision {
     pub depth: PlanReviewDepth,
     pub model_per_stage: BTreeMap<String, String>,
     pub floor_from_plan: Tier,
+    pub rationale: Vec<RationaleRow>,
+    /// Present only when the Triage grader's verdict decided this tier: the receipt showing
+    /// *why* T2 and not just *that* T2. Never rendered as a replacement for the static rows —
+    /// the grader names the tier (issue #166) and the static rows stay recorded as the prior,
+    /// the statistics-never-taxonomy discipline of ADR-0012 applied to the tier call itself.
+    /// `serde(default)` keeps every pre-#166 `decision.json` parsing; `skip_serializing_if`
+    /// keeps a static-only Decision's bytes identical to what the pre-#166 writer emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graded: Option<GraderVerdict>,
+}
+
+/// The grader's own verdict, exactly as parsed from its return file (issue #166: the LLM
+/// grader judges the tier from Plan facts + the raw issue text; static thresholds stay as a
+/// recorded prior, not the tie-break that always wins). `tier` is the one field the
+/// supervisor treats as binding input; `rationale` is the receipt a human reads.
+///
+/// Grind-owned like [`PlanFacts`], so `deny_unknown_fields` turns writer-side drift into a
+/// failing test rather than a silently dropped key (the receipt-honesty rule of the #166
+/// contract). **Fail-closed direction**: a missing or unreadable grade file never produces
+/// one of these — it falls back to the static decision, per ADR-0015.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraderVerdict {
+    pub tier: Tier,
+    /// A fallback static tier when the grader gave no tier at all.
     pub rationale: Vec<RationaleRow>,
 }
 
@@ -1560,6 +1588,7 @@ pub fn select_tier(
         model_per_stage: tiers.models_for(tier).clone(),
         floor_from_plan: floor,
         rationale,
+        graded: None,
     }
 }
 
@@ -2040,6 +2069,7 @@ mod tier_tests {
             new_module_count: 0,
             declared_hot_paths: vec![],
         };
+
         let diff = DiffFacts {
             changed_loc: 1041,
             risky_paths_hit: vec![],
@@ -2048,5 +2078,82 @@ mod tier_tests {
             dep_manifest_touched: false,
         };
         assert_eq!(replay(&plan, &diff, None), Tier::T2);
+    }
+    #[test]
+    fn a_graded_decision_round_trips_both_the_grade_and_the_static_rows() {
+        let mut decision = select_tier(
+            Pass::Triage,
+            Some(&PlanFacts {
+                step_count: 3,
+                forecast_paths: vec![],
+                new_module_count: 0,
+                declared_hot_paths: vec![],
+            }),
+            None,
+            None,
+            Tier::T0,
+            &Tiers::default(),
+        );
+        let static_rationale = decision.rationale.clone();
+        decision.graded = Some(GraderVerdict {
+            tier: Tier::T1,
+            rationale: vec![RationaleRow {
+                signal: "grader".to_string(),
+                value: "one-step plan, no risky paths".to_string(),
+                weight: "-> t1".to_string(),
+            }],
+        });
+        let json = serde_json::to_string(&decision).expect("serialize");
+        assert!(json.contains("\"graded\""));
+        let round: Decision = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(round, decision);
+        assert_eq!(round.rationale, static_rationale);
+    }
+
+    #[test]
+    fn a_static_decision_omits_the_graded_key_entirely() {
+        let decision = select_tier(Pass::Triage, None, None, None, Tier::T0, &Tiers::default());
+        assert!(decision.graded.is_none());
+        let json = serde_json::to_string(&decision).expect("serialize");
+        assert!(
+            !json.contains("graded"),
+            "skip_serializing_if keeps a static-only Decision byte-compatible with the pre-#166 writer: {json}"
+        );
+    }
+
+    /// A `decision.json` written before #166 carried no `graded` key at all. `serde(default)`
+    /// must keep every such record parsing — the Diff-triage floor-binding reader is never
+    /// allowed to see a parse fail (the #166 contract's seam rule 2).
+    const PRE_GRADE_DECISION: &str = r#"{
+        "tier": "t3",
+        "personas": ["correctness", "tests", "consistency", "security"],
+        "depth": {"reviewers": 3},
+        "model_per_stage": {"work": "strong"},
+        "floor_from_plan": "t0",
+        "rationale": [
+            {"signal": "template_record", "value": "1 reverted of 4 runs, 0 unattended completions", "weight": "-> t3"}
+        ]
+    }"#;
+
+    #[test]
+    fn a_pre_grade_decision_json_without_the_graded_key_still_parses() {
+        let decoded: Decision =
+            serde_json::from_str(PRE_GRADE_DECISION).expect("pre-#166 record decodes");
+        assert_eq!(decoded.tier, Tier::T3);
+        assert!(decoded.graded.is_none());
+    }
+
+    #[test]
+    fn a_grade_json_with_an_unknown_field_fails_to_parse_not_silently_drops() {
+        let drifted = r#"{
+            "tier": "t2",
+            "rationale": [],
+            "confidence": 0.9
+        }"#;
+        let parsed: Result<GraderVerdict, _> = serde_json::from_str(drifted);
+        assert!(
+            parsed.is_err(),
+            "deny_unknown_fields must turn writer-side drift into a failing test, not a dropped key"
+        );
     }
 }

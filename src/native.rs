@@ -95,6 +95,7 @@ fn transcript_filename(label: FileLabel, n: usize, slot: usize) -> String {
     match label {
         FileLabel::Attempt => format!("messages-{n}{suffix}.jsonl"),
         FileLabel::Reflect => format!("reflect-messages-{n}{suffix}.jsonl"),
+        FileLabel::Grade => format!("grade-messages-{n}{suffix}.jsonl"),
     }
 }
 

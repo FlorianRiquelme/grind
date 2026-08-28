@@ -31,8 +31,10 @@ authored skill text:
 
 Plan, Triage, PlanReview, Work, Simplify, DiffTriage, Review, Validate, Fixes, Ship.
 
-Triage and DiffTriage are pure Rust passes costing zero tokens: they size later stages into tiers
-T0–T3 from observable facts about the plan and the diff — escalation-only, fail-closed to T2.
+Triage and DiffTriage size later stages into tiers T0–T3 from observable facts about the plan
+and the diff — escalation-only, fail-closed to T2. Triage runs one additional strong-routed
+grader turn (ADR-0020): the grader judges the tier from the Job and Plan facts, with the static
+table recorded as the prior; DiffTriage remains a pure Rust pass costing zero tokens.
 Stage completion is supervisor observation of durable return files (`stages/<name>.return.json`),
 never the agent's claim; advancement is the total function `rung::next`; a death re-enters only
 the stage that died.
@@ -111,7 +113,7 @@ ln -s <path-to-this-repo>/skills/enqueue ~/.claude/skills/enqueue
   contract with `src/job.rs`, tested by `tests/enqueue_template.rs`.
 - [`tests/`](tests/) — every safety property, including the compile-fail carrier, which shells out
   to `rustc` rather than taking a dev-dependency.
-- [`docs/adr/`](docs/adr/) — nineteen accepted decisions constraining almost every change here.
+- [`docs/adr/`](docs/adr/) — twenty accepted decisions constraining almost every change here.
 - [`docs/findings/`](docs/findings/) — seven findings docs, six of them dogfood Runs'
   measurements (`0001`–`0006`) and one cross-backend audit (`0007`).
 - [`docs/provisioned-host.md`](docs/provisioned-host.md) — what a host owes before a Dispatch

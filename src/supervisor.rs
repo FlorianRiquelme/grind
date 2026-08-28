@@ -1156,7 +1156,26 @@ fn load_plan_facts(stages_dir: &Path) -> Option<PlanFacts> {
 /// `decision.json` and the stage's own return. Consumes **no Attempt** — the `StageEntry` this
 /// pushes carries `cost_usd: Some(0.0)`, `turns: Some(0)`, and `session_id: "[R]"`, a literal
 /// chosen (over an empty string) so a rendered stage table reads *pure Rust, no session* rather
-/// than looking like an unresolved field.
+/// than looking like an unresolved field — unless the Triage grader ran, in which case the
+/// Triage row carries the grader session's own id, cost and turns instead (issue #166: the
+/// grader's session *is* the tier call, so the receipt is real, never `[R]`).
+///
+/// The Triage ladder, fail-closed at every rung (ADR-0020's exemption from ADR-0015's
+/// escalation-only frame applies to this one tier call only):
+///
+/// 1. the static `select_tier` result is computed exactly as before — the recorded prior;
+/// 2. the grader session runs once (re-entered once on an errored attempt that left no
+///    verdict, the same bound Reflect uses); an unreadable skill text skips the grader
+///    entirely;
+/// 3. `stages/triage/grade.json`, when present and parseable, *replaces* the static tier —
+///    never maxes, the whole point of the exemption — and its rationale rows lead the
+///    receipt with the static rows kept behind them as the prior;
+/// 4. anything else — absent file, garbage, a schema drift `deny_unknown_fields` rejects —
+///    keeps the static decision verbatim with `graded: None`.
+///
+/// Diff-triage is untouched: it still reads Triage's `decision.json` for the floor (the
+/// `graded` field round-trips through serde defaults, so the floor reader never notices a
+/// grade behind the tier) and still only ever raises from it.
 fn run_r_pass(
     record: &mut RunRecord,
     run_dir: &Path,
@@ -1166,17 +1185,40 @@ fn run_r_pass(
     let stages_dir = run_dir.join("stages");
     let tiers = load_tiers(worktree);
     let template_record = template_record_for(&record.job.target_repo, &record.run_id);
-    let decision = match stage {
+    let (decision, grader) = match stage {
         Stage::Triage => {
             let plan_facts = load_plan_facts(&stages_dir);
-            decide::select_tier(
+            let static_decision = decide::select_tier(
                 Pass::Triage,
                 plan_facts.as_ref(),
                 None,
                 Some(&template_record),
                 Tier::T0,
                 &tiers,
-            )
+            );
+            let grader = dispatch_triage_grader(record, run_dir, &static_decision);
+            let grade_text =
+                world::read_to_string(&stages_dir.join("triage").join("grade.json")).ok();
+            let graded = grade_text.is_some()
+                && serde_json::from_str::<decide::GraderVerdict>(grade_text.as_deref().unwrap())
+                    .is_ok();
+            let decision =
+                triage_decision_with_grade(static_decision, grade_text.as_deref(), &tiers);
+            let note = match (&grader, graded) {
+                (Some(_), true) => {
+                    " — the grader's verdict decided the tier; static rows kept as the prior"
+                }
+                (Some(_), false) => " — no readable grade; fail-closed to the static tier",
+                (None, _) => " (grader not dispatched; static tier stands)",
+            };
+            say(
+                run_dir,
+                &format!(
+                    "  [R] triage decided {} (floor {}){note}",
+                    decision.tier, decision.floor_from_plan
+                ),
+            );
+            (decision, grader)
         }
         Stage::DiffTriage => {
             let range = format!("{}..HEAD", record.job.handoff_sha);
@@ -1197,14 +1239,15 @@ fn run_r_pass(
                 .map(|d| d.tier)
                 .unwrap_or(Tier::T2);
             let plan_facts = load_plan_facts(&stages_dir);
-            decide::select_tier(
+            let decision = decide::select_tier(
                 Pass::DiffTriage,
                 plan_facts.as_ref(),
                 Some(&diff_facts),
                 Some(&template_record),
                 floor,
                 &tiers,
-            )
+            );
+            (decision, None)
         }
         _ => unreachable!("run_r_pass is only ever called for Triage or DiffTriage"),
     };
@@ -1225,27 +1268,205 @@ fn run_r_pass(
         .map_err(|e| Refusal::saying(format!("could not serialise the {name} return: {e}")))?;
     world::write_atomic(&stages_dir.join(format!("{name}.return.json")), &ret_json)
         .map_err(Refusal::saying)?;
-
-    say(
-        run_dir,
-        &format!(
-            "  [R] {name} decided {} (floor {})",
-            decision.tier, decision.floor_from_plan
-        ),
-    );
-    record.push_stage_entry(rung::StageEntry {
-        name,
-        session_id: "[R]".to_string(),
-        status: ReturnStatus::Complete,
-        artifact_paths: vec![
-            format!("stages/{stage}/decision.json"),
-            format!("stages/{stage}.return.json"),
-        ],
-        model: None,
-        cost_usd: Some(0.0),
-        turns: Some(0),
-    });
+    let mut artifact_paths = vec![
+        format!("stages/{stage}/decision.json"),
+        format!("stages/{stage}.return.json"),
+    ];
+    if world::read_to_string(&stages_dir.join("triage").join("grade.json")).is_ok() {
+        artifact_paths.push("stages/triage/grade.json".to_string());
+    }
+    match grader {
+        Some(attempt) => record.push_stage_entry(rung::StageEntry {
+            name,
+            session_id: attempt::grade_session_id(&record.run_id),
+            status: ReturnStatus::Complete,
+            artifact_paths,
+            model: runner::StageModel::Class(runner::ModelClass::Strong).claude_code_arg(),
+            cost_usd: attempt.total_cost_usd,
+            turns: attempt.num_turns,
+        }),
+        None => record.push_stage_entry(rung::StageEntry {
+            name,
+            session_id: "[R]".to_string(),
+            status: ReturnStatus::Complete,
+            artifact_paths,
+            model: None,
+            cost_usd: Some(0.0),
+            turns: Some(0),
+        }),
+    }
     Ok(())
+}
+
+/// The Triage grader's one dispatch — Reflect's shape (`maybe_dispatch_reflect`), pointed at a
+/// verdict file instead of a return file. Runs before the tier is final: the static decision
+/// rides along in the prompt as the recorded prior, and the grader's whole job is to say
+/// whether the Job's actual nature deserves a different one (issue #166: the docs-two-liner
+/// that routed T3 on a `template_record` artifact).
+///
+/// **Fail-closed everywhere.** No `$HOME`, no skill text, or an exhausted re-entry bound
+/// dispatches nothing and returns `None`; the caller keeps the static decision. An errored
+/// attempt that left no `grade.json` is resumed once — the same bound Reflect carries — and
+/// after that the static prior stands, loudly, in the say-line.
+fn dispatch_triage_grader(
+    record: &mut RunRecord,
+    run_dir: &Path,
+    static_decision: &decide::Decision,
+) -> Option<Attempt> {
+    let home = world::home()?;
+    let skill_path = skills_root(&home).join("grade").join("SKILL.md");
+    let Ok(skill_text) = world::read_to_string(&skill_path) else {
+        say(
+            run_dir,
+            "    note: the grader skill text is unavailable — skipping the grader",
+        );
+        return None;
+    };
+    let session_id = attempt::grade_session_id(&record.run_id);
+    let grade_path = run_dir.join("stages").join("triage").join("grade.json");
+    let mut n = record
+        .stages()
+        .iter()
+        .filter(|entry| entry.session_id == session_id)
+        .count();
+    if n >= 2 {
+        say(
+            run_dir,
+            "    note: the grader already re-entered once — skipping",
+        );
+        return None;
+    }
+    let plan_facts_text =
+        world::read_to_string(&run_dir.join("stages").join("plan").join("plan-facts.json")).ok();
+    let prompt = grade_prompt(
+        &skill_text,
+        &record.job,
+        plan_facts_text.as_deref(),
+        static_decision,
+        &grade_path,
+    );
+    let conditions = StageConditions {
+        claude_bin: &record.claude_bin,
+        run_id: &record.run_id,
+    };
+    let denied = attempt::denied_for_grade();
+    let grade_model = runner::StageModel::Class(runner::ModelClass::Strong);
+    let run_dir_str = run_dir.display().to_string();
+    let runner = record.runner(&home, run_dir, Some(Stage::Triage));
+    let mut classified;
+    loop {
+        n += 1;
+        let mode = if n == 1 && transcript_lines_for(run_dir, &session_id) == 0 {
+            Mode::Dispatch
+        } else {
+            Mode::Resume
+        };
+        let invocation = match mode {
+            Mode::Dispatch => claude::grade_dispatch(&conditions, &prompt),
+            _ => claude::grade_resume(&conditions, &prompt),
+        };
+        say(run_dir, &format!("  [grade] attempt {n} ({mode}) …"));
+        let spec = runner::RunSpec {
+            invocation: &invocation,
+            cwd: run_dir,
+            run_dir,
+            attempt_n: n,
+            session_id: &session_id,
+            worktree: &run_dir_str,
+            model: &grade_model,
+            denied_globs: &denied,
+            file_label: runner::FileLabel::Grade,
+        };
+        let graded = runner.run(&spec);
+        let errored = graded.is_error;
+        let have_grade = world::read_to_string(&grade_path).is_ok();
+        classified = Some(graded);
+        if !errored || have_grade || n >= 2 {
+            break;
+        }
+        say(
+            run_dir,
+            "    note: the grader attempt errored with no verdict file — resuming once",
+        );
+    }
+    classified
+}
+
+/// The grader's whole prompt: the skill text (schema, discipline, tier vocabulary) plus the
+/// context block the skill itself deliberately does not embed — the Job's own rows, the Plan
+/// facts JSON, and the static prior with its rationale rows. Everything here is grind-owned
+/// prose or a file the Run already produced; the grader reads nothing else and writes nothing
+/// else (the skill's own Never list enforces the one-file discipline).
+fn grade_prompt(
+    skill_text: &str,
+    job: &Job,
+    plan_facts_json: Option<&str>,
+    static_decision: &decide::Decision,
+    grade_path: &Path,
+) -> String {
+    let mut prompt = String::from(skill_text);
+    prompt.push_str("\n\n## Your context\n\n");
+    prompt.push_str(&format!("Job title: {}\n", job.title));
+    if let Some(intent) = &job.intent {
+        prompt.push_str(&format!("Job intent: {intent}\n"));
+    }
+    prompt.push_str(&format!("Done predicate: {}\n", job.done_predicate));
+    match plan_facts_json {
+        Some(json) => {
+            prompt.push_str("\nPlan facts (JSON):\n\n```json\n");
+            prompt.push_str(json);
+            prompt.push_str("\n```\n");
+        }
+        None => prompt.push_str(
+            "\nPlan facts: absent — the static pass already failed closed for this; say so if \
+             it moves your verdict.\n",
+        ),
+    }
+    prompt.push_str(&format!(
+        "\nThe static thresholds' prior for this Run: tier {}.\nIts rationale rows:\n",
+        static_decision.tier
+    ));
+    for row in &static_decision.rationale {
+        prompt.push_str(&format!(
+            "- {}: {} ({})\n",
+            row.signal, row.value, row.weight
+        ));
+    }
+    prompt.push_str(&format!(
+        "\nWrite your verdict to {} , exactly one JSON object per the schema above.\n",
+        grade_path.display()
+    ));
+    prompt
+}
+
+/// The grade merge, pure so the fail-closed ladder is testable from literals: a grade that is
+/// absent, unparseable, or schema-drifted (`deny_unknown_fields` rejects extra keys — a
+/// writer-side drift is a failing parse, not a silently dropped field, ADR-0006) leaves the
+/// static decision verbatim with `graded: None`. A parseable grade *replaces* the tier —
+/// ADR-0020's exemption from the escalation-only max — and rebuilds the roster, review depth
+/// and model routing for the tier it names, with the grader's rationale rows leading and the
+/// static rows kept behind them as the recorded prior. `floor_from_plan` is untouched: the
+/// floor is what the facts said, not what the grader overrode.
+fn triage_decision_with_grade(
+    mut static_decision: decide::Decision,
+    grade_text: Option<&str>,
+    tiers: &Tiers,
+) -> decide::Decision {
+    let Some(text) = grade_text else {
+        return static_decision;
+    };
+    let Ok(verdict) = serde_json::from_str::<decide::GraderVerdict>(text) else {
+        return static_decision;
+    };
+    static_decision.tier = verdict.tier;
+    static_decision.personas = decide::panel(static_decision.tier, None, None);
+    static_decision.depth = decide::depth_for(static_decision.tier);
+    static_decision.model_per_stage = tiers.models_for(static_decision.tier).clone();
+    static_decision
+        .rationale
+        .splice(..0, verdict.rationale.clone());
+    static_decision.graded = Some(verdict);
+    static_decision
 }
 
 /// Which model *class* (`decide::Decision::model_per_stage`) resolves to for one stage, per
@@ -3059,5 +3280,80 @@ mod tests {
             path,
             Path::new("/home/op/.grind/runs/20260821-000000-snapper-90/resume.log")
         );
+    }
+
+    fn static_decision() -> decide::Decision {
+        decide::Decision {
+            tier: Tier::T3,
+            personas: vec![decide::Persona::Correctness],
+            depth: decide::PlanReviewDepth { reviewers: 3 },
+            model_per_stage: std::collections::BTreeMap::new(),
+            floor_from_plan: Tier::T0,
+            rationale: vec![decide::RationaleRow {
+                signal: "template_record".to_string(),
+                value: "ci_failed".to_string(),
+                weight: "-> t3".to_string(),
+            }],
+            graded: None,
+        }
+    }
+
+    #[test]
+    fn an_absent_grade_keeps_the_static_decision_verbatim() {
+        let tiers = Tiers::default();
+        let decision = triage_decision_with_grade(static_decision(), None, &tiers);
+        assert_eq!(decision, static_decision());
+    }
+
+    #[test]
+    fn garbage_grade_json_fails_closed_to_the_static_tier() {
+        let tiers = Tiers::default();
+        let decision =
+            triage_decision_with_grade(static_decision(), Some("this is not json"), &tiers);
+        assert_eq!(decision, static_decision());
+    }
+
+    #[test]
+    fn a_schema_drifted_grade_is_rejected_not_silently_trimmed() {
+        let tiers = Tiers::default();
+        let decision = triage_decision_with_grade(
+            static_decision(),
+            Some(r#"{"tier": "t1", "rationale": [], "confidence": "high"}"#),
+            &tiers,
+        );
+        assert_eq!(
+            decision,
+            static_decision(),
+            "deny_unknown_fields must reject"
+        );
+    }
+
+    #[test]
+    fn a_valid_grade_replaces_the_t3_prior_instead_of_maxing() {
+        let tiers = Tiers::default();
+        let grade = r#"{"tier": "t1", "rationale": [
+            {"signal": "job_nature", "value": "docs two-liner", "weight": "-> t1"},
+            {"signal": "prior_mismatch", "value": "t3 on template_record", "weight": "overrides"}
+        ]}"#;
+        let decision = triage_decision_with_grade(static_decision(), Some(grade), &tiers);
+        assert_eq!(decision.tier, Tier::T1, "the grader replaces, never maxes");
+        assert_eq!(decision.depth.reviewers, 1);
+        assert!(decision.graded.is_some());
+        assert_eq!(decision.rationale.len(), 3, "grader rows lead, prior kept");
+        assert_eq!(decision.rationale[0].signal, "job_nature");
+        assert_eq!(decision.rationale[2].signal, "template_record");
+        assert_eq!(decision.floor_from_plan, Tier::T0, "the floor is untouched");
+    }
+
+    #[test]
+    fn a_grade_agreeing_with_the_prior_still_records_the_verdict() {
+        let tiers = Tiers::default();
+        let grade = r#"{"tier": "t3", "rationale": [
+            {"signal": "job_nature", "value": "pays on auth paths", "weight": "agrees t3"}
+        ]}"#;
+        let decision = triage_decision_with_grade(static_decision(), Some(grade), &tiers);
+        assert_eq!(decision.tier, Tier::T3);
+        assert_eq!(decision.graded.as_ref().unwrap().rationale.len(), 1);
+        assert_eq!(decision.rationale.len(), 2);
     }
 }

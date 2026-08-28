@@ -351,10 +351,15 @@ impl StageModel {
 /// (claude-code) / `messages-N.jsonl` (native) — both adapters' default. `Reflect` is
 /// `reflect-N.*` / `reflect-messages-N.jsonl`: Reflect is never an Attempt (it lands no
 /// `Attempt` row and is budget-exempt), so its files must never collide with attempt N's.
+/// `Grade` is `grade-N.*` / `grade-messages-N.jsonl` for the same reason: the Triage grader
+/// (issue #166) is also a non-Attempt judgment seat bolted beside the ladder (ADR-0015), and
+/// its prompt/stdout/stderr triple and native transcript must never collide with attempt N's
+/// or Reflect's either.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileLabel {
     Attempt,
     Reflect,
+    Grade,
 }
 
 impl FileLabel {
@@ -362,6 +367,7 @@ impl FileLabel {
         match self {
             Self::Attempt => "attempt",
             Self::Reflect => "reflect",
+            Self::Grade => "grade",
         }
     }
 }

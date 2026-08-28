@@ -97,6 +97,20 @@ pub fn denied_for_reflect() -> Vec<String> {
     denials
 }
 
+/// The Triage grader's denial set — the same shape [`denied_for_reflect`] builds, and for the
+/// same reason: the grader is report-only in the sense that it judges and never edits the
+/// worktree, but it **must** write its one return file (`<stages-dir>/triage/grade.json`), so
+/// `Write`/`Edit` stay allowed while the write-capable Bash forms (plus `git push*` outright)
+/// are denied — a shell loop writing a second file is the drift those denials catch, not a
+/// sandbox promise. The skill's own prose carries the one-file discipline; this is the tool
+/// layer behind it. Same cwd story as Reflect: dispatched with the run directory, so there is
+/// no repo tree under the session for `Write`/`Edit` to touch in the first place.
+pub fn denied_for_grade() -> Vec<String> {
+    let mut denials: Vec<String> = DENIED_TOOLS.iter().map(|s| s.to_string()).collect();
+    denials.extend(PANEL_BASH_FORMS.iter().map(|s| s.to_string()));
+    denials
+}
+
 /// The session id a stage's own Attempt dispatches or resumes: a validly formatted UUID,
 /// deterministically derived from `(run_id, stage)`. `claude -p --session-id` only accepts a
 /// UUID, so the literal `<run>-<stage>` text this used to format died every dispatch at
@@ -114,6 +128,15 @@ pub fn stage_session_id(run_id: &str, stage: rung::Stage) -> String {
 /// [`rung::Stage`] deliberately has no variant for it (the design's own words).
 pub fn reflect_session_id(run_id: &str) -> String {
     session_id_from(run_id, "reflect")
+}
+
+/// The Triage grader's session id — the same derivation as a stage's, named `"grade"`. Like
+/// Reflect (and unlike every rung), grading is a judgment seat bolted beside the ladder rather
+/// than on it (ADR-0015): the supervisor dispatches it directly, so it needs its own
+/// deterministic, re-derivable id for `--resume` re-entry, exactly as [`reflect_session_id`]
+/// documents.
+pub fn grade_session_id(run_id: &str) -> String {
+    session_id_from(run_id, "grade")
 }
 
 /// Two independent FNV-1a passes over `(run_id, name)` in both orders give 128 bits without
@@ -1602,6 +1625,30 @@ mod tests {
             "reflect must still write its own artifacts"
         );
         assert!(!reflect.contains(&"Edit".to_string()));
+    }
+
+    #[test]
+    fn grade_carries_the_write_capable_bash_forms_but_not_write_or_edit() {
+        let grade = denied_for_grade();
+        for glob in DENIED_TOOLS {
+            assert!(grade.iter().any(|g| g == glob), "grade must carry {glob}");
+        }
+        for glob in PANEL_BASH_FORMS {
+            assert!(grade.iter().any(|g| g == glob), "grade must carry {glob}");
+        }
+        assert!(
+            !grade.contains(&"Write".to_string()),
+            "grade must still write its one verdict file"
+        );
+        assert!(!grade.contains(&"Edit".to_string()));
+    }
+
+    #[test]
+    fn grade_session_id_is_valid_uuid_deterministic_and_distinct_from_reflect_s() {
+        let id = grade_session_id("run-20260822-001");
+        assert_eq!(grade_session_id("run-20260822-001"), id);
+        assert_eq!(id.len(), 36);
+        assert_ne!(id, reflect_session_id("run-20260822-001"));
     }
 
     /// An attempt record written before the transcript name was recorded. Verbatim old shape:

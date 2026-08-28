@@ -106,11 +106,13 @@ resolves.
   minimal Linux host is quite likely to be. Presence only: a busybox `ps` is on `PATH` and still
   cannot answer, so this item catches the absent one and `observe::process_start_stamp` catches
   the rest by reading three-valued.
-- **The ten stage skill directories are present under `~/.grind/skills/run`.** — *dispatch* — Grit
-  (ADR-0015) dispatches one stage skill per rung rather than the retired `lfg` plugin's
-  mega-session; a host that never copied `skills/run/*` into place would pass every check above
-  and still have nothing to read at the first stage. Presence only, the same layout-declared
-  shape every other item here reads: the host declares itself by what is on disk.
+- **The ten stage skill directories are present under `~/.grind/skills/run`.** — *dispatch* —
+  Grit (ADR-0015) dispatches one stage skill per rung rather than the retired `lfg` plugin's
+  mega-session, and since ADR-0020 the Triage tier call
+  also reads one grader skill (`skills/run/grade/`); a host that never copied `skills/run/*`
+  into place would pass every check above and still have nothing to read at the first stage.
+  Presence only, the same layout-declared shape every other item here reads: the host declares
+  itself by what is on disk.
 
   Provisioning what once pinned a plugin version now freezes **provenance**: the `grind` binary's
   own version plus a hash of this skill tree, both resolved once at dispatch and recorded on the

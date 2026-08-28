@@ -8,8 +8,8 @@
 
 use crate::attempt::{
     Attempt, Clearance, Conditions, DENIED_TOOLS, DONE_PROMISE, Invocation, Mode, StageConditions,
-    StageContext, denied_for, denied_for_reflect, is_rate_limited, mentions_limit, normalise,
-    reflect_session_id, stage_session_id, text_at,
+    StageContext, denied_for, denied_for_grade, denied_for_reflect, grade_session_id,
+    is_rate_limited, mentions_limit, normalise, reflect_session_id, stage_session_id, text_at,
 };
 use crate::observe::{Observed, Reason};
 use crate::rung;
@@ -174,6 +174,49 @@ pub fn reflect_dispatch(conditions: &StageConditions, skill_text: &str) -> Invoc
 /// supervisor, never by this builder.
 pub fn reflect_resume(conditions: &StageConditions, skill_text: &str) -> Invocation {
     build_reflect(conditions, skill_text, Mode::Resume)
+}
+
+/// The Triage grader's first Attempt, opening `<run>-grade` (issue #166). Not a rung — like
+/// Reflect, the grader is a judgment seat bolted beside the ladder rather than on it
+/// (ADR-0015), so it never goes through [`stage_invocation`]; the supervisor calls this
+/// directly once plan facts and the raw issue text are in hand. The prompt is passed in by
+/// the caller — the supervisor composes it from the plan facts and issue text, and this
+/// builder stays a pure argv shape. Worktree protection is
+/// [`crate::attempt::denied_for_grade`]'s write-capable Bash-form denials, the same shape
+/// [`denied_for_reflect`] rides on.
+pub fn grade_dispatch(conditions: &StageConditions, prompt: &str) -> Invocation {
+    build_grade(conditions, prompt, Mode::Dispatch)
+}
+
+/// A later Attempt for the grader, resuming `<run>-grade` — bounded to one re-entry by the
+/// supervisor, never by this builder.
+pub fn grade_resume(conditions: &StageConditions, prompt: &str) -> Invocation {
+    build_grade(conditions, prompt, Mode::Resume)
+}
+
+fn build_grade(conditions: &StageConditions, prompt: &str, mode: Mode) -> Invocation {
+    let session_id = grade_session_id(conditions.run_id);
+    let mut argv = vec![
+        conditions.claude_bin.to_string(),
+        "-p".to_string(),
+        "--output-format".to_string(),
+        "json".to_string(),
+        "--permission-mode".to_string(),
+        "bypassPermissions".to_string(),
+    ];
+    match mode {
+        Mode::Dispatch => {
+            argv.push("--session-id".to_string());
+            argv.push(session_id);
+        }
+        Mode::Resume | Mode::CiBabysit => {
+            argv.push("--resume".to_string());
+            argv.push(session_id);
+        }
+    }
+    argv.push("--disallowedTools".to_string());
+    argv.extend(denied_for_grade());
+    Invocation::build(argv, prompt.to_string(), mode)
 }
 
 fn build_reflect(conditions: &StageConditions, skill_text: &str, mode: Mode) -> Invocation {
