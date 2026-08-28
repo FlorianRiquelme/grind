@@ -127,7 +127,7 @@ CI and nothing else.
 
 ## Status
 
-Single-user proof of concept, used by its author against their own repos. Seven dogfood Runs are
+Single-user proof of concept, used by its author against their own repos. Six dogfood Runs are
 recorded under `docs/findings/`; handback fidelity, morning decisions per run, unattended
 completion rate, cost, and self-diagnosable failures are tracked in
 [STRATEGY.md](STRATEGY.md). Not looking for contributors — if a colleague wants this, they fork
