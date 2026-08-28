@@ -314,6 +314,15 @@ is deliberately stacked on another open branch; a worktree forked behind main si
 convention and doc changes (observed: #150 opened without seeing the CodeRabbit-triage
 section #149 had just added).
 
+When an agent session is rooted in this checkout, the harness's Edit tool can reject worktree
+paths with a stale snapshot hash ("hash #XXXX is not from this session") even immediately after
+a fresh read — same-relative-path files in the two checkouts collide in its snapshot cache
+(observed across every read/edit cycle on #179). Bridge it instead of fighting it:
+`scripts/worktree-edit-link.sh ../grind-<issue>` links the worktree's top level under
+`.worktree-grind-<issue>-*` paths with absolute targets, and reads/edits go through those. Run
+it with `--rm` once the work merges — the links are session scaffolding, and a relative symlink
+target silently resolves into *this* checkout instead of the worktree.
+
 ### CodeRabbit triage
 
 Every PR gets an automatic CodeRabbit bot review a few minutes after opening, and every inline
@@ -357,6 +366,8 @@ an external-system quirk or a bug context that must survive belongs in
 `docs/agents/code-rationale.md` — or an ADR, if it decides something. Prose beside code rots
 faster than the code changes, and the reader here re-reads the code anyway.
 
+Inline-comment additions to `.rs` files are hard-blocked at edit time by the `.omp/hooks/pre/no-inline-comments.ts` pre-tool hook.
+
 ### Agent-facility guardrails
 
 Agent instructions for assistants on this repo live in this file and in TTSR guardrails under
@@ -367,6 +378,7 @@ triggers match, never an always-on token cost. Seven exist today: `denied-tools-
 `widen-grammar-sweep-declarations`. When a constraint above ("Constraints that are easy to
 violate") is forgettable-but-critical and scoped to specific files/symbols/commands, encode it
 there too instead of expecting every violating edit to pass through this file.
+Beyond these declarative rules, three pre-tool hooks under `.omp/hooks/pre/` (`no-inline-comments.ts`, `denied-tools-mirror.ts`, `prefer-just-verify.ts`) hard-block violating tool calls in interactive sessions, and the `verify-fixer` subagent under `.omp/agents/` performs scoped `just verify` failure repair.
 
 ### Domain docs
 

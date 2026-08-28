@@ -426,7 +426,9 @@ fn sandbox(name: &str) -> Sandbox {
 
     let toolbox = home.join(".fake/toolbox");
     fs::create_dir_all(&toolbox).expect("a toolbox");
-    for tool in ["git", "sh", "cat", "sed", "dirname", "uname", "ps", "mkdir"] {
+    for tool in [
+        "git", "sh", "cat", "sed", "dirname", "uname", "ps", "mkdir", "df",
+    ] {
         let real = which(tool);
         let _ = std::os::unix::fs::symlink(&real, toolbox.join(tool));
     }

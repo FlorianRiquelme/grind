@@ -135,6 +135,13 @@ here, or in an ADR when it decides something.
 - **RunOutcome**: ADR-0009 put clippy in the verify recipe, but under a library target a `pub`
   enum no longer raises the dead-code warning, so an exhaustive match over the enum stands in
   for it — a representable-state statement enforced by test instead of lint.
+- **disk_headroom**: A POSIX-mode `df` row is not safely positional. `-P` fixes line wrapping,
+  not tokenisation: `df -Pk /System/Volumes/Data/home` emits `map auto_home 0 0 0 100%
+  /System/Volumes/Data/home` — seven fields, where index 3 is `Used` and parses cleanly as
+  `u64`, so a positional read yields a confident wrong number rather than the unreadable branch.
+  Counting from the right fails too, since `Mounted on` may contain spaces. `Available` is
+  located as the token immediately preceding the single `%`-suffixed `Capacity` token, which
+  survives spaces on both sides.
 
 ## src/decide.rs
 

@@ -442,6 +442,9 @@ pub enum Check {
     /// The OpenAI-compatible endpoint answers a connection-level probe (`net::probe_endpoint`,
     /// R9). No key resolves the endpoint, so without one this check cannot even be tried.
     EndpointReachable,
+    /// Free space, read with `df -Pk`, on the volume holding `~/.grind` and on the volume
+    /// holding each declared clone — measured against [`DISK_HEADROOM_FLOOR_GIB`].
+    DiskHeadroom,
     /// No honest boolean exists. Rendered as unchecked, with no boolean beside it.
     NoBoolean,
 }
@@ -483,6 +486,12 @@ pub fn host_items() -> &'static [HostItem] {
             depth: Depth::Dispatch,
             check: Check::OmpBinary,
             doc_anchor: "`~/.bun/bin/omp` is executable, or `GRIND_OMP_BIN` names it.",
+        },
+        HostItem {
+            name: "disk headroom",
+            depth: Depth::Dispatch,
+            check: Check::DiskHeadroom,
+            doc_anchor: "The volumes holding `~/.grind` and each declared clone have room left.",
         },
         HostItem {
             name: "git on PATH",
@@ -601,6 +610,13 @@ pub fn dispatch_subset() -> Vec<&'static HostItem> {
 /// The floor `git` inherits from SSH commit signing. Not invented here — nothing else in Grind
 /// needs a recent git.
 pub const GIT_VERSION_FLOOR: (u64, u64) = (2, 34);
+
+/// The floor a disk-headroom reading must clear. Not invented here — inherited from #165's own
+/// sizing note ("the batch's five concurrent walks suggest ≥5 GiB per concurrent Run as a
+/// starting floor constant") and `docs/findings/0006-five-run-native-batch.md:183` ("host disk
+/// hit 98% full mid-batch (~3 GiB free at peak); four of the five verifies survived only after
+/// regenerable build caches were cleared by hand").
+pub const DISK_HEADROOM_FLOOR_GIB: u64 = 5;
 
 /// `git status --porcelain`: any output at all means dirty.
 pub fn is_dirty(porcelain: &str) -> bool {
@@ -1316,6 +1332,25 @@ mod tests {
                 .iter()
                 .any(|i| i.check == Check::OmpBinary)
         );
+    }
+
+    #[test]
+    fn disk_headroom_is_dispatch_depth_and_in_the_dispatch_subset() {
+        let matches: Vec<&HostItem> = host_items()
+            .iter()
+            .filter(|i| i.check == Check::DiskHeadroom)
+            .collect();
+        assert_eq!(matches.len(), 1, "exactly one disk-headroom item");
+        let item = matches[0];
+        assert_eq!(item.depth, Depth::Dispatch);
+        assert_eq!(
+            dispatch_subset()
+                .iter()
+                .filter(|i| i.name == item.name)
+                .count(),
+            1
+        );
+        assert_eq!(DISK_HEADROOM_FLOOR_GIB, 5);
     }
 
     #[test]
