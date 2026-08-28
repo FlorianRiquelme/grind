@@ -162,6 +162,11 @@ pub struct StageEntry {
     pub model: Option<String>,
     pub cost_usd: Option<f64>,
     pub turns: Option<u64>,
+    /// Which adapter executed this stage's attempt. `None` on pre-composite records and
+    /// the legacy path — the honest absent answer, never a guess (ADR-0017, composite
+    /// amendment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<crate::runner::Backend>,
 }
 
 /// Assemble [`StageReturns`] from ten optional slots of raw JSON text, one per stage in ladder

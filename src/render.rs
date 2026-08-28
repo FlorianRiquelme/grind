@@ -690,11 +690,14 @@ fn line(out: &mut String, text: &str) {
 /// dispatch), so one record has one answer about what ran and #158's divergence between the
 /// two surfaces cannot regrow. See that function for the per-backend reading.
 fn model_of(found: &RunView) -> String {
+    let empty = crate::runner::ClassRoutes::default();
+    let routes = found.class_routes.as_ref().unwrap_or(&empty);
     crate::runner::declared_model(
         found.backend,
         found.model.as_deref(),
         found.fast_model_override.as_deref(),
         found.strong_model_override.as_deref(),
+        routes,
     )
 }
 

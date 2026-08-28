@@ -265,6 +265,7 @@ fn drive_attempt_with_prompt(
         fast_model: None,
         strong_model: None,
         proto_override: None,
+        routes: runner::ClassRoutes::default(),
         max_turns,
     }
     .run(&spec)

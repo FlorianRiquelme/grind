@@ -1146,6 +1146,7 @@ mod tests {
             fast_model: None,
             strong_model: None,
             proto_override: None,
+            routes: runner::ClassRoutes::default(),
             max_turns: None,
         };
 

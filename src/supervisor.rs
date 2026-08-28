@@ -170,6 +170,16 @@ struct RunRecord {
     omp_bin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     omp_version: Option<String>,
+    /// The composite per-class routing (ADR-0017, composite amendment): the resolved pair
+    /// snapshotted at dispatch. `None` on every record written before it existed and on
+    /// any Run whose classes all ride the line backend — the honest legacy answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    class_routes: Option<runner::ClassRoutes>,
+    /// The claude-code binary's reported version, snapshotted at readiness when
+    /// claude-code participates in this Run — the same snapshot discipline `omp_version`
+    /// follows. `None` when the binary could not be asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_version: Option<String>,
 }
 
 /// Frozen once, at dispatch — never re-resolved, for the same reason the plugin pin never was:
@@ -232,7 +242,9 @@ impl RunRecord {
         home: &Path,
         run_dir: &Path,
         stage: Option<Stage>,
+        model: &runner::StageModel,
     ) -> Box<dyn runner::StageRunner> {
+        let _ = model;
         let max_turns = stage.map(|stage| {
             let worktree = std::path::PathBuf::from(&self.worktree);
             let tiers = load_tiers(&worktree);
@@ -248,6 +260,7 @@ impl RunRecord {
                 fast_model: self.fast_model_override.clone(),
                 strong_model: self.strong_model_override.clone(),
                 proto_override: self.proto_override,
+                routes: self.class_routes.clone().unwrap_or_default(),
                 max_turns,
                 omp_bin: self.omp_bin.clone(),
             },
@@ -429,6 +442,7 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         job.issue
     );
     let pid = world::pid();
+    let (fast_own, strong_own) = selection.own_ids();
     let mut record = RunRecord {
         run_id: run_id.clone(),
         created_at: world::now_iso(),
@@ -453,11 +467,16 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         reflected: false,
         backend: selection.backend,
         endpoint_override: selection.endpoint_override,
-        fast_model_override: selection.fast_model,
-        strong_model_override: selection.strong_model,
+        fast_model_override: fast_own,
+        strong_model_override: strong_own,
         proto_override: selection.proto_override,
         omp_bin,
         omp_version,
+        class_routes: {
+            let routes = selection.routes.clone();
+            (!routes.is_empty()).then_some(routes)
+        },
+        claude_version: None,
         job,
     };
     let run_dir = job::runs_dir(&home).join(&run_id);
@@ -529,6 +548,7 @@ fn dispatch_banner(record: &RunRecord) -> Vec<String> {
             record.model.as_deref(),
             record.fast_model_override.as_deref(),
             record.strong_model_override.as_deref(),
+            &record.class_routes.clone().unwrap_or_default(),
         )
     ));
     if record.backend == Backend::ClaudeCode {
@@ -922,7 +942,7 @@ fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
     let denied = attempt::denied_for_reflect();
     let reflect_model = runner::StageModel::Class(runner::ModelClass::Strong);
     let run_dir_str = run_dir.display().to_string();
-    let runner = record.runner(&home, run_dir, None);
+    let runner = record.runner(&home, run_dir, None, &reflect_model);
     let spec = runner::RunSpec {
         invocation: &invocation,
         cwd: run_dir,
@@ -943,6 +963,7 @@ fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
         model: None,
         cost_usd: classified.total_cost_usd,
         turns: classified.num_turns,
+        backend: None,
     });
     let _ = record.save(path);
 }
@@ -1281,9 +1302,11 @@ fn run_r_pass(
             session_id: attempt::grade_session_id(&record.run_id),
             status: ReturnStatus::Complete,
             artifact_paths,
-            model: runner::StageModel::Class(runner::ModelClass::Strong).claude_code_arg(),
+            model: runner::StageModel::Class(runner::ModelClass::Strong)
+                .claude_code_arg(&runner::ClassRoutes::default()),
             cost_usd: attempt.total_cost_usd,
             turns: attempt.num_turns,
+            backend: None,
         }),
         None => record.push_stage_entry(rung::StageEntry {
             name,
@@ -1293,6 +1316,7 @@ fn run_r_pass(
             model: None,
             cost_usd: Some(0.0),
             turns: Some(0),
+            backend: None,
         }),
     }
     Ok(())
@@ -1352,7 +1376,7 @@ fn dispatch_triage_grader(
     let denied = attempt::denied_for_grade();
     let grade_model = runner::StageModel::Class(runner::ModelClass::Strong);
     let run_dir_str = run_dir.display().to_string();
-    let runner = record.runner(&home, run_dir, Some(Stage::Triage));
+    let runner = record.runner(&home, run_dir, Some(Stage::Triage), &grade_model);
     let mut classified;
     loop {
         n += 1;
@@ -1675,7 +1699,8 @@ fn run_ladder_attempt(
         Mode::Resume
     };
     let stage_model = resolve_stage_model(record, run_dir, stage);
-    let claude_model_arg = stage_model.claude_code_arg();
+    let claude_model_arg =
+        stage_model.claude_code_arg(record.class_routes.as_ref().unwrap_or(&Default::default()));
     let notes = if stage == Stage::Plan {
         let base = notes_for(&home, &record.job.target_repo);
         let lessons = lessons_for(&home, &record.job);
@@ -1717,7 +1742,7 @@ fn run_ladder_attempt(
         &format!("  [{started_at}] {stage} attempt {n} ({mode}) …"),
     );
     let denied = attempt::denied_for(stage);
-    let runner = record.runner(&home, run_dir, Some(stage));
+    let runner = record.runner(&home, run_dir, Some(stage), &stage_model);
     let spec = runner::RunSpec {
         invocation: &invocation,
         cwd: worktree,
@@ -1757,6 +1782,7 @@ fn run_ladder_attempt(
         model: claude_model_arg,
         cost_usd,
         turns,
+        backend: None,
     });
     Ok(())
 }
@@ -1772,7 +1798,8 @@ fn run_ship_babysit_attempt(
 ) -> Result<(), Refusal> {
     let session_id = attempt::stage_session_id(&record.run_id, Stage::Ship);
     let stage_model = resolve_stage_model(record, run_dir, Stage::Ship);
-    let claude_model_arg = stage_model.claude_code_arg();
+    let claude_model_arg =
+        stage_model.claude_code_arg(record.class_routes.as_ref().unwrap_or(&Default::default()));
     let conditions = Conditions {
         claude_bin: &record.claude_bin,
         session_id: &session_id,
@@ -1790,7 +1817,7 @@ fn run_ship_babysit_attempt(
         .iter()
         .map(|glob| glob.to_string())
         .collect();
-    let runner = record.runner(&home, run_dir, None);
+    let runner = record.runner(&home, run_dir, None, &stage_model);
     let spec = runner::RunSpec {
         invocation: &invocation,
         cwd: worktree,
