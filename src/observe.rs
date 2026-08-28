@@ -702,7 +702,7 @@ pub fn skills_present(entries: &[String]) -> Observed<Outcome> {
     if missing.is_empty() {
         satisfied("all ten stage skill directories are present under ~/.grind/skills/run")
     } else {
-        unsatisfied(&format!(
+        unsatisfied(format!(
             "missing stage skill directories: {}",
             missing.join(", ")
         ))
@@ -1050,12 +1050,12 @@ pub fn unchecked(why: &str) -> Observed<Outcome> {
     Observed::Present(Outcome::Unchecked(why.to_string()))
 }
 
-fn satisfied(what: &str) -> Observed<Outcome> {
-    Observed::Present(Outcome::Satisfied(what.to_string()))
+pub fn satisfied(what: impl Into<String>) -> Observed<Outcome> {
+    Observed::Present(Outcome::Satisfied(what.into()))
 }
 
-fn unsatisfied(what: &str) -> Observed<Outcome> {
-    Observed::Present(Outcome::Unsatisfied(what.to_string()))
+pub fn unsatisfied(what: impl Into<String>) -> Observed<Outcome> {
+    Observed::Present(Outcome::Unsatisfied(what.into()))
 }
 
 /// **When the restart one-shot actually fires**, which differs by platform and which doctor
@@ -1161,7 +1161,7 @@ pub fn declared_clone(
         Some(found) if found.eq_ignore_ascii_case(declared) => {
             satisfied("origin names the target repo")
         }
-        Some(found) => unsatisfied(&format!("origin names {found}, the Job names {declared}")),
+        Some(found) => unsatisfied(format!("origin names {found}, the Job names {declared}")),
         None => Observed::Unobservable(Reason::saying(
             "git remote get-url origin: no owner/name in the remote",
         )),
@@ -1197,7 +1197,7 @@ pub fn one_clone_per_repo(clone_paths: &[String], declared: &str) -> Observed<Ou
     match same_name.len() {
         0 => unsatisfied("no clone declared for this repo"),
         1 => satisfied("one declared clone"),
-        n => unsatisfied(&format!("{n} clones named `{name}` under ~/.grind/repos")),
+        n => unsatisfied(format!("{n} clones named `{name}` under ~/.grind/repos")),
     }
 }
 
@@ -1264,9 +1264,9 @@ pub fn endpoint_reachable(probed: Option<bool>) -> Observed<Outcome> {
 /// precondition that fails for no reason.
 pub fn on_path(tool: &str, completed: &Completed) -> Observed<Outcome> {
     if completed.code == Some(0) && !completed.stdout.trim().is_empty() {
-        satisfied(&format!("`{tool}` resolves on PATH"))
+        satisfied(format!("`{tool}` resolves on PATH"))
     } else {
-        unsatisfied(&format!("`{tool}` does not resolve on PATH"))
+        unsatisfied(format!("`{tool}` does not resolve on PATH"))
     }
 }
 
@@ -1279,12 +1279,12 @@ pub fn git_version_floor(completed: &Completed, floor: (u64, u64)) -> Observed<O
         return Observed::Unobservable(Reason::saying("git --version: unreadable"));
     };
     if (major, minor) >= floor {
-        satisfied(&format!(
+        satisfied(format!(
             "git {major}.{minor}, at or above {}.{}",
             floor.0, floor.1
         ))
     } else {
-        unsatisfied(&format!(
+        unsatisfied(format!(
             "git {major}.{minor} is below the {}.{} floor",
             floor.0, floor.1
         ))
@@ -1330,11 +1330,11 @@ pub fn disk_headroom(readings: &[(String, Completed)], floor_gib: u64) -> Observ
     }
     let (label, gib) = tightest.expect("at least one reading parsed, checked above");
     if gib >= floor_gib {
-        satisfied(&format!(
+        satisfied(format!(
             "{gib} GiB free on the volume holding {label}, at or above {floor_gib} GiB"
         ))
     } else {
-        unsatisfied(&format!(
+        unsatisfied(format!(
             "{gib} GiB free on the volume holding {label} is below the {floor_gib} GiB floor"
         ))
     }
@@ -1453,7 +1453,7 @@ pub fn signing_config(
     if missing.is_empty() {
         satisfied("gpg.format ssh, a private signing key, commit.gpgsign true")
     } else {
-        unsatisfied(&missing.join("; "))
+        unsatisfied(missing.join("; "))
     }
 }
 

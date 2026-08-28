@@ -8,7 +8,8 @@
 //! failed [`Attempt`], never a clean stop.
 
 use crate::runner::{
-    Backend, CallSummary, Endpoint, FileLabel, ProtoMode, RunSpec, StageRunner, TranscriptEvent,
+    Backend, CallSummary, DEFAULT_MODEL, Endpoint, FileLabel, ProtoMode, Route, RunSpec,
+    StageModel, StageRunner, TranscriptEvent,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -734,9 +735,24 @@ impl StageRunner for crate::runner::NativeAdapter {
         let started_at = world::now_iso();
         let max_turns = self.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
 
-        let model_id = spec
-            .model
-            .native_id(self.fast_model.as_deref(), self.strong_model.as_deref());
+        let model_id = match spec.model {
+            StageModel::Pinned(_) => spec
+                .model
+                .native_id(self.fast_model.as_deref(), self.strong_model.as_deref()),
+            StageModel::Class(class) => match self.routes.for_class(*class) {
+                Some(Route {
+                    backend: Backend::Native,
+                    id: Some(id),
+                }) => id.clone(),
+                Some(Route {
+                    backend: Backend::Native,
+                    id: None,
+                }) => DEFAULT_MODEL.to_string(),
+                _ => spec
+                    .model
+                    .native_id(self.fast_model.as_deref(), self.strong_model.as_deref()),
+            },
+        };
         let endpoint = match Endpoint::resolve(self.endpoint_override.as_deref(), Some(&model_id)) {
             Ok(endpoint) => endpoint,
             Err(reason) => {
@@ -1146,7 +1162,7 @@ mod tests {
             fast_model: None,
             strong_model: None,
             proto_override: None,
-            routes: runner::ClassRoutes::default(),
+            routes: crate::runner::ClassRoutes::default(),
             max_turns: None,
         };
 

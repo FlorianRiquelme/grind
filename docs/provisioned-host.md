@@ -42,6 +42,9 @@ housekeeping here is what withdraws the guarantee.
 ```
 ~/.grind/
   repos/<owner>/<name>    the clone Grind dispatches into
+    agent                 the repo's agent binding: a profile name or one agent line
+  agent                   the host's default agent line
+  agents/<name>           the profile library: one file per profile, one agent line each
   bin/claude              the binary Grind spawns
   runs/<run-id>/run.json  Run state
   locks/<owner>-<name>-<branch>
@@ -216,6 +219,20 @@ plus a login* on darwin, and do not let the shorter phrase stand for both.
   the key check above owns presence. Reported for both backends regardless of which is
   declared, so both stay selectable from one doctor run.
 
+- **`~/.grind/agents/` holds one profile per file; doctor seeds `glm` and `opus-plan` when
+  absent.** — *doctor* — The profile library (ADR-0017, composite amendment): each file's name
+  is the profile name (`[a-z0-9][a-z0-9-]*`) and its first line is one agent line in the same
+  grammar as `~/.grind/agent`. When the directory is absent doctor seeds it once with the two
+  defaults — the workhorse `glm` composite and `opus-plan` — and never rewrites an existing
+  library, so an edit is permanent until a human undoes it. Every file present is then read
+  and parsed: a misnamed or unparsable profile fails loudly naming the file, because a
+  profile that cannot be read at doctor time cannot be read at dispatch time either.
+- **Each declared clone's `agent` file, when present, holds a profile name or one agent
+  line.** — *doctor* — The per-repo binding, `<repo>/agent` (ADR-0017, composite amendment):
+  one line, dereferenced like any other agent declaration. Absent files pass — the binding is
+  optional and absence is the host default — but a file that is present and cannot be read or
+  parsed fails loudly naming the path, on the same register as the host line itself.
+
 The line's grammar extends past the backend and the bare base-url token (ADR-0017, amended):
 `model=`, `fast=` and `strong=` declare which model id each of grind's own `fast`/`strong`
 routing classes resolves to on the native backend — `fast=`/`strong=` override `model=`
@@ -225,6 +242,14 @@ observed) that cannot execute native tool calls at all. Neither key is a doctor 
 of its own: the two checks above already cover what a native Dispatch needs before its first
 Attempt, and a declared model id or protocol is only as good as the Attempt that actually
 calls the endpoint with it.
+
+The composite amendment (ADR-0017) extends the grammar once more: a `fast=`/`strong=` value
+may carry a `<backend>/` prefix routing that class to another backend
+(`strong=claude-code/claude-opus-5` on an `omp` line), and the resolution chain gains two
+tiers below the host line — the repo's `agent` file, then a Job's `| Agent |` row, which
+wins over both. A Job pin or repo binding naming a profile dereferences through
+`~/.grind/agents/`; precedence is **Job pin → repo `agent` file → host default**, resolved
+fresh at dispatch and never on resume.
 
 ## Credentials
 

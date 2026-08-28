@@ -919,6 +919,99 @@ fn scenario_h_a_ladder_walk_completes_plan_then_triage_before_plan_review_ever_d
     }
 }
 
+/// The composite acceptance: one host, one Run, **two backends**. The Job pins the
+/// `opus-plan` shape — omp on the line, strong routed to claude-code — so Plan (always
+/// strong before a Decision exists) must execute under the *claude* fake while a later
+/// stage runs under omp... except this scenario's walk only ever reaches Plan: a job-pin
+/// line plus a plan that completes honestly, asserting the routing off the record's
+/// per-stage `backend` and off the fake that actually received the spawn. The point is
+/// the seam, not the distance: one dispatch, two adapters, both provisioned for.
+#[test]
+fn a_job_pinned_composite_profile_executes_stages_across_two_backends() {
+    let box_ = sandbox("composite-two-backends");
+    box_.scenario(&["plan_writes_return", "success_done"])
+        .pr_appears_at(2);
+    // The Job pin: profile name dereferenced through the seeded library.
+    let issue = box_.fake().join("gh/issue.json");
+    let raw = fs::read_to_string(&issue).expect("the Job issue");
+    fs::write(
+        &issue,
+        // The Agent row goes inside the JSON body string, so its own newline is the
+        // two-character escape the body is stored with — not a raw control character.
+        raw.replace(
+            "| Budget ceiling |",
+            "\\n| Agent | opus-plan |\\n| Budget ceiling |",
+        ),
+    )
+    .expect("add the Agent row");
+    // The profile library: written by the test, since the sandbox stands in for a
+    // provisioned host whose doctor seeded it. The profile is the opus-plan composite:
+    // omp on the line, strong routed to claude-code with its opus id.
+    let agents = box_.home.join(".grind/agents");
+    fs::create_dir_all(&agents).expect("the profile library");
+    fs::write(
+        agents.join("opus-plan"),
+        "omp strong=claude-code/claude-opus-5\n",
+    )
+    .expect("seed the opus-plan profile");
+    // omp now participates (the line backend), so readiness demands its binary: the
+    // fake answers `--version` and, if ever spawned for a stage, replays nothing — this
+    // walk only reaches Plan, which the strong route sends to claude.
+    let omp = box_.home.join(".bun/bin/omp");
+    fs::create_dir_all(box_.home.join(".bun/bin")).expect("the bun bin");
+    fs::write(
+        &omp,
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo \"omp/18.0.6\"; exit 0; fi\nexit 3\n",
+    )
+    .expect("write the fake omp");
+    let mut mode = fs::metadata(&omp).expect("stat the fake omp").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+    fs::set_permissions(&omp, mode).expect("make the fake omp executable");
+
+    let (out, err, code) = box_.run(&["run", ISSUE]);
+    assert_eq!(code, Some(0), "{out}\n{err}");
+
+    let record = box_.record();
+    let stages = record["stages"].as_array().expect("stages");
+    assert_eq!(stages[0]["name"], "plan");
+    assert_eq!(
+        stages[0]["backend"], "claude-code",
+        "Plan is strong, and the profile routes strong to claude-code: {stages:?}"
+    );
+    assert_eq!(
+        record["class_routes"]["strong"]["backend"], "claude-code",
+        "the full resolved pair is snapshotted, not foreign-filtered"
+    );
+    assert_eq!(
+        record["class_routes"]["strong"]["id"], "claude-opus-5",
+        "the profile's id rides verbatim"
+    );
+    assert_eq!(
+        record["claude_version"], "1.2.3 (Claude Code)",
+        "claude participates, so its version was snapshotted"
+    );
+    // The claude fake received the Plan spawn: its argv carries the session id Plan owns.
+    let plan_argv = box_
+        .argvs()
+        .into_iter()
+        .find(|argv| {
+            argv.iter().any(|a| {
+                a == &attempt::stage_session_id(
+                    record["run_id"].as_str().expect("a run id"),
+                    rung::Stage::Plan,
+                )
+            })
+        })
+        .expect("the plan spawn reached the claude fake");
+    assert!(plan_argv.contains(&"--session-id".to_string()));
+    // And the banner told the truth about the routing before anything ran.
+    let log = fs::read_to_string(box_.run_dir().join("supervisor.log")).expect("the log");
+    assert!(
+        log.contains("route strong claude-code/claude-opus-5"),
+        "{log}"
+    );
+}
+
 /// A completed Run's record, to stage cut-off and stopped Runs from.
 fn a_real_record(box_: &Sandbox) -> serde_json::Value {
     box_.scenario(&["success_done"]).pr_appears_at(1);

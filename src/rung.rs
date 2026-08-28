@@ -339,6 +339,7 @@ mod tests {
             model: Some("claude-opus-5".to_string()),
             cost_usd: Some(1.23),
             turns: Some(7),
+            backend: Some(crate::runner::Backend::ClaudeCode),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: StageEntry = serde_json::from_str(&json).unwrap();

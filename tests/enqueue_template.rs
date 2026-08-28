@@ -83,6 +83,27 @@ fn the_templates_table_carries_an_intent_row_and_the_parser_reads_it() {
 }
 
 #[test]
+fn the_templates_agent_row_reads_none_and_round_trips_when_named() {
+    let template = template();
+
+    // The example table writes `none`, so the parser must read no pin at all.
+    let job =
+        grind::job::from_issue_json(&as_issue(&example_table(&template))).expect("a readable Job");
+    assert_eq!(job.agent, None, "`none` must read as no Agent pin");
+
+    // A named profile round-trips into Job.agent.
+    let pinned =
+        example_table(&template).replace("| **Agent** | `none` |", "| **Agent** | `opus-plan` |");
+    assert_ne!(
+        pinned,
+        example_table(&template),
+        "the Agent row must exist to rename"
+    );
+    let job = grind::job::from_issue_json(&as_issue(&pinned)).expect("a readable Job");
+    assert_eq!(job.agent.as_deref(), Some("opus-plan"));
+}
+
+#[test]
 fn the_templates_table_carries_no_budget_ceiling_row() {
     let table = example_table(&template()).to_lowercase();
     assert!(!table.contains("budget ceiling"), "{table}");
