@@ -53,6 +53,12 @@ pub struct Job {
     /// branch contract out. No validator: it is prose.
     pub intent: Option<String>,
     pub model: Option<String>,
+    /// The Job's own agent declaration: a profile name from `~/.grind/agents/`, or one
+    /// full agent line (ADR-0017, composite amendment). Wins over the repo binding and
+    /// the host default; `#[serde(default)]` for the same pre-cutover reason as
+    /// `done_predicate` — absence genuinely means a record from before this row existed.
+    #[serde(default)]
+    pub agent: Option<String>,
     /// How the Run will know this is done, stated so a machine could grade it. Consumed by the
     /// stage machinery (ADR-0015) — the Plan stage inherits it, plan review grades it, the PR
     /// body renders its verdict; parsed and recorded here. `#[serde(default)]` because a record
@@ -180,6 +186,7 @@ pub fn from_issue_json(raw: &str) -> Result<Job, Refusal> {
     validate_anchor(&anchor)?;
     let intent = optional("intent");
     let model = optional("model");
+    let agent = optional("agent");
     let done_predicate = required("done predicate")?;
     let base_branch = required("base branch")?;
     let verify_entrypoint = required("verify entrypoint")?;
@@ -197,6 +204,7 @@ pub fn from_issue_json(raw: &str) -> Result<Job, Refusal> {
         handoff_sha,
         anchor,
         intent,
+        agent,
         model,
         done_predicate,
         base_branch,
@@ -394,6 +402,186 @@ pub fn read_selection(home: &Path) -> Result<runner::Selection, String> {
     parsed.map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// `~/.grind/agents/` — the profile library (ADR-0017, composite amendment): one file per
+/// profile, the same one-line grammar as `agent`. Doctor seeds the defaults once when the
+/// directory is absent; user-editable, never rewritten.
+pub fn agents_dir(home: &Path) -> PathBuf {
+    grind_dir(home).join("agents")
+}
+
+/// `<repo>/agent` — the repo binding: one line, a profile name or a full agent line.
+pub fn repo_agent_file(repo_path: &Path) -> PathBuf {
+    repo_path.join("agent")
+}
+
+/// The profile file for `name`, whose shape is `[a-z0-9][a-z0-9-]*` — a directory
+/// segment, so a name that would escape the library refuses here rather than at the fs.
+pub fn profile_file(home: &Path, name: &str) -> Result<PathBuf, String> {
+    let valid = !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !valid {
+        return Err(format!(
+            "invalid profile name {name:?} (expected [a-z0-9][a-z0-9-]*)"
+        ));
+    }
+    Ok(agents_dir(home).join(name))
+}
+
+/// Exactly what doctor seeds when `~/.grind/agents` is absent: the workhorse default the
+/// host already runs, and the opus-plan composite the epic exists to enable. Never
+/// rewritten, never seeded over an existing directory.
+pub const SEED_PROFILES: [(&str, &str); 2] = [
+    (
+        "glm",
+        "omp fast=openrouter/z-ai/glm-5.3-flash strong=openrouter/z-ai/glm-5.3-flash",
+    ),
+    (
+        "opus-plan",
+        "omp fast=openrouter/z-ai/glm-5.3-flash strong=claude-code/claude-opus-5",
+    ),
+];
+
+/// `true` = seeded now; `false` = the directory already existed. Only real fs errors are
+/// errors; an existing library is never touched.
+pub fn seed_agent_profiles(home: &Path) -> Result<bool, String> {
+    let dir = agents_dir(home);
+    if world::exists(&dir) {
+        return Ok(false);
+    }
+    world::create_dir_all(&dir)?;
+    for (name, line) in SEED_PROFILES {
+        let path = profile_file(home, name)?;
+        world::write(&path, &format!("{line}\n"))
+            .map_err(|e| format!("could not seed profile {name:?}: {e}"))?;
+    }
+    Ok(true)
+}
+
+/// One line that is either a profile name (dereferenced through `~/.grind/agents/<name>`)
+/// or a full agent line (its first token parses as a `Backend`). Loud on an invalid name,
+/// a missing profile, an unreadable file, an unparseable line. An empty or blank line is
+/// the default selection — the file names a deviation, nothing else.
+pub fn deref_agent_line(home: &Path, line: &str) -> Result<runner::Selection, String> {
+    // The same one-line discipline `read_selection` holds the host file to: a repo
+    // binding or a profile file carrying two non-blank lines is two declarations in one
+    // file, and second-reading it would pick a winner silently.
+    let declared_lines: Vec<&str> = line.lines().filter(|l| !l.trim().is_empty()).collect();
+    if declared_lines.len() > 1 {
+        return Err(format!("expected one line, found {}", declared_lines.len()));
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return runner::Selection::parse_line("");
+    }
+    let first = trimmed.split_whitespace().next().unwrap_or_default();
+    if runner::Backend::parse(first).is_ok() {
+        return runner::Selection::parse_line(trimmed);
+    }
+    let tokens = trimmed.split_whitespace().count();
+    if tokens > 1 {
+        return Err(format!(
+            "a profile name is one token, found {tokens} in {trimmed:?} \
+             (write the profile name alone, or a full agent line)"
+        ));
+    }
+    let path = profile_file(home, first)?;
+    if !world::exists(&path) {
+        return Err(format!(
+            "agent profile {first:?} not found (no file at {})",
+            path.display()
+        ));
+    }
+    let text = world::read_to_string(&path)?;
+    let profile_lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    match profile_lines.as_slice() {
+        [] => Err(format!("profile file {} carries no line", path.display())),
+        [only] => {
+            runner::Selection::parse_line(only).map_err(|e| format!("{}: {e}", path.display()))
+        }
+        many => Err(format!(
+            "{}: expected one line, found {}",
+            path.display(),
+            many.len()
+        )),
+    }
+}
+
+/// Where the winning agent declaration came from. Banner and doctor observability only —
+/// never serialized into any record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentSource {
+    JobPin,
+    Repo,
+    Host,
+}
+
+/// The precedence chain resolved fresh at dispatch (never on resume): the Job's `Agent`
+/// pin, else the repo's `agent` file, else the host default. The host file is read first
+/// and loudly regardless of which tier wins — a malformed `~/.grind/agent` refuses even
+/// when a Job pin would have won, because a host fact stays loud (ADR-0017).
+#[derive(Debug, Clone)]
+pub struct ResolvedAgent {
+    pub selection: runner::Selection,
+    pub source: AgentSource,
+    /// The profile name when the winning declaration dereferenced one, else `None`.
+    pub profile: Option<String>,
+}
+
+pub fn resolve_agent(
+    home: &Path,
+    repo_path: Option<&Path>,
+    job_agent: Option<&str>,
+) -> Result<ResolvedAgent, String> {
+    let host = read_selection(home)?;
+    if let Some(pin) = job_agent.filter(|pin| !pin.trim().is_empty()) {
+        let selection = deref_agent_line(home, pin)?;
+        return Ok(ResolvedAgent {
+            selection,
+            source: AgentSource::JobPin,
+            profile: profile_name_of(home, pin),
+        });
+    }
+    if let Some(repo) = repo_path {
+        let file = repo_agent_file(repo);
+        if world::exists(&file) {
+            let line = world::read_to_string(&file)
+                .map_err(|e| format!("could not read {}: {e}", file.display()))?;
+            let derefed =
+                deref_agent_line(home, &line).map_err(|e| format!("{}: {e}", file.display()))?;
+            // A blank binding names no deviation — absence means the host default, so it
+            // falls through rather than reading as a Repo declaration of "the default".
+            if !line.trim().is_empty() {
+                return Ok(ResolvedAgent {
+                    selection: derefed,
+                    source: AgentSource::Repo,
+                    profile: profile_name_of(home, &line),
+                });
+            }
+        }
+    }
+    Ok(ResolvedAgent {
+        selection: host,
+        source: AgentSource::Host,
+        profile: None,
+    })
+}
+
+/// The profile name a declaration dereferenced, when it did: a line whose first token is
+/// neither blank nor a `Backend` names a profile. A full agent line names nothing.
+fn profile_name_of(home: &Path, line: &str) -> Option<String> {
+    let first = line.split_whitespace().next()?;
+    if runner::Backend::parse(first).is_ok() {
+        return None;
+    }
+    profile_file(home, first).ok().map(|_| first.to_string())
+}
+
 /// How an item is caught. `docs/provisioned-host.md` is the operative list and these three
 /// marks are its depth model; the test below asserts each item carries the mark that document
 /// gives it, because membership alone cannot catch a mis-marked item and that is the only
@@ -445,6 +633,12 @@ pub enum Check {
     /// Free space, read with `df -Pk`, on the volume holding `~/.grind` and on the volume
     /// holding each declared clone — measured against [`DISK_HEADROOM_FLOOR_GIB`].
     DiskHeadroom,
+    /// The `~/.grind/agents/` profile library (ADR-0017, composite amendment): seeded when
+    /// absent, then every file in it must be a valid profile that parses. Doctor only.
+    AgentProfiles,
+    /// Every declared clone's `agent` file, when present, derefs to a readable agent
+    /// selection. Absent files pass; a malformed one fails loudly naming the path.
+    RepoAgentDeclarations,
     /// No honest boolean exists. Rendered as unchecked, with no boolean beside it.
     NoBoolean,
 }
@@ -540,6 +734,18 @@ pub fn host_items() -> &'static [HostItem] {
             depth: Depth::Doctor,
             check: Check::EndpointReachable,
             doc_anchor: "The agent endpoint answers.",
+        },
+        HostItem {
+            name: "agent profiles",
+            depth: Depth::Doctor,
+            check: Check::AgentProfiles,
+            doc_anchor: "`~/.grind/agents/` holds one profile per file; doctor seeds `glm` and `opus-plan` when absent.",
+        },
+        HostItem {
+            name: "repo agent files",
+            depth: Depth::Doctor,
+            check: Check::RepoAgentDeclarations,
+            doc_anchor: "Each declared clone's `agent` file, when present, holds a profile name or one agent line.",
         },
         HostItem {
             name: "credential: gh auth store",
@@ -1430,6 +1636,195 @@ mod tests {
         let home = home_with_agent("native\ncodex\n");
         let refusal = read_selection(&home).expect_err("must refuse");
         assert!(refusal.contains("expected one line"), "{refusal}");
+        world::remove_tree(&home);
+    }
+
+    /// A throwaway home with a profile library laid out, removed when the test ends.
+    fn home_with_profiles(entries: &[(&str, &str)]) -> PathBuf {
+        let home = world::temp_dir("agent-chain");
+        world::create_dir_all(&agents_dir(&home)).expect("a scratch agents dir");
+        for (name, line) in entries {
+            world::write(&profile_file(&home, name).expect("a valid name"), line)
+                .expect("a scratch profile");
+        }
+        home
+    }
+
+    #[test]
+    fn profile_file_rejects_names_that_are_not_directory_segments() {
+        for bad in ["", "-glm", "Glm", "glm_5", "../glm", "glm/opus", "glm "] {
+            assert!(
+                profile_file(Path::new("/h"), bad).is_err(),
+                "{bad:?} must refuse"
+            );
+        }
+        for good in ["glm", "opus-plan", "7b", "glm-5-3"] {
+            assert!(
+                profile_file(Path::new("/h"), good).is_ok(),
+                "{good:?} must be a valid profile name"
+            );
+        }
+    }
+
+    #[test]
+    fn seeding_writes_the_defaults_once_and_never_rewrites() {
+        let home = world::temp_dir("agent-chain");
+        assert_eq!(seed_agent_profiles(&home), Ok(true));
+        assert_eq!(seed_agent_profiles(&home), Ok(false));
+        for (name, line) in SEED_PROFILES {
+            let text = world::read_to_string(&profile_file(&home, name).expect("a valid name"))
+                .expect("a seeded profile");
+            assert_eq!(text.trim(), line, "profile {name} seeds verbatim");
+        }
+        // An existing library is never touched: a profile the operator added survives, and
+        // seeding a second time does not restore anything over it.
+        world::write(
+            &profile_file(&home, "custom").expect("a valid name"),
+            "native\n",
+        )
+        .expect("a custom profile");
+        assert_eq!(seed_agent_profiles(&home), Ok(false));
+        assert!(world::exists(
+            &profile_file(&home, "custom").expect("a valid name")
+        ));
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn a_profile_name_derefs_through_the_library_and_a_line_does_not() {
+        let home = home_with_profiles(&[("glm", SEED_PROFILES[0].1)]);
+        let derefed = deref_agent_line(&home, "glm").expect("a derefable profile");
+        assert_eq!(derefed.backend, runner::Backend::parse("omp").unwrap());
+        assert_eq!(
+            derefed.own_ids().1,
+            Some("openrouter/z-ai/glm-5.3-flash".to_string())
+        );
+        let direct = deref_agent_line(&home, "native https://example.invalid/v1")
+            .expect("a full agent line");
+        assert_eq!(direct.backend, runner::Backend::parse("native").unwrap());
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn deref_refuses_loudly_on_an_invalid_name_a_missing_profile_and_an_unparsable_line() {
+        let home = home_with_profiles(&[("bad", "codex\n")]);
+        assert!(
+            deref_agent_line(&home, "../escape").is_err(),
+            "invalid name"
+        );
+        let missing = deref_agent_line(&home, "no-such-profile").expect_err("must refuse");
+        assert!(missing.contains("no-such-profile"), "{missing}");
+        let unparsable = deref_agent_line(&home, "bad").expect_err("must refuse");
+        assert!(unparsable.contains("agents/bad"), "{unparsable}");
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn a_blank_deref_line_is_the_default_selection() {
+        let home = world::temp_dir("agent-chain");
+        let selection = deref_agent_line(&home, "   ").expect("the default");
+        assert_eq!(selection.backend, runner::Backend::default());
+        assert_eq!(selection.routes.is_empty(), true);
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn a_profile_row_with_trailing_prose_refuses_rather_than_reading_the_first_token() {
+        let home = home_with_profiles(&[("glm", SEED_PROFILES[0].1)]);
+        let refusal = deref_agent_line(&home, "glm (the cheap one)").expect_err("must refuse");
+        assert!(refusal.contains("one token"), "{refusal}");
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn a_declaration_with_two_non_blank_lines_refuses_rather_than_second_reading_it() {
+        let refusal =
+            deref_agent_line(&PathBuf::from("/nowhere"), "native\ncodex").expect_err("must refuse");
+        assert!(refusal.contains("expected one line, found 2"), "{refusal}");
+    }
+
+    #[test]
+    fn a_profile_file_with_two_lines_refuses_rather_than_reading_only_the_first() {
+        let home = home_with_profiles(&[]);
+        world::create_dir_all(&agents_dir(&home)).expect("the library");
+        world::write(&agents_dir(&home).join("split"), "omp\nclaude-code\n")
+            .expect("a two-line profile");
+        let refusal = deref_agent_line(&home, "split").expect_err("must refuse");
+        assert!(refusal.contains("expected one line, found 2"), "{refusal}");
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn the_chain_prefers_the_job_pin_then_the_repo_file_then_the_host() {
+        let home = home_with_profiles(&[
+            ("glm", SEED_PROFILES[0].1),
+            ("opus-plan", SEED_PROFILES[1].1),
+        ]);
+        let repo = grind_dir(&home).join("repos").join("o").join("n");
+        world::create_dir_all(&repo).expect("a scratch repo dir");
+
+        // Host only.
+        let resolved = resolve_agent(&home, Some(&repo), None).expect("the host tier");
+        assert_eq!(resolved.source, AgentSource::Host);
+        assert_eq!(resolved.profile, None);
+        assert_eq!(resolved.selection.backend, runner::Backend::default());
+        assert!(resolved.selection.routes.is_empty());
+
+        // Repo file overrides the host; a profile name derefs.
+        world::write(&repo_agent_file(&repo), "glm\n").expect("a repo binding");
+        let resolved = resolve_agent(&home, Some(&repo), None).expect("the repo tier");
+        assert_eq!(resolved.source, AgentSource::Repo);
+        assert_eq!(resolved.profile.as_deref(), Some("glm"));
+        assert_eq!(
+            resolved.selection.backend,
+            runner::Backend::parse("omp").unwrap()
+        );
+
+        // Job pin overrides both — and wins even with a full agent line.
+        let resolved =
+            resolve_agent(&home, Some(&repo), Some("native https://x.example/v1")).expect("pin");
+        assert_eq!(resolved.source, AgentSource::JobPin);
+        assert_eq!(resolved.profile, None);
+        assert_eq!(
+            resolved.selection.endpoint_override.as_deref(),
+            Some("https://x.example/v1")
+        );
+        let resolved = resolve_agent(&home, Some(&repo), Some("opus-plan")).expect("pinned name");
+        assert_eq!(resolved.source, AgentSource::JobPin);
+        assert_eq!(resolved.profile.as_deref(), Some("opus-plan"));
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn a_malformed_host_file_refuses_even_when_a_job_pin_would_win() {
+        let home = world::temp_dir("agent-chain");
+        world::create_dir_all(&grind_dir(&home)).expect("a scratch .grind dir");
+        world::write(&agent_file(&home), "codex\n").expect("a malformed host line");
+        let refusal = resolve_agent(&home, None, Some("native"))
+            .expect_err("the host tier stays loud under a winning pin");
+        assert!(refusal.contains(".grind/agent"), "{refusal}");
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn a_blank_repo_agent_file_falls_through_to_the_host() {
+        let home = world::temp_dir("agent-chain");
+        let repo = grind_dir(&home).join("repos").join("o").join("n");
+        world::create_dir_all(&repo).expect("a scratch repo dir");
+        world::write(&repo_agent_file(&repo), "\n").expect("a blank binding");
+        let resolved = resolve_agent(&home, Some(&repo), None).expect("the host tier");
+        assert_eq!(resolved.source, AgentSource::Host);
+        world::remove_tree(&home);
+    }
+
+    #[test]
+    fn a_malformed_repo_agent_file_refuses_and_names_the_path() {
+        let home = world::temp_dir("agent-chain");
+        let repo = grind_dir(&home).join("repos").join("o").join("n");
+        world::create_dir_all(&repo).expect("a scratch repo dir");
+        world::write(&repo_agent_file(&repo), "codex\n").expect("a malformed binding");
+        let refusal = resolve_agent(&home, Some(&repo), None).expect_err("must refuse");
+        assert!(refusal.contains("repos/o/n/agent"), "{refusal}");
         world::remove_tree(&home);
     }
 }

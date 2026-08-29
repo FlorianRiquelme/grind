@@ -16,6 +16,7 @@ dropped. Everything else in the body is prose Grind never reads.
 | **Done predicate** | `just verify` is green and the screensource seam has a passing test |
 | **Base branch** | `main` |
 | **Verify entrypoint** | `just verify` |
+| **Agent** | `none` |
 | **Declared hot paths** | `src/decide.rs, src/policy.rs` |
 | **Intent** | A settled plan transcribed into one module; the shape is decided. |
 ```
@@ -40,6 +41,12 @@ row renamed on either side turns `just verify` red. That is the whole of the sea
 One line, written only when there is something true to say; the Anchor is where the work itself
 is stated, and a second place stating it drifts. A row reading `none`, `-`, `n/a` or empty is the
 same as no row, and the built prompt then carries no characterisation of the work at all.
+
+**`Agent` is optional** (ADR-0017, composite amendment): a profile name from
+`~/.grind/agents/` (e.g. `glm`, `opus-plan`), or one full agent line
+(e.g. `omp fast=openrouter/z-ai/glm-5.3-flash strong=claude-code/claude-opus-5`). The pin
+overrides the repo's `agent` file and the host default; a row reading `none`, `-`, `n/a` or
+empty is the same as no row, and the Run then follows the repo binding or the host default.
 
 **`Model` — silence was right on both real Jobs.**
 

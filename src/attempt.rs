@@ -681,6 +681,7 @@ mod tests {
             handoff_sha: "9d1f4c7a".to_string(),
             anchor: "docs/plans/a.md".to_string(),
             intent: None,
+            agent: None,
             model: None,
             done_predicate: "just verify is green".to_string(),
             base_branch: "main".to_string(),

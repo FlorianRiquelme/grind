@@ -114,8 +114,9 @@ ln -s <path-to-this-repo>/skills/enqueue ~/.claude/skills/enqueue
 - [`tests/`](tests/) — every safety property, including the compile-fail carrier, which shells out
   to `rustc` rather than taking a dev-dependency.
 - [`docs/adr/`](docs/adr/) — twenty accepted decisions constraining almost every change here.
-- [`docs/findings/`](docs/findings/) — seven findings docs, six of them dogfood Runs'
-  measurements (`0001`–`0006`) and one cross-backend audit (`0007`).
+- [`docs/findings/`](docs/findings/) — eight findings docs: six dogfood Runs'
+  measurements (`0001`–`0006`), one cross-backend audit (`0007`), and one composite-profile
+  spike observation (`0008`).
 - [`docs/provisioned-host.md`](docs/provisioned-host.md) — what a host owes before a Dispatch
   succeeds on it.
 - [`AGENTS.md`](AGENTS.md) and [`CONTEXT.md`](CONTEXT.md) — contributor constraints, and the
@@ -126,8 +127,9 @@ CI and nothing else.
 
 ## Status
 
-Single-user proof of concept, used by its author against their own repos. Six dogfood Runs are
-recorded under `docs/findings/`; handback fidelity, morning decisions per run, unattended
+Single-user proof of concept, used by its author against their own repos. The dogfood Runs are
+recorded under `docs/findings/` (`0001`–`0008`; `0008` records the two composite-profile
+spike Runs); handback fidelity, morning decisions per run, unattended
 completion rate, cost, and self-diagnosable failures are tracked in
 [STRATEGY.md](STRATEGY.md). Not looking for contributors — if a colleague wants this, they fork
 their own.

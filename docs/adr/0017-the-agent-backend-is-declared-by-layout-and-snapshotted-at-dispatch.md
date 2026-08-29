@@ -233,3 +233,60 @@ validated per-family allowlist or shipping the extension hook (`pi.on('tool_call
 that enforces the globs verbatim. The default backend is untouched; nothing about the other two
 adapters changes ([ADR-0019](0019-both-adapters-stay-and-deletion-needs-priced-parity.md) still
 owns deletion).
+
+## Amendment (2026-08-28): composite profiles — a per-class `<backend>/` binding, a profile library, a repo binding, and a Job pin
+
+Epic [#185](https://github.com/FlorianRiquelme/grind/issues/185). The host's real usage is
+composite — opus-class planning, a cheap workhorse for everything else, compliance Runs that
+must execute claude-code outright — and the one-backend-per-Run grammar cannot say so. The
+seam survives unchanged: a model *class* still crosses it, the snapshot is still the Run's
+constitution, and the loud-failure register still governs every parse. What grows is the
+grammar's class values and the chain of files the dispatch reads.
+
+**The class value grows a backend prefix.** `strong=claude-code/claude-opus-5` routes the
+strong class to the claude-code backend with `claude-opus-5` as that backend's own id; the
+prefix is parsed by the same `Backend::parse` that refuses an unknown line backend. A bare
+value (`fast=openrouter/z-ai/glm-5.3-flash`) stays on the line's backend — every file that
+parsed before this amendment parses identically now. A prefix with an empty remainder
+(`claude-code/`) names the backend's own default for the class. The prefix rule is: if the
+text before the first `/` parses as a known backend name, it is a prefix; vendor namespaces
+(`z-ai/...`, `deepseek/...`) never collide because none of their first segments is a backend
+name. The one accepted loss: a native id that literally begins `native/` cannot be spelled
+bare — an acceptable false refusal. The claude-code arm now accepts `fast=`/`strong=` keys
+(prefixed or bare) and nothing else; its bare line and its no-arguments refusal are
+unchanged. Every record field the pair feeds stays a declaration, never a credential.
+
+**Selection is a chain of files, resolved once at dispatch.** Precedence: the Job body's
+`| Agent | … |` row, else the repo binding `~/.grind/repos/<owner>/<name>/agent` (one line: a
+profile name or a full agent line), else the host default `~/.grind/agent`. The host file is
+read first and loudly regardless of which tier wins — a malformed `~/.grind/agent` refuses
+the dispatch even when a Job pin would have won, because a host fact stays loud. A repo or
+Job tier that fails to parse, names an unknown profile, or is unreadable refuses the same
+way; a blank or absent repo file falls through; a Job pin cannot be overridden.
+
+**The profile library `~/.grind/agents/<name>` holds the sane defaults.** One file per
+profile, the same one-line grammar; names are `[a-z0-9][a-z0-9-]*`. `grind doctor` seeds
+`glm` (the workhorse both classes ride) and `opus-plan` (glm workhorse, opus-class strong)
+exactly once — when the directory is absent — and never rewrites an existing library; the
+files are the operator's to edit. Doctor parse-checks every profile file and every declared
+clone's `agent` file, and prints the resolved per-class table.
+
+**The record snapshots the resolved pair, and both binaries' versions when two backends
+participate.** `RunRecord` gains `class_routes` (the full resolved per-class pair; absent on
+legacy lines, which is the honest answer) and `claude_version` — snapshotted at readiness
+when claude-code participates, exactly as `omp_version` is for omp. `RunView` mirrors both
+under the same carrier rule as every optional field: the roundtrip test must give them
+values, because a `skip_serializing_if` field left `None` proves nothing.
+
+**Execution moves per stage.** A stage's backend is its model-class route's backend, else
+the line backend; a Job's `model:` pin still crosses verbatim and still rides the line
+backend. `resolve_stage_model` is untouched — per-stage *concrete* binding is per-class
+binding composed with the existing per-stage class routing, and a stage wanting a binding no
+class expresses is a future grammar row. Each stage records which adapter executed it
+(`StageEntry.backend`); the dispatch banner names each foreign route; readiness (binaries,
+keys, endpoint probes) covers the *participant set* — the line backend plus every route
+backend. `endpoint_override` stays a native-line fact; a native route reached from another
+backend's line dials the default endpoint with the environment's key. The original Costs
+note that the one-line grammar had no room for per-stage routing stands superseded by priced
+evidence (run 178: a ~165× spread between identical legs); nothing was deleted, and the
+default-file flip ADR-0019 gates remains where it was.

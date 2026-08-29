@@ -1142,6 +1142,7 @@ mod tests {
                 model: Some("claude-sonnet-5".to_string()),
                 cost_usd: Some(1.23),
                 turns: Some(4),
+                backend: Some(crate::runner::Backend::ClaudeCode),
             },
             crate::rung::StageEntry {
                 name: "triage".to_string(),
@@ -1151,6 +1152,7 @@ mod tests {
                 model: None,
                 cost_usd: Some(0.0),
                 turns: Some(0),
+                backend: None,
             },
         ]
     }

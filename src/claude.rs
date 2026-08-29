@@ -974,6 +974,8 @@ mod tests {
         let adapter = ClaudeCodeAdapter {
             claude_bin: "claude".to_string(),
             home: PathBuf::from("/nonexistent-home-for-claude-adapter-test"),
+            fast_model: None,
+            strong_model: None,
         };
         let run_dir = PathBuf::from("/nonexistent-dir-for-claude-adapter-test/run-1");
         let model = crate::runner::StageModel::Class(crate::runner::ModelClass::Strong);

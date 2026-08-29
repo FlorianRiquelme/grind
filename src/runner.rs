@@ -129,28 +129,64 @@ pub enum ProtoMode {
     Text,
 }
 
+/// One class's binding: which backend runs it, and that backend's own model id — `None`
+/// meaning the backend's own default for that class (harness default on claude-code, no
+/// `--model` on omp, [`DEFAULT_MODEL`] on native). The `<backend>/` prefix of a class value
+/// (`strong=claude-code/claude-opus-5`) parses into one of these.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Route {
+    pub backend: Backend,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// The per-class routing one selection resolves to (ADR-0017, composite amendment). The
+/// `Default` — both sides absent — is today's behavior byte-for-byte: every class rides
+/// the line backend with no declared id.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassRoutes {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<Route>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strong: Option<Route>,
+}
+
+impl ClassRoutes {
+    pub fn for_class(&self, class: ModelClass) -> Option<&Route> {
+        match class {
+            ModelClass::Fast => self.fast.as_ref(),
+            ModelClass::Strong => self.strong.as_ref(),
+        }
+    }
+
+    /// The routes whose backend is not `backend` — the composite part of the pair.
+    pub fn foreign_to(&self, backend: Backend) -> ClassRoutes {
+        let strip = |route: Option<Route>| route.filter(|route| route.backend != backend);
+        ClassRoutes {
+            fast: strip(self.fast.clone()),
+            strong: strip(self.strong.clone()),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fast.is_none() && self.strong.is_none()
+    }
+}
+
 /// One `~/.grind/agent` line: `<backend> [<base-url>] [key=value ...]` (ADR-0017, extended).
 /// The base-url token — bare, no `=` — is the hermetic-test / self-hosting seam kept for
 /// backward compatibility with the grammar ADR-0017 first shipped; `base-url=`, `model=`,
 /// `fast=`, `strong=` and `proto=` are the key/value extensions (`fast=`/`strong=` only,
 /// no positional or endpoint, on an omp line). Credentials never appear here (env only).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Selection {
     pub backend: Backend,
     pub endpoint_override: Option<String>,
-    /// The model id `StageModel::Class(ModelClass::Fast)` resolves to on the native
-    /// backend (`fast=`, or `model=` when `fast=` is absent). `None` falls back to
-    /// [`DEFAULT_MODEL`].
-    pub fast_model: Option<String>,
-    /// The model id `StageModel::Class(ModelClass::Strong)` resolves to on the native
-    /// backend (`strong=`, or `model=` when `strong=` is absent). `None` falls back to
-    /// [`DEFAULT_MODEL`].
-    pub strong_model: Option<String>,
-    /// A declared wire mode, when `proto=` is present. Declaring it skips the probe
-    /// entirely and latches from the declaration (ADR-0018): `stealth/ox-alpha` proved
-    /// unable to execute native tool calls at all, so an undeclared run wastes one failed
-    /// request discovering that every time.
     pub proto_override: Option<ProtoMode>,
+    /// The per-class routing the line resolves to: a bare `fast=`/`strong=` value lands
+    /// here as a route naming the line backend; a `<backend>/`-prefixed value names that
+    /// backend. Both sides absent = every class rides the line backend with no id.
+    pub routes: ClassRoutes,
 }
 
 impl Selection {
@@ -161,6 +197,13 @@ impl Selection {
     /// positional, kept for backward compatibility. An unknown key, a duplicate key, a
     /// `key=` with an empty value, or `proto=` with anything but `native`/`text` fails
     /// loud — the same register `Backend::parse` already rejects an unknown backend on.
+    ///
+    /// A class value (`fast=`/`strong=`) is either a bare id — the line backend's own
+    /// vocabulary — or a `<backend>/`-prefixed id routing that class elsewhere; a
+    /// prefix with an empty remainder (`claude-code/`) names that backend's own
+    /// default for the class. A value whose text before the first `/` does not parse
+    /// as a backend name is a bare id, so vendor namespaces (`z-ai/glm-5.3-flash`)
+    /// never collide with the prefix grammar.
     pub fn parse_line(line: &str) -> Result<Self, String> {
         let line = line.trim();
         if line.is_empty() {
@@ -171,24 +214,47 @@ impl Selection {
         let mut tokens: Vec<&str> = tokens.collect();
 
         if backend == Backend::ClaudeCode {
-            return if tokens.is_empty() {
-                Ok(Self {
-                    backend,
-                    ..Self::default()
-                })
-            } else {
-                Err(format!(
-                    "claude-code takes no arguments, found {:?} \
-                     (expected a bare \"claude-code\" line)",
-                    tokens.join(" ")
-                ))
-            };
+            let mut routes = ClassRoutes::default();
+            for token in &tokens {
+                let Some((key, value)) = token.split_once('=') else {
+                    return Err(format!(
+                        "claude-code takes no arguments, found {:?} \
+                         (expected a bare \"claude-code\" line)",
+                        tokens.join(" ")
+                    ));
+                };
+                if value.is_empty() {
+                    return Err(format!("`{key}=` has an empty value on the agent line"));
+                }
+                match key {
+                    "fast" if routes.fast.is_some() => {
+                        return Err("duplicate `fast` on the agent line".to_string());
+                    }
+                    "fast" => routes.fast = Some(class_value(backend, value)?),
+                    "strong" if routes.strong.is_some() => {
+                        return Err("duplicate `strong` on the agent line".to_string());
+                    }
+                    "strong" => routes.strong = Some(class_value(backend, value)?),
+                    _ => {
+                        return Err(format!(
+                            "claude-code takes no arguments, found {:?} \
+                             (expected a bare \"claude-code\" line)",
+                            tokens.join(" ")
+                        ));
+                    }
+                }
+            }
+            return Ok(Self {
+                backend,
+                endpoint_override: None,
+                proto_override: None,
+                routes,
+            });
         }
 
         if backend == Backend::Omp {
-            let mut fast: Option<String> = None;
-            let mut strong: Option<String> = None;
-            for token in tokens {
+            let mut routes = ClassRoutes::default();
+            for token in &tokens {
                 let Some((key, value)) = token.split_once('=') else {
                     return Err(format!(
                         "omp takes no positional arguments, found {token:?} \
@@ -199,14 +265,14 @@ impl Selection {
                     return Err(format!("`{key}=` has an empty value on the agent line"));
                 }
                 match key {
-                    "fast" if fast.is_some() => {
+                    "fast" if routes.fast.is_some() => {
                         return Err("duplicate `fast` on the agent line".to_string());
                     }
-                    "fast" => fast = Some(value.to_string()),
-                    "strong" if strong.is_some() => {
+                    "fast" => routes.fast = Some(class_value(backend, value)?),
+                    "strong" if routes.strong.is_some() => {
                         return Err("duplicate `strong` on the agent line".to_string());
                     }
-                    "strong" => strong = Some(value.to_string()),
+                    "strong" => routes.strong = Some(class_value(backend, value)?),
                     other => {
                         return Err(format!(
                             "unknown key {other:?} on an omp agent line \
@@ -218,9 +284,8 @@ impl Selection {
             return Ok(Self {
                 backend,
                 endpoint_override: None,
-                fast_model: fast,
-                strong_model: strong,
                 proto_override: None,
+                routes,
             });
         }
 
@@ -233,11 +298,10 @@ impl Selection {
         }
 
         let mut model: Option<String> = None;
-        let mut fast: Option<String> = None;
-        let mut strong: Option<String> = None;
+        let mut routes = ClassRoutes::default();
         let mut proto: Option<ProtoMode> = None;
 
-        for token in tokens {
+        for token in &tokens {
             let Some((key, value)) = token.split_once('=') else {
                 return Err(format!(
                     "expected `key=value` on the agent line, found {token:?}"
@@ -255,14 +319,14 @@ impl Selection {
                     return Err("duplicate `model` on the agent line".to_string());
                 }
                 "model" => model = Some(value.to_string()),
-                "fast" if fast.is_some() => {
+                "fast" if routes.fast.is_some() => {
                     return Err("duplicate `fast` on the agent line".to_string());
                 }
-                "fast" => fast = Some(value.to_string()),
-                "strong" if strong.is_some() => {
+                "fast" => routes.fast = Some(class_value(backend, value)?),
+                "strong" if routes.strong.is_some() => {
                     return Err("duplicate `strong` on the agent line".to_string());
                 }
-                "strong" => strong = Some(value.to_string()),
+                "strong" => routes.strong = Some(class_value(backend, value)?),
                 "proto" if proto.is_some() => {
                     return Err("duplicate `proto` on the agent line".to_string());
                 }
@@ -282,17 +346,77 @@ impl Selection {
             }
         }
 
-        let fast_model = fast.or_else(|| model.clone());
-        let strong_model = strong.or(model);
+        if let Some(model) = &model {
+            let bare = Route {
+                backend,
+                id: Some(model.clone()),
+            };
+            routes.fast = routes.fast.or(Some(bare.clone()));
+            routes.strong = routes.strong.or(Some(bare));
+        }
 
         Ok(Self {
             backend,
             endpoint_override,
-            fast_model,
-            strong_model,
             proto_override: proto,
+            routes,
         })
     }
+}
+
+impl Selection {
+    /// The route one class resolves to: its entry, else a route naming the line backend
+    /// with no id — the line backend's own default for that class.
+    pub fn class_route(&self, class: ModelClass) -> Route {
+        self.routes.for_class(class).cloned().unwrap_or(Route {
+            backend: self.backend,
+            id: None,
+        })
+    }
+
+    /// `(fast, strong)` ids of the routes naming the LINE backend — what the legacy
+    /// `RunRecord` fields snapshot. Bare values land here; a self-referencing prefix
+    /// (`omp strong=omp/glm-5.3-flash`) normalizes here too.
+    pub fn own_ids(&self) -> (Option<String>, Option<String>) {
+        let own = |route: Option<&Route>| {
+            route
+                .filter(|route| route.backend == self.backend)
+                .and_then(|route| route.id.clone())
+        };
+        (
+            own(self.routes.fast.as_ref()),
+            own(self.routes.strong.as_ref()),
+        )
+    }
+
+    /// The routes naming a backend other than the line's — the composite part.
+    pub fn foreign_routes(&self) -> ClassRoutes {
+        self.routes.foreign_to(self.backend)
+    }
+}
+
+/// One class value off the agent line: a bare id rides the line backend; a value whose
+/// first `/`-segment parses as a backend name is a prefix routing the class to that
+/// backend, an empty remainder naming its own default. A first segment that is not a
+/// backend name (`z-ai`, `openrouter`) leaves the value a bare id, so vendor namespaces
+/// never collide with the prefix grammar.
+fn class_value(line_backend: Backend, value: &str) -> Result<Route, String> {
+    let Some((head, rest)) = value.split_once('/') else {
+        return Ok(Route {
+            backend: line_backend,
+            id: Some(value.to_string()),
+        });
+    };
+    Ok(match Backend::parse(head) {
+        Ok(backend) => Route {
+            backend,
+            id: (!rest.is_empty()).then(|| rest.to_string()),
+        },
+        Err(_) => Route {
+            backend: line_backend,
+            id: Some(value.to_string()),
+        },
+    })
 }
 
 /// Grind's own routing intent for one stage, not a concrete model id: a model id is a
@@ -326,12 +450,25 @@ impl StageModel {
 
     /// The claude-code `--model` argument this stage-model resolves to, or `None` for no
     /// flag at all — `Class(Strong)`'s shape, the harness default before this plan existed
-    /// and the one R2 requires stay byte-for-byte unchanged.
-    pub fn claude_code_arg(&self) -> Option<String> {
+    /// and the one R2 requires stay byte-for-byte unchanged. A route naming claude-code
+    /// carries the class id; its `None` id means the harness default (no flag on Strong,
+    /// the alias on Fast); an absent route falls back to the legacy answers.
+    pub fn claude_code_arg(&self, routes: &ClassRoutes) -> Option<String> {
+        let route = |class: ModelClass| {
+            routes
+                .for_class(class)
+                .filter(|route| route.backend == Backend::ClaudeCode)
+        };
         match self {
             Self::Pinned(id) => Some(id.clone()),
-            Self::Class(ModelClass::Fast) => Some(Self::CLAUDE_FAST_ALIAS.to_string()),
-            Self::Class(ModelClass::Strong) => None,
+            Self::Class(ModelClass::Fast) => match route(ModelClass::Fast) {
+                Some(Route { id: Some(id), .. }) => Some(id.clone()),
+                Some(Route { id: None, .. }) | None => Some(Self::CLAUDE_FAST_ALIAS.to_string()),
+            },
+            Self::Class(ModelClass::Strong) => match route(ModelClass::Strong) {
+                Some(Route { id, .. }) => id.clone(),
+                None => None,
+            },
         }
     }
 
@@ -413,21 +550,64 @@ pub(crate) fn declared_model(
     pinned: Option<&str>,
     fast_override: Option<&str>,
     strong_override: Option<&str>,
+    routes: &ClassRoutes,
 ) -> String {
     if let Some(pinned) = pinned {
         return pinned.to_string();
     }
+    fn on_line(backend: Backend, route: Option<&Route>) -> Option<&Route> {
+        route.filter(|route| route.backend == backend)
+    }
     match backend {
-        Backend::Native | Backend::Omp => {
-            let fast = fast_override.unwrap_or(DEFAULT_MODEL);
-            let strong = strong_override.unwrap_or(DEFAULT_MODEL);
+        Backend::ClaudeCode => {
+            let fast = on_line(backend, routes.fast.as_ref());
+            let strong = on_line(backend, routes.strong.as_ref());
+            if fast.is_none() && strong.is_none() {
+                return "(session default — unpinned)".to_string();
+            }
+            let render = |route: Option<&Route>| match route {
+                Some(Route { id: Some(id), .. }) => format!("claude-code/{id}"),
+                _ => "claude-code (its default)".to_string(),
+            };
+            let (fast, strong) = (render(fast), render(strong));
             if fast == strong {
-                fast.to_string()
+                fast
             } else {
                 format!("fast {fast} · strong {strong}")
             }
         }
-        Backend::ClaudeCode => "(session default — unpinned)".to_string(),
+        Backend::Native | Backend::Omp => {
+            let render = |route: Option<&Route>, legacy: Option<&str>| match route {
+                Some(Route {
+                    backend: route_backend,
+                    id: Some(id),
+                }) => {
+                    if *route_backend == backend {
+                        id.clone()
+                    } else {
+                        format!("{}/{id}", route_backend.as_str())
+                    }
+                }
+                Some(Route {
+                    backend: route_backend,
+                    id: None,
+                }) => {
+                    if *route_backend == backend {
+                        DEFAULT_MODEL.to_string()
+                    } else {
+                        format!("{} (its default)", route_backend.as_str())
+                    }
+                }
+                None => legacy.unwrap_or(DEFAULT_MODEL).to_string(),
+            };
+            let fast = render(routes.fast.as_ref(), fast_override);
+            let strong = render(routes.strong.as_ref(), strong_override);
+            if fast == strong {
+                fast
+            } else {
+                format!("fast {fast} · strong {strong}")
+            }
+        }
     }
 }
 /// Which key pays for the endpoint being dialled — the pure half of [`Endpoint::resolve`], so
@@ -530,6 +710,10 @@ pub struct ClaudeCodeAdapter {
     pub claude_bin: String,
     /// Host home — transcript discovery resolves under it (~/.claude/projects/...).
     pub home: PathBuf,
+    /// Host-declared model id for `Class(Fast)` naming claude-code (`None` = the alias).
+    pub fast_model: Option<String>,
+    /// Host-declared model id for `Class(Strong)` naming claude-code (`None` = no flag).
+    pub strong_model: Option<String>,
 }
 
 /// Adapter #2: grind-owned agent loop (default-off until P3 evidence).
@@ -543,6 +727,8 @@ pub struct NativeAdapter {
     /// A declared wire mode (`Selection::proto_override`) — when present, skips the probe
     /// entirely and latches from the declaration (ADR-0018).
     pub proto_override: Option<ProtoMode>,
+    /// The resolved per-class routing; this adapter consults only routes naming `Native`.
+    pub routes: ClassRoutes,
     /// The resolved per-stage turn ceiling for this attempt's stage (`None` keeps the loop's
     /// compiled fallback), resolved by the caller from `docs/tiers.toml`.
     pub max_turns: Option<usize>,
@@ -559,6 +745,8 @@ pub struct OmpAdapter {
     pub fast_model: Option<String>,
     /// Host-declared model id for `StageModel::Class(ModelClass::Strong)` (`strong=`).
     pub strong_model: Option<String>,
+    /// The resolved per-class routing; this adapter consults only routes naming `Omp`.
+    pub routes: ClassRoutes,
 }
 
 /// Everything [`runner_for`] needs from the layout-declared selection (ADR-0017) beyond
@@ -570,6 +758,10 @@ pub struct NativeConfig {
     pub fast_model: Option<String>,
     pub strong_model: Option<String>,
     pub proto_override: Option<ProtoMode>,
+    /// The resolved per-class routing (full pair, never foreign-filtered): each adapter
+    /// consults only the routes naming its own backend, falling back to the legacy
+    /// per-class fields for records written before this existed.
+    pub routes: ClassRoutes,
     /// The stage-resolved turn ceiling handed to [`NativeAdapter`] verbatim; `None` is the
     /// undeclared answer and keeps the loop's compiled fallback.
     pub max_turns: Option<usize>,
@@ -591,12 +783,15 @@ pub fn runner_for(
         Backend::ClaudeCode => Box::new(ClaudeCodeAdapter {
             claude_bin: claude_bin.to_string(),
             home: home.to_path_buf(),
+            fast_model: native.fast_model,
+            strong_model: native.strong_model,
         }),
         Backend::Native => Box::new(NativeAdapter {
             endpoint_override: native.endpoint_override,
             fast_model: native.fast_model,
             strong_model: native.strong_model,
             proto_override: native.proto_override,
+            routes: native.routes,
             max_turns: native.max_turns,
         }),
         Backend::Omp => Box::new(OmpAdapter {
@@ -609,6 +804,7 @@ pub fn runner_for(
             }),
             fast_model: native.fast_model,
             strong_model: native.strong_model,
+            routes: native.routes,
         }),
     }
 }
@@ -624,30 +820,109 @@ mod tests {
     /// sees its session's picks.
     #[test]
     fn declared_model_answers_from_the_record_and_never_from_a_surface() {
+        let none = ClassRoutes::default();
         for backend in [Backend::Native, Backend::Omp] {
             assert_eq!(
-                declared_model(backend, Some("pinned/id"), Some("other"), None),
+                declared_model(backend, Some("pinned/id"), Some("other"), None, &none),
                 "pinned/id",
                 "the pin wins on every backend"
             );
             assert_eq!(
-                declared_model(backend, None, Some("a/b"), Some("a/b")),
+                declared_model(backend, None, Some("a/b"), Some("a/b"), &none),
                 "a/b"
             );
             assert_eq!(
-                declared_model(backend, None, Some("a/b"), Some("c/d")),
+                declared_model(backend, None, Some("a/b"), Some("c/d"), &none),
                 "fast a/b · strong c/d"
             );
-            assert_eq!(declared_model(backend, None, None, None), DEFAULT_MODEL);
+            assert_eq!(
+                declared_model(backend, None, None, None, &none),
+                DEFAULT_MODEL
+            );
         }
         assert_eq!(
-            declared_model(Backend::ClaudeCode, Some("pinned/id"), None, None),
+            declared_model(Backend::ClaudeCode, Some("pinned/id"), None, None, &none),
             "pinned/id",
             "the pin wins on every backend"
         );
         assert_eq!(
-            declared_model(Backend::ClaudeCode, None, None, None),
+            declared_model(Backend::ClaudeCode, None, None, None, &none),
             "(session default — unpinned)"
+        );
+    }
+
+    /// A composite pair renders each class as `<backend>/<id>` when the route leaves the
+    /// line backend, `<backend> (its default)` when it names one with no id, and the bare
+    /// legacy id when it rides the line backend; a claude-code line with no claude-code
+    /// routes stays honestly unpinned.
+    #[test]
+    fn declared_model_renders_composite_routes_per_class() {
+        let composite = ClassRoutes {
+            fast: Some(Route {
+                backend: Backend::Omp,
+                id: Some("z-ai/glm-5.3-flash".to_string()),
+            }),
+            strong: Some(Route {
+                backend: Backend::ClaudeCode,
+                id: Some("claude-opus-5".to_string()),
+            }),
+        };
+        assert_eq!(
+            declared_model(Backend::Native, None, None, None, &composite),
+            "fast omp/z-ai/glm-5.3-flash · strong claude-code/claude-opus-5"
+        );
+        let defaults = ClassRoutes {
+            fast: Some(Route {
+                backend: Backend::Native,
+                id: None,
+            }),
+            strong: Some(Route {
+                backend: Backend::ClaudeCode,
+                id: None,
+            }),
+        };
+        assert_eq!(
+            declared_model(Backend::Native, None, None, None, &defaults),
+            format!("fast {} · strong claude-code (its default)", DEFAULT_MODEL)
+        );
+        let self_named = ClassRoutes {
+            fast: Some(Route {
+                backend: Backend::Native,
+                id: Some("a/b".to_string()),
+            }),
+            strong: Some(Route {
+                backend: Backend::Native,
+                id: Some("a/b".to_string()),
+            }),
+        };
+        assert_eq!(
+            declared_model(Backend::Native, None, None, None, &self_named),
+            "a/b",
+            "routes naming the line backend render bare, like legacy values"
+        );
+        let foreign_only = ClassRoutes {
+            fast: Some(Route {
+                backend: Backend::Omp,
+                id: Some("x/y".to_string()),
+            }),
+            strong: None,
+        };
+        assert_eq!(
+            declared_model(Backend::ClaudeCode, None, None, None, &foreign_only),
+            "(session default — unpinned)",
+            "routes naming other backends are invisible to the claude-code line"
+        );
+        let claude_fast = ClassRoutes {
+            fast: Some(Route {
+                backend: Backend::ClaudeCode,
+                id: Some("claude-sonnet-5".to_string()),
+            }),
+            strong: None,
+        };
+        assert_eq!(
+            declared_model(Backend::ClaudeCode, None, None, None, &claude_fast),
+            "fast claude-code/claude-sonnet-5 · strong claude-code (its default)",
+            "a claude-code-named id renders prefixed; the undeclared class names its default"
         );
     }
 
@@ -755,8 +1030,7 @@ mod tests {
         let s = Selection::parse_line("native").expect("bare native");
         assert_eq!(s.backend, Backend::Native);
         assert_eq!(s.endpoint_override, None);
-        assert_eq!(s.fast_model, None);
-        assert_eq!(s.strong_model, None);
+        assert_eq!(s.routes, ClassRoutes::default());
         assert_eq!(s.proto_override, None);
     }
 
@@ -772,19 +1046,29 @@ mod tests {
     #[test]
     fn model_key_sets_both_classes_at_once() {
         let s = Selection::parse_line("native model=stealth/ox-alpha").expect("model=");
-        assert_eq!(s.fast_model.as_deref(), Some("stealth/ox-alpha"));
-        assert_eq!(s.strong_model.as_deref(), Some("stealth/ox-alpha"));
+        assert_eq!(
+            s.routes,
+            ClassRoutes {
+                fast: Some(Route {
+                    backend: Backend::Native,
+                    id: Some("stealth/ox-alpha".to_string())
+                }),
+                strong: Some(Route {
+                    backend: Backend::Native,
+                    id: Some("stealth/ox-alpha".to_string())
+                }),
+            }
+        );
     }
 
     #[test]
     fn explicit_fast_or_strong_overrides_model_individually() {
         let s =
             Selection::parse_line("native model=shared fast=quick/one").expect("model= plus fast=");
-        assert_eq!(s.fast_model.as_deref(), Some("quick/one"), "fast= wins");
         assert_eq!(
-            s.strong_model.as_deref(),
-            Some("shared"),
-            "model= still backs strong"
+            s.own_ids(),
+            (Some("quick/one".to_string()), Some("shared".to_string())),
+            "fast= wins while model= still backs strong"
         );
     }
 
@@ -806,8 +1090,8 @@ mod tests {
             s.endpoint_override.as_deref(),
             Some("https://example.invalid/v1")
         );
-        assert_eq!(s.fast_model.as_deref(), Some("stealth/ox-alpha"));
-        assert_eq!(s.strong_model.as_deref(), Some("stealth/ox-alpha"));
+        assert_eq!(s.own_ids().0.as_deref(), Some("stealth/ox-alpha"));
+        assert_eq!(s.own_ids().1.as_deref(), Some("stealth/ox-alpha"));
         assert_eq!(s.proto_override, Some(ProtoMode::Text));
     }
 
@@ -867,16 +1151,20 @@ mod tests {
         let s = Selection::parse_line("omp").expect("bare omp");
         assert_eq!(s.backend, Backend::Omp);
         assert_eq!(s.endpoint_override, None);
-        assert_eq!(s.fast_model, None);
-        assert_eq!(s.strong_model, None);
+        assert_eq!(s.routes, ClassRoutes::default());
         assert_eq!(s.proto_override, None);
     }
 
     #[test]
     fn omp_fast_and_strong_keys_populate_the_class_declarations() {
         let s = Selection::parse_line("omp fast=x/glm-flash strong=y/glm-max").expect("omp keys");
-        assert_eq!(s.fast_model.as_deref(), Some("x/glm-flash"));
-        assert_eq!(s.strong_model.as_deref(), Some("y/glm-max"));
+        assert_eq!(
+            s.own_ids(),
+            (
+                Some("x/glm-flash".to_string()),
+                Some("y/glm-max".to_string())
+            )
+        );
     }
 
     #[test]
@@ -896,8 +1184,6 @@ mod tests {
             refused.contains("unknown key") && refused.contains("base-url"),
             "{refused}"
         );
-        let refused = Selection::parse_line("omp proto=text").expect_err("must refuse");
-        assert!(refused.contains("proto"), "{refused}");
     }
 
     #[test]
@@ -916,25 +1202,67 @@ mod tests {
     }
 
     #[test]
-    fn backend_parse_accepts_omp_and_names_all_three_backends_in_its_refusal() {
-        assert_eq!(Backend::parse("omp"), Ok(Backend::Omp));
-        let refused = Backend::parse("opus").expect_err("must refuse");
-        for expected in ["claude-code", "native", "omp"] {
-            assert!(refused.contains(expected), "{expected} missing: {refused}");
-        }
-    }
-    #[test]
     fn claude_code_arg_maps_pinned_verbatim_fast_to_the_alias_strong_to_no_flag() {
+        let none = ClassRoutes::default();
         assert_eq!(
-            StageModel::Pinned("gpt-4o".into()).claude_code_arg(),
+            StageModel::Pinned("gpt-4o".into()).claude_code_arg(&none),
             Some("gpt-4o".to_string())
         );
         assert_eq!(
-            StageModel::Class(ModelClass::Fast).claude_code_arg(),
+            StageModel::Class(ModelClass::Fast).claude_code_arg(&none),
             Some(StageModel::CLAUDE_FAST_ALIAS.to_string())
         );
         assert_eq!(
-            StageModel::Class(ModelClass::Strong).claude_code_arg(),
+            StageModel::Class(ModelClass::Strong).claude_code_arg(&none),
+            None
+        );
+    }
+
+    /// A route naming claude-code carries the class id; its `None` id is the harness
+    /// default (the alias on Fast, no flag on Strong); routes naming other backends are
+    /// invisible to the claude-code resolution.
+    #[test]
+    fn claude_code_arg_resolves_routes_naming_claude_code() {
+        let id_route = |backend: Backend, id: Option<&str>| Route {
+            backend,
+            id: id.map(str::to_string),
+        };
+        let routed = ClassRoutes {
+            fast: Some(id_route(Backend::ClaudeCode, Some("claude-haiku-5"))),
+            strong: Some(id_route(Backend::ClaudeCode, Some("claude-opus-5"))),
+        };
+        assert_eq!(
+            StageModel::Class(ModelClass::Fast).claude_code_arg(&routed),
+            Some("claude-haiku-5".to_string())
+        );
+        assert_eq!(
+            StageModel::Class(ModelClass::Strong).claude_code_arg(&routed),
+            Some("claude-opus-5".to_string())
+        );
+        let default_claude = ClassRoutes {
+            fast: Some(id_route(Backend::ClaudeCode, None)),
+            strong: Some(id_route(Backend::ClaudeCode, None)),
+        };
+        assert_eq!(
+            StageModel::Class(ModelClass::Fast).claude_code_arg(&default_claude),
+            Some(StageModel::CLAUDE_FAST_ALIAS.to_string())
+        );
+        assert_eq!(
+            StageModel::Class(ModelClass::Strong).claude_code_arg(&default_claude),
+            None,
+            "a claude-code route with no id keeps the no-flag harness default"
+        );
+        let foreign = ClassRoutes {
+            fast: Some(id_route(Backend::Omp, Some("z-ai/glm-5.3-flash"))),
+            strong: Some(id_route(Backend::Native, Some("a/b"))),
+        };
+        assert_eq!(
+            StageModel::Class(ModelClass::Fast).claude_code_arg(&foreign),
+            Some(StageModel::CLAUDE_FAST_ALIAS.to_string()),
+            "routes naming other backends fall back to the legacy answers"
+        );
+        assert_eq!(
+            StageModel::Class(ModelClass::Strong).claude_code_arg(&foreign),
             None
         );
     }
@@ -963,6 +1291,202 @@ mod tests {
             StageModel::Pinned("gpt-4o".into()).native_id(Some("x"), Some("y")),
             "gpt-4o",
             "a pin crosses verbatim regardless of the declared classes"
+        );
+    }
+
+    /// A prefixed value routes the class to the named backend; an unknown prefix backend
+    /// is a loud error naming the value as written; a `None`-id route (`claude-code/`)
+    /// names the backend's own default; and a native id with a vendor slash
+    /// (`z-ai/glm-5.3-flash`) is never mistaken for a prefix.
+    #[test]
+    fn class_values_parse_prefixes_per_the_grammar() {
+        let s = Selection::parse_line(
+            "omp fast=openrouter/z-ai/glm-5.3-flash strong=claude-code/claude-opus-5",
+        )
+        .expect("prefixed omp keys");
+        assert_eq!(s.backend, Backend::Omp);
+        assert_eq!(
+            s.routes.fast,
+            Some(Route {
+                backend: Backend::Omp,
+                id: Some("openrouter/z-ai/glm-5.3-flash".to_string()),
+            }),
+            "openrouter is not a backend name, so the value stays bare on the line backend"
+        );
+        assert_eq!(
+            s.routes.strong,
+            Some(Route {
+                backend: Backend::ClaudeCode,
+                id: Some("claude-opus-5".to_string()),
+            })
+        );
+        assert_eq!(
+            s.own_ids(),
+            (Some("openrouter/z-ai/glm-5.3-flash".to_string()), None),
+            "only the route naming the line backend is an own id"
+        );
+        assert_eq!(
+            s.foreign_routes(),
+            ClassRoutes {
+                fast: None,
+                strong: s.routes.strong.clone(),
+            }
+        );
+
+        let s = Selection::parse_line("native strong=claude-code/").expect("empty remainder");
+        assert_eq!(
+            s.routes.strong,
+            Some(Route {
+                backend: Backend::ClaudeCode,
+                id: None,
+            }),
+            "an empty remainder names the backend's own default"
+        );
+
+        let s = Selection::parse_line("omp fast=opus/claude-opus-5")
+            .expect("an unknown first segment is a bare id, not an error");
+        assert_eq!(
+            s.routes.fast,
+            Some(Route {
+                backend: Backend::Omp,
+                id: Some("opus/claude-opus-5".to_string()),
+            }),
+            "only a known backend name before the first / is a prefix"
+        );
+
+        let s = Selection::parse_line("native fast=z-ai/glm-5.3-flash").expect("vendor slash");
+        assert_eq!(
+            s.routes.fast,
+            Some(Route {
+                backend: Backend::Native,
+                id: Some("z-ai/glm-5.3-flash".to_string()),
+            }),
+            "a first segment that is not a backend name is a bare id"
+        );
+    }
+
+    /// A claude-code line now accepts `fast=`/`strong=` keys (prefixed or bare) and
+    /// nothing else: positional or unknown keys keep the loud no-arguments refusal, and
+    /// duplicates and empty values refuse like every other arm.
+    #[test]
+    fn claude_code_class_keys_parse_and_everything_else_refuses() {
+        let s = Selection::parse_line("claude-code fast=claude-haiku-5 strong=claude-opus-5")
+            .expect("claude-code keys");
+        assert_eq!(
+            s.routes,
+            ClassRoutes {
+                fast: Some(Route {
+                    backend: Backend::ClaudeCode,
+                    id: Some("claude-haiku-5".to_string()),
+                }),
+                strong: Some(Route {
+                    backend: Backend::ClaudeCode,
+                    id: Some("claude-opus-5".to_string()),
+                }),
+            }
+        );
+        let refused =
+            Selection::parse_line("claude-code fast=native/a/b strong=").expect_err("empty");
+        assert!(refused.contains("empty value"), "{refused}");
+        let refused = Selection::parse_line("claude-code fast=a fast=b").expect_err("duplicate");
+        assert!(
+            refused.contains("duplicate") && refused.contains("fast"),
+            "{refused}"
+        );
+        let refused = Selection::parse_line("claude-code model=a").expect_err("unknown key");
+        assert!(
+            refused.contains("claude-code takes no arguments"),
+            "{refused}"
+        );
+        let refused = Selection::parse_line("claude-code https://x").expect_err("positional");
+        assert!(
+            refused.contains("claude-code takes no arguments"),
+            "{refused}"
+        );
+    }
+
+    /// A duplicate prefixed key refuses like a duplicate bare one.
+    #[test]
+    fn a_duplicate_prefixed_key_refuses_like_a_bare_one() {
+        let refused =
+            Selection::parse_line("native fast=native/a fast=native/b").expect_err("duplicate");
+        assert!(
+            refused.contains("duplicate") && refused.contains("fast"),
+            "{refused}"
+        );
+    }
+
+    /// `model=` fills both classes as bare line-backend values, so prefixed keys win
+    /// per class exactly as before the composite grammar.
+    #[test]
+    fn model_key_fills_both_classes_as_line_backend_routes() {
+        let s = Selection::parse_line("native model=shared fast=claude-code/claude-opus-5")
+            .expect("model= plus prefixed fast=");
+        assert_eq!(
+            s.routes.fast,
+            Some(Route {
+                backend: Backend::ClaudeCode,
+                id: Some("claude-opus-5".to_string()),
+            }),
+            "the explicit class key wins"
+        );
+        assert_eq!(
+            s.routes.strong,
+            Some(Route {
+                backend: Backend::Native,
+                id: Some("shared".to_string()),
+            }),
+            "model= still backs the other class on the line backend"
+        );
+    }
+
+    /// The class-route helpers: an absent class entry is the line backend's own default;
+    /// self-referencing prefixes normalize into own ids; foreign routes keep their ids.
+    #[test]
+    fn class_route_own_ids_and_foreign_routes_answer_per_the_contract() {
+        let s = Selection::parse_line("omp fast=x/glm-flash strong=claude-code/")
+            .expect("composite omp line");
+        assert_eq!(
+            s.class_route(ModelClass::Fast),
+            Route {
+                backend: Backend::Omp,
+                id: Some("x/glm-flash".to_string()),
+            }
+        );
+        assert_eq!(
+            s.class_route(ModelClass::Strong),
+            Route {
+                backend: Backend::ClaudeCode,
+                id: None,
+            }
+        );
+        assert_eq!(
+            s.own_ids(),
+            (Some("x/glm-flash".to_string()), None),
+            "a None-id route contributes no own id"
+        );
+        let bare = Selection::parse_line("omp").expect("bare omp");
+        assert_eq!(
+            bare.class_route(ModelClass::Strong),
+            Route {
+                backend: Backend::Omp,
+                id: None,
+            },
+            "an absent entry is the line backend's own default"
+        );
+        assert_eq!(bare.own_ids(), (None, None));
+        assert_eq!(bare.foreign_routes(), ClassRoutes::default());
+        let self_ref =
+            Selection::parse_line("omp strong=omp/glm-max").expect("self-referencing prefix");
+        assert_eq!(
+            self_ref.own_ids(),
+            (None, Some("glm-max".to_string())),
+            "a self-referencing prefix normalizes into an own id"
+        );
+        assert_eq!(
+            self_ref.foreign_routes(),
+            ClassRoutes::default(),
+            "a self-referencing prefix is not foreign"
         );
     }
 }

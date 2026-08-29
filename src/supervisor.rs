@@ -170,6 +170,16 @@ struct RunRecord {
     omp_bin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     omp_version: Option<String>,
+    /// The composite per-class routing (ADR-0017, composite amendment): the resolved pair
+    /// snapshotted at dispatch. `None` on every record written before it existed and on
+    /// any Run whose classes all ride the line backend — the honest legacy answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    class_routes: Option<runner::ClassRoutes>,
+    /// The claude-code binary's reported version, snapshotted at readiness when
+    /// claude-code participates in this Run — the same snapshot discipline `omp_version`
+    /// follows. `None` when the binary could not be asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_version: Option<String>,
 }
 
 /// Frozen once, at dispatch — never re-resolved, for the same reason the plugin pin never was:
@@ -232,25 +242,44 @@ impl RunRecord {
         home: &Path,
         run_dir: &Path,
         stage: Option<Stage>,
-    ) -> Box<dyn runner::StageRunner> {
+        model: &runner::StageModel,
+    ) -> (Backend, Box<dyn runner::StageRunner>) {
         let max_turns = stage.map(|stage| {
             let worktree = std::path::PathBuf::from(&self.worktree);
             let tiers = load_tiers(&worktree);
             let tier = latest_decided_tier(run_dir);
             crate::native::max_turns_for(&stage.to_string(), tier.as_deref(), Some(&tiers))
         });
-        runner::runner_for(
-            self.backend,
-            &self.claude_bin,
-            home,
-            runner::NativeConfig {
-                endpoint_override: self.endpoint_override.clone(),
-                fast_model: self.fast_model_override.clone(),
-                strong_model: self.strong_model_override.clone(),
-                proto_override: self.proto_override,
-                max_turns,
-                omp_bin: self.omp_bin.clone(),
-            },
+        // The stage's backend: a pinned model rides the line backend; a class first asks
+        // the composite routing (a foreign route is exactly how a stage lands on another
+        // backend), else the line backend. The legacy record fields
+        // (`fast_model_override`/`strong_model_override`) ride into the config either way
+        // — they are the line backend's own ids, consumed by whichever adapter actually
+        // runs, and foreign routes override them per class.
+        let routes = self.class_routes.clone().unwrap_or_default();
+        let backend = match model {
+            runner::StageModel::Pinned(_) => self.backend,
+            runner::StageModel::Class(class) => routes
+                .for_class(*class)
+                .map(|route| route.backend)
+                .unwrap_or(self.backend),
+        };
+        (
+            backend,
+            runner::runner_for(
+                backend,
+                &self.claude_bin,
+                home,
+                runner::NativeConfig {
+                    endpoint_override: self.endpoint_override.clone(),
+                    fast_model: self.fast_model_override.clone(),
+                    strong_model: self.strong_model_override.clone(),
+                    proto_override: self.proto_override,
+                    routes,
+                    max_turns,
+                    omp_bin: self.omp_bin.clone(),
+                },
+            ),
         )
     }
 }
@@ -360,21 +389,27 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
     let job = job::from_issue_json(&issue.stdout)?;
     world::print_line(&format!("Job #{}: {}", job.issue, job.title));
 
-    let selection = job::read_selection(&home).map_err(Refusal::saying)?;
+    let repo_path = job::repo_path(&home, &job.target_repo);
+    let resolved = job::resolve_agent(&home, Some(&repo_path), job.agent.as_deref())
+        .map_err(Refusal::saying)?;
+    let selection = resolved.selection;
 
-    refuse_unless_host_ready(&home, &job, selection.backend)?;
+    refuse_unless_host_ready(&home, &job, &participants(&selection))?;
 
-    refuse_unless_native_ready(selection.backend, selection.endpoint_override.as_deref())?;
+    refuse_unless_native_ready(
+        selection.backend,
+        participants(&selection).contains(&Backend::Native),
+        selection.endpoint_override.as_deref(),
+    )?;
 
     refuse_claude_pin_on_native(selection.backend, job.model.as_deref())?;
 
-    let repo_path = job::repo_path(&home, &job.target_repo);
     let claude_bin = job::claude_bin(&home);
 
-    // The omp backend's snapshot, taken beside `claude_bin`'s and only for its own
-    // backend: readiness already demanded the binary executable, so this reads the version
-    // while the world is known good rather than mid-Run.
-    let (omp_bin, omp_version) = if selection.backend == Backend::Omp {
+    // The omp backend's snapshot, taken beside `claude_bin`'s and only when omp
+    // participates: readiness already demanded the binary executable, so this reads the
+    // version while the world is known good rather than mid-Run.
+    let (omp_bin, omp_version) = if participants(&selection).contains(&Backend::Omp) {
         omp_snapshot(&home)
     } else {
         (None, None)
@@ -429,6 +464,8 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         job.issue
     );
     let pid = world::pid();
+    let backends = participants(&selection);
+    let (fast_own, strong_own) = selection.own_ids();
     let mut record = RunRecord {
         run_id: run_id.clone(),
         created_at: world::now_iso(),
@@ -453,11 +490,20 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
         reflected: false,
         backend: selection.backend,
         endpoint_override: selection.endpoint_override,
-        fast_model_override: selection.fast_model,
-        strong_model_override: selection.strong_model,
+        fast_model_override: fast_own,
+        strong_model_override: strong_own,
         proto_override: selection.proto_override,
         omp_bin,
         omp_version,
+        class_routes: {
+            let routes = selection.routes.clone();
+            (!routes.is_empty()).then_some(routes)
+        },
+        claude_version: if backends.contains(&Backend::ClaudeCode) {
+            claude_snapshot(&claude_bin)
+        } else {
+            None
+        },
         job,
     };
     let run_dir = job::runs_dir(&home).join(&run_id);
@@ -529,19 +575,40 @@ fn dispatch_banner(record: &RunRecord) -> Vec<String> {
             record.model.as_deref(),
             record.fast_model_override.as_deref(),
             record.strong_model_override.as_deref(),
+            &record.class_routes.clone().unwrap_or_default(),
         )
     ));
+    // The omp snapshot line's truthfulness rule, applied to claude too: a binary line
+    // exists to say what this Run will execute under, so it names the pair only when the
+    // snapshot actually heard a version. A foreign route (a class routed to a backend
+    // other than the line's) gets its own line, so a composite Run names the whole
+    // routing rather than only its line backend; a route with no id names the backend's
+    // own default.
     if record.backend == Backend::ClaudeCode {
         lines.push(format!("  claude {}", record.claude_bin));
     }
-    // The same truthfulness rule the claude line carries: the binary line exists to say
-    // what this Run will execute under, so it names both only when the snapshot actually
-    // heard a version — an omp binary that answered nothing gets no line rather than one
-    // its first Attempt would contradict.
-    if record.backend == Backend::Omp
-        && let (Some(bin), Some(version)) = (&record.omp_bin, &record.omp_version)
-    {
+    if let (Some(bin), Some(version)) = (&record.omp_bin, &record.omp_version) {
         lines.push(format!("  omp {bin} ({version})"));
+    }
+    if let Some(version) = &record.claude_version {
+        lines.push(format!("  claude {} ({version})", record.claude_bin));
+    }
+    let empty = runner::ClassRoutes::default();
+    let routes = record.class_routes.as_ref().unwrap_or(&empty);
+    let routes = routes
+        .fast
+        .as_ref()
+        .map(|route| ("fast", route))
+        .into_iter()
+        .chain(routes.strong.as_ref().map(|route| ("strong", route)))
+        .filter(|(_, route)| route.backend != record.backend);
+    for (class, route) in routes {
+        let id = route
+            .id
+            .as_deref()
+            .map(|id| format!("{}/{}", route.backend.as_str(), id))
+            .unwrap_or_else(|| format!("{} (its default)", route.backend.as_str()));
+        lines.push(format!("  route {class} {id}"));
     }
     lines
 }
@@ -574,6 +641,53 @@ fn omp_version_line(stdout: &str) -> Option<String> {
     } else {
         Some(stripped.to_string())
     }
+}
+
+/// The claude-code backend's binary/version snapshot, the exact shape [`omp_snapshot`]
+/// gives omp: the resolved binary path and whatever `<bin> --version` printed on its
+/// first line. A child that will not run yields no version rather than a guessed one —
+/// the banner honors the absence by staying silent, by the same truthfulness rule.
+fn claude_snapshot(claude_bin: &Path) -> Option<String> {
+    let out = world::run(
+        &[claude_bin.display().to_string(), "--version".to_string()],
+        None,
+    );
+    if out.code != Some(0) {
+        return None;
+    }
+    claude_version_line(&out.stdout)
+}
+
+/// The pure half of [`claude_snapshot`]: the first line of `<bin> --version`'s stdout,
+/// empty meaning none. Split from the spawn so the reading is a string literal here
+/// rather than a process.
+fn claude_version_line(stdout: &str) -> Option<String> {
+    let line = stdout.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        None
+    } else {
+        Some(line.to_string())
+    }
+}
+
+/// Every backend this Run will execute anything under: the selection's line backend,
+/// plus any foreign route's backend. One set, three consumers — the readiness filter,
+/// the omp snapshot, and the claude snapshot all ask it, so a composite Run's foreign
+/// backend is provisioned-for and version-snapshotted exactly like a line backend.
+fn participants(selection: &runner::Selection) -> Vec<Backend> {
+    let mut all = vec![selection.backend];
+    let routes = selection.foreign_routes();
+    if let Some(route) = routes.fast
+        && !all.contains(&route.backend)
+    {
+        all.push(route.backend);
+    }
+    if let Some(route) = routes.strong
+        && !all.contains(&route.backend)
+    {
+        all.push(route.backend);
+    }
+    all
 }
 
 /// The identity to record beside a pid. `Absent` and `Unobservable` are the same fact at *this*
@@ -922,7 +1036,7 @@ fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
     let denied = attempt::denied_for_reflect();
     let reflect_model = runner::StageModel::Class(runner::ModelClass::Strong);
     let run_dir_str = run_dir.display().to_string();
-    let runner = record.runner(&home, run_dir, None);
+    let (reflect_backend, runner) = record.runner(&home, run_dir, None, &reflect_model);
     let spec = runner::RunSpec {
         invocation: &invocation,
         cwd: run_dir,
@@ -943,6 +1057,7 @@ fn maybe_dispatch_reflect(record: &mut RunRecord, run_dir: &Path, path: &Path) {
         model: None,
         cost_usd: classified.total_cost_usd,
         turns: classified.num_turns,
+        backend: Some(reflect_backend),
     });
     let _ = record.save(path);
 }
@@ -1275,15 +1390,25 @@ fn run_r_pass(
     if world::read_to_string(&stages_dir.join("triage").join("grade.json")).is_ok() {
         artifact_paths.push("stages/triage/grade.json".to_string());
     }
+    let empty = runner::ClassRoutes::default();
+    let grade_backend = record
+        .class_routes
+        .as_ref()
+        .unwrap_or(&empty)
+        .for_class(runner::ModelClass::Strong)
+        .map(|route| route.backend)
+        .unwrap_or(record.backend);
     match grader {
         Some(attempt) => record.push_stage_entry(rung::StageEntry {
             name,
             session_id: attempt::grade_session_id(&record.run_id),
             status: ReturnStatus::Complete,
             artifact_paths,
-            model: runner::StageModel::Class(runner::ModelClass::Strong).claude_code_arg(),
+            model: runner::StageModel::Class(runner::ModelClass::Strong)
+                .claude_code_arg(&record.class_routes.clone().unwrap_or_default()),
             cost_usd: attempt.total_cost_usd,
             turns: attempt.num_turns,
+            backend: Some(grade_backend),
         }),
         None => record.push_stage_entry(rung::StageEntry {
             name,
@@ -1293,6 +1418,7 @@ fn run_r_pass(
             model: None,
             cost_usd: Some(0.0),
             turns: Some(0),
+            backend: None,
         }),
     }
     Ok(())
@@ -1352,7 +1478,7 @@ fn dispatch_triage_grader(
     let denied = attempt::denied_for_grade();
     let grade_model = runner::StageModel::Class(runner::ModelClass::Strong);
     let run_dir_str = run_dir.display().to_string();
-    let runner = record.runner(&home, run_dir, Some(Stage::Triage));
+    let (_backend, runner) = record.runner(&home, run_dir, Some(Stage::Triage), &grade_model);
     let mut classified;
     loop {
         n += 1;
@@ -1675,7 +1801,8 @@ fn run_ladder_attempt(
         Mode::Resume
     };
     let stage_model = resolve_stage_model(record, run_dir, stage);
-    let claude_model_arg = stage_model.claude_code_arg();
+    let claude_model_arg =
+        stage_model.claude_code_arg(record.class_routes.as_ref().unwrap_or(&Default::default()));
     let notes = if stage == Stage::Plan {
         let base = notes_for(&home, &record.job.target_repo);
         let lessons = lessons_for(&home, &record.job);
@@ -1717,7 +1844,7 @@ fn run_ladder_attempt(
         &format!("  [{started_at}] {stage} attempt {n} ({mode}) …"),
     );
     let denied = attempt::denied_for(stage);
-    let runner = record.runner(&home, run_dir, Some(stage));
+    let (stage_backend, runner) = record.runner(&home, run_dir, Some(stage), &stage_model);
     let spec = runner::RunSpec {
         invocation: &invocation,
         cwd: worktree,
@@ -1757,6 +1884,7 @@ fn run_ladder_attempt(
         model: claude_model_arg,
         cost_usd,
         turns,
+        backend: Some(stage_backend),
     });
     Ok(())
 }
@@ -1772,7 +1900,8 @@ fn run_ship_babysit_attempt(
 ) -> Result<(), Refusal> {
     let session_id = attempt::stage_session_id(&record.run_id, Stage::Ship);
     let stage_model = resolve_stage_model(record, run_dir, Stage::Ship);
-    let claude_model_arg = stage_model.claude_code_arg();
+    let claude_model_arg =
+        stage_model.claude_code_arg(record.class_routes.as_ref().unwrap_or(&Default::default()));
     let conditions = Conditions {
         claude_bin: &record.claude_bin,
         session_id: &session_id,
@@ -1790,7 +1919,7 @@ fn run_ship_babysit_attempt(
         .iter()
         .map(|glob| glob.to_string())
         .collect();
-    let runner = record.runner(&home, run_dir, None);
+    let (_backend, runner) = record.runner(&home, run_dir, Some(Stage::Ship), &stage_model);
     let spec = runner::RunSpec {
         invocation: &invocation,
         cwd: worktree,
@@ -1840,8 +1969,8 @@ fn announce(run_dir: &Path, record: &RunRecord, observation: &Observation, verdi
     );
 }
 
-fn refuse_unless_host_ready(home: &Path, job: &Job, backend: Backend) -> Result<(), Refusal> {
-    for item in required_dispatch_items(backend) {
+fn refuse_unless_host_ready(home: &Path, job: &Job, backends: &[Backend]) -> Result<(), Refusal> {
+    for item in required_dispatch_items(backends) {
         refusal_for(item.name, check_presence(home, job, item.check))?;
     }
     Ok(())
@@ -1867,12 +1996,12 @@ fn refusal_for(name: &str, found: Observed<ItemOutcome>) -> Result<(), Refusal> 
 /// either still dispatches every other backend, because a binary its backend never runs must
 /// not be able to refuse it. Everything else at dispatch depth is backend-agnostic, so this
 /// is the one filter rather than a per-backend list.
-fn required_dispatch_items(backend: Backend) -> Vec<&'static job::HostItem> {
+fn required_dispatch_items(backends: &[Backend]) -> Vec<&'static job::HostItem> {
     job::dispatch_subset()
         .into_iter()
         .filter(|item| match item.check {
-            job::Check::ClaudeBinary => backend == Backend::ClaudeCode,
-            job::Check::OmpBinary => backend == Backend::Omp,
+            job::Check::ClaudeBinary => backends.contains(&Backend::ClaudeCode),
+            job::Check::OmpBinary => backends.contains(&Backend::Omp),
             _ => true,
         })
         .collect()
@@ -1884,10 +2013,14 @@ fn required_dispatch_items(backend: Backend) -> Vec<&'static job::HostItem> {
 /// doctor endpoint probe). The `Endpoint` itself is dropped at the call site below, immediately
 /// — only whether it resolved crosses into this function.
 fn refuse_unless_native_ready_from(
-    backend: Backend,
+    _backend: Backend,
+    native_participates: bool,
     resolved: Result<(), String>,
 ) -> Result<(), Refusal> {
-    if backend != Backend::Native {
+    // The line backend alone decides nothing here: a composite Run whose *foreign*
+    // route dials native needs the endpoint preflight exactly as much as a native-line
+    // Run does, which is why the gate keys on participation rather than on the line.
+    if !native_participates {
         return Ok(());
     }
     resolved.map_err(|e| Refusal::saying(format!("agent: {e}")))
@@ -1895,10 +2028,12 @@ fn refuse_unless_native_ready_from(
 
 fn refuse_unless_native_ready(
     backend: Backend,
+    native_participates: bool,
     endpoint_override: Option<&str>,
 ) -> Result<(), Refusal> {
     refuse_unless_native_ready_from(
         backend,
+        native_participates,
         runner::Endpoint::resolve(endpoint_override, None).map(|_endpoint| ()),
     )
 }
@@ -2262,7 +2397,7 @@ mod tests {
 
     #[test]
     fn native_backend_does_not_require_the_claude_binary() {
-        let items = required_dispatch_items(Backend::Native);
+        let items = required_dispatch_items(&[Backend::Native]);
         assert!(
             !items.iter().any(|i| i.check == job::Check::ClaudeBinary),
             "a native-only host must not be refused for lacking `claude`"
@@ -2271,6 +2406,7 @@ mod tests {
 
     fn job() -> Job {
         Job {
+            agent: None,
             issue: 28,
             url: "https://github.com/FlorianRiquelme/snapper/issues/28".to_string(),
             title: "Slice 1b".to_string(),
@@ -2372,26 +2508,26 @@ mod tests {
 
     #[test]
     fn claude_code_backend_still_requires_the_claude_binary() {
-        let items = required_dispatch_items(Backend::ClaudeCode);
+        let items = required_dispatch_items(&[Backend::ClaudeCode]);
         assert!(items.iter().any(|i| i.check == job::Check::ClaudeBinary));
     }
 
     #[test]
     fn narrowing_by_backend_drops_only_the_foreign_binary() {
         let whole = job::dispatch_subset().len();
-        let items = |backend| required_dispatch_items(backend);
+        let items = |backends: &[Backend]| required_dispatch_items(backends);
         assert_eq!(
-            items(Backend::ClaudeCode).len(),
+            items(&[Backend::ClaudeCode]).len(),
             whole - 1,
             "claude-code drops `omp binary` and nothing else"
         );
         assert_eq!(
-            items(Backend::Omp).len(),
+            items(&[Backend::Omp]).len(),
             whole - 1,
             "omp drops `claude binary` and nothing else"
         );
         assert_eq!(
-            items(Backend::Native).len(),
+            items(&[Backend::Native]).len(),
             whole - 2,
             "native runs neither binary, so both drop"
         );
@@ -2408,6 +2544,7 @@ mod tests {
         assert_eq!(
             refuse_unless_native_ready_from(
                 Backend::ClaudeCode,
+                false,
                 Err("would refuse if this were consulted".to_string())
             ),
             Ok(())
@@ -2418,6 +2555,7 @@ mod tests {
     fn a_native_backend_with_no_credential_refuses_dispatch() {
         let refusal = refuse_unless_native_ready_from(
             Backend::Native,
+            true,
             Err("no OPENROUTER_API_KEY / OPENAI_API_KEY in environment".to_string()),
         );
         let said = refusal.expect_err("no credential must refuse").to_string();
@@ -2431,7 +2569,7 @@ mod tests {
     #[test]
     fn a_native_backend_with_a_credential_proceeds() {
         assert_eq!(
-            refuse_unless_native_ready_from(Backend::Native, Ok(())),
+            refuse_unless_native_ready_from(Backend::Native, true, Ok(())),
             Ok(())
         );
     }
@@ -2465,9 +2603,20 @@ mod tests {
         assert_eq!(refuse_claude_pin_on_native(Backend::Native, None), Ok(()));
     }
 
+    /// The day-one fixture carries an omp snapshot beside a claude-code backend — a shape
+    /// dispatch can no longer produce (the snapshot is taken only when omp participates).
+    /// Pure-backend banner tests clear it, because the banner now speaks for every
+    /// participating backend the record names, not only the line's.
+    fn day_one_pure() -> RunRecord {
+        let mut record = day_one();
+        record.omp_bin = None;
+        record.omp_version = None;
+        record
+    }
+
     #[test]
     fn a_claude_code_banner_still_names_the_unpinned_default_and_the_binary() {
-        let mut record = day_one();
+        let mut record = day_one_pure();
         record.backend = Backend::ClaudeCode;
         record.model = None;
         assert_eq!(
@@ -2482,7 +2631,7 @@ mod tests {
 
     #[test]
     fn a_native_banner_names_the_declared_model_instead_of_calling_itself_unpinned() {
-        let mut record = day_one();
+        let mut record = day_one_pure();
         record.backend = Backend::Native;
         record.model = None;
         record.fast_model_override = Some("stealth/ox-alpha".to_string());
@@ -2498,7 +2647,7 @@ mod tests {
 
     #[test]
     fn a_native_banner_splits_distinct_fast_and_strong_declarations() {
-        let mut record = day_one();
+        let mut record = day_one_pure();
         record.backend = Backend::Native;
         record.model = None;
         record.fast_model_override = Some("stealth/ox-alpha".to_string());
@@ -2514,7 +2663,7 @@ mod tests {
 
     #[test]
     fn an_undeclared_native_banner_names_the_concrete_default_that_will_run() {
-        let mut record = day_one();
+        let mut record = day_one_pure();
         record.backend = Backend::Native;
         record.model = None;
         assert_eq!(
@@ -2541,6 +2690,132 @@ mod tests {
                 "{backend:?}: only a claude-code Run names the binary"
             );
         }
+    }
+
+    #[test]
+    fn a_composite_banner_renders_one_route_line_per_foreign_route() {
+        let mut record = day_one();
+        record.backend = Backend::Omp;
+        record.model = None;
+        record.class_routes = Some(runner::ClassRoutes {
+            fast: Some(runner::Route {
+                backend: Backend::Omp,
+                id: Some("z-ai/glm-5.3-flash".to_string()),
+            }),
+            strong: Some(runner::Route {
+                backend: Backend::ClaudeCode,
+                id: Some("claude-opus-5".to_string()),
+            }),
+        });
+        let banner = dispatch_banner(&record);
+        assert!(
+            banner.contains(&"  route strong claude-code/claude-opus-5".to_string()),
+            "{banner:?}"
+        );
+        assert!(
+            !banner.iter().any(|line| line.contains("route fast")),
+            "an own-backend route is not foreign: {banner:?}"
+        );
+    }
+
+    #[test]
+    fn a_none_id_route_line_names_the_backends_own_default() {
+        let mut record = day_one();
+        record.backend = Backend::Native;
+        record.model = None;
+        record.class_routes = Some(runner::ClassRoutes {
+            fast: None,
+            strong: Some(runner::Route {
+                backend: Backend::ClaudeCode,
+                id: None,
+            }),
+        });
+        let banner = dispatch_banner(&record);
+        assert!(
+            banner.contains(&"  route strong claude-code (its default)".to_string()),
+            "{banner:?}"
+        );
+    }
+
+    #[test]
+    fn the_claude_line_carries_the_version_only_when_one_was_heard() {
+        let mut record = day_one();
+        record.backend = Backend::ClaudeCode;
+        record.omp_bin = None;
+        record.omp_version = None;
+        let silent = dispatch_banner(&record);
+        assert!(
+            !silent
+                .iter()
+                .any(|line| line.starts_with("  claude ") && line.contains('(')),
+            "no version heard, no version named: {silent:?}"
+        );
+        record.claude_version = Some("2.1.0".to_string());
+        let heard = dispatch_banner(&record);
+        assert!(
+            heard
+                .iter()
+                .any(|line| *line == format!("  claude {} (2.1.0)", record.claude_bin)),
+            "{heard:?}"
+        );
+    }
+
+    #[test]
+    fn the_claude_version_line_reads_the_first_line_only() {
+        assert_eq!(
+            claude_version_line("2.1.0 (Claude Code)\nmore\n").as_deref(),
+            Some("2.1.0 (Claude Code)")
+        );
+        assert_eq!(claude_version_line(""), None);
+    }
+
+    #[test]
+    fn participants_is_the_line_backend_plus_the_foreign_route_backends() {
+        let mut selection = runner::Selection::default();
+        assert_eq!(participants(&selection), vec![Backend::ClaudeCode]);
+        selection.backend = Backend::Omp;
+        selection.routes = runner::ClassRoutes {
+            fast: Some(runner::Route {
+                backend: Backend::Omp,
+                id: Some("glm".to_string()),
+            }),
+            strong: Some(runner::Route {
+                backend: Backend::Native,
+                id: None,
+            }),
+        };
+        assert_eq!(
+            participants(&selection),
+            vec![Backend::Omp, Backend::Native]
+        );
+        selection.routes.strong = Some(runner::Route {
+            backend: Backend::ClaudeCode,
+            id: None,
+        });
+        assert_eq!(
+            participants(&selection),
+            vec![Backend::Omp, Backend::ClaudeCode]
+        );
+    }
+
+    #[test]
+    fn a_foreign_native_route_triggers_the_native_readiness_gate() {
+        let refusal = refuse_unless_native_ready_from(
+            Backend::Omp,
+            true,
+            Err("no OPENROUTER_API_KEY / OPENAI_API_KEY in environment".to_string()),
+        )
+        .expect_err("a Run whose strong class dials native must preflight its endpoint");
+        assert!(refusal.to_string().contains("agent:"));
+        assert_eq!(
+            refuse_unless_native_ready_from(
+                Backend::Omp,
+                false,
+                Err("would refuse if this were consulted".to_string())
+            ),
+            Ok(()),
+            "a Run nothing of which dials native must not be gated on it"
+        );
     }
 
     #[test]
@@ -2726,7 +3001,7 @@ mod tests {
             runner::StageModel::Class(runner::ModelClass::Strong)
         );
         assert_eq!(
-            resolved.claude_code_arg(),
+            resolved.claude_code_arg(&record.class_routes.clone().unwrap_or_default()),
             None,
             "strong means the harness default: no --model flag"
         );
@@ -2897,6 +3172,7 @@ mod tests {
             model: None,
             cost_usd: Some(3.2),
             turns: Some(11),
+            backend: Some(Backend::ClaudeCode),
         });
         written.provenance = Some(Provenance {
             binary_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2914,6 +3190,17 @@ mod tests {
         // asserted to contain the keys.
         written.omp_bin = Some("/Users/operator/.bun/bin/omp".to_string());
         written.omp_version = Some("18.0.6".to_string());
+        // The composite fields are `skip_serializing_if = "Option::is_none"` too, so the
+        // same carrier rule applies: a roundtrip that leaves them `None` would pass while
+        // proving nothing about the bytes.
+        written.class_routes = Some(runner::ClassRoutes {
+            fast: None,
+            strong: Some(runner::Route {
+                backend: Backend::ClaudeCode,
+                id: Some("claude-opus-5".to_string()),
+            }),
+        });
+        written.claude_version = Some("2.1.0 (Claude Code)".to_string());
         let bytes = serde_json::to_string(&written).expect("serialise");
         let read: crate::view::RunView = serde_json::from_str(&bytes)
             .expect("the reader must accept every field the writer emits");
@@ -2941,8 +3228,10 @@ mod tests {
         assert_eq!(read.proto_override, written.proto_override);
         assert_eq!(read.omp_bin, written.omp_bin);
         assert_eq!(read.omp_version, written.omp_version);
+        assert_eq!(read.class_routes, written.class_routes);
+        assert_eq!(read.claude_version, written.claude_version);
         let body = serde_json::from_str::<serde_json::Value>(&bytes).expect("the bytes");
-        for key in ["omp_bin", "omp_version"] {
+        for key in ["omp_bin", "omp_version", "class_routes", "claude_version"] {
             assert!(
                 body.get(key).is_some(),
                 "a valued snapshot field must survive serialisation as `{key}`"
