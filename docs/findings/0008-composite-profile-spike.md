@@ -155,3 +155,23 @@ record file is copied into the repo.
   all three (Plan: 17 turns, $1.09; Triage: 2 turns, $0.29; Plan-review: 6 turns, $3.06). The
   contrast is with a two-backend leg of the same spike, which would show the same question asked
   across an adapter boundary — this leg does not.
+
+## Post-terminal addendum (human-verified, 2026-08-29)
+
+The Work-time tables above are partial by construction (`stages[]` is
+append-only; see "What the observation cannot cover"). Final record states,
+read after both Runs reached terminal:
+
+- **Leg 1 (`…187`)**: terminal `completed`, 8 attempts, 4 commits, PR open,
+  `reflected = true`. Full ladder: plan/plan-review/review/validate =
+  claude-code ($1.69/$2.46/$3.06/$0.86), work/simplify/fixes/ship = omp,
+  diff-triage = `[R]` (backend absent, honest). Reflect metered $6.64.
+- **Leg 2 (`…189`)**: terminal `completed`, 8 attempts, 3 commits, PR open,
+  `reflected = true`. Every rung claude-code (Job pin `claude-code` outranked
+  the repo binding `opus-plan`); `class_routes` absent, `omp_bin`/`omp_version`
+  absent. Metered total $10.16.
+- **omp cost channel**: the unmetered omp rows above are a channel fact, not a
+  zero-spend fact — no `total_cost_usd`, no usage frame, and
+  `advisor_cost_changed` carries no payload on merge-gateway/glm-5.3-flash
+  (omp v18.0.9). A metered channel is the prerequisite for any ADR-0019
+  default flip (verdict recorded on issue #189).
