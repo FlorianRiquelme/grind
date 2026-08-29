@@ -11,19 +11,13 @@ figures are quoted and summarized; no file from `~/.grind/runs/` is copied
 into the repo (ADR-0008).
 
 ## Leg 1 — the two-backend composite (`20260828-212910-grind-187`)
-The record of Job
-[#187](https://github.com/FlorianRiquelme/grind/issues/187) on branch
-`feat/185-p0-spike`, the P0 spike of epic
-[#185](https://github.com/FlorianRiquelme/grind/issues/185) dispatched from the
-brief [docs/plans/2026-08-28-001-composite-profile-spike-brief.md](../plans/2026-08-28-001-composite-profile-spike-brief.md).
-The Run drives one throwaway Job through a ladder whose stages are deliberately
-split across two adapters by the `opus-plan` class binding, and this doc is
-written from the Run's own record at Work time: `run.json` and
-`stages/triage/decision.json` under `~/.grind/runs/20260828-212910-grind-187/`.
-Only figures are quoted and summarized; no file from `~/.grind/runs/` is copied
-into the repo (ADR-0008).
 
-## Dispatch binding
+The Run drives one throwaway Job through a ladder whose stages are deliberately
+split across two adapters by the `opus-plan` class binding. Figures quoted from
+the Run's own record: `run.json` and `stages/triage/decision.json` under
+`~/.grind/runs/20260828-212910-grind-187/`.
+
+### Dispatch binding
 
 Verbatim from `run.json` `class_routes`: `fast` routes to backend `omp` with
 model id `openrouter/z-ai/glm-5.3-flash`; `strong` routes to backend
@@ -32,7 +26,7 @@ model id `openrouter/z-ai/glm-5.3-flash`; `strong` routes to backend
 `provenance.binary_version` is `0.1.0` and `provenance.skills_hash` is
 `b7bea3223c7fa7a5`.
 
-## Per-stage backends
+### Per-stage backends
 
 One row per ladder rung, in ladder order. A stage whose `stages[]` entry
 carries no `backend` key reads `absent` (the field is
@@ -62,7 +56,7 @@ key, so they fall to `strong` via the fallback (`src/supervisor.rs:1614-1617`);
 Plan is always routed `strong` before any Decision exists
 (`src/supervisor.rs:1606-1607`).
 
-## Which adapter executed which stage
+### Which adapter executed which stage
 
 The `opus-plan` binding intends Plan to ride the foreign `claude-code` route
 while the workhorse stages ride `omp`. What the record shows at write time:
@@ -83,7 +77,7 @@ Run writing at Work time observes `plan`, `triage`, and `plan-review` and
 nothing after itself. Work itself is among the unobserved. No adapter claim in
 this doc goes beyond what the entries state.
 
-## Evidence-tree coherence across the adapters
+### Evidence-tree coherence across the adapters
 
 Per adapter that executed at least one observed stage. Triage's adapter is
 absent from the record, so it cannot be listed as its own adapter; its entry's
@@ -127,7 +121,7 @@ is unobserved at write time — so this Run's rows are the first data that
 could bear on the question, recorded as that rather than as an answer to
 0007's; 0007 never measured `omp`.
 
-## What the observation cannot cover
+### What the observation cannot cover
 
 - **`stages[]` is append-only.** Downstream stages are unobserved at Work
   time; the tail of the table is necessarily partial, and a second commit from
@@ -146,7 +140,7 @@ record file is copied into the repo.
 
 ## Leg 2 — the compliance pin (`20260828-222129-grind-189`)
 
-## Compliance-leg observations
+### Compliance-leg observations
 
 - **Per-stage backend.** `run.json`'s `stages[]` records the same backend for each of the three
   rungs this leg ran:
