@@ -127,8 +127,9 @@ CI and nothing else.
 
 ## Status
 
-Single-user proof of concept, used by its author against their own repos. Nine dogfood Runs are
-recorded under `docs/findings/`; handback fidelity, morning decisions per run, unattended
+Single-user proof of concept, used by its author against their own repos. The dogfood Runs are
+recorded under `docs/findings/` (`0001`–`0008`; `0008` records the two composite-profile
+spike Runs); handback fidelity, morning decisions per run, unattended
 completion rate, cost, and self-diagnosable failures are tracked in
 [STRATEGY.md](STRATEGY.md). Not looking for contributors — if a colleague wants this, they fork
 their own.
