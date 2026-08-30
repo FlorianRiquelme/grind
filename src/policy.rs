@@ -794,10 +794,6 @@ mod tests {
                 assert!(!said.contains(banned), "{variant}");
             }
         }
-        assert!(matches!(
-            Stop::Blocked("Bash(git push --force)".to_string()),
-            Stop::Blocked(_)
-        ));
     }
 
     #[test]

@@ -683,7 +683,6 @@ mod tests {
         seen.checks_red = Observed::Present(true);
         seen.checks_pending = Observed::Present(false);
         assert_eq!(verdict(&signals_of(&seen), true), Verdict::Completed);
-        assert_eq!(seen.checks_red, Observed::Present(true));
     }
 
     /// (a) of the amended boundary: pending checks still yield `Incomplete` when the
@@ -1917,7 +1916,7 @@ mod tier_tests {
     }
 
     #[test]
-    fn t3_roster_stays_unique_and_security_only_when_it_fired() {
+    fn t3_roster_carries_security_exactly_when_the_diff_hits() {
         let with_security = DiffFacts {
             changed_loc: 5,
             risky_paths_hit: vec![RiskyPathKind::Crypto],
@@ -1931,15 +1930,6 @@ mod tier_tests {
             roster.iter().filter(|p| **p == Persona::Security).count(),
             1
         );
-        let unique = roster.iter().collect::<std::collections::HashSet<_>>();
-        assert_eq!(
-            unique.len(),
-            roster.len(),
-            "every roster entry maps one-to-one onto review/<persona>/findings.json — a \
-             duplicate seat would overwrite its sibling's file and defeat the lead's \
-             exists-vs-spawned reconciliation (#117)"
-        );
-
         let no_risky_diff = DiffFacts {
             changed_loc: 5,
             risky_paths_hit: vec![],

@@ -768,10 +768,17 @@ mod tests {
         );
     }
 
+    /// `run_bounded` nulls stdin: a child that would otherwise hang on a read (`cat`) reads
+    /// EOF and exits cleanly. The kill path has its own test; this pins that no
+    /// inherited-tty stdin can leak into a headless child.
     #[test]
-    fn a_child_reading_stdin_hangs_forever_without_the_null_but_is_still_killed_on_time() {
+    fn run_bounded_nulls_stdin_so_a_reading_child_reads_eof_instead_of_hanging() {
         let out = run_bounded(&words(&["cat"]), None, &[], Duration::from_millis(500));
-        assert!(out.code == Some(0) || out.code.is_none(), "{out:?}");
+        assert_eq!(
+            out.code,
+            Some(0),
+            "a nulled stdin gives `cat` EOF, not a hang: {out:?}"
+        );
     }
 
     #[test]
@@ -910,6 +917,22 @@ mod tests {
             "{got:?} vs e1={:?} e2={:?}",
             shifted(e1, 0),
             shifted(e2, 0)
+        );
+    }
+
+    /// Known-answer pins for the civil calendar math: `local_or_utc`'s fallback and the
+    /// depth marks read `civil`'s hour/minute, so a regression here must name the exact
+    /// broken day, not a self-consistent mirror.
+    #[test]
+    fn civil_converts_known_epochs_to_their_utc_fields() {
+        assert_eq!(civil(0), (1970, 1, 1, 0, 0, 0));
+        assert_eq!(civil(86_399), (1970, 1, 1, 23, 59, 59));
+        assert_eq!(civil(86_400), (1970, 1, 2, 0, 0, 0));
+        assert_eq!(civil(951_782_400), (2000, 2, 29, 0, 0, 0), "leap day");
+        assert_eq!(
+            civil(1_234_567_890),
+            (2009, 2, 13, 23, 31, 30),
+            "known epoch"
         );
     }
 }

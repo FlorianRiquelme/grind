@@ -2630,16 +2630,6 @@ README.md
     }
 
     #[test]
-    fn every_arm_is_constructed_somewhere_in_this_module() {
-        let arms: [Observed<u64>; 3] = [
-            Observed::Present(1),
-            Observed::Absent,
-            Observed::Unobservable(Reason::saying("constructed")),
-        ];
-        assert_eq!(arms.len(), 3);
-    }
-
-    #[test]
     fn native_freshness_reads_the_newest_of_several_mtimes() {
         let now = 1_785_000_000u64;
         let older = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(now - 500);

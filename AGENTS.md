@@ -71,6 +71,28 @@ constrain — never the whole transcript or a whole output file. A transcript-wi
 unsatisfiable by construction and gets deleted by whoever trips it next (ledger entry
 `2026-08-25-grind-138-negative-assertions-stay-scoped-to-their-turn.md`).
 
+A test that cannot fail is worse than no test: it reads as a guard while guarding nothing.
+Before writing one, name what breaks if the code it claims to guard is deleted or broken —
+if the honest answer is "nothing", delete the test (or the guard it implies, per
+`2026-08-27-grind-165-a-coverage-gap-can-be-behaviourally-inert.md`). The recurring shapes,
+all swept out in one pass (ledger `2026-08-30-tautological-test-sweep.md`):
+
+- **Self-comparison** — `assert_eq!(f(x), f(x))`, or an expected value computed by the same
+  code under test (a mirror). Compute the expectation independently or pin a known answer.
+- **Compiler-guaranteed invariants** — a declared array length vs its own literal's element
+  count; an array literal's own `len()`.
+- **Asserting the fixture** — re-asserting a value the test itself set or constructed two
+  statements earlier.
+- **Structurally-true properties** — a uniqueness check over a literal built unique; a
+  state-list loop asserting its own members are not two states absent from the list.
+- **Unreachable faults** — making `supervisor.log` unwritable and then resuming an
+  already-completed Run: the resume short-circuits before any log write, so the fault is
+  never exercised. The fault must sit on the path the assertions claim to cover.
+
+A test-only source carrier (`include_str!("supervisor.rs")` grepping for the exact seam
+expression) is the honest fallback when behavior at the call site can't be observed directly —
+but split literals used in a negative grep, or the test matches its own source line.
+
 ## Constraints that are easy to violate
 
 - **Run state is never committed.** It is the supervisor's own working record, not history. It

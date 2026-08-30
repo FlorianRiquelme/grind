@@ -2847,7 +2847,6 @@ mod tests {
 
     #[test]
     fn the_key_is_the_repo_and_the_branch_and_never_a_filesystem_path() {
-        assert_eq!(lock_key("o/n", "feat/x"), lock_key("o/n", "feat/x"));
         assert_ne!(lock_key("o/n", "feat/x"), lock_key("o/n", "feat/y"));
         assert_ne!(lock_key("o/n", "feat/x"), lock_key("o/other", "feat/x"));
     }
@@ -2880,20 +2879,6 @@ mod tests {
     }
 
     #[test]
-    fn a_blocked_run_is_resumable_and_a_completed_or_exhausted_one_is_not() {
-        for resumable in [
-            State::Dispatched,
-            State::RateLimited,
-            State::Died,
-            State::Uncorroborated,
-            State::Unobserved,
-            State::Blocked,
-        ] {
-            assert!(!matches!(resumable, State::Completed | State::Exhausted));
-        }
-    }
-
-    #[test]
     fn a_new_records_session_id_is_the_plan_stages_own() {
         let run = "20260806-122620-snapper-28";
         let plan = attempt::stage_session_id(run, Stage::Plan);
@@ -2909,45 +2894,30 @@ mod tests {
     /// The seam itself (issue #146, CodeRabbit review): the supervisor records whatever
     /// `reflect_status` answers for the classified Attempt — the fix substituted
     /// `reflect_status(classified.is_error)` for `classified.done_promise ||
-    /// classified.parse_ok`. Error taking precedence over a spoken done-promise is only
-    /// guaranteed while the promise stays out of the helper's inputs, so this builds the
-    /// classified Attempt the name claims — errored ending, DONE promised mid-stream — and
-    /// pins the record through the same expression the supervisor runs. Reverting the
-    /// substitution at the push_stage_entry call fails here, not three helper-only greens.
+    /// classified.parse_ok` at the push_stage_entry call. A helper-only test cannot see a
+    /// revert of that substitution, so the source carrier below greps this module for the
+    /// exact expression the supervisor runs and for the promise staying out of its inputs;
+    /// the two pins beside it hold the helper's own precedence. All three parts must fail
+    /// together if the seam or the helper drifts back to reading the promise.
     #[test]
     fn an_error_ending_takes_precedence_over_a_spoken_done_promise() {
-        let attempt = Attempt {
-            n: 1,
-            mode: Mode::Dispatch,
-            started_at: "s".to_string(),
-            ended_at: "e".to_string(),
-            exit_code: Some(1),
-            is_error: true,
-            parse_ok: true,
-            subtype: Some("success".to_string()),
-            stop_reason: None,
-            api_error_status: None,
-            terminal_reason: None,
-            num_turns: Some(3),
-            total_cost_usd: None,
-            usage: None,
-            permission_denials: vec![],
-            done_promise: true,
-            rate_limited: false,
-            result_tail: String::new(),
-            fanout: Observed::Absent,
-            transcript: crate::attempt::Transcript::PredatesName,
-        };
-        let status = reflect_status(attempt.is_error);
+        let source = include_str!("supervisor.rs");
+        let seam = ["status: reflect_status(", "classified.is_error)"].concat();
+        assert!(
+            source.contains(&seam),
+            "the push_stage_entry seam must read `classified.is_error`, not the promise: \
+             look for `{seam}` in the reflect stage entry"
+        );
+        let forbidden = ["reflect_status(", "classified.done_promise"].concat();
+        assert!(
+            !source.contains(&forbidden),
+            "the done-promise must never feed reflect_status at the seam"
+        );
         assert_eq!(
-            status,
+            reflect_status(true),
             ReturnStatus::Incomplete,
             "an errored ending that spoke the sentinel mid-stream is still not a complete stage"
         );
-    }
-
-    #[test]
-    fn a_reflect_that_spoke_for_itself_is_complete() {
         assert_eq!(reflect_status(false), ReturnStatus::Complete);
     }
 
@@ -2971,8 +2941,8 @@ mod tests {
     }
 
     #[test]
-    fn skills_hash_of_no_files_is_stable_and_not_a_special_case() {
-        assert_eq!(skills_hash(&[]), skills_hash(&[]));
+    fn skills_hash_of_no_files_is_the_fnv_offset_basis() {
+        assert_eq!(skills_hash(&[]), "cbf29ce484222325");
     }
 
     #[test]
@@ -3248,16 +3218,6 @@ mod tests {
             serde_json::from_value::<crate::view::RunView>(value).is_err(),
             "an undeclared field must fail rather than being dropped silently"
         );
-    }
-
-    #[test]
-    fn the_attempt_list_can_only_grow() {
-        const DAY_ONE: &str = include_str!("../tests/fixtures/record/day-one.json");
-        let mut record: RunRecord = serde_json::from_str(DAY_ONE).unwrap();
-        let before = record.attempts().len();
-        let last = record.attempts().last().unwrap().clone();
-        record.push_attempt(last);
-        assert_eq!(record.attempts().len(), before + 1);
     }
 
     fn day_one() -> RunRecord {
