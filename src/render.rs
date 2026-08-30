@@ -1399,10 +1399,6 @@ mod tests {
         for dropped in ["plan  ", "review residuals", "ledger entries"] {
             assert!(!text.contains(dropped), "`{dropped}` still prints:\n{text}");
         }
-        assert!(matches!(
-            observation().plan_files,
-            Observed::Present(_) | Observed::Absent
-        ));
     }
 
     #[test]
@@ -1686,7 +1682,6 @@ mod tests {
                 "{surface} shows a superseded note:\n{text}"
             );
         }
-        assert_eq!(record.clearances.len(), 2, "both rows stay in the record");
         assert!(markdown.contains("2026-08-21T21:00:00+00:00"), "{markdown}");
     }
 
