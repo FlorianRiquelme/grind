@@ -2902,9 +2902,9 @@ mod tests {
     #[test]
     fn an_error_ending_takes_precedence_over_a_spoken_done_promise() {
         let source = include_str!("supervisor.rs");
-        let seam = "status: reflect_status(classified.is_error)";
+        let seam = ["status: reflect_status(", "classified.is_error)"].concat();
         assert!(
-            source.contains(seam),
+            source.contains(&seam),
             "the push_stage_entry seam must read `classified.is_error`, not the promise: \
              look for `{seam}` in the reflect stage entry"
         );

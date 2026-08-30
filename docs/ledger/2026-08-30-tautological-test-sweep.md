@@ -2,7 +2,7 @@
 date: 2026-08-30
 run: supervised-session
 paths: [src/observe.rs, src/policy.rs, src/decide.rs, src/render.rs, src/world.rs, src/supervisor.rs, tests/denied_tools.rs, tests/topology.rs, tests/end_to_end.rs]
-statement: A full sweep for tautological tests — tests that pass whether or not the code they claim to guard works — found twelve across the base; deleted the dead ones, rewrote the ones whose intent was real, and codified the shapes in AGENTS.md.
+statement: A full sweep for tautological tests — tests that pass whether or not the code they claim to guard works — found fourteen across the base (five deleted, four rewritten, five trimmed of dead assertions inside otherwise-live tests); codified the shapes in AGENTS.md.
 status: candidate
 ---
 
