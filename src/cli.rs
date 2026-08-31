@@ -11,7 +11,7 @@ use crate::job::{self, Check, Depth, Refusal};
 use crate::native;
 use crate::net;
 use crate::observe::{self, Observed, Outcome};
-use crate::render::{self, DoctorLine, SingleRun};
+use crate::render::{self, DoctorLine};
 use crate::runner;
 use crate::supervisor;
 use crate::view::{self, Lookup};
@@ -173,6 +173,16 @@ fn outcomes() -> i32 {
     Observability::Answered.code()
 }
 
+fn observe_for(found: &view::RunView) -> observe::Observation {
+    view::observe_fresh(
+        Path::new(&found.worktree),
+        &found.job.handoff_sha,
+        &found.job.branch,
+        &found.job.base_branch,
+        world::now_iso(),
+    )
+}
+
 fn outcome_line(home: &Path, run_id: &str, found: &view::RunView) -> String {
     let worktree = Path::new(&found.worktree);
     let observation = observe_for(found);
@@ -331,44 +341,24 @@ fn status_one(run_id: &str) -> i32 {
             print_err(&render::refusal(&reason.to_string()));
             Observability::CouldNotAnswer.code()
         }
-        Lookup::Here(found) => {
-            let observation = observe_for(&found);
-            let signals = decide::signals_of(&observation);
-            let promised = found.attempts.last().is_some_and(|a| a.done_promise);
-            let verdict = decide::verdict(&signals, promised);
-            let live = live_for(&home, run_id, &found);
+        Lookup::Here(_) => {
+            let Some(facts) = view::gather(&home, run_id) else {
+                print_err(&render::refusal(&format!("{run_id}: unreadable")));
+                return Observability::CouldNotAnswer.code();
+            };
+            let live = live_for(&home, run_id, &facts.found);
             let here = view::supervisor_here(
-                found.supervisor_identity.as_deref(),
-                &observe::process_start_stamp(&world::ps_start_stamp(found.supervisor_pid)),
+                facts.found.supervisor_identity.as_deref(),
+                &observe::process_start_stamp(&world::ps_start_stamp(facts.found.supervisor_pid)),
             );
-            print(&render::run_view(&SingleRun {
-                found: &found,
-                observation: &observation,
-                live: &live,
-                verdict: &verdict,
-                contract: &view::verify_contract_of(&found.worktree),
-                furthest: decide::furthest_stage(&observation),
-                supervisor_here: &here,
-                cleared: found.clearances.last(),
-                run_state: &view::record_path(&home, run_id),
-            }));
-            if matches!(verdict, decide::Verdict::Unobserved(_)) {
+            print(&render::run_view(&facts, &live, &here));
+            if matches!(facts.verdict, decide::Verdict::Unobserved(_)) {
                 Observability::CouldNotAnswer.code()
             } else {
                 Observability::Answered.code()
             }
         }
     }
-}
-
-fn observe_for(found: &view::RunView) -> observe::Observation {
-    view::observe_fresh(
-        Path::new(&found.worktree),
-        &found.job.handoff_sha,
-        &found.job.branch,
-        &found.job.base_branch,
-        world::now_iso(),
-    )
 }
 
 /// The live view, dispatched on the Run's snapshotted backend (#135). Each adapter reads its own
