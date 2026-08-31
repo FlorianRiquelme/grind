@@ -2,16 +2,29 @@
 //!
 //! Downstream consumers — supervisor, policy, observe, serve, render — see one currency
 //! ([`crate::attempt::Attempt`]) and one transcript-event schema
-//! ([`TranscriptEvent`]). Normalization happens inside adapters; nothing outside
-//! this module branches on backend.
+//! ([`TranscriptEvent`]). Normalization happens inside adapters.
 //!
-//! Two adapters exist:
+//! Three adapters exist:
 //!
 //! - [`ClaudeCodeAdapter`] — today's behavior: `claude -p` argv via
 //!   [`crate::world::spawn_recorded`], Claude Code transcripts under `~/.claude/projects/`.
 //! - [`NativeAdapter`] — a grind-owned agent loop speaking any OpenAI-compatible
 //!   `/chat/completions` endpoint, grind-defined tools, grind-owned transcripts
 //!   (`messages-N.jsonl` in the run dir).
+//! - [`OmpAdapter`] — the omp harness CLI hosted as a child (#176), its own JSONL session
+//!   files harvested out of the stage's `--session-dir`.
+//!
+//! **Four things vary per adapter, and all four branch here and nowhere else** (issue #194).
+//! Three of them used to be spread across `cli`, `serve` and `page`, where widening for a
+//! fourth adapter meant remembering three files:
+//!
+//! - *how a stage executes* — [`StageRunner::run`], reached through [`runner_for`];
+//! - *how a Run's live progress is read* — [`live`], over whichever transcripts that
+//!   adapter writes;
+//! - *which files an attempt leaves behind* — [`evidence`], names only, so the renderer
+//!   stays a renderer;
+//! - *what carries the stage's denied-tool globs* — [`Backend::denials`], which every
+//!   adapter must answer for itself because the three answers genuinely differ.
 //!
 //! Selection is layout-declared (`~/.grind/agent`, ADR-0017), snapshotted into the
 //! RunRecord at dispatch, and honored verbatim on resume.
@@ -115,6 +128,55 @@ impl Backend {
                 "unknown agent backend {other:?} \
                  (expected \"claude-code\", \"native\" or \"omp\")"
             )),
+        }
+    }
+
+    /// What carries [`RunSpec::denied_globs`] into this adapter's execution, and therefore
+    /// whether they bind at all. The three answers differ, this match is the only place that
+    /// says so, and an adapter #4 cannot compile without answering.
+    pub fn denials(self) -> DenialCarrier {
+        match self {
+            Self::ClaudeCode => DenialCarrier::Argv,
+            Self::Native => DenialCarrier::Gate,
+            Self::Omp => DenialCarrier::Unenforced,
+        }
+    }
+}
+
+/// How one adapter carries the stage's denied-tool globs.
+///
+/// The globs themselves are stage policy (`attempt::DENIED_TOOLS`, widened per stage by
+/// `attempt::denied_for`) and the supervisor hands the same list to every adapter. What
+/// differs is what happens to it afterwards, and until issue #194 nothing said so: the field
+/// on [`RunSpec`] claimed to be *the single permission source both adapters enforce* while
+/// being read at exactly one line in the crate.
+///
+/// This is a type rather than prose because ADR-0006's test applies: a new adapter inheriting
+/// silence here is **omission**, which is typeable. It records what an adapter does; it grants
+/// nothing and gates nothing. Narrowing what the globs cover is intent, and no carrier
+/// defends against intent — `DENIED_TOOLS` stays prose in `AGENTS.md` for exactly that reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenialCarrier {
+    /// grind's own in-process gate reads [`RunSpec::denied_globs`] before every tool call
+    /// (`tools::gate`, the native adapter). The list a Run carries is the list that binds.
+    Gate,
+    /// The globs ride argv into a child that enforces them itself (`--disallowedTools`, the
+    /// claude-code adapter). Built into the [`crate::attempt::Invocation`] by
+    /// `claude::build_stage`, so the adapter never reads [`RunSpec::denied_globs`] — the same
+    /// list reaches the same place by a different carrier.
+    Argv,
+    /// Nothing enforces them: the harness exposes no per-call permission channel and is
+    /// hosted with blanket approval (`omp --auto-approve`). ADR-0017 decided this in writing
+    /// and records the gap rather than papering over it; naming it here is the record.
+    Unenforced,
+}
+
+impl DenialCarrier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gate => "gate",
+            Self::Argv => "argv",
+            Self::Unenforced => "unenforced",
         }
     }
 }
@@ -686,8 +748,14 @@ pub struct RunSpec<'a> {
     /// and each adapter maps it to its own concrete id (`StageModel::claude_code_arg`,
     /// `StageModel::native_id`).
     pub model: &'a StageModel,
-    /// This stage's denied-tool globs (attempt::denied_for / denied_for_reflect) —
-    /// the single permission source both adapters enforce.
+    /// This stage's denied-tool globs (attempt::denied_for / denied_for_reflect), handed to
+    /// every adapter alike because they are stage policy, not adapter policy.
+    ///
+    /// **What each adapter does with them differs, and [`Backend::denials`] is where that is
+    /// written down.** Only [`DenialCarrier::Gate`] reads this field: the claude-code adapter
+    /// gets the same list by argv, baked into [`RunSpec::invocation`] by `claude::build_stage`,
+    /// and the omp adapter enforces nothing at all (ADR-0017). Reading a full list here and
+    /// concluding a Run is fenced is the misreading this field's previous doc invited.
     pub denied_globs: &'a [String],
     /// Which artifact family this call's file names belong to (`attempt-N.*` /
     /// `messages-N.jsonl` vs. `reflect-N.*` / `reflect-messages-N.jsonl`).
@@ -809,9 +877,186 @@ pub fn runner_for(
     }
 }
 
+/// The live view, dispatched on the Run's snapshotted backend — the second backend branch,
+/// and the whole of it (issue #194). Each adapter reads its own transcripts and returns the
+/// one [`crate::view::Live`] shape: `claude::live` a claude-code session's JSONL under
+/// `~/.claude/projects/`, `native::live` the `messages-N.jsonl` the native loop leaves under
+/// the Run's own directory, `omp::live` the harvested session file beside it.
+///
+/// This lived twice, byte-identical, as `cli::live_for` and `serve::live_for` — the two
+/// surfaces a human asks *what is this Run doing* on. Widening for an adapter is one arm
+/// here now instead of two copies in two modules.
+///
+/// The floor it replaced read only `freshness` for a native Run and left every other field
+/// `Unobservable`; `grind status` exited *Answered* over a blank panel, which is no answer at
+/// all for the command `docs/agents/run-observation.md` names as the way to ask.
+pub fn live(home: &Path, run_id: &str, found: &crate::view::RunView) -> crate::view::Live {
+    let now = crate::world::now_epoch();
+    match found.backend {
+        Backend::ClaudeCode => crate::claude::live(
+            &crate::claude::transcript_path(home, &found.worktree, &found.session_id),
+            now,
+        ),
+        Backend::Native => crate::native::live(&crate::job::runs_dir(home).join(run_id), now),
+        Backend::Omp => crate::omp::live(&crate::job::runs_dir(home).join(run_id), now),
+    }
+}
+
+/// One file an attempt left behind: what to call it on screen, and its bare name under the
+/// Run's directory. A name, never a URL and never markup — the renderer that shows these is
+/// the only thing that knows how a link is spelled.
+pub struct Evidence {
+    pub label: &'static str,
+    pub file: String,
+}
+
+/// Which files attempt `n` wrote, per backend — the third backend branch (issue #194),
+/// lifted out of `page::evidence_links` so the dashboard renderer no longer carries a
+/// per-adapter match of its own.
+///
+/// There is no filesystem access here: it names what each adapter *writes* rather than
+/// checking what exists, which is what let the pre-#135 renderer link the claude-code trio
+/// under a native attempt that never wrote one.
+///
+/// `transcript` is the three-valued fact the Attempt itself carries, and each value answers
+/// differently (issue #161): a recorded name wins over the computed one — a native attempt
+/// that re-entered after a crash allocated the first free slot, `messages-2-2.jsonl`, while
+/// `messages-2.jsonl` still holds the dead attempt's record, so the computed name would put
+/// another attempt's transcript under this row's heading (issue #156); every record written
+/// before the name existed keeps the constructed fallback, which names that attempt's own
+/// file exactly; and an attempt whose lifecycle ended before allocating anything names no
+/// file at all — the URL today's fallback served was backed by nothing. The claude-code trio
+/// ignores the fact entirely: those three names are determined by `n` alone.
+///
+/// `PredatesName` survives only on the native side, where the constructed `messages-{n}.jsonl`
+/// names that attempt's own file exactly. Omp never wrote one, so for it the pre-name value is
+/// the same fact as wrote-none: no file to name.
+pub fn evidence(
+    backend: Backend,
+    n: usize,
+    transcript: &crate::attempt::Transcript,
+) -> Vec<Evidence> {
+    use crate::attempt::Transcript;
+    let one = |label: &'static str, file: String| vec![Evidence { label, file }];
+    match backend {
+        Backend::ClaudeCode => ["prompt.txt", "stdout.json", "stderr.log"]
+            .into_iter()
+            .map(|label| Evidence {
+                label,
+                file: format!("attempt-{n}.{label}"),
+            })
+            .collect(),
+        Backend::Native => match transcript {
+            Transcript::Recorded(name) => one("messages.jsonl", name.clone()),
+            Transcript::PredatesName => one("messages.jsonl", format!("messages-{n}.jsonl")),
+            Transcript::WroteNone => Vec::new(),
+        },
+        Backend::Omp => match transcript {
+            Transcript::Recorded(name) => one("sessions.jsonl", name.clone()),
+            Transcript::PredatesName | Transcript::WroteNone => Vec::new(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observe::Observed;
+
+    const DAY_ONE: &str = include_str!("../tests/fixtures/record/day-one.json");
+
+    /// The day-one fixture, with `backend` overridden — a record written before selection
+    /// existed carries neither field and defaults to `ClaudeCode`, so a literal string edit is
+    /// how the other backend gets exercised without hand-building the whole record shape.
+    fn found_with_backend(backend: &str) -> crate::view::RunView {
+        let mut value: serde_json::Value = serde_json::from_str(DAY_ONE).unwrap();
+        value["backend"] = serde_json::json!(backend);
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn a_claude_code_run_is_unaffected_by_the_native_branch() {
+        let found = found_with_backend("claude-code");
+        let home = Path::new("/nowhere/that/exists");
+        let live_view = live(home, &found.run_id, &found);
+        assert_eq!(
+            live_view.transcript,
+            crate::claude::transcript_path(home, &found.worktree, &found.session_id)
+        );
+        assert!(matches!(live_view.freshness, Observed::Unobservable(_)));
+        assert!(matches!(live_view.now_skill, Observed::Unobservable(_)));
+    }
+
+    #[test]
+    fn a_native_run_reads_its_own_transcript_and_not_only_its_freshness() {
+        let found = found_with_backend("native");
+        let home = crate::world::temp_dir("runner-live-native");
+        let run_dir = crate::job::runs_dir(&home).join(&found.run_id);
+        crate::world::create_dir_all(&run_dir).expect("a scratch run directory");
+        crate::world::write(
+            &run_dir.join("messages-1.jsonl"),
+            concat!(
+                r#"{"event":"skill_declared","value":{"skill":"work"}}"#,
+                "\n",
+                r#"{"event":"protocol_selected","value":{"mode":"text","reason":"declared"}}"#,
+                "\n",
+                r#"{"event":"assistant_tool_calls","value":{"calls":[{"name":"bash","arguments":"{\"command\":\"just verify\"}"}]}}"#,
+                "\n",
+                r#"{"event":"tool_result","value":{"call_id":"text","output":"all green"}}"#,
+                "\n",
+            ),
+        )
+        .expect("a scratch messages file");
+
+        let live_view = live(&home, &found.run_id, &found);
+        assert!(
+            matches!(live_view.freshness, Observed::Present(_)),
+            "{:?}",
+            live_view.freshness
+        );
+        assert_eq!(live_view.now_skill, Observed::Present("work".to_string()));
+        assert_eq!(
+            live_view.assistant_now,
+            Observed::Present(r#"bash {"command":"just verify"}"#.to_string())
+        );
+        assert_eq!(
+            live_view.last_words,
+            vec![
+                r#"bash {"command":"just verify"}"#.to_string(),
+                "all green".to_string(),
+                String::new(),
+            ]
+        );
+        assert!(
+            matches!(live_view.fanout, Observed::Unobservable(_)),
+            "{:?}",
+            live_view.fanout
+        );
+        assert_eq!(live_view.transcript, run_dir.join("messages-1.jsonl"));
+
+        crate::world::remove_tree(&home);
+    }
+
+    #[test]
+    fn a_native_transcript_of_nothing_recognisable_is_absent_and_never_a_crash() {
+        let found = found_with_backend("native");
+        let home = crate::world::temp_dir("runner-live-native-garbage");
+        let run_dir = crate::job::runs_dir(&home).join(&found.run_id);
+        crate::world::create_dir_all(&run_dir).expect("a scratch run directory");
+        crate::world::write(
+            &run_dir.join("messages-1.jsonl"),
+            "{\"event\":\"turn\"}\nnot json\n",
+        )
+        .expect("a scratch messages file");
+
+        let live_view = live(&home, &found.run_id, &found);
+        assert!(matches!(live_view.freshness, Observed::Present(_)));
+        assert_eq!(live_view.now_skill, Observed::Absent);
+        assert_eq!(live_view.assistant_now, Observed::Absent);
+        assert_eq!(live_view.last_words, vec![String::new(); 3]);
+
+        crate::world::remove_tree(&home);
+    }
 
     /// The one derivation both surfaces render from: the pin wins outright, a native or
     /// omp Run's equal class declarations collapse to one id, split declarations name both

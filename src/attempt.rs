@@ -315,6 +315,27 @@ pub struct Attempt {
     pub api_error_status: Option<String>,
     pub terminal_reason: Option<String>,
     pub num_turns: Option<u64>,
+    /// What this attempt spent, in dollars — **and a field whose `None` means three different
+    /// things depending on which adapter produced the row** (issue #194). Nothing at the type
+    /// level says so, and [`Attempt::is_wait`] reads it, which is what makes the divergence
+    /// worth writing down rather than leaving to whoever greps three files next:
+    ///
+    /// - **claude-code** (`crate::claude::classify`) takes the child's own `total_cost_usd`
+    ///   JSON field verbatim. `None` is genuinely ambiguous — a renamed key and a true zero
+    ///   look the same from here — and that ambiguity is why `is_wait` keys on *presence*.
+    /// - **native** (`crate::native::cost_floor`) sums `usage.cost` live off the wire and
+    ///   floors the answer to `Some(0.0)`. It never emits `None`, deliberately: the loop
+    ///   authoritatively knows it recorded no cost, and `None` would make a first-turn rate
+    ///   limit spend the attempt budget instead of reading as a Wait.
+    /// - **omp** (`crate::omp::classify`) scans the harvested JSONL for `message_end`
+    ///   assistant frames. `None` means *the harness exposed no spend channel at all*, never a
+    ///   zero — the `saw_usage` gate exists so a silent stream stops manufacturing `$0.00`.
+    ///
+    /// The three are individually reasoned and each lands on the safe side of `is_wait`, so
+    /// this is a documented divergence rather than a defect. What a fourth adapter must not do
+    /// is pick a convention by accident: a producer reporting `Some(0.0)` where it means
+    /// *unknown* makes every one of its attempts free and its Run endless.
+    /// `tests/cost_conventions.rs` pins all three, and the `is_wait` answer each one yields.
     pub total_cost_usd: Option<f64>,
     pub usage: Option<serde_json::Value>,
     pub permission_denials: Vec<serde_json::Value>,

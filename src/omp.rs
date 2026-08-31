@@ -270,7 +270,11 @@ fn resume_suffix(filename: &str) -> Option<&str> {
 /// wrong shape outright — junk lines cost themselves and nothing else, the same
 /// line-by-line rule every transcript reader in this crate records for files whose real
 /// format drifts between its own lines.
-pub(crate) fn classify(
+///
+/// `pub` for the same reason [`crate::claude::classify`] is: it is a pure function over a raw
+/// triple, and `tests/cost_conventions.rs` compares this backend's `total_cost_usd` convention
+/// with the other two adapters' in one place (issue #194).
+pub fn classify(
     stdout: &str,
     stderr: &str,
     code: Option<i32>,

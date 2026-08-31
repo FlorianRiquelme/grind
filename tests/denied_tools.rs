@@ -212,3 +212,57 @@ fn every_built_argv_carries_all_base_denials_regardless_of_stage() {
         }
     }
 }
+
+/// **What each adapter does with the list, pinned against what its source actually does**
+/// (issue #194). `runner::Backend::denials` is the one place that says the three adapters
+/// carry the same globs three different ways; a declaration nobody checks is worth as little
+/// as the doc comment it replaced, which claimed *the single permission source both adapters
+/// enforce* while being read at one line in the crate.
+///
+/// Source carriers, for the reason `AGENTS.md` names: the difference is *which mechanism an
+/// adapter reaches for*, and no call site can be made to observe that a module never calls
+/// something. Each needle is split before being used in a negative, so this test does not
+/// match its own source.
+///
+/// Break either half and this fails: teach the omp adapter to gate and its declaration goes
+/// stale; drop `--disallowedTools` from the claude-code argv and its `Argv` claim does too.
+#[test]
+fn each_adapters_declared_denial_carrier_is_what_its_source_does() {
+    use grind::runner::{Backend, DenialCarrier};
+
+    let native = read("src/native.rs");
+    let claude = read("src/claude.rs");
+    let omp = read("src/omp.rs");
+
+    let gate_call = format!("tools::{}(spec.denied_globs", "gate");
+    let argv_flag = format!("--disallowed{}", "Tools");
+    let auto_approve = format!("--auto-{}", "approve");
+
+    assert_eq!(Backend::Native.denials(), DenialCarrier::Gate);
+    assert!(
+        native.contains(&gate_call),
+        "the native adapter declares Gate, so it must be the one reading RunSpec::denied_globs"
+    );
+
+    assert_eq!(Backend::ClaudeCode.denials(), DenialCarrier::Argv);
+    assert!(
+        claude.contains(&argv_flag),
+        "the claude-code adapter declares Argv, so its argv must still carry the flag"
+    );
+    assert!(
+        !claude.contains(&gate_call),
+        "an adapter declaring Argv must not also be gating"
+    );
+
+    assert_eq!(Backend::Omp.denials(), DenialCarrier::Unenforced);
+    assert!(
+        omp.contains(&auto_approve),
+        "the omp adapter declares Unenforced, and blanket approval is what makes that true \
+         (ADR-0017 decided it in writing)"
+    );
+    assert!(
+        !omp.contains(&gate_call) && !omp.contains(&argv_flag),
+        "an adapter declaring Unenforced must not be carrying the globs by either mechanism — \
+         if it grew one, widen the declaration rather than this test"
+    );
+}

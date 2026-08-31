@@ -616,61 +616,39 @@ fn attempt_list(run_id: &str, found: &RunView) -> String {
     out
 }
 
-/// What one attempt's row links to, which depends on what that Run's backend actually wrote
-/// to disk (issue found in review: `RunView.backend` was added by #135 and read nowhere).
-/// `ClaudeCodeAdapter::run` writes the three `attempt-N.*` files; `NativeAdapter::run` writes
-/// only `messages-N.jsonl` in the run dir — rendering the claude-code trio for a native attempt
-/// links three files that were never written. This is a pure renderer with no filesystem
-/// access, so it names what each backend writes rather than checking what exists.
+/// What one attempt's row links to. **Which files exist is the adapter's fact, not the
+/// renderer's** — `crate::runner::evidence` names them and this spells the links (issue
+/// #194 moved the per-backend match there, where the other three adapter differences already
+/// live). The reason the fact is per-backend at all: `ClaudeCodeAdapter::run` writes the
+/// three `attempt-N.*` files, `NativeAdapter::run` writes only `messages-N.jsonl` in the run
+/// dir, so rendering the claude-code trio for a native attempt links three files that were
+/// never written (issue found in review: `RunView.backend` was added by #135 and read
+/// nowhere).
 ///
-/// `transcript` is the three-valued fact the Attempt itself carries, and each value renders
-/// its own row (issue #161): a recorded name wins over the computed one — a native attempt that
-/// re-entered after a crash allocated the first free slot, `messages-2-2.jsonl`, while
-/// `messages-2.jsonl` still holds the dead attempt's record, so the computed name would put
-/// another attempt's transcript under this row's heading (issue #156); every record written
-/// before the name existed keeps the constructed fallback, which names that attempt's own file
-/// exactly; and an attempt whose lifecycle ended before allocating anything renders no link at
-/// all — the URL today's fallback served was backed by nothing. The claude-code trio ignores
-/// the fact entirely: those three names are determined by `n` alone.
+/// An attempt that names no file renders no row at all, and no placeholder stands in for one
+/// (issue #161) — the URL the old fallback served was backed by nothing.
 fn evidence_links(
     run_id: &str,
     n: usize,
     backend: crate::runner::Backend,
     transcript: &crate::attempt::Transcript,
 ) -> String {
-    let run_id = esc(run_id);
-    match backend {
-        crate::runner::Backend::ClaudeCode => format!(
-            "<div class=\"g-ev\"><a class=\"g-link\" href=\"/raw/runs/{run_id}/attempt-{n}.prompt.txt\">prompt.txt</a>\
-<a class=\"g-link\" href=\"/raw/runs/{run_id}/attempt-{n}.stdout.json\">stdout.json</a>\
-<a class=\"g-link\" href=\"/raw/runs/{run_id}/attempt-{n}.stderr.log\">stderr.log</a></div>"
-        ),
-        crate::runner::Backend::Native => match transcript {
-            crate::attempt::Transcript::Recorded(name) => format!(
-                "<div class=\"g-ev\"><a class=\"g-link\" href=\"/raw/runs/{run_id}/{}\">messages.jsonl</a></div>",
-                esc(name)
-            ),
-            crate::attempt::Transcript::PredatesName => {
-                let name = esc(&format!("messages-{n}.jsonl"));
-                format!(
-                    "<div class=\"g-ev\"><a class=\"g-link\" href=\"/raw/runs/{run_id}/{name}\">messages.jsonl</a></div>"
-                )
-            }
-            // Nothing was ever written under this attempt's name, so there is nothing to
-            // link — and no placeholder stands in for one (issue #161).
-            crate::attempt::Transcript::WroteNone => String::new(),
-        },
-        crate::runner::Backend::Omp => match transcript {
-            crate::attempt::Transcript::Recorded(name) => format!(
-                "<div class=\"g-ev\"><a class=\"g-link\" href=\"/raw/runs/{run_id}/{}\">sessions.jsonl</a></div>",
-                esc(name)
-            ),
-            // A session file that never materialized links nothing (issue #161's rule).
-            crate::attempt::Transcript::WroteNone | crate::attempt::Transcript::PredatesName => {
-                String::new()
-            }
-        },
+    let files = crate::runner::evidence(backend, n, transcript);
+    if files.is_empty() {
+        return String::new();
     }
+    let run_id = esc(run_id);
+    let links: String = files
+        .iter()
+        .map(|ev| {
+            format!(
+                "<a class=\"g-link\" href=\"/raw/runs/{run_id}/{}\">{}</a>",
+                esc(&ev.file),
+                esc(ev.label)
+            )
+        })
+        .collect();
+    format!("<div class=\"g-ev\">{links}</div>")
 }
 
 fn last_words_block(live: &Live) -> String {

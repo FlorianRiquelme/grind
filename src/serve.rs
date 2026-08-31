@@ -8,9 +8,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::claude;
 use crate::job;
-use crate::native;
 use crate::observe;
 use crate::page;
 use crate::runner;
@@ -211,35 +209,13 @@ fn run_response(home: &Path, id: &str, fragment: bool) -> Response {
         found.supervisor_identity.as_deref(),
         &observe::process_start_stamp(&world::ps_start_stamp(found.supervisor_pid)),
     );
-    let live = live_for(home, id, &found);
+    let live = runner::live(home, id, &found);
     let body = if fragment {
         page::run_fragment(id, &facts, &live, &here)
     } else {
         page::run_page(id, &facts, &live, &here)
     };
     html(body)
-}
-
-/// The live view, dispatched on the Run's snapshotted backend (#135). Each adapter reads its own
-/// transcripts and returns the one [`view::Live`] shape: `claude::live` a claude-code session's
-/// JSONL under `~/.claude/projects/`, `native::live` the `messages-N.jsonl` the native loop
-/// leaves under the Run's own directory. The floor this replaces read only `freshness` for a
-/// native Run and left every other field `Unobservable`, so the dashboard rendered a blank live
-/// panel as if it had answered — for the surface a human watches precisely to be told what a Run
-/// is doing. A claude-code Run is unaffected.
-fn live_for(home: &Path, run_id: &str, found: &view::RunView) -> view::Live {
-    match found.backend {
-        runner::Backend::ClaudeCode => claude::live(
-            &claude::transcript_path(home, &found.worktree, &found.session_id),
-            world::now_epoch(),
-        ),
-        runner::Backend::Native => {
-            native::live(&job::runs_dir(home).join(run_id), world::now_epoch())
-        }
-        runner::Backend::Omp => {
-            crate::omp::live(&job::runs_dir(home).join(run_id), world::now_epoch())
-        }
-    }
 }
 
 /// The `supervisor.log` delta (KTD9): `o` bytes in, at most [`LOG_CAP`] bytes out, the
