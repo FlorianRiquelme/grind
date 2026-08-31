@@ -19,6 +19,7 @@ The observation block, top to bottom, is the answer to *how is it going*:
 
 ```
   verdict           unobserved — …        # what happened, never quality (ADR-0003)
+  blocker           Bash(gh pr merge 41) must be cleared — `grind cleared …`, then `grind resume …`
   furthest stage    dispatched
   now               compound-engineering:ce-work
   doing             Coherence review returned clean — zero findings. Waiting on…
@@ -29,6 +30,11 @@ The observation block, top to bottom, is the answer to *how is it going*:
 - **`doing`** is the transcript's last assistant message, one line — the direct answer to
   *what is it doing right now*. Read fresh from the session transcript on every call;
   mid-attempt, this is the field that moves.
+- **`blocker`** appears only on a Run the supervisor stopped for a human, and names both what
+  must be cleared and the two-step route to clearing it. It is a fact about the world, in the
+  same family as a rate limit — not a judgement of the work. The Handback and the dashboard
+  compose the same phrase from the same field, so no surface can be the one that withholds it
+  (#193).
 - **`progress`** is seconds since the newest write across the parent transcript **and every
   fan-out subagent transcript**. A quiet parent during a fan-out is healthy, not stuck.
 - A `?` means *could not observe*, never a verdict. Report it as blindness, not as a state
