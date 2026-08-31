@@ -7,12 +7,10 @@
 //! **Verdict language describes what happened, never quality** (ADR-0003). Check every string
 //! this module emits against that rule; there is a test at the bottom that does.
 
-use crate::attempt::Clearance;
-use crate::decide::{Decision, Stage, Verdict, VerifyContract};
+use crate::decide::{Decision, Verdict, VerifyContract};
 use crate::observe::{Observation, Observed, Outcome, RunOutcome, UNOBSERVABLE_MARK};
 use crate::rung::{ReturnStatus, StageEntry};
 use crate::view::{Facts, Live, RosterRow, RunView, one_line};
-use std::path::Path;
 
 /// One item of doctor's report, as `cli` hands it over: the name and the depth mark alongside
 /// the classified result, so this module needs no edge to the module that owns the list.
@@ -22,39 +20,28 @@ pub struct DoctorLine<'a> {
     pub outcome: Observed<Outcome>,
 }
 
-/// Everything the single-Run view is composed from. A named struct rather than eight
-/// arguments, so a new line's input is `E0063` at the call site rather than a positional slot
-/// somebody transposes.
-pub struct SingleRun<'a> {
-    pub found: &'a RunView,
-    pub observation: &'a Observation,
-    pub live: &'a Live,
-    pub verdict: &'a Verdict,
-    pub contract: &'a VerifyContract,
-    pub furthest: Stage,
-    pub supervisor_here: &'a Observed<bool>,
-    /// The latest clearance, shown only when one exists (#16 — it decides nothing).
-    pub cleared: Option<&'a Clearance>,
-    pub run_state: &'a Path,
-}
-
 /// The single-Run view: **alive, where, stuck, and about to cost something**, top to bottom,
 /// with no follow-up needed. Thirty seconds of looking is the whole budget.
 ///
+/// It takes [`Facts`] and the two per-backend observations `gather` cannot make — the same
+/// three arguments `page::run_page` takes, for the same reason. The struct it used to compose
+/// its own list from overlapped `Facts` on seven of nine fields and lacked `blocker`, so
+/// `grind status <run-id>` was the one projection that never reached the Blocker at all (#193).
+///
 /// The line order is fixed and the last-words block is exactly three lines, so
 /// `watch -n 30 grind status <id>` never jitters and the operator's eye can park on one row.
-pub fn run_view(view: &SingleRun) -> String {
-    let SingleRun {
+pub fn run_view(facts: &Facts, live: &Live, supervisor_here: &Observed<bool>) -> String {
+    let Facts {
         found,
         observation,
-        live,
         verdict,
         contract,
         furthest,
-        supervisor_here,
+        blocker,
         cleared,
         run_state,
-    } = view;
+        ..
+    } = facts;
     let furthest = *furthest;
     let (made, budget) = found.attempt_counter();
     let mut out = String::new();
@@ -86,6 +73,12 @@ pub fn run_view(view: &SingleRun) -> String {
         &mut out,
         &format!("  verdict           {}", verdict_line(verdict, observation)),
     );
+    if let Some(what) = blocker {
+        line(
+            &mut out,
+            &format!("  blocker           {}", blocker_note(what, &found.run_id)),
+        );
+    }
     if let Some(clearance) = cleared {
         line(
             &mut out,
@@ -530,12 +523,17 @@ fn handback_verdict(
         said = format!("{said} — ${:.2} of repair spent", repair_spend(found));
     }
     if let Some(what) = blocker {
-        said = format!(
-            "{said}  (a Blocker: {what} must be cleared — {})",
-            repair_hint(&found.run_id)
-        );
+        said = format!("{said}  (a Blocker: {})", blocker_note(what, &found.run_id));
     }
     said
+}
+
+/// What must be cleared, and the route to clearing it, as one phrase. Every surface that
+/// reports a Blocker composes it here — the Handback, `grind status` and the dashboard alike —
+/// so *what* and *how to clear it* cannot come apart on the surface a human happens to be
+/// looking at (#193).
+pub fn blocker_note(what: &str, run_id: &str) -> String {
+    format!("{what} must be cleared — {}", repair_hint(run_id))
 }
 
 /// The two-step repair, in order: `cleared` records what changed, `resume` spends. One
@@ -920,7 +918,8 @@ fn item_outcome(outcome: &Observed<Outcome>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decide::VerifyCoverage;
+    use crate::attempt::Clearance;
+    use crate::decide::{Stage, VerifyCoverage};
     use crate::observe::{Pr, Reason};
     use crate::runner::Backend;
     use crate::view::Fanout;
@@ -1003,17 +1002,17 @@ mod tests {
         live: &Live,
         verdict: &Verdict,
     ) -> String {
-        run_view(&SingleRun {
-            found,
-            observation,
+        run_view(
+            &facts_of(
+                found.clone(),
+                observation.clone(),
+                verdict.clone(),
+                coverage(),
+                None,
+            ),
             live,
-            verdict,
-            contract: &contract(),
-            furthest: Stage::PrOpen,
-            supervisor_here: &Observed::Present(true),
-            cleared: found.clearances.last(),
-            run_state: Path::new("/home/op/.grind/runs/20260806-122620-snapper-28/run.json"),
-        })
+            &Observed::Present(true),
+        )
     }
 
     fn label_order(text: &str) -> Vec<String> {

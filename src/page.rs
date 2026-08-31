@@ -660,6 +660,22 @@ fn last_words_block(live: &Live) -> String {
     )
 }
 
+/// The Blocker, with the route to clearing it. The head's own `blocker:` chip names *what*
+/// and has room for nothing else; a panel is where the two-step repair fits, and it composes
+/// through [`crate::render::blocker_note`] so the dashboard cannot spell that repair
+/// differently from the Handback or `grind status` (#193). Absent on every Run that is not
+/// blocked, like every other panel here.
+fn blocker_panel(facts: &Facts) -> String {
+    let Some(what) = &facts.blocker else {
+        return String::new();
+    };
+    format!(
+        "<div class=\"g-panel\" style=\"border-color:var(--hold)\"><div class=\"g-phead\">blocker</div>\
+<div style=\"padding:10px 12px\">{}</div></div>",
+        esc(&crate::render::blocker_note(what, &facts.found.run_id))
+    )
+}
+
 fn clearance_panel(facts: &Facts) -> String {
     let Some(c) = &facts.cleared else {
         return String::new();
@@ -892,7 +908,12 @@ fn run_grid(run_id: &str, facts: &Facts) -> String {
 
 pub fn run_fragment(run_id: &str, facts: &Facts, live: &Live, here: &Observed<bool>) -> String {
     let any_live = matches!(facts.found.state.as_str(), "dispatched" | "rate_limited");
-    let side = format!("{}{}", last_words_block(live), grit_panels(facts));
+    let side = format!(
+        "{}{}{}",
+        blocker_panel(facts),
+        last_words_block(live),
+        grit_panels(facts)
+    );
     format!(
         "<div data-g-root=\"run\" data-live=\"{}\">{}\
 <div style=\"max-width:1010px;margin:0 auto;padding:12px 16px\">\
@@ -908,7 +929,12 @@ pub fn run_fragment(run_id: &str, facts: &Facts, live: &Live, here: &Observed<bo
 }
 
 pub fn run_page(run_id: &str, facts: &Facts, live: &Live, here: &Observed<bool>) -> String {
-    let side = format!("{}{}", last_words_block(live), grit_panels(facts));
+    let side = format!(
+        "{}{}{}",
+        blocker_panel(facts),
+        last_words_block(live),
+        grit_panels(facts)
+    );
     let body = format!(
         "{}{}<div style=\"max-width:1010px;margin:0 auto;padding:12px 16px\">\
 <div class=\"g-grid\" style=\"display:grid;grid-template-columns:1fr 396px;gap:12px;align-items:start\">\
