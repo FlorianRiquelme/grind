@@ -45,6 +45,7 @@ const FLAT_SUFFIX: &str = "11111111-2222-4333-8444-555555555555";
 /// The filename `strayed.sh` writes into the encoded-cwd bucket instead.
 const STRAY_FILE: &str = "2026-01-02T03-04-05-000Z_99999999-8888-4777-8666-555555555555.jsonl";
 
+/// The snapshotted binary path this Run is pinned to — the whole seam.
 fn fake_omp() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fakes/bin/omp")
 }
@@ -60,6 +61,8 @@ struct Sandbox {
 }
 
 impl Sandbox {
+    /// Take the lock, build an empty tree, lay down the scenario the fake reads its shapes
+    /// from, and point `$HOME` at it.
     fn new(name: &str, shapes: &[&str]) -> Sandbox {
         let lock = ENV_LOCK
             .lock()
@@ -82,6 +85,7 @@ impl Sandbox {
         }
     }
 
+    /// Where the adapter puts this stage's own session directory, `run_dir/sessions/<sid>`.
     fn stage_dir(&self) -> PathBuf {
         self.run_dir.join("sessions").join(SESSION_ID)
     }
@@ -91,6 +95,7 @@ impl Sandbox {
         format!("{}/", self.stage_dir().display())
     }
 
+    /// The tree `strayed_after` walks when `--session-dir` was ignored.
     fn stray_bucket(&self) -> PathBuf {
         self.root.join(".omp/agent/sessions")
     }
@@ -111,6 +116,7 @@ impl Sandbox {
         panic!("the fake never logged attempt {attempt_n}:\n{log}");
     }
 
+    /// The copy `harvest` left in the Run's evidence tree, by name.
     fn harvested(&self, filename: &str) -> String {
         std::fs::read_to_string(self.stage_dir().join(filename))
             .unwrap_or_else(|e| panic!("no harvested copy of {filename}: {e}"))
