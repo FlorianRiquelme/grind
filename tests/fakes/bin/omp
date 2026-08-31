@@ -1,0 +1,68 @@
+#!/bin/sh
+# The fake `omp` at the snapshotted binary path (`RunRecord.omp_bin`, ADR-0017 line 216).
+#
+# The claude fake's reasoning verbatim: the seam is the binary path, and it is the only seam
+# here — only a real process replays a real exit code the parent did not choose, a real
+# separate stderr file, and a real session file the harness wrote where it felt like writing
+# it. A shell script at this path needs no trait and no injection.
+#
+# Three differences from the `claude` fake, each forced by what the omp adapter actually does:
+#
+#   * Its shapes live in `tests/fakes/omp-shapes/`, a sibling of the claude fake's own
+#     `tests/fakes/shapes/` rather than a subdirectory of it: `tests/end_to_end.rs` copies that
+#     directory flat into every sandbox it builds, and a nested directory makes the copy fail.
+#   * Its control directory is derived from `--session-dir`, not from `$HOME`. The adapter
+#     hands every attempt `<run_dir>/sessions/<sid>/`, so the Run directory is two levels up
+#     and `<run_dir>/fake/` is a per-sandbox scratch no other Run can reach. `$HOME` stays
+#     free to mean only what `strayed_after` reads it for.
+#   * `--version` answers and exits before anything is counted. The dispatch snapshot probes
+#     the binary (`supervisor::omp_snapshot`), and a probe that spent a scenario shape would
+#     make every attempt-indexed assertion below off by one.
+for a in "$@"; do
+  if [ "$a" = "--version" ]; then
+    printf 'omp/18.0.6\n'
+    exit 0
+  fi
+done
+
+SESSION_DIR=""
+WANT=0
+for a in "$@"; do
+  if [ "$WANT" = 1 ]; then
+    SESSION_DIR="$a"
+    WANT=0
+  fi
+  if [ "$a" = "--session-dir" ]; then WANT=1; fi
+done
+if [ -z "$SESSION_DIR" ]; then
+  printf 'the fake omp was spawned without --session-dir\n' >&2
+  exit 64
+fi
+
+SESSION_DIR=${SESSION_DIR%/}
+RUN_DIR=$(dirname "$(dirname "$SESSION_DIR")")
+F="$RUN_DIR/fake"
+mkdir -p "$F" "$SESSION_DIR"
+
+ATTEMPT=$(cat "$F/counter" 2>/dev/null || echo 0)
+ATTEMPT=$((ATTEMPT + 1))
+printf '%s\n' "$ATTEMPT" > "$F/counter"
+
+# The argv exactly as handed over, one element per line, so the literal flags of every
+# attempt can be asserted afterwards.
+{
+  for a in "$@"; do printf '%s\n' "$a"; done
+  printf -- '--- attempt %s\n' "$ATTEMPT"
+} >> "$F/argv.log"
+
+cat > "$F/prompt-$ATTEMPT.txt"
+
+SHAPE=$(sed -n "${ATTEMPT}p" "$F/scenario" 2>/dev/null)
+[ -n "$SHAPE" ] || SHAPE=$(sed -n '$p' "$F/scenario" 2>/dev/null)
+if [ -z "$SHAPE" ]; then
+  printf 'the fake omp has no shape for attempt %s\n' "$ATTEMPT" >&2
+  exit 65
+fi
+
+export SESSION_DIR RUN_DIR ATTEMPT
+exec "$(dirname "$0")/../omp-shapes/$SHAPE.sh"
