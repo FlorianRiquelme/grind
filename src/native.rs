@@ -466,15 +466,29 @@ struct AttemptFacts<'a> {
 /// itself), exit 0/1, and rate-limit detection asked of the shared classifier over a
 /// payload carrying the error text — policy parity without duplicating needles.
 ///
-/// `total_cost_usd` carries the run's summed `usage.cost` when the endpoint reported
-/// one (`accumulate_usage` folds each turn's per-request cost into the total), and is
-/// otherwise `Some(0.0)` — never `None`: unlike the claude-code path, where an absent
-/// JSON field is genuinely ambiguous between "renamed key" and "true zero", the native
-/// loop authoritatively knows it recorded no cost. `None` here would make
-/// `Attempt::is_wait()` false for every native Attempt regardless of `num_turns`,
-/// which lets a first-turn rate limit spend the attempt budget and keeps
-/// `trailing_waits` permanently at 0 — the Run 2 failure ADR-0002/0004 exist to
-/// prevent.
+/// `total_cost_usd` is [`cost_floor`]'s answer.
+///
+/// **This backend's cost convention, named rather than inlined** (issue #194): the run's
+/// summed `usage.cost` when the endpoint reported one (`accumulate_usage` folds each turn's
+/// per-request cost into the total), and otherwise `Some(0.0)` — never `None`. Unlike the
+/// claude-code path, where an absent JSON field is genuinely ambiguous between "renamed key"
+/// and "true zero", the native loop authoritatively knows it recorded no cost. `None` here
+/// would make `crate::attempt::Attempt::is_wait` false for every native Attempt regardless of
+/// `num_turns`, which lets a first-turn rate limit spend the attempt budget and keeps
+/// `trailing_waits` permanently at 0 — the Run 2 failure ADR-0002/0004 exist to prevent.
+///
+/// It is a named public function so that the one place a reader can compare all three
+/// adapters' conventions (`tests/cost_conventions.rs`) can reach this one too; the other two
+/// producers are already public classifiers.
+pub fn cost_floor(usage: Option<&Value>) -> Option<f64> {
+    Some(
+        usage
+            .and_then(|u| u.get("cost"))
+            .and_then(|c| c.as_f64())
+            .unwrap_or(0.0),
+    )
+}
+
 fn synthesize(facts: AttemptFacts) -> Attempt {
     let (exit_code, is_error, spoken) = match facts.ending {
         Ending::Completed(text) => (Some(0), false, text),
@@ -501,14 +515,7 @@ fn synthesize(facts: AttemptFacts) -> Attempt {
         api_error_status: None,
         terminal_reason,
         num_turns: Some(facts.turns_used as u64),
-        total_cost_usd: Some(
-            facts
-                .usage
-                .as_ref()
-                .and_then(|u| u.get("cost"))
-                .and_then(|c| c.as_f64())
-                .unwrap_or(0.0),
-        ),
+        total_cost_usd: cost_floor(facts.usage.as_ref()),
         usage: facts.usage,
         permission_denials: facts.denials,
         done_promise,

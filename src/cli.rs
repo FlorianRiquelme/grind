@@ -5,10 +5,8 @@
 //! a gate through the back door: something downstream acts on the code, and a finding starts
 //! blocking. There is deliberately no conversion from a verdict in existence anywhere in this
 //! module (ADR-0006's convention mode, aimed at the surface most exposed to it).
-use crate::claude;
 use crate::decide;
 use crate::job::{self, Check, Depth, Refusal};
-use crate::native;
 use crate::net;
 use crate::observe::{self, Observed, Outcome};
 use crate::render::{self, DoctorLine, SingleRun};
@@ -336,7 +334,7 @@ fn status_one(run_id: &str) -> i32 {
             let signals = decide::signals_of(&observation);
             let promised = found.attempts.last().is_some_and(|a| a.done_promise);
             let verdict = decide::verdict(&signals, promised);
-            let live = live_for(&home, run_id, &found);
+            let live = runner::live(&home, run_id, &found);
             let here = view::supervisor_here(
                 found.supervisor_identity.as_deref(),
                 &observe::process_start_stamp(&world::ps_start_stamp(found.supervisor_pid)),
@@ -369,28 +367,6 @@ fn observe_for(found: &view::RunView) -> observe::Observation {
         &found.job.base_branch,
         world::now_iso(),
     )
-}
-
-/// The live view, dispatched on the Run's snapshotted backend (#135). Each adapter reads its own
-/// transcripts and returns the one [`view::Live`] shape: `claude::live` a claude-code session's
-/// JSONL under `~/.claude/projects/`, `native::live` the `messages-N.jsonl` the native loop
-/// leaves under the Run's own directory. The floor this replaces read only `freshness` for a
-/// native Run and left every other field `Unobservable`; `grind status` exited *Answered* over a
-/// blank panel, which is no answer at all for the command `docs/agents/run-observation.md` names
-/// as the way to ask what a Run is doing. A claude-code Run is unaffected.
-fn live_for(home: &Path, run_id: &str, found: &view::RunView) -> view::Live {
-    match found.backend {
-        runner::Backend::ClaudeCode => claude::live(
-            &claude::transcript_path(home, &found.worktree, &found.session_id),
-            world::now_epoch(),
-        ),
-        runner::Backend::Native => {
-            native::live(&job::runs_dir(home).join(run_id), world::now_epoch())
-        }
-        runner::Backend::Omp => {
-            crate::omp::live(&job::runs_dir(home).join(run_id), world::now_epoch())
-        }
-    }
 }
 
 /// Serve the dashboard. The kernel prints its own startup line; `Ok` here only means it
@@ -828,101 +804,6 @@ fn print_err(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const DAY_ONE: &str = include_str!("../tests/fixtures/record/day-one.json");
-
-    /// The day-one fixture, with `backend` overridden — a record written before selection
-    /// existed carries neither field and defaults to `ClaudeCode`, so a literal string edit is
-    /// how the other backend gets exercised without hand-building the whole record shape.
-    fn found_with_backend(backend: &str) -> view::RunView {
-        let mut value: serde_json::Value = serde_json::from_str(DAY_ONE).unwrap();
-        value["backend"] = serde_json::json!(backend);
-        serde_json::from_value(value).unwrap()
-    }
-
-    #[test]
-    fn a_claude_code_run_is_unaffected_by_the_native_branch() {
-        let found = found_with_backend("claude-code");
-        let home = Path::new("/nowhere/that/exists");
-        let live = live_for(home, &found.run_id, &found);
-        assert_eq!(
-            live.transcript,
-            claude::transcript_path(home, &found.worktree, &found.session_id)
-        );
-        assert!(matches!(live.freshness, Observed::Unobservable(_)));
-        assert!(matches!(live.now_skill, Observed::Unobservable(_)));
-    }
-
-    #[test]
-    fn a_native_run_reads_its_own_transcript_and_not_only_its_freshness() {
-        let found = found_with_backend("native");
-        let home = world::temp_dir("cli-live-for-native");
-        let run_dir = job::runs_dir(&home).join(&found.run_id);
-        world::create_dir_all(&run_dir).expect("a scratch run directory");
-        world::write(
-            &run_dir.join("messages-1.jsonl"),
-            concat!(
-                r#"{"event":"skill_declared","value":{"skill":"work"}}"#,
-                "\n",
-                r#"{"event":"protocol_selected","value":{"mode":"text","reason":"declared"}}"#,
-                "\n",
-                r#"{"event":"assistant_tool_calls","value":{"calls":[{"name":"bash","arguments":"{\"command\":\"just verify\"}"}]}}"#,
-                "\n",
-                r#"{"event":"tool_result","value":{"call_id":"text","output":"all green"}}"#,
-                "\n",
-            ),
-        )
-        .expect("a scratch messages file");
-
-        let live = live_for(&home, &found.run_id, &found);
-        assert!(
-            matches!(live.freshness, Observed::Present(_)),
-            "{:?}",
-            live.freshness
-        );
-        assert_eq!(live.now_skill, Observed::Present("work".to_string()));
-        assert_eq!(
-            live.assistant_now,
-            Observed::Present(r#"bash {"command":"just verify"}"#.to_string())
-        );
-        assert_eq!(
-            live.last_words,
-            vec![
-                r#"bash {"command":"just verify"}"#.to_string(),
-                "all green".to_string(),
-                String::new(),
-            ]
-        );
-        assert!(
-            matches!(live.fanout, Observed::Unobservable(_)),
-            "{:?}",
-            live.fanout
-        );
-        assert_eq!(live.transcript, run_dir.join("messages-1.jsonl"));
-
-        world::remove_tree(&home);
-    }
-
-    #[test]
-    fn a_native_transcript_of_nothing_recognisable_is_absent_and_never_a_crash() {
-        let found = found_with_backend("native");
-        let home = world::temp_dir("cli-live-for-native-garbage");
-        let run_dir = job::runs_dir(&home).join(&found.run_id);
-        world::create_dir_all(&run_dir).expect("a scratch run directory");
-        world::write(
-            &run_dir.join("messages-1.jsonl"),
-            "{\"event\":\"turn\"}\nnot json\n",
-        )
-        .expect("a scratch messages file");
-
-        let live = live_for(&home, &found.run_id, &found);
-        assert!(matches!(live.freshness, Observed::Present(_)));
-        assert_eq!(live.now_skill, Observed::Absent);
-        assert_eq!(live.assistant_now, Observed::Absent);
-        assert_eq!(live.last_words, vec![String::new(); 3]);
-
-        world::remove_tree(&home);
-    }
 
     #[test]
     fn the_exit_code_reports_whether_status_could_answer_and_never_how_the_run_is_doing() {

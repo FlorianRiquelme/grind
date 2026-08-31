@@ -566,8 +566,16 @@ pub fn dispatch(reference: &str) -> Result<Outcome, Refusal> {
 /// unpinned — and an undeclared class still names the concrete id [`runner::DEFAULT_MODEL`]
 /// resolves to, because that is what will run. An omp Run names its binary and version only
 /// when readiness actually heard a version, by the same rule.
+///
+/// The `denials` line applies that rule to the barrier itself (issue #194). `DENIED_TOOLS` is
+/// documented as the *entire* barrier, and the three adapters carry it three ways — one of
+/// them not at all (ADR-0017). The operator picking a backend in `~/.grind/agent` is picking
+/// which of those they get, and a banner that named the backend while staying silent about the
+/// carrier left them to infer the fenced case. It states a fact about this Run, never a
+/// judgement about it, and it gates nothing: an unenforced Run dispatches exactly as before.
 fn dispatch_banner(record: &RunRecord) -> Vec<String> {
     let mut lines = vec![format!("  backend {}", record.backend.as_str())];
+    lines.push(format!("  denials {}", record.backend.denials().as_str()));
     lines.push(format!(
         "  model {}",
         runner::declared_model(
@@ -2623,6 +2631,7 @@ mod tests {
             dispatch_banner(&record),
             vec![
                 "  backend claude-code".to_string(),
+                "  denials argv".to_string(),
                 "  model (session default — unpinned)".to_string(),
                 format!("  claude {}", record.claude_bin),
             ]
@@ -2640,6 +2649,7 @@ mod tests {
             dispatch_banner(&record),
             vec![
                 "  backend native".to_string(),
+                "  denials gate".to_string(),
                 "  model stealth/ox-alpha".to_string(),
             ]
         );
@@ -2656,6 +2666,7 @@ mod tests {
             dispatch_banner(&record),
             vec![
                 "  backend native".to_string(),
+                "  denials gate".to_string(),
                 "  model fast stealth/ox-alpha · strong deepseek/deepseek-chat-v3.1".to_string(),
             ]
         );
@@ -2670,6 +2681,7 @@ mod tests {
             dispatch_banner(&record),
             vec![
                 "  backend native".to_string(),
+                "  denials gate".to_string(),
                 format!("  model {}", runner::DEFAULT_MODEL),
             ]
         );
@@ -2677,13 +2689,17 @@ mod tests {
 
     #[test]
     fn a_pinned_job_names_its_pin_on_either_backend() {
-        for backend in [Backend::Native, Backend::ClaudeCode] {
+        for (backend, denials) in [
+            (Backend::Native, "  denials gate"),
+            (Backend::ClaudeCode, "  denials argv"),
+        ] {
             let mut record = day_one();
             record.backend = backend;
             record.model = Some("claude-opus-9".to_string());
             let banner = dispatch_banner(&record);
             assert_eq!(banner[0], format!("  backend {}", backend.as_str()));
-            assert_eq!(banner[1], "  model claude-opus-9");
+            assert_eq!(banner[1], denials);
+            assert_eq!(banner[2], "  model claude-opus-9");
             assert_eq!(
                 banner.iter().any(|l| l.starts_with("  claude ")),
                 backend == Backend::ClaudeCode,
@@ -2708,6 +2724,11 @@ mod tests {
             }),
         });
         let banner = dispatch_banner(&record);
+        assert_eq!(
+            banner[1], "  denials unenforced",
+            "an omp Run says so at dispatch rather than leaving the operator to infer a \
+             fence it does not have (ADR-0017): {banner:?}"
+        );
         assert!(
             banner.contains(&"  route strong claude-code/claude-opus-5".to_string()),
             "{banner:?}"

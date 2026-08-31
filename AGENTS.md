@@ -126,6 +126,27 @@ but split literals used in a negative grep, or the test matches its own source l
   never a Wait**, and that clause is load-bearing: a crash leaves cost and turns both absent, so
   reading absence as *did no work* makes every crash loop free and endless. A run of Waits is
   bounded by `CONSECUTIVE_WAITS`, counted off the persisted list so a reboot cannot reset it.
+- **`Attempt.total_cost_usd` has three producers and its `None` means three different things**
+  (#194). claude-code copies the child's own JSON field, where absence is genuinely ambiguous
+  between a renamed key and a true zero; native sums `usage.cost` off the wire and floors to
+  `Some(0.0)`, never absent, because the loop knows what it recorded; omp reports `None` when
+  the harness exposed no spend channel at all, which a `$0.00` would misstate. All three are
+  deliberate, all three land on the safe side of `Attempt::is_wait`, and
+  `tests/cost_conventions.rs` is where they sit side by side. **A fourth producer must choose
+  on purpose**: reporting `Some(0.0)` for *unknown* makes every one of its Attempts a Wait, so
+  none spend the budget and the Run never terminates.
+- **Adding a backend is four arms in `src/runner.rs`, and one of them the compiler cannot
+  check.** Execution (`StageRunner::run` via `runner_for`), live-progress observation
+  (`runner::live`), evidence file names (`runner::evidence`) and the denied-glob carrier
+  (`Backend::denials`) all vary per adapter, and all four branch in `runner.rs` and nowhere
+  else — the module doc says so, and it has to stay true. Three of them used to live in
+  `cli.rs`, `serve.rs` and `page.rs`, with `cli::live_for` and `serve::live_for` byte-identical
+  copies of each other (#194). **Never re-scatter one**: widening for adapter #4 should be one
+  file, and a match moved back out to a surface is one more place a reader has to find. The
+  compiler forces all four arms to exist, but only `denials` can be *wrong while compiling* —
+  it is a claim about what the adapter does, and a new adapter copying a neighbour's arm
+  inherits a claim it never earned. `tests/denied_tools.rs` checks each declaration against
+  what that adapter's source actually reaches for.
 - **`Blocked` is a supervisor state and a policy stop, never a `Verdict` variant.** ADR-0006
   prohibits `Verdict::{Rejected, Blocked, Failed}` by name because those words judge the *work*;
   a Blocker is a fact about the *world*, in the same family as `RateLimited`. Refusing to build
@@ -301,6 +322,16 @@ but split literals used in a negative grep, or the test matches its own source l
 
   Widening the list is safe and welcome; narrowing it is not.
 
+  **Which adapter carries them, and whether they bind at all, is `Backend::denials`** (#194).
+  The supervisor hands the same list to every adapter, and the three do different things with
+  it: native's own gate reads `RunSpec::denied_globs` before each tool call, claude-code gets
+  the same list by argv (`--disallowedTools`, baked into the `Invocation`), and omp enforces
+  nothing — it is hosted with blanket approval, which ADR-0017 decided in writing and records
+  rather than papers over. A Dispatch banner names the carrier so an operator picking a backend
+  is told which one they got. Reading a full `denied_globs` slice and concluding a Run is
+  fenced is the misreading the old *the single permission source both adapters enforce* doc
+  invited; nothing here narrows the list, and nothing here may.
+
   Denials are inherited by subagents and survive `bypassPermissions`. Don't loosen the list to
   make a Run go through — and note that **nothing sits behind it**: no credential can withhold
   merge from something allowed to open a PR (`Pull requests: write` covers both,
@@ -396,12 +427,13 @@ Inline-comment additions to `.rs` files are hard-blocked at edit time by the `.o
 
 Agent instructions for assistants on this repo live in this file and in TTSR guardrails under
 `.omp/rules/*.md` — injected into the assistant's stream only when the rule's condition/glob
-triggers match, never an always-on token cost. Seven exist today: `denied-tools-narrowing`,
+triggers match, never an always-on token cost. Eight exist today: `denied-tools-narrowing`,
 `run-json-sole-writer`, `verdict-language-no-quality`, `provenance-frozen-at-dispatch`,
 `enqueue-template-job-contract`, `index-lines-follow-directories`,
-`widen-grammar-sweep-declarations`. When a constraint above ("Constraints that are easy to
-violate") is forgettable-but-critical and scoped to specific files/symbols/commands, encode it
-there too instead of expecting every violating edit to pass through this file.
+`widen-grammar-sweep-declarations`, `backend-arms-branch-in-runner`. When a constraint above
+("Constraints that are easy to violate") is forgettable-but-critical and scoped to specific
+files/symbols/commands, encode it there too instead of expecting every violating edit to pass
+through this file.
 Beyond these declarative rules, three pre-tool hooks under `.omp/hooks/pre/` (`no-inline-comments.ts`, `denied-tools-mirror.ts`, `prefer-just-verify.ts`) hard-block violating tool calls in interactive sessions, and the `verify-fixer` subagent under `.omp/agents/` performs scoped `just verify` failure repair.
 
 ### Domain docs
